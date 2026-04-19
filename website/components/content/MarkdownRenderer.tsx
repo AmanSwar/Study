@@ -7,8 +7,29 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
 import { useState, ReactNode } from 'react'
+import dynamic from 'next/dynamic'
 import { Copy, Check, Link2 } from 'lucide-react'
-import { AsciiDiagram } from './AsciiDiagram'
+
+// AsciiDiagram parses diagrams into large SVG trees. Rendering that during
+// SSR (×60 diagrams × 141 pages) blows the Vercel build budget. Load it
+// client-only — server renders the placeholder below, client hydrates with
+// the real SVG.
+const AsciiDiagram = dynamic(
+  () => import('./AsciiDiagram').then((m) => m.AsciiDiagram),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
+        <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary bg-bg-surface/50">
+          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider bg-cyan-500/20 text-cyan-400">
+            Diagram
+          </span>
+        </div>
+        <div className="p-4 text-xs text-text-tertiary font-mono">Loading diagram…</div>
+      </div>
+    ),
+  }
+)
 
 interface MarkdownRendererProps {
   content: string
