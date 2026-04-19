@@ -8,6 +8,7 @@ import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
 import { useState, ReactNode } from 'react'
 import { Copy, Check, Link2 } from 'lucide-react'
+import { AsciiDiagram } from './AsciiDiagram'
 
 interface MarkdownRendererProps {
   content: string
@@ -41,14 +42,14 @@ function childrenToText(children: ReactNode): string {
 }
 
 /**
- * Detect if a block contains ASCII diagrams (box-drawing characters, arrows, etc.).
- * Used to skip line numbers for these blocks since line numbers destroy alignment
- * and make diagrams harder to read.
+ * Detect if a block is an ASCII diagram worth trying to render as SVG.
+ * We require actual box-drawing characters (U+2500–257F) — stray arrows or
+ * geometric glyphs in comments (common in asm/C code) don't count.
  */
 function isAsciiDiagram(content: string): boolean {
-  // Unicode box-drawing, block, arrow, and misc graphic characters
-  const diagramChars = /[\u2500-\u257F\u2580-\u259F\u2190-\u21FF\u25A0-\u25FF\u2600-\u26FF]/
-  return diagramChars.test(content)
+  // Box-drawing block only (corners, edges, junctions)
+  const boxDrawingChars = /[\u2500-\u257F]/
+  return boxDrawingChars.test(content)
 }
 
 /**
@@ -90,17 +91,19 @@ function MarkdownCodeBlock({ language, children }: { language: string; children:
     cuda: 'bg-green-500/20 text-green-400',
   }
 
-  // A block is "text-like" (diagram, prose, pseudocode) if: no language tag,
-  // tagged as text/plain/ascii/diagram, OR it contains box-drawing characters
-  // even with a language tag (some source files use ```c or ```text for ASCII).
-  const isDiagram = !language ||
-    ['text', 'plain', 'ascii', 'diagram'].includes(language) ||
-    isAsciiDiagram(code)
+  // A block is a "diagram" only if it actually contains box-drawing characters.
+  // Previously we classified any unlabeled block as a diagram, but many of those
+  // are structured text / tables / data — those should render as regular code.
+  const isDiagram = isAsciiDiagram(code)
 
-  const label = isDiagram ? 'Diagram' : (langLabels[language] || language || 'Code')
-  const colorClass = isDiagram
-    ? 'bg-cyan-500/20 text-cyan-400'
-    : (langColors[language] || 'bg-gray-500/20 text-gray-400')
+  // For diagram blocks, hand off to the AsciiDiagram component which parses
+  // and renders as SVG (with fallback to styled ASCII if parsing fails).
+  if (isDiagram) {
+    return <AsciiDiagram code={code} language={language} />
+  }
+
+  const label = langLabels[language] || language || 'Code'
+  const colorClass = langColors[language] || 'bg-gray-500/20 text-gray-400'
 
   return (
     <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
@@ -128,43 +131,27 @@ function MarkdownCodeBlock({ language, children }: { language: string; children:
         </button>
       </div>
 
-      {/* Content */}
-      {isDiagram ? (
-        // ASCII diagrams: single <pre> with explicit white-space: pre,
-        // horizontal scroll for long lines, no line numbers.
-        <div className="overflow-x-auto">
+      {/* Real code: line numbers on the left, scrollable code on the right.
+          Uses inline-flex so content expands to its natural width (no wrapping),
+          and the outer div provides overflow scroll. */}
+      <div className="overflow-x-auto">
+        <div className="inline-flex min-w-full">
+          <div
+            className="select-none flex-none py-4 pl-4 pr-3 text-right text-text-tertiary/50 text-xs font-mono bg-bg-code"
+            style={{ lineHeight: 1.625 }}
+          >
+            {lines.map((_, i) => (
+              <div key={i}>{i + 1}</div>
+            ))}
+          </div>
           <pre
-            className="p-4 text-sm font-mono text-text-primary"
-            style={{ whiteSpace: 'pre', lineHeight: 1.5 }}
+            className="flex-none py-4 pr-4 pl-2 text-sm font-mono text-text-primary"
+            style={{ whiteSpace: 'pre', lineHeight: 1.625 }}
           >
             <code>{code}</code>
           </pre>
         </div>
-      ) : (
-        // Real code: line numbers on the left, scrollable content on the right.
-        // Uses an inline-flex layout with width auto so content expands to its
-        // natural width (no wrapping), and the outer div provides overflow scroll.
-        <div className="overflow-x-auto">
-          <div className="inline-flex min-w-full">
-            {/* Line numbers column */}
-            <div
-              className="select-none flex-none py-4 pl-4 pr-3 text-right text-text-tertiary/50 text-xs font-mono bg-bg-code"
-              style={{ lineHeight: 1.625 }}
-            >
-              {lines.map((_, i) => (
-                <div key={i}>{i + 1}</div>
-              ))}
-            </div>
-            {/* Code column */}
-            <pre
-              className="flex-none py-4 pr-4 pl-2 text-sm font-mono text-text-primary"
-              style={{ whiteSpace: 'pre', lineHeight: 1.625 }}
-            >
-              <code>{code}</code>
-            </pre>
-          </div>
-        </div>
-      )}
+      </div>
     </div>
   )
 }
@@ -298,10 +285,16 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
             <hr className="my-10 border-t border-border-primary" />
           ),
           code: ({ className, children, ...props }) => {
+            const childrenStr = String(children)
             const match = /language-(\w+)/.exec(className || '')
-            const isBlock = match !== null
+            // Treat as a code BLOCK if:
+            //   - It has a language- class (typical ```lang fenced block), OR
+            //   - Its content contains a newline (fenced block with no lang).
+            // Otherwise render as inline code.
+            const isBlock = match !== null || childrenStr.includes('\n')
             if (isBlock) {
-              return <MarkdownCodeBlock language={match[1]}>{String(children).replace(/\n$/, '')}</MarkdownCodeBlock>
+              const language = match ? match[1] : ''
+              return <MarkdownCodeBlock language={language}>{childrenStr.replace(/\n$/, '')}</MarkdownCodeBlock>
             }
             return (
               <code className="px-1.5 py-0.5 rounded bg-bg-code text-accent-cyan text-[0.9em] font-mono break-words" {...props}>

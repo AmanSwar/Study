@@ -1,9 +1,9 @@
-import Link from 'next/link'
-import { ArrowLeft, ArrowRight } from 'lucide-react'
 import { Breadcrumbs, BreadcrumbItem } from '@/components/layout/Breadcrumbs'
 import { ModuleHeader } from '@/components/content/ModuleHeader'
 import { MarkdownRenderer } from '@/components/content/MarkdownRenderer'
 import { TableOfContents } from '@/components/content/TableOfContents'
+import { ModuleNav } from '@/components/layout/ModuleNav'
+import { ReadingProgress } from '@/components/layout/ReadingProgress'
 import { loadMarkdown, extractHeadings, stripFirstH1 } from '@/lib/markdown'
 
 interface MarkdownModulePageProps {
@@ -33,12 +33,14 @@ interface MarkdownModulePageProps {
 
 /**
  * MarkdownModulePage — a server component that loads a source markdown file
- * and renders it inside the standard module page layout (breadcrumbs + header
- * + content + ToC + nav).
+ * and renders it inside the standard module page layout:
  *
- * The full source markdown is rendered with 100% fidelity via MarkdownRenderer,
- * which maps every markdown element to the same styled components used by the
- * curated module pages.
+ *   [ReadingProgress bar at top]
+ *   [Breadcrumbs]
+ *   [ModuleHeader with number, title, description, metadata]
+ *   [MarkdownRenderer — full content]
+ *   [TableOfContents — right rail on wide screens]
+ *   [ModuleNav — rich prev/next cards with arrow key shortcuts]
  */
 export async function MarkdownModulePage({
   sourcePath,
@@ -59,6 +61,7 @@ export async function MarkdownModulePage({
 
   return (
     <>
+      <ReadingProgress />
       <Breadcrumbs items={breadcrumbs} />
 
       <div className="flex gap-0">
@@ -75,29 +78,7 @@ export async function MarkdownModulePage({
 
           <MarkdownRenderer content={content} />
 
-          {/* Navigation */}
-          <div className="mt-12 pt-6 border-t border-border-primary flex items-center justify-between">
-            {prev ? (
-              <Link
-                href={prev.href}
-                className="flex items-center gap-2 text-sm font-medium text-accent-blue hover:gap-3 transition-all"
-              >
-                <ArrowLeft className="w-4 h-4" /> Prev: {prev.label}
-              </Link>
-            ) : (
-              <div />
-            )}
-            {next ? (
-              <Link
-                href={next.href}
-                className="flex items-center gap-2 text-sm font-medium text-accent-blue hover:gap-3 transition-all"
-              >
-                Next: {next.label} <ArrowRight className="w-4 h-4" />
-              </Link>
-            ) : (
-              <div />
-            )}
-          </div>
+          <ModuleNav prev={prev} next={next} />
         </article>
 
         <TableOfContents items={tocItems} />
