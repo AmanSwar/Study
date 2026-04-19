@@ -41,11 +41,28 @@ function childrenToText(children: ReactNode): string {
 }
 
 /**
- * CodeBlock component matching the existing site style
+ * Detect if a block contains ASCII diagrams (box-drawing characters, arrows, etc.).
+ * Used to skip line numbers for these blocks since line numbers destroy alignment
+ * and make diagrams harder to read.
+ */
+function isAsciiDiagram(content: string): boolean {
+  // Unicode box-drawing, block, arrow, and misc graphic characters
+  const diagramChars = /[\u2500-\u257F\u2580-\u259F\u2190-\u21FF\u25A0-\u25FF\u2600-\u26FF]/
+  return diagramChars.test(content)
+}
+
+/**
+ * CodeBlock component matching the existing site style.
+ * - ASCII/text blocks render as clean scrollable <pre> with no line numbers
+ *   (line numbers destroy the alignment of box-drawing characters).
+ * - Code blocks (with a language) get line numbers via a grid layout
+ *   that doesn't constrain content width, so long lines scroll horizontally
+ *   instead of wrapping.
  */
 function MarkdownCodeBlock({ language, children }: { language: string; children: string }) {
   const [copied, setCopied] = useState(false)
-  const lines = children.replace(/\n$/, '').split('\n')
+  const code = children.replace(/\n$/, '')
+  const lines = code.split('\n')
 
   const handleCopy = async () => {
     try {
@@ -60,7 +77,8 @@ function MarkdownCodeBlock({ language, children }: { language: string; children:
     asm: 'Assembly', assembly: 'Assembly', bash: 'Bash', shell: 'Shell',
     rust: 'Rust', typescript: 'TypeScript', ts: 'TypeScript', js: 'JavaScript',
     javascript: 'JavaScript', go: 'Go', cuda: 'CUDA', metal: 'Metal',
-    json: 'JSON', yaml: 'YAML', sql: 'SQL', text: 'Text', '': 'Text',
+    json: 'JSON', yaml: 'YAML', sql: 'SQL', text: 'Diagram', '': 'Diagram',
+    plain: 'Diagram', ascii: 'Diagram', diagram: 'Diagram',
   }
   const langColors: Record<string, string> = {
     python: 'bg-yellow-500/20 text-yellow-400', py: 'bg-yellow-500/20 text-yellow-400',
@@ -71,11 +89,22 @@ function MarkdownCodeBlock({ language, children }: { language: string; children:
     typescript: 'bg-blue-500/20 text-blue-400', ts: 'bg-blue-500/20 text-blue-400',
     cuda: 'bg-green-500/20 text-green-400',
   }
-  const label = langLabels[language] || language || 'Text'
-  const colorClass = langColors[language] || 'bg-gray-500/20 text-gray-400'
+
+  // A block is "text-like" (diagram, prose, pseudocode) if: no language tag,
+  // tagged as text/plain/ascii/diagram, OR it contains box-drawing characters
+  // even with a language tag (some source files use ```c or ```text for ASCII).
+  const isDiagram = !language ||
+    ['text', 'plain', 'ascii', 'diagram'].includes(language) ||
+    isAsciiDiagram(code)
+
+  const label = isDiagram ? 'Diagram' : (langLabels[language] || language || 'Code')
+  const colorClass = isDiagram
+    ? 'bg-cyan-500/20 text-cyan-400'
+    : (langColors[language] || 'bg-gray-500/20 text-gray-400')
 
   return (
     <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
+      {/* Header */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary bg-bg-surface/50">
         <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider ${colorClass}`}>
           {label}
@@ -98,20 +127,44 @@ function MarkdownCodeBlock({ language, children }: { language: string; children:
           )}
         </button>
       </div>
-      <div className="overflow-x-auto">
-        <pre className="p-4 text-sm leading-relaxed font-mono">
-          <code>
-            {lines.map((line, i) => (
-              <div key={i} className="flex">
-                <span className="select-none w-10 shrink-0 text-right pr-4 text-text-tertiary/50 text-xs leading-relaxed">
-                  {i + 1}
-                </span>
-                <span className="flex-1 text-text-primary whitespace-pre">{line || ' '}</span>
-              </div>
-            ))}
-          </code>
-        </pre>
-      </div>
+
+      {/* Content */}
+      {isDiagram ? (
+        // ASCII diagrams: single <pre> with explicit white-space: pre,
+        // horizontal scroll for long lines, no line numbers.
+        <div className="overflow-x-auto">
+          <pre
+            className="p-4 text-sm font-mono text-text-primary"
+            style={{ whiteSpace: 'pre', lineHeight: 1.5 }}
+          >
+            <code>{code}</code>
+          </pre>
+        </div>
+      ) : (
+        // Real code: line numbers on the left, scrollable content on the right.
+        // Uses an inline-flex layout with width auto so content expands to its
+        // natural width (no wrapping), and the outer div provides overflow scroll.
+        <div className="overflow-x-auto">
+          <div className="inline-flex min-w-full">
+            {/* Line numbers column */}
+            <div
+              className="select-none flex-none py-4 pl-4 pr-3 text-right text-text-tertiary/50 text-xs font-mono bg-bg-code"
+              style={{ lineHeight: 1.625 }}
+            >
+              {lines.map((_, i) => (
+                <div key={i}>{i + 1}</div>
+              ))}
+            </div>
+            {/* Code column */}
+            <pre
+              className="flex-none py-4 pr-4 pl-2 text-sm font-mono text-text-primary"
+              style={{ whiteSpace: 'pre', lineHeight: 1.625 }}
+            >
+              <code>{code}</code>
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
