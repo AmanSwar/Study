@@ -30,7 +30,74 @@ function resolveSourcePath(relativePath: string): string {
 export async function loadMarkdown(relativePath: string): Promise<string> {
   const fullPath = resolveSourcePath(relativePath)
   const content = await fs.readFile(fullPath, 'utf-8')
-  return content
+  return normalizeDisplayMath(content)
+}
+
+/**
+ * Normalize `$$...$$` display-math blocks so the $$ delimiters are on their
+ * own lines. `remark-math` mis-parses blocks where `$$` has content on the
+ * same line (e.g. `$$\text{Fetch} = \begin{cases}` ... `\end{cases}$$`). It
+ * swallows the opening line and extends past the closing delimiter. We fix
+ * this by ensuring every `$$` is on its own line.
+ *
+ * Skips code fences so we don't mangle math-looking content inside code blocks.
+ */
+function normalizeDisplayMath(content: string): string {
+  const lines = content.split('\n')
+  const out: string[] = []
+  let inCodeFence = false
+  let inMath = false
+
+  for (const line of lines) {
+    // Track fenced code blocks; don't touch their contents
+    if (/^```/.test(line)) {
+      inCodeFence = !inCodeFence
+      out.push(line)
+      continue
+    }
+    if (inCodeFence) {
+      out.push(line)
+      continue
+    }
+
+    // Count the number of $$ delimiters on this line
+    const dollarPairs = line.match(/\$\$/g)
+    const count = dollarPairs ? dollarPairs.length : 0
+
+    if (count === 0) {
+      out.push(line)
+      continue
+    }
+
+    if (count >= 2) {
+      // Single-line block math like `$$...$$` — leave as-is, it parses fine
+      out.push(line)
+      continue
+    }
+
+    // Odd number of $$ on this line: it opens or closes a multi-line block.
+    // Split on $$ and put the delimiter on its own line, keeping any
+    // surrounding content on adjacent lines.
+    const parts = line.split('$$')
+    // parts has length 2 here (one $$ split).
+    const [before, after] = parts
+
+    if (!inMath) {
+      // This line opens the math block
+      if (before.trim()) out.push(before.trimEnd())
+      out.push('$$')
+      if (after.trim()) out.push(after.trimStart())
+      inMath = true
+    } else {
+      // This line closes the math block
+      if (before.trim()) out.push(before.trimEnd())
+      out.push('$$')
+      if (after.trim()) out.push(after.trimStart())
+      inMath = false
+    }
+  }
+
+  return out.join('\n')
 }
 
 /**

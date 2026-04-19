@@ -171,7 +171,23 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
     <div className="markdown-content">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeKatex, rehypeRaw]}
+        rehypePlugins={[
+          [
+            rehypeKatex,
+            {
+              // Don't throw on parse errors — render the failing TeX as-is
+              // (colored/highlighted) so the rest of the page still renders.
+              throwOnError: false,
+              // Display errors inline (as colored text) rather than popup tooltips
+              errorColor: 'var(--accent-red)',
+              // Be permissive with non-standard macros
+              strict: false as const,
+              // Enable common extensions like \begin{cases}, \begin{align*}, etc.
+              trust: true,
+            },
+          ],
+          rehypeRaw,
+        ]}
         components={{
           h1: ({ children, ...props }) => {
             const text = childrenToText(children)
