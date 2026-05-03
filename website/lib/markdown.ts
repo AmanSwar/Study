@@ -30,7 +30,42 @@ function resolveSourcePath(relativePath: string): string {
 export async function loadMarkdown(relativePath: string): Promise<string> {
   const fullPath = resolveSourcePath(relativePath)
   const content = await fs.readFile(fullPath, 'utf-8')
-  return normalizeDisplayMath(content)
+  return normalizeVisualizationPlaceholders(normalizeDisplayMath(content))
+}
+
+/**
+ * Convert `[VISUALIZATION: <Title>]` placeholders into a fenced code block
+ * with language `viz`, so the renderer can swap them for real interactive
+ * SVG components. Skips occurrences inside fenced code blocks (Python
+ * docstrings etc. that happen to use the same notation).
+ */
+function normalizeVisualizationPlaceholders(content: string): string {
+  const lines = content.split('\n')
+  const out: string[] = []
+  let inCodeFence = false
+  for (const line of lines) {
+    if (/^```/.test(line)) {
+      inCodeFence = !inCodeFence
+      out.push(line)
+      continue
+    }
+    if (!inCodeFence) {
+      const m = line.match(/^\s*\[VISUALIZATION(?::\s*(.+?))?\]\s*$/)
+      if (m) {
+        const slug = (m[1] || 'default')
+          .toLowerCase()
+          .replace(/[^\w\s-]/g, '')
+          .trim()
+          .replace(/\s+/g, '-')
+        out.push('```viz')
+        out.push(slug)
+        out.push('```')
+        continue
+      }
+    }
+    out.push(line)
+  }
+  return out.join('\n')
 }
 
 /**

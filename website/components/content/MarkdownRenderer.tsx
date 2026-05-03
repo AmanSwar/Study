@@ -31,6 +31,25 @@ const AsciiDiagram = dynamic(
   }
 )
 
+// Visualizations carry interactive SVG charts. Same SSR-cost reasoning as
+// AsciiDiagram — load on the client.
+const Visualization = dynamic(
+  () => import('./Visualization').then((m) => m.Visualization),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
+        <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary bg-bg-surface/50">
+          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider bg-amber-500/20 text-amber-400">
+            Visualization
+          </span>
+        </div>
+        <div className="p-4 text-xs text-text-tertiary font-mono">Loading visualization…</div>
+      </div>
+    ),
+  }
+)
+
 interface MarkdownRendererProps {
   content: string
 }
@@ -110,6 +129,12 @@ function MarkdownCodeBlock({ language, children }: { language: string; children:
     rust: 'bg-orange-500/20 text-orange-400',
     typescript: 'bg-blue-500/20 text-blue-400', ts: 'bg-blue-500/20 text-blue-400',
     cuda: 'bg-green-500/20 text-green-400',
+  }
+
+  // `viz` blocks are visualization placeholders synthesised by the markdown
+  // preprocessor from `[VISUALIZATION: <Title>]` lines. The body is the slug.
+  if (language === 'viz') {
+    return <Visualization id={code.trim()} />
   }
 
   // A block is a "diagram" only if it actually contains box-drawing characters.
