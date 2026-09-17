@@ -85,8 +85,9 @@
       if (!hl || !code || pre.hasAttribute('data-hl-done')) return;
       var set = {};
       hl.split(',').forEach(function (r) { var m = r.trim().split('-'); var a = +m[0], b = +(m[1] || m[0]); for (var i = a; i <= b; i++) set[i] = 1; });
+      // The span is display:block, so its trailing newline must live inside it or it renders as an extra blank line.
       var lines = code.innerHTML.split('\n');
-      code.innerHTML = lines.map(function (l, i) { return set[i + 1] ? '<span class="hl">' + l + '</span>' : l; }).join('\n');
+      code.innerHTML = lines.map(function (l, i) { var last = i === lines.length - 1; return set[i + 1] ? '<span class="hl">' + l + (last ? '' : '\n') + '</span>' : l + (last ? '' : '\n'); }).join('');
       pre.setAttribute('data-hl-done', '1');
     }
     var langs = Object.keys(need);
@@ -266,6 +267,11 @@
   function initStandalone(root) {
     var html = document.documentElement;
     if (!html.classList.contains('study-standalone')) return function () {};
+    // web fonts (the site self-hosts these; a file opened directly has only system fallbacks without this)
+    if (!q('link[data-study-fonts]')) {
+      var f = el('link', { rel: 'stylesheet', 'data-study-fonts': '1', href: 'https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap' });
+      document.head.appendChild(f);
+    }
     // theme
     var stored = null; try { stored = localStorage.getItem('study-theme'); } catch (e) {}
     var forced = html.getAttribute('data-theme');
@@ -291,11 +297,17 @@
     var ol = el('ol'); toc.appendChild(ol);
     var lis = [];
     heads.forEach(function (h) { if (h.closest('.study-header')) return; var li = el('li', { class: h.tagName === 'H3' ? 'l3' : 'l2' }); li.appendChild(el('a', { href: '#' + h.id }, h.textContent)); ol.appendChild(li); lis.push([h, li]); });
-    var io = new IntersectionObserver(function (entries) {
-      entries.forEach(function (e) { if (e.isIntersecting) { lis.forEach(function (p) { p[1].classList.toggle('is-active', p[0] === e.target); }); } });
-    }, { rootMargin: '-10% 0px -80% 0px', threshold: 0 });
-    lis.forEach(function (p) { io.observe(p[0]); });
-    return function () { window.removeEventListener('scroll', onScroll); io.disconnect(); };
+    // active = last heading above the reading line; earlier ones are "past"
+    var raf = null;
+    function mark() {
+      raf = null;
+      var y = window.scrollY + 120, cur = -1;
+      lis.forEach(function (p, i) { if (p[0].getBoundingClientRect().top + window.scrollY <= y) cur = i; });
+      lis.forEach(function (p, i) { p[1].classList.toggle('is-active', i === cur); p[1].classList.toggle('is-past', i < cur); });
+    }
+    function onScrollToc() { if (raf === null) raf = requestAnimationFrame(mark); }
+    window.addEventListener('scroll', onScrollToc, { passive: true }); mark();
+    return function () { window.removeEventListener('scroll', onScroll); window.removeEventListener('scroll', onScrollToc); };
   }
 
   /* ---------- public API ---------- */

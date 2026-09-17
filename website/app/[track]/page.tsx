@@ -1,9 +1,7 @@
 import type { Metadata } from 'next'
 import { notFound } from 'next/navigation'
-import { Breadcrumbs } from '@/components/layout/Breadcrumbs'
 import { TrackHeader, PartsGrid, ModuleCards, AppendixCards } from '@/components/content/TrackIndex'
 import { getRegistry, getTrack } from '@/lib/registry'
-import { colorClasses } from '@/lib/track-theme'
 
 export const dynamicParams = false
 
@@ -19,13 +17,11 @@ export async function generateMetadata({ params }: { params: Promise<{ track: st
 export default async function TrackIndexPage({ params }: { params: Promise<{ track: string }> }) {
   const track = await getTrack((await params).track)
   if (!track) notFound()
-  const theme = colorClasses(track.color)
   return (
-    <>
-      <Breadcrumbs items={[{ label: track.shortTitle }]} />
+    <div className="max-w-[46rem] mx-auto px-6 sm:px-8 pt-10 pb-24">
       <TrackHeader track={track} />
-      {track.parts ? <PartsGrid parts={track.parts} theme={theme} /> : <ModuleCards modules={track.modules ?? []} theme={theme} />}
-      {track.appendices.length > 0 && <AppendixCards appendices={track.appendices} theme={theme} />}
-    </>
+      {track.parts ? <PartsGrid parts={track.parts} /> : <ModuleCards modules={track.modules ?? []} />}
+      {track.appendices.length > 0 && <AppendixCards appendices={track.appendices} />}
+    </div>
   )
 }

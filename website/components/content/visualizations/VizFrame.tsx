@@ -10,17 +10,15 @@ interface VizFrameProps {
 
 export function VizFrame({ title, caption, children }: VizFrameProps) {
   return (
-    <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary bg-bg-surface/50">
-        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider bg-amber-500/20 text-amber-400">
-          Visualization
-        </span>
-        <span className="text-[11px] text-text-tertiary tracking-tight">{title}</span>
+    <div className="code-block">
+      <div className="code-head">
+        <span className="lang">Visualization</span>
+        <span className="code-title">{title}</span>
       </div>
       <div className="p-4">
         <div className="overflow-x-auto">{children}</div>
         {caption && (
-          <p className="mt-3 text-xs text-text-tertiary leading-relaxed">{caption}</p>
+          <p className="ui mt-3 mb-0 font-sans text-[13px] text-text-secondary leading-relaxed">{caption}</p>
         )}
       </div>
     </div>

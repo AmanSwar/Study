@@ -92,10 +92,11 @@ export interface Registry {
 }
 
 /** Sidebar/footer only need the navigational subset — keeps fs paths out of the client payload. */
-export interface NavModule { id: string; number: number; shortTitle: string; href: string }
+export interface NavModule { id: string; number: number; shortTitle: string; href: string; readingTime: string }
 export interface NavPart { id: string; number: number; shortTitle: string; href: string; modules: NavModule[] }
 export interface NavTrack {
   id: string
+  title: string
   shortTitle: string
   href: string
   color: TrackColor

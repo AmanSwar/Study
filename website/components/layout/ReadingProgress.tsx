@@ -2,33 +2,22 @@
 
 import { useEffect, useState } from 'react'
 
-/**
- * A thin progress bar fixed to the top of the viewport showing how far the
- * user has scrolled through the page. Subtle and non-intrusive.
- */
+/** A 2px hairline at the very top of the viewport: how far through the page you are. */
 export function ReadingProgress() {
   const [progress, setProgress] = useState(0)
 
   useEffect(() => {
     let rafId: number | null = null
-
     const update = () => {
       const scrollTop = window.scrollY
       const scrollHeight = document.documentElement.scrollHeight - window.innerHeight
-      const pct = scrollHeight > 0 ? Math.min(100, (scrollTop / scrollHeight) * 100) : 0
-      setProgress(pct)
+      setProgress(scrollHeight > 0 ? Math.min(100, (scrollTop / scrollHeight) * 100) : 0)
       rafId = null
     }
-
-    const onScroll = () => {
-      if (rafId !== null) return
-      rafId = requestAnimationFrame(update)
-    }
-
+    const onScroll = () => { if (rafId === null) rafId = requestAnimationFrame(update) }
     update()
     window.addEventListener('scroll', onScroll, { passive: true })
     window.addEventListener('resize', onScroll, { passive: true })
-
     return () => {
       window.removeEventListener('scroll', onScroll)
       window.removeEventListener('resize', onScroll)
@@ -37,17 +26,8 @@ export function ReadingProgress() {
   }, [])
 
   return (
-    <div
-      className="fixed top-0 left-0 right-0 h-[2px] z-[60] pointer-events-none"
-      style={{ background: 'transparent' }}
-    >
-      <div
-        className="h-full transition-[width] duration-150 ease-out"
-        style={{
-          width: `${progress}%`,
-          background: 'linear-gradient(90deg, var(--accent-blue), var(--accent-cyan))',
-        }}
-      />
+    <div className="no-print fixed top-0 left-0 right-0 h-[2px] z-[60] pointer-events-none" aria-hidden="true">
+      <div className="h-full bg-accent-blue transition-[width] duration-100 ease-linear" style={{ width: `${progress}%` }} />
     </div>
   )
 }

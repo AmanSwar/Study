@@ -2,94 +2,78 @@
 
 import { useEffect, useState } from 'react'
 
-interface TocItem {
-  id: string
-  title: string
-  level: number
-}
+export interface TocItem { id: string; title: string; level: number }
 
 interface TableOfContentsProps {
   items: TocItem[]
+  /** small print under the list: reading time, sources, position in the track */
+  meta?: React.ReactNode
 }
 
 /**
- * Floating table of contents shown on wide screens (≥1280px).
- * Uses IntersectionObserver to highlight the currently-visible section.
+ * "On this page" rail (≥ 80rem). The current section is the last heading above
+ * the reading line; earlier sections are dimmed as read.
  */
-export function TableOfContents({ items }: TableOfContentsProps) {
-  const [activeId, setActiveId] = useState<string>('')
+export function TableOfContents({ items, meta }: TableOfContentsProps) {
+  const [current, setCurrent] = useState(-1)
 
   useEffect(() => {
     if (items.length === 0) return
-
-    // Track visible headings. As they enter/leave the viewport, we pick the
-    // topmost visible one as active.
-    const visible = new Set<string>()
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          if (entry.isIntersecting) visible.add(entry.target.id)
-          else visible.delete(entry.target.id)
-        })
-
-        // Pick the first item in the document that's currently visible
-        const firstVisible = items.find((item) => visible.has(item.id))
-        if (firstVisible) {
-          setActiveId(firstVisible.id)
-        }
-      },
-      {
-        rootMargin: '-80px 0px -60% 0px',
-        threshold: 0,
-      }
-    )
-
-    items.forEach((item) => {
-      const el = document.getElementById(item.id)
-      if (el) observer.observe(el)
-    })
-
-    return () => observer.disconnect()
+    let raf: number | null = null
+    const mark = () => {
+      raf = null
+      const line = window.scrollY + 120
+      let cur = -1
+      items.forEach((item, i) => {
+        const el = document.getElementById(item.id)
+        if (el && el.getBoundingClientRect().top + window.scrollY <= line) cur = i
+      })
+      setCurrent(cur)
+    }
+    const onScroll = () => { if (raf === null) raf = requestAnimationFrame(mark) }
+    mark()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    window.addEventListener('resize', onScroll, { passive: true })
+    return () => {
+      window.removeEventListener('scroll', onScroll)
+      window.removeEventListener('resize', onScroll)
+      if (raf !== null) cancelAnimationFrame(raf)
+    }
   }, [items])
 
-  if (items.length === 0) return null
+  if (items.length === 0 && !meta) return null
 
   return (
-    <nav className="hidden xl:block sticky top-20 w-56 shrink-0 ml-10 self-start max-h-[calc(100vh-6rem)] overflow-y-auto">
-      <div className="mb-4 text-[10px] font-semibold uppercase tracking-[0.12em] text-text-tertiary">
-        On this page
-      </div>
-      <ul className="space-y-0.5">
-        {items.map((item) => {
-          const isActive = activeId === item.id
-          return (
-            <li key={item.id}>
-              <a
-                href={`#${item.id}`}
-                className={`group block py-1.5 text-[13px] leading-snug transition-colors relative ${
-                  item.level === 3 ? 'pl-5' : 'pl-3'
-                } ${
-                  isActive
-                    ? 'text-accent-blue'
-                    : 'text-text-tertiary hover:text-text-primary'
-                }`}
-              >
-                {/* Active indicator */}
-                <span
-                  className={`absolute left-0 top-1/2 -translate-y-1/2 w-0.5 rounded-full transition-all ${
-                    isActive
-                      ? 'h-5 bg-accent-blue'
-                      : 'h-0 bg-transparent group-hover:h-3 group-hover:bg-text-tertiary/40'
-                  }`}
-                  aria-hidden="true"
-                />
-                <span className="line-clamp-2">{item.title}</span>
-              </a>
-            </li>
-          )
-        })}
-      </ul>
+    <nav className="ui reading-rail no-print font-sans text-[12.5px] leading-[1.4]" aria-label="On this page">
+      {items.length > 0 && (
+        <>
+          <p className="mb-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-text-tertiary">On this page</p>
+          <ol>
+            {items.map((item, i) => {
+              const active = i === current
+              const past = i < current
+              return (
+                <li key={item.id}>
+                  <a
+                    href={`#${item.id}`}
+                    aria-current={active ? 'location' : undefined}
+                    className={`block py-[0.3rem] pr-2 border-l-[1.5px] transition-colors ${item.level === 3 ? 'pl-6 text-[11.5px]' : 'pl-3.5'} ${
+                      active
+                        ? 'border-text-primary text-text-primary'
+                        : past
+                          ? 'border-border-primary text-text-secondary hover:text-text-primary'
+                          : 'border-border-primary text-text-tertiary hover:text-text-primary'
+                    }`}
+                  >
+                    {item.title}
+                  </a>
+                </li>
+              )
+            })}
+          </ol>
+        </>
+      )}
+      {meta && <div className="mt-5 pt-4 border-t border-border-primary text-[11.5px] leading-relaxed text-text-tertiary">{meta}</div>}
     </nav>
   )
 }
