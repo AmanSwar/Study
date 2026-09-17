@@ -1,7 +1,9 @@
 import Link from 'next/link'
 import { Code2 } from 'lucide-react'
 
-export function Footer() {
+export interface FooterTrack { id: string; shortTitle: string }
+
+export function Footer({ tracks = [] }: { tracks?: FooterTrack[] }) {
   return (
     <footer className="border-t border-border-primary bg-bg-primary mt-auto">
       <div className="max-w-7xl mx-auto px-4 lg:px-6 py-10">
@@ -14,11 +16,10 @@ export function Footer() {
           </div>
 
           <div className="flex items-center gap-6 text-xs text-text-tertiary">
-            <div className="flex items-center gap-4">
-              <Link href="/mlsys" className="hover:text-text-primary transition-colors">MLsys</Link>
-              <Link href="/intel" className="hover:text-text-primary transition-colors">Intel/AMD</Link>
-              <Link href="/qualcomm" className="hover:text-text-primary transition-colors">Qualcomm</Link>
-              <Link href="/quant" className="hover:text-text-primary transition-colors">Quant</Link>
+            <div className="flex items-center gap-4 flex-wrap">
+              {tracks.map((t) => (
+                <Link key={t.id} href={`/${t.id}`} className="hover:text-text-primary transition-colors">{t.shortTitle}</Link>
+              ))}
             </div>
             <a
               href="https://github.com/AmanSwar/Study"

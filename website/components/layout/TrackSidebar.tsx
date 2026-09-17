@@ -4,15 +4,17 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useState, useEffect, useRef } from 'react'
 import { ChevronRight } from 'lucide-react'
-import { Track, Part, ModuleMeta } from '@/lib/types'
+import type { NavTrack, NavPart, NavModule } from '@/lib/registry-types'
+import { colorClasses } from '@/lib/track-theme'
 
 interface TrackSidebarProps {
-  track: Track
+  track: NavTrack
 }
 
 export function TrackSidebar({ track }: TrackSidebarProps) {
   const pathname = usePathname()
   const activeItemRef = useRef<HTMLAnchorElement | null>(null)
+  const theme = colorClasses(track.color)
 
   // Scroll active item into view on mount
   useEffect(() => {
@@ -28,7 +30,7 @@ export function TrackSidebar({ track }: TrackSidebarProps) {
         href={`/${track.id}`}
         className={`block px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.1em] transition-colors
           ${pathname === `/${track.id}`
-            ? 'text-accent-blue'
+            ? theme.text
             : 'text-text-tertiary hover:text-text-secondary'}`}
       >
         {track.shortTitle}
@@ -46,7 +48,7 @@ export function TrackSidebar({ track }: TrackSidebarProps) {
           />
         ))}
 
-        {/* Flat modules (Qualcomm, Quant) */}
+        {/* Flat tracks (deep dives, Qualcomm, Quant) */}
         {track.modules?.map((module) => (
           <ModuleLink
             key={module.id}
@@ -56,6 +58,46 @@ export function TrackSidebar({ track }: TrackSidebarProps) {
           />
         ))}
       </div>
+
+      {(track.appendices.length > 0 || track.hasSources) && (
+        <div className="mt-4 pt-3 border-t border-border-primary space-y-0.5">
+          {track.appendices.length > 0 && (
+            <Link
+              href={`/${track.id}/appendices`}
+              className={`block px-4 py-1.5 text-[11px] font-semibold uppercase tracking-[0.1em] transition-colors
+                ${pathname === `/${track.id}/appendices` ? theme.text : 'text-text-tertiary hover:text-text-secondary'}`}
+            >
+              Appendices
+            </Link>
+          )}
+          {track.appendices.map((a) => (
+            <Link
+              key={a.id}
+              href={a.href}
+              ref={pathname === a.href ? activeItemRef : null}
+              className={`flex items-center gap-2.5 px-3 py-1.5 text-sm rounded-md mx-1 transition-all
+                ${pathname === a.href
+                  ? 'bg-accent-blue-subtle text-accent-blue font-medium'
+                  : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover'}`}
+            >
+              <span className={`text-[10px] font-mono shrink-0 ${pathname === a.href ? 'text-accent-blue' : 'text-text-tertiary'}`}>{a.letter}</span>
+              <span className="truncate">{a.title}</span>
+            </Link>
+          ))}
+          {track.hasSources && (
+            <Link
+              href={`/${track.id}/sources`}
+              className={`flex items-center gap-2.5 px-3 py-1.5 text-sm rounded-md mx-1 transition-all
+                ${pathname === `/${track.id}/sources`
+                  ? 'bg-accent-blue-subtle text-accent-blue font-medium'
+                  : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover'}`}
+            >
+              <span className="text-[10px] font-mono shrink-0 text-text-tertiary">§</span>
+              <span className="truncate">Sources</span>
+            </Link>
+          )}
+        </div>
+      )}
     </nav>
   )
 }
@@ -66,7 +108,7 @@ function PartSection({
   currentPath,
   activeItemRef,
 }: {
-  part: Part
+  part: NavPart
   trackId: string
   currentPath: string
   activeItemRef: React.MutableRefObject<HTMLAnchorElement | null>
@@ -115,7 +157,7 @@ function ModuleLink({
   isActive,
   activeItemRef,
 }: {
-  module: ModuleMeta
+  module: NavModule
   isActive: boolean
   activeItemRef: React.MutableRefObject<HTMLAnchorElement | null>
 }) {

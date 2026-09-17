@@ -1,8 +1,15 @@
 'use client'
 
-import { createContext, useContext, useState, useEffect, ReactNode, useMemo } from 'react'
+import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
 import { SearchDialog } from './SearchDialog'
-import { buildSearchIndex } from '@/lib/search-index'
+import type { SearchItem } from '@/lib/search-index'
+
+// The index is prerendered at build time (app/search-index.json/route.ts) and
+// fetched once, lazily, the first time search opens.
+let indexPromise: Promise<SearchItem[]> | null = null
+function loadIndex(): Promise<SearchItem[]> {
+  return (indexPromise ??= fetch('/search-index.json').then((r) => (r.ok ? r.json() : [])).catch(() => { indexPromise = null; return [] }))
+}
 
 interface SearchContextValue {
   open: () => void
@@ -19,7 +26,14 @@ const SearchContext = createContext<SearchContextValue | null>(null)
  */
 export function SearchProvider({ children }: { children: ReactNode }) {
   const [isOpen, setIsOpen] = useState(false)
-  const items = useMemo(() => buildSearchIndex(), [])
+  const [items, setItems] = useState<SearchItem[]>([])
+
+  useEffect(() => {
+    if (!isOpen || items.length) return
+    let alive = true
+    loadIndex().then((data) => { if (alive) setItems(data) })
+    return () => { alive = false }
+  }, [isOpen, items.length])
 
   const open = () => setIsOpen(true)
   const close = () => setIsOpen(false)

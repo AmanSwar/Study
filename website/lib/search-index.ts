@@ -1,67 +1,42 @@
-import { allTracks } from '@/content/tracks'
+import type { Track } from './registry-types'
 
 export interface SearchItem {
   id: string
   title: string
-  subtitle: string          // e.g., "MLsys · Part 1" or "Quant · Chapter 5"
+  subtitle: string          // e.g. "MLsys · Part 1: Fundamentals · Module 3"
   href: string
-  track: string             // 'mlsys' | 'intel' | 'qualcomm' | 'quant'
-  keywords: string          // combined searchable text
+  track: string             // track id
+  trackLabel: string
+  color: string
+  keywords: string          // combined searchable text, lowercased
 }
 
 /**
- * Build a flat list of all modules across all tracks for client-side search.
- * Computed once at build time since it's static.
+ * Flatten every visible module across all tracks into search items. Runs on
+ * the server (route handler) — `extraKeywords` lets HTML modules contribute
+ * their headings/body text keyed by `${track.id}-${module.id}`.
  */
-export function buildSearchIndex(): SearchItem[] {
+export function buildSearchIndex(tracks: Track[], extraKeywords: Record<string, string> = {}): SearchItem[] {
   const items: SearchItem[] = []
-
-  for (const track of allTracks) {
-    // Flat tracks (Qualcomm, Quant) with direct modules
-    if (track.modules) {
-      for (const module of track.modules) {
-        items.push({
-          id: `${track.id}-${module.id}`,
-          title: module.title,
-          subtitle: `${track.shortTitle} · ${module.id.startsWith('chapter') ? `Chapter ${module.number}` : `Module ${module.number}`}`,
-          href: module.href,
-          track: track.id,
-          keywords: [
-            module.title,
-            module.shortTitle,
-            module.description,
-            track.shortTitle,
-            track.title,
-          ].join(' ').toLowerCase(),
-        })
-      }
-    }
-
-    // Hierarchical tracks (MLsys, Intel) with parts → modules
-    if (track.parts) {
-      for (const part of track.parts) {
-        for (const module of part.modules) {
-          items.push({
-            id: `${track.id}-${module.id}`,
-            title: module.title,
-            subtitle: `${track.shortTitle} · Part ${part.number}: ${part.shortTitle} · Module ${module.number}`,
-            href: module.href,
-            track: track.id,
-            keywords: [
-              module.title,
-              module.shortTitle,
-              module.description,
-              part.title,
-              part.shortTitle,
-              track.shortTitle,
-              track.title,
-            ].join(' ').toLowerCase(),
-          })
-        }
-      }
+  for (const track of tracks) {
+    for (const mod of track.allModules) {
+      const part = mod.partId ? track.parts?.find((p) => p.id === mod.partId) : undefined
+      const id = `${track.id}-${mod.id}`
+      items.push({
+        id,
+        title: mod.title,
+        subtitle: `${track.shortTitle} · ${part ? `Part ${part.number}: ${part.shortTitle} · ` : ''}${track.unitLabel} ${mod.number}`,
+        href: mod.href,
+        track: track.id,
+        trackLabel: track.shortTitle,
+        color: track.color,
+        keywords: [mod.title, mod.shortTitle, mod.description, part?.title, part?.shortTitle, track.shortTitle, track.title, track.category, extraKeywords[id]]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase(),
+      })
     }
   }
-
   return items
 }
 
@@ -83,19 +58,14 @@ export function searchItems(items: SearchItem[], query: string): SearchItem[] {
     const titleLower = item.title.toLowerCase()
     const keywords = item.keywords
 
-    // All tokens must match
     if (!tokens.every((t) => keywords.includes(t))) continue
 
     let score = 0
-    // Title starts with query → highest
     if (titleLower.startsWith(q)) score += 1000
-    // Title contains full query
     else if (titleLower.includes(q)) score += 500
-    // Any token matches title
     for (const t of tokens) {
       if (titleLower.includes(t)) score += 100
     }
-    // Shorter titles rank higher among equal-score items
     score -= item.title.length * 0.1
 
     scored.push({ item, score })

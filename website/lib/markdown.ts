@@ -1,35 +1,11 @@
 import { promises as fs } from 'fs'
-import path from 'path'
 
 /**
- * Root directory of the study material repository.
- * The website lives at <repo>/website/, so source files are one level up.
+ * Read a source markdown file (absolute path, resolved by lib/registry.ts from
+ * the track's manifest directory) and normalise it for the renderer.
  */
-const REPO_ROOT = path.resolve(process.cwd(), '..')
-
-/**
- * Source directories mapped by prefix.
- * - Paths starting with "MLsys/", "intel/", "qualcomm/" are under "computer science/"
- * - Paths starting with "From_Zero_to_Quant/" are directly under the repo root
- */
-function resolveSourcePath(relativePath: string): string {
-  if (relativePath.startsWith('From_Zero_to_Quant/')) {
-    return path.join(REPO_ROOT, relativePath)
-  }
-  // Default: under "computer science/"
-  return path.join(REPO_ROOT, 'computer science', relativePath)
-}
-
-/**
- * Read a source markdown file and return its content as a string.
- *
- * Examples:
- *   loadMarkdown('MLsys/part_01_.../module_01_....md')          → computer science/MLsys/...
- *   loadMarkdown('From_Zero_to_Quant/Chapter_01_....md')        → From_Zero_to_Quant/...
- */
-export async function loadMarkdown(relativePath: string): Promise<string> {
-  const fullPath = resolveSourcePath(relativePath)
-  const content = await fs.readFile(fullPath, 'utf-8')
+export async function loadMarkdown(absPath: string): Promise<string> {
+  const content = await fs.readFile(absPath, 'utf-8')
   return normalizeVisualizationPlaceholders(normalizeDisplayMath(content))
 }
 

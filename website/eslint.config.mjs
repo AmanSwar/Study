@@ -12,6 +12,10 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Static design system + vendored KaTeX/highlight.js for HTML study modules (plain ES5/ES2020, not TS).
+    "public/**",
+    // One-off migration script; its inputs were deleted after it ran.
+    "scripts/**",
   ]),
 ]);
 

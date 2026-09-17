@@ -26,11 +26,11 @@ export const metadata: Metadata = {
     template: '%s · aman.study',
   },
   description:
-    'A personal knowledge base covering ML Systems Engineering, CPU Architecture, Qualcomm Hexagon NPU, and Quantitative Finance. 104 modules across 4 tracks.',
+    'A personal knowledge base of expert-level courses and deep dives — ML systems, hardware architecture, software engineering, quantitative finance — researched from primary sources.',
   metadataBase: new URL('https://aman-study.vercel.app'),
   openGraph: {
     title: 'aman.study',
-    description: 'PhD-level study material across 4 tracks, 104 modules.',
+    description: 'Expert-level courses and deep dives, researched from primary sources.',
     type: 'website',
   },
 }

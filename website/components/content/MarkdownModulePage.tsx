@@ -7,15 +7,15 @@ import { ReadingProgress } from '@/components/layout/ReadingProgress'
 import { loadMarkdown, extractHeadings, stripFirstH1 } from '@/lib/markdown'
 
 interface MarkdownModulePageProps {
-  /** Path to source markdown, relative to "computer science/" directory */
-  sourcePath: string
+  /** Absolute path to the source markdown (from the registry) */
+  absPath: string
   /** Breadcrumb items leading to this module */
   breadcrumbs: BreadcrumbItem[]
   /** Module number for the header */
   moduleNumber: number
   /** Module title */
   title: string
-  /** Track ID (mlsys, intel, qualcomm) */
+  /** Track ID */
   track: string
   /** Part number (0 for flat tracks like Qualcomm) */
   part: number
@@ -43,7 +43,7 @@ interface MarkdownModulePageProps {
  *   [ModuleNav — rich prev/next cards with arrow key shortcuts]
  */
 export async function MarkdownModulePage({
-  sourcePath,
+  absPath,
   breadcrumbs,
   moduleNumber,
   title,
@@ -55,7 +55,7 @@ export async function MarkdownModulePage({
   prev,
   next,
 }: MarkdownModulePageProps) {
-  const rawContent = await loadMarkdown(sourcePath)
+  const rawContent = await loadMarkdown(absPath)
   const content = stripFirstH1(rawContent)
   const tocItems = extractHeadings(content).filter((h) => h.level === 2)
 

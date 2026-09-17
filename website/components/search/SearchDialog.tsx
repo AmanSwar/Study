@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { Search, X, ArrowRight, CornerDownLeft } from 'lucide-react'
 import { SearchItem, searchItems } from '@/lib/search-index'
+import { colorClasses } from '@/lib/track-theme'
 
 interface SearchDialogProps {
   open: boolean
@@ -146,7 +147,7 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
                       : 'hover:bg-bg-surface-hover'
                   }`}
                 >
-                  <TrackBadge track={item.track} />
+                  <TrackBadge label={item.trackLabel} color={item.color} />
                   <div className="flex-1 min-w-0">
                     <div className={`text-sm font-medium truncate ${
                       activeIndex === idx ? 'text-accent-blue' : 'text-text-primary'
@@ -190,17 +191,10 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
   )
 }
 
-function TrackBadge({ track }: { track: string }) {
-  const config: Record<string, { label: string; color: string }> = {
-    mlsys: { label: 'MLsys', color: 'bg-blue-500/20 text-blue-500' },
-    intel: { label: 'Intel', color: 'bg-cyan-500/20 text-cyan-600' },
-    qualcomm: { label: 'Qualcomm', color: 'bg-orange-500/20 text-orange-500' },
-    quant: { label: 'Quant', color: 'bg-green-500/20 text-green-600' },
-  }
-  const c = config[track] || { label: track, color: 'bg-gray-500/20 text-gray-500' }
+function TrackBadge({ label, color }: { label: string; color: string }) {
   return (
-    <span className={`text-[10px] font-semibold px-2 py-1 rounded-md uppercase tracking-wider shrink-0 ${c.color}`}>
-      {c.label}
+    <span className={`text-[10px] font-semibold px-2 py-1 rounded-md uppercase tracking-wider shrink-0 ${colorClasses(color).badge}`}>
+      {label}
     </span>
   )
 }
