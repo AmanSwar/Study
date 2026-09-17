@@ -9,6 +9,7 @@
 //   next       <manifest.json> [--limit N]            prints ids of modules with status != published (JSON array)
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import { withLock } from './lock.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
 const flags = {}, pos = [], kv = {};
@@ -39,6 +40,7 @@ if (cmd === 'init') {
   console.log(p);
 } else if (cmd === 'apply-plan') {
   const [mp, pp] = pos; if (!mp || !pp) die('apply-plan <manifest.json> <plan.json>');
+  withLock(resolve(mp), () => {
   const m = load(mp), plan = load(pp);
   if (!!plan.modules === !!plan.parts) die('plan must have exactly one of modules | parts');
   if (m.kind === 'deep-dive' && plan.parts) die('deep dives are flat: use modules');
@@ -50,16 +52,20 @@ if (cmd === 'init') {
   save(mp, m);
   const mods = allModules(m);
   console.log(`applied: ${mods.length} modules${m.parts ? ` in ${m.parts.length} parts` : ''}; est ${mods.reduce((s, x) => s + (x.estWords || 0), 0)} words`);
+  });
 } else if (cmd === 'set-module') {
   const [mp, id] = pos; if (!mp || !id) die('set-module <manifest.json> <moduleId> …');
+  withLock(resolve(mp), () => {
   const m = load(mp); const mod = allModules(m).find(x => x.id === id) || die(`no module "${id}"`);
   if (flags['from-lint']) { const l = load(flags['from-lint']); Object.assign(mod, { words: l.words, figures: l.figures, tables: l.tables, citations: l.citations, unverified: l.unverified, readingTime: l.readingTime }); }
   if (flags.status) mod.status = flags.status;
   Object.assign(mod, kv);
   if (mod.status === 'published' && !existsSync(join(resolve(mp), '..', mod.file))) die(`cannot publish: file missing ${mod.file}`);
   save(mp, m); console.log(`${id}: status=${mod.status} words=${mod.words ?? '-'} readingTime=${mod.readingTime ?? '-'}`);
+  });
 } else if (cmd === 'set-track') {
   const [mp] = pos; if (!mp) die('set-track <manifest.json> …');
+  withLock(resolve(mp), () => {
   const m = load(mp);
   if (flags.status) m.status = flags.status;
   m.generator.pipeline = m.generator.pipeline || {};
@@ -67,6 +73,7 @@ if (cmd === 'init') {
   if (flags.approved !== undefined) { m.generator.pipeline.approved = flags.approved === true || flags.approved === 'true'; if (m.generator.pipeline.approved) m.generator.pipeline.approvedAt = now(); }
   Object.assign(m, kv);
   save(mp, m); console.log(`track ${m.id}: status=${m.status} stage=${m.generator.pipeline.stage} approved=${m.generator.pipeline.approved}`);
+  });
 } else if (cmd === 'status') {
   const m = load(pos[0] || die('status <manifest.json>'));
   const mods = allModules(m);

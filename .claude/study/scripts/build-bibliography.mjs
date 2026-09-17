@@ -4,6 +4,7 @@
 // Usage: node build-bibliography.mjs <manifest.json>
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve, dirname, join, relative } from 'node:path';
+import { withLock } from './lock.mjs';
 
 const file = process.argv[2];
 if (!file) { console.error('usage: build-bibliography.mjs <manifest.json>'); process.exit(2); }
@@ -55,8 +56,12 @@ ${items}
 </main></div></body></html>
 `;
 writeFileSync(join(dir, 'bibliography.html'), out);
-m.appendices = (m.appendices || []).filter(a => a.id !== 'bibliography');
-const letter = String.fromCharCode(65 + m.appendices.length);
-m.appendices.push({ id: 'bibliography', letter, title: 'Bibliography', file: 'bibliography.html', format: 'html' });
-writeFileSync(abs, JSON.stringify(m, null, 2) + '\n');
+const letter = withLock(abs, () => {
+  const cur = JSON.parse(readFileSync(abs, 'utf8'));
+  cur.appendices = (cur.appendices || []).filter(a => a.id !== 'bibliography');
+  const l = String.fromCharCode(65 + cur.appendices.length);
+  cur.appendices.push({ id: 'bibliography', letter: l, title: 'Bibliography', file: 'bibliography.html', format: 'html' });
+  writeFileSync(abs, JSON.stringify(cur, null, 2) + '\n');
+  return l;
+});
 console.log(`bibliography.html: ${entries.length} unique sources from ${modules.length} modules → appendix ${letter}`);

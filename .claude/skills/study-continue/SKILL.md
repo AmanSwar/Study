@@ -2,7 +2,7 @@
 name: study-continue
 description: 'Resume an unfinished deep dive or course from its manifest.json — picks up at the first incomplete stage (research, plan, checkpoint, remaining modules, assemble). Use when Aman says "continue <slug>", "finish the <x> course", "resume the deep dive", or when a previous /study-deepdive or /study-course run was interrupted.'
 when_to_use: 'continue <slug>; resume <slug>; finish the <topic> course; pick up the deep dive where it stopped'
-argument-hint: '<slug or topic words> [--go]'
+argument-hint: '<slug or topic words> [--go] [--parallel N]'
 model: sonnet
 effort: xhigh
 allowed-tools: Agent, WebSearch, WebFetch, Read, Write, Edit, Glob, Grep, AskUserQuestion, Bash(node .claude/study/scripts/*), Bash(node ${CLAUDE_PROJECT_DIR}/.claude/study/scripts/*), Bash(ls *), Bash(cat *), Bash(find *)
@@ -18,7 +18,7 @@ Find the track: `find . -maxdepth 3 -name manifest.json -not -path "./website/*"
 Print `node .claude/study/scripts/manifest.mjs status "<dir>/manifest.json"` and read `generator.kind`, `pipeline.stage`, `pipeline.approved`, and per-module status.
 
 ## 2. Resume at the first incomplete stage
-Follow the matching skill's procedure from that stage on — read `.claude/skills/study-deepdive/SKILL.md` or `.claude/skills/study-course/SKILL.md` (by `kind`) for the exact agent prompts, batch size (4), word bands, and the report format. Constraints from the original request are in `generator.request`; pass them verbatim to agents.
+Follow the matching skill's procedure from that stage on — read `.claude/skills/study-deepdive/SKILL.md` or `.claude/skills/study-course/SKILL.md` (by `kind`) for the exact agent prompts, batch size (4, or `--parallel N`), word bands, and the report format. Constraints from the original request are in `generator.request`; pass them verbatim to agents.
 
 | Manifest says | Do |
 |---|---|

@@ -2,7 +2,7 @@
 name: study-deepdive
 description: 'Deep dive — exhaustive, citation-backed, visual-first HTML study material on ONE narrow topic (a chip, an architecture, a library, a mechanism, a practice) for aman.study, researched live from primary sources. Use when Aman wants to learn a specific thing in depth rather than a whole field; for a whole field use /study-course.'
 when_to_use: 'deep dive on X; everything about X; I want to learn X in depth; make me study material on <specific topic>; explore all <product family>'
-argument-hint: '<topic> [--category cs|finance|maths|business] [--go] [--pages N]'
+argument-hint: '<topic> [--category cs|finance|maths|business] [--go] [--pages N] [--parallel N]'
 model: sonnet
 effort: xhigh
 allowed-tools: Agent, WebSearch, WebFetch, Read, Write, Edit, Glob, Grep, AskUserQuestion, Bash(node .claude/study/scripts/*), Bash(node ${CLAUDE_PROJECT_DIR}/.claude/study/scripts/*), Bash(mkdir *), Bash(ls *), Bash(cat *), Bash(curl *)
@@ -15,7 +15,7 @@ You coordinate; the agents do the heavy work. Keep your own output short. Every 
 Request: `$ARGUMENTS`
 
 ## 0. Intake (you)
-1. Parse: topic (everything that is not a flag), `--category` (default `cs`), `--go` (skip the checkpoint), `--pages N` (cap pages). Inline constraints in the request (scope limits, must-include sources, audience overrides) are passed **verbatim** to every agent.
+1. Parse: topic (everything that is not a flag), `--category` (default `cs`), `--go` (skip the checkpoint), `--pages N` (cap pages), `--parallel N` (writers per batch, default 4). Inline constraints in the request (scope limits, must-include sources, audience overrides) are passed **verbatim** to every agent.
 2. Derive: `slug` = kebab-case of the topic (≤ 40 chars, no stop words); category dir = `computer science/` | `finance/` | `maths/` | `business/`; manifest `category` = `Computer Science` | `Finance` | `Mathematics` | `Business`; `<dir>` = `<category dir>/<slug>`.
    Pick `color`/`icon` by topic: hardware → cyan/Cpu, ML systems → blue/Brain, distributed/infra → blue/Server, software practice → orange/Layers, finance → green/TrendingUp, maths → purple/Sigma, networking → cyan/Network, data → amber/Database.
 3. If `<dir>/manifest.json` exists: stop and tell Aman to use `/study-continue <slug>`.
@@ -43,7 +43,7 @@ Show the planner's checkpoint text verbatim, then `AskUserQuestion` with options
 With `--go`: approve automatically and print the checkpoint text for the record.
 
 ## 4. Write (agents `study-writer`, background, 4 at a time)
-`node .claude/study/scripts/manifest.mjs next "<dir>/manifest.json"` lists pages not yet published. Take up to **4**; for each, one `Agent` call with `subagent_type: "study-writer"`, `run_in_background: true`, all in the same message. Prompt:
+`node .claude/study/scripts/manifest.mjs next "<dir>/manifest.json"` lists pages not yet published. Take up to **4** (or `--parallel N`; use 2 when several study sessions run at once to stay under API rate limits); for each, one `Agent` call with `subagent_type: "study-writer"`, `run_in_background: true`, all in the same message. Prompt:
 > Write module `<id>` of track `<slug>` (kind: deep-dive). Track directory: `<dir>`; output file: `<dir>/<file>`; `{{STUDY_BASE}}` = `../../website/public/study`. Read the references listed in your instructions, your manifest entry, the neighbouring pages' scopes (<prev id / next id, or "none">), and `<dir>/sources.json`. Word band 6000–12000 (`--min-words 6000 --max-words 12000`). Constraints from Aman: <verbatim or "none">. Follow your procedure exactly: plan file → write incrementally → lint to zero errors → `manifest.mjs set-module … --status published --from-lint …` → report.
 
 Wait for all notifications of the batch, note each writer's report (especially `unverified` lists and `failed` status), then launch the next batch until `next` returns `[]`. A `failed` module gets one retry with the writer's "what remains" note appended; if it fails again, leave it `failed` and report.
