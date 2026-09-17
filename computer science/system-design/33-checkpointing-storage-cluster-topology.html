@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage and Checkpointing at Scale: Cluster Network Topology · System Design</title>
+<meta name="description" content="Meta's 24,576-GPU three-layer Clos network and its Tectonic storage fabric, read as one system: how a synchronized, GPU-state checkpoint burst crosses an oversubscribed network and lands on a fabric built for both sustained warehouse traffic and short, sharp write spikes.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 33</p>
+  <h1>Storage and Checkpointing at Scale: Cluster Network Topology</h1>
+  <p class="lede">Meta trains Llama 3 405B on a three-layer Clos network wired for 24,576 H100s and a Tectonic storage fabric wired for 2 TB/s sustained and 7 TB/s peak — two separate pieces of infrastructure that meet exactly once, at the moment every GPU in the job writes its checkpoint state at nearly the same instant. This module works out what that topology costs, what that burst costs, and how ByteDance's MegaScale answers the same burst problem with a different placement of the same trade-off.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>4</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 7</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f1t"><title id="f1t">Three layers: GPUs, the Clos compute network, and the Tectonic storage fabric, joined by a checkpoint-write path down and a training-data-read path up</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="40" y="20" width="720" height="90" rx="10" class="d-block"/>
+    <text x="400" y="52" text-anchor="middle" class="d-text-inv d-bold">GPUs — up to 16,384 H100s, 80GB HBM3 each</text>
+    <text x="400" y="74" text-anchor="middle" class="d-text-inv d-small">per-GPU checkpoint state: 1 MB – 4 GB (§3.2)</text>
+    <text x="400" y="93" text-anchor="middle" class="d-text-inv d-small">8 GPUs + 2 CPUs / Grand Teton server, NVLink inside the server</text>
+
+    <path d="M600,110 L600,150" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="640" y="135" text-anchor="middle" class="d-mono d-small">checkpoint write</text>
+    <path d="M200,150 L200,110" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="160" y="135" text-anchor="middle" class="d-mono d-small">shard read</text>
+
+    <rect x="40" y="150" width="720" height="90" rx="10" class="d-block-2"/>
+    <text x="400" y="182" text-anchor="middle" class="d-text-inv d-bold">Compute network — 3-layer Clos, RoCE, 400 Gbps/GPU (§2)</text>
+    <text x="400" y="204" text-anchor="middle" class="d-text-inv d-small">rack → pod (full bisection) → cluster (1:7 oversubscribed at aggregation)</text>
+    <text x="400" y="223" text-anchor="middle" class="d-text-inv d-small">carries GPU-to-GPU collectives and the checkpoint/read traffic below</text>
+
+    <path d="M600,240 L600,280" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="655" y="265" text-anchor="middle" class="d-mono d-small">aggregate burst</text>
+    <path d="M200,280 L200,240" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="150" y="265" text-anchor="middle" class="d-mono d-small">sharded dataset</text>
+
+    <rect x="40" y="280" width="720" height="90" rx="10" class="d-block-accent"/>
+    <text x="400" y="312" text-anchor="middle" class="d-text-inv d-bold">Storage fabric — Tectonic: 240 PB, 7,500 SSD servers (§3)</text>
+    <text x="400" y="334" text-anchor="middle" class="d-text-inv d-small">2 TB/s sustained, 7 TB/s peak — GFS's single-namespace, replicated-chunk idea (Module 7)</text>
+    <text x="400" y="353" text-anchor="middle" class="d-text-inv d-small">also the destination Module 32's tokenized shards write into and read back from</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> Two independently engineered fabrics meet at one boundary: a checkpoint write goes down through the Clos network into Tectonic; a training-data shard read (Module 32) goes back up. The capacity, throughput, and topology numbers are Meta's own, disclosed for Llama 3 405B pre-training<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="two-fabrics-one-job">1. Two fabrics, one job</h2>
+<p>Everything this course has covered about intra-node parallelism — how tensor, pipeline, context, and fully-sharded data parallelism divide up a 405B-parameter model's weights, optimizer state, and activations across GPUs — determines <em>what</em> a training job has to persist and <em>how much</em> of it lives on each GPU. This module does not re-derive that; it starts from the number Meta discloses as the output of that decision — between 1 MB and 4 GB of state per GPU<a class="cite" href="#ref-1">1</a> — and asks what has to be true of the network underneath the GPUs, and the storage fabric underneath that, for tens of thousands of GPUs to write that state at once without stalling the job.</p>
+<p>Llama 3 405B pre-trains on up to 16,384 H100 GPUs (700 W TDP, 80 GB HBM3 each) on Meta's Grand Teton server platform, eight GPUs and two CPUs per server, connected by NVLink inside the server<a class="cite" href="#ref-1">1</a>. Two systems sit underneath that fleet, built and scaled independently of each other. The first is a three-layer Clos network — RoCE-based, 400 Gbps per GPU — whose job is to move activations, gradients, and optimizer-state shards between GPUs during every training step<a class="cite" href="#ref-1">1</a>. The second is Tectonic, Meta's general-purpose distributed file system, whose job is to hold the bytes that outlive a single step: pre-tokenized dataset shards read in in Module 32's pipeline, and model checkpoints written out here<a class="cite" href="#ref-1">1</a>. The network is provisioned for the steady, symmetric, latency-sensitive traffic of collective communication. The storage fabric is provisioned for something structurally different: mostly-steady read/write traffic from thousands of tenants, punctuated by a checkpoint write that every GPU in the job issues within the same few seconds of wall-clock time. Section 2 covers the network; Section 3 covers what a synchronized checkpoint burst does to the storage fabric's stated throughput envelope; Section 4 brings in ByteDance's MegaScale as a second production system solving the same burst problem with a different design.</p>
+<p>One detail worth fixing before either fabric gets discussed in numbers: the 24,576-GPU network described below is built once, at cluster scale, and then multiplexed across many jobs — Llama 3 405B pre-training uses at most 16,384 of the 24,576 available GPUs at any given time<a class="cite" href="#ref-1">1</a>, and Meta explicitly notes it uses "only up to 16K of these 24K GPUs for Llama 3 pre-training"<a class="cite" href="#ref-1">1</a>. The topology this module derives is therefore sized for the cluster as a shared resource, not for one job's peak demand, and which subset of GPUs a given job actually lands on — and how that placement interacts with the pod boundaries Section 2 describes — is a scheduling decision made by MAST, Meta's global-scale training scheduler<a class="cite" href="#ref-1">1</a>, covered by name only here and in full by Module 34.</p>
+
+<h3 id="tectonic-is-gfs-lineage">1.1 Tectonic is Module 7's GFS lineage, reused</h3>
+<p>Tectonic is not a training-specific storage system. It is Meta's general-purpose distributed file system, the same fabric that also holds Meta's data-warehouse tables and blob storage, pointed at a training cluster as one more tenant<a class="cite" href="#ref-1">1</a>. Its architecture is the idea Module 7 derives from the Google File System — a metadata authority that never sits on the data path, and a large population of storage servers that hold the actual bytes, replicated or erasure-coded for durability<a class="cite" href="#ref-2">2</a> — scaled past the point where a single master's memory can hold the whole metadata working set, by disaggregating that metadata into its own hash-partitioned service (Module 7, §8.1) rather than keeping it on one machine. Nothing about that lineage is training-specific, and this module does not re-derive it. What is specific to this module is the workload: a checkpoint write is not the steady, moderate-size read/write stream a data-warehouse tenant produces, and Section 3 works out exactly what shape it is instead.</p>
+<p>It is worth stating plainly what the disclosed numbers do and do not cover on the read side of the same fabric. Module 32 covers the tokenized-shard pipeline that produces Tectonic's dataset-read traffic in detail, and stops at the same wall this module runs into from the other direction: Meta's paper never discloses the shard file format, shard size, or steady-state read throughput those shards impose on Tectonic. What Meta does instrument and disclose is the checkpoint-write burst specifically — per-GPU size range, sustained and peak throughput, an explicit pause-time goal<a class="cite" href="#ref-1">1</a> — with no comparable numbers at all for the ordinary dataset-read load competing for the same 2 TB/s sustained figure. That asymmetry in disclosure is part of why this module's arithmetic in Section 3 treats the checkpoint burst as the object of study: it is the one Tectonic workload on a training cluster that Meta actually put numbers against.</p>
+<p>It is worth being precise about which part of the access pattern is genuinely new and which part is not. GFS's own design target was large, mostly-sequential files written by a small number of concurrent appenders and read by a moderate number of clients — a shape well matched by a chunked, replicated file with a single lease-holding primary ordering each mutation (Module 7, and, underneath it, the GFS paper's own §3.1<a class="cite" href="#ref-2">2</a>). A checkpoint write keeps the "large, mostly-sequential per-object write" part of that shape — each GPU's local state is one blob, written once, not appended to incrementally — but changes the concurrency dimension by orders of magnitude: instead of a small number of appenders sharing a file, a checkpoint event is thousands of independent clients, each writing its own distinct object, all starting within the same narrow window. GFS's chunked-replication idea does not need to change to accommodate that — the master's job of placing and replicating each chunk is unaffected by how many other chunks happen to be written at the same moment, and Tectonic's disaggregated, hash-partitioned metadata (Module 7, §8.1) removes the one place a single-master design could have turned that concurrency into a metadata bottleneck. What does change is purely a throughput-provisioning question, not an architectural one: the fabric needs enough aggregate write bandwidth, for a short enough interval, to absorb every one of those thousands of simultaneous single-object writes — which is exactly the 2 TB/s-versus-7 TB/s question Section 3 quantifies, and exactly why this module frames Tectonic as the same idea applied to a new access pattern rather than a new idea.</p>
+
+<h2 id="compute-network">2. The compute network: a three-layer Clos topology at 24,576-GPU scale</h2>
+<p>Meta names its RoCE-based training network precisely: 24,576 GPUs (usually written 24K), connected by a three-layer Clos network, based on Arista 7800 and Minipack2 Open Compute Project switches, with 400 Gbps interconnects between GPUs<a class="cite" href="#ref-1">1</a>. Llama 3 405B pre-training uses up to 16,384 of those 24,576 GPUs<a class="cite" href="#ref-1">1</a> — the topology is provisioned larger than any single disclosed job, because Meta runs many jobs and multiplexes the cluster across them (the placement decision itself is Module 34's scheduler, not this module's topology).</p>
+
+<h3 id="rack-pod-cluster">2.1 Rack, pod, cluster</h3>
+<p>The three layers, bottom to top, each add roughly two orders of magnitude in scope while giving up bandwidth guarantees only at the very top:</p>
+<ul>
+<li><b>Rack.</b> 16 GPUs, split across two Grand Teton servers, connected by a single Minipack2 top-of-rack (ToR) switch<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>Pod.</b> 192 racks connected by Cluster Switches, forming a pod of 3,072 GPUs (192 × 16) <em>with full bisection bandwidth, ensuring no oversubscription</em><a class="cite" href="#ref-1">1</a> — any half of the pod can talk to the other half at the full rate its NICs support.</li>
+<li><b>Cluster.</b> Eight such pods, connected by Aggregation Switches, form the 24,576-GPU cluster. At this top layer, Meta states plainly that the network <em>"does not maintain full bisection bandwidth and instead has an oversubscription ratio of 1:7"</em><a class="cite" href="#ref-1">1</a>.</li>
+</ul>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 420" role="img" aria-labelledby="f2t"><title id="f2t">Three-layer Clos topology: 16-GPU racks aggregate into 3,072-GPU pods at full bisection bandwidth, and eight pods aggregate into a 24,576-GPU cluster at 1:7 oversubscription</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="20" y="40" width="200" height="340" rx="10" class="d-panel"/>
+    <text x="120" y="65" text-anchor="middle" class="d-title">Rack</text>
+    <rect x="45" y="85" width="150" height="50" rx="6" class="d-block"/>
+    <text x="120" y="106" text-anchor="middle" class="d-text-inv d-small">Server 0 — 8 GPUs</text>
+    <text x="120" y="122" text-anchor="middle" class="d-text-inv d-small">+ NVLink inside</text>
+    <rect x="45" y="150" width="150" height="50" rx="6" class="d-block"/>
+    <text x="120" y="171" text-anchor="middle" class="d-text-inv d-small">Server 1 — 8 GPUs</text>
+    <text x="120" y="187" text-anchor="middle" class="d-text-inv d-small">+ NVLink inside</text>
+    <rect x="45" y="215" width="150" height="40" rx="6" class="d-block-2"/>
+    <text x="120" y="240" text-anchor="middle" class="d-text-inv d-small">ToR switch (Minipack2)</text>
+    <text x="120" y="285" text-anchor="middle" class="d-mono d-small">16 GPUs</text>
+    <text x="120" y="303" text-anchor="middle" class="d-mono d-small">400 Gbps/GPU</text>
+    <text x="120" y="345" text-anchor="middle" class="d-text-light d-small">no oversubscription</text>
+    <text x="120" y="361" text-anchor="middle" class="d-text-light d-small">stated at rack scale</text>
+
+    <path d="M225,210 L305,210" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="265" y="195" text-anchor="middle" class="d-mono d-small">× 192</text>
+
+    <rect x="310" y="40" width="220" height="340" rx="10" class="d-panel"/>
+    <text x="420" y="65" text-anchor="middle" class="d-title">Pod</text>
+    <rect x="330" y="85" width="180" height="130" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="420" y="105" text-anchor="middle" class="d-small">192 racks</text>
+    <g class="d-small">
+      <rect x="340" y="115" width="26" height="18" class="d-block" rx="3"/><rect x="372" y="115" width="26" height="18" class="d-block" rx="3"/><rect x="404" y="115" width="26" height="18" class="d-block" rx="3"/><rect x="436" y="115" width="26" height="18" class="d-block" rx="3"/><rect x="468" y="115" width="26" height="18" class="d-block" rx="3"/>
+      <rect x="340" y="140" width="26" height="18" class="d-block" rx="3"/><rect x="372" y="140" width="26" height="18" class="d-block" rx="3"/><rect x="404" y="140" width="26" height="18" class="d-block" rx="3"/><rect x="436" y="140" width="26" height="18" class="d-block" rx="3"/><rect x="468" y="140" width="26" height="18" class="d-block" rx="3"/>
+      <rect x="340" y="165" width="26" height="18" class="d-block" rx="3"/><rect x="372" y="165" width="26" height="18" class="d-block" rx="3"/><rect x="404" y="165" width="26" height="18" class="d-block" rx="3"/><rect x="436" y="165" width="26" height="18" class="d-block" rx="3"/><rect x="468" y="165" width="26" height="18" class="d-block" rx="3"/>
+    </g>
+    <text x="420" y="205" text-anchor="middle" class="d-text-light d-small">(illustrative subset of 192)</text>
+    <rect x="330" y="225" width="180" height="40" rx="6" class="d-block-2"/>
+    <text x="420" y="250" text-anchor="middle" class="d-text-inv d-small">Cluster Switches</text>
+    <text x="420" y="295" text-anchor="middle" class="d-mono d-small">3,072 GPUs</text>
+    <text x="420" y="313" text-anchor="middle" class="d-mono d-small">= 192 × 16</text>
+    <text x="420" y="345" text-anchor="middle" class="d-bold d-small">full bisection —</text>
+    <text x="420" y="361" text-anchor="middle" class="d-bold d-small">no oversubscription</text>
+
+    <path d="M535,210 L615,210" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="575" y="195" text-anchor="middle" class="d-mono d-small">× 8</text>
+
+    <rect x="620" y="40" width="160" height="340" rx="10" class="d-panel"/>
+    <text x="700" y="65" text-anchor="middle" class="d-title">Cluster</text>
+    <g>
+      <rect x="640" y="85" width="120" height="16" class="d-fill-orange-soft d-stroke-orange" rx="3"/>
+      <rect x="640" y="104" width="120" height="16" class="d-fill-orange-soft d-stroke-orange" rx="3"/>
+      <rect x="640" y="123" width="120" height="16" class="d-fill-orange-soft d-stroke-orange" rx="3"/>
+      <rect x="640" y="142" width="120" height="16" class="d-fill-orange-soft d-stroke-orange" rx="3"/>
+      <rect x="640" y="161" width="120" height="16" class="d-fill-orange-soft d-stroke-orange" rx="3"/>
+      <rect x="640" y="180" width="120" height="16" class="d-fill-orange-soft d-stroke-orange" rx="3"/>
+      <rect x="640" y="199" width="120" height="16" class="d-fill-orange-soft d-stroke-orange" rx="3"/>
+      <rect x="640" y="218" width="120" height="16" class="d-fill-orange-soft d-stroke-orange" rx="3"/>
+    </g>
+    <text x="700" y="248" text-anchor="middle" class="d-small">8 pods</text>
+    <rect x="640" y="260" width="120" height="40" rx="6" class="d-block-accent"/>
+    <text x="700" y="285" text-anchor="middle" class="d-text-inv d-small">Aggregation Sw.</text>
+    <text x="700" y="325" text-anchor="middle" class="d-mono d-small">24,576 GPUs</text>
+    <text x="700" y="343" text-anchor="middle" class="d-bold d-small">1:7 oversubscribed</text>
+    <text x="700" y="361" text-anchor="middle" class="d-text-light d-small">(§2.2 arithmetic)</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Meta's RoCE training network: 16 GPUs/rack, 192 racks/pod at full bisection bandwidth (3,072 GPUs), 8 pods/cluster at 1:7 oversubscription (24,576 GPUs). Rack and pod counts, bisection-bandwidth claims, and the 1:7 ratio are Meta's disclosed figures<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="oversubscription-arithmetic">2.2 The arithmetic of 1:7 oversubscription</h3>
+<p>"Oversubscription ratio of 1:7" is a compact way of saying the aggregation layer was deliberately under-built relative to what a fully non-blocking network would require, and it is worth turning into actual bandwidth numbers, because the size of the shortfall is what a topology-unaware scheduler would run straight into.</p>
+<p>Each GPU's NIC carries 400 Gbps<a class="cite" href="#ref-1">1</a>. The standard definition of full bisection bandwidth is that any way of splitting the network's endpoints into two equal halves must be able to sustain every endpoint talking across the split at its full rate — so a fully non-blocking fabric for \(N\) endpoints at \(B\) Gbps each needs \(\frac{N}{2} \times B\) Gbps of aggregate cross-cut capacity.</p>
+<p>At the pod — 3,072 GPUs, and Meta states this layer <em>is</em> full bisection<a class="cite" href="#ref-1">1</a> — that requirement is:</p>
+$$ \frac{3{,}072}{2} \times 400\ \text{Gbps} = 1{,}536 \times 400\ \text{Gbps} = 614{,}400\ \text{Gbps} = 614.4\ \text{Tbps} $$
+<p>If the full 24,576-GPU cluster held to the same non-blocking standard, the aggregation layer would need to carry:</p>
+$$ \frac{24{,}576}{2} \times 400\ \text{Gbps} = 12{,}288 \times 400\ \text{Gbps} = 4{,}915{,}200\ \text{Gbps} \approx 4{,}915.2\ \text{Tbps} $$
+<p>across any cut that separates the cluster's pods into two halves. Meta provisions roughly a seventh of that instead — about 702 Tbps<a class="cite" href="#ref-1">1</a> — which is the concrete meaning of "1:7": cross-pod traffic gets to share a fabric sized for \(4{,}915.2 / 7 \approx 702.2\) Tbps of aggregate capacity, not 4,915.2 Tbps. That is not a rounding error or an oversight; deep-buffer switches, longer cable runs, and Aggregation Switch port count all cost money that scales with cluster size, and Meta is choosing to pay for roughly one-seventh of the fully non-blocking aggregation fabric a homogeneous 24,576-GPU Clos tree would otherwise need. The 1:7 ratio is a cost decision made with full knowledge of which traffic crosses pod boundaries and how tolerant that traffic is of the resulting contention — which is exactly what Section 2.3 covers.</p>
+
+<h3 id="living-with-oversubscription">2.3 Living with an oversubscribed top layer</h3>
+<p>An oversubscribed aggregation layer only works if the traffic that actually has to cross it can tolerate the contention, and Meta's parallelism placement is built around that constraint rather than around it. The 4D parallelism scheme orders dimensions <code>[TP, CP, PP, DP]</code> from innermost to outermost specifically <em>"based on the requirements for network bandwidth and latency"</em>: tensor and context parallelism need the highest bandwidth and lowest latency and stay inside a server or a tightly coupled group of GPUs, while data parallelism (implemented as FSDP) sits outermost <em>"because it can tolerate longer network latency by asynchronously prefetching sharded model weights and reducing gradients"</em><a class="cite" href="#ref-1">1</a>. Aman already has the mechanics of why FSDP tolerates that latency, and this module does not re-derive them; the point this module adds is that the placement decision is also a topology decision — the traffic Meta lets spill across the oversubscribed aggregation layer is, by construction, the traffic best able to absorb a 7x-narrower pipe.</p>
+<p>Two further mechanisms exist specifically because 24,576 GPUs producing synchronized collective traffic breaks naive load balancing. First, Equal-Cost Multi-Path (ECMP) routing does not spread LLM training's "fat" network flows evenly, so Meta's collective library opens 16 network flows between any two communicating GPUs instead of one, and an Enhanced-ECMP (E-ECMP) protocol hashes on extra fields in the RoCE packet header to actually spread those 16 flows across the available paths<a class="cite" href="#ref-1">1</a>. The failure mode E-ECMP exists to fix is standard ECMP's own hashing behavior: a router splits traffic across equal-cost paths by hashing each flow's header fields to a path, which works well for many small, short-lived flows but breaks down for a small number of very large, long-lived ones — plain ECMP has no way to know that two "elephant" flows landed on the same physical link, and no mechanism to move one once they have. LLM training's collective communication is exactly the elephant-flow case: a small number of GPU pairs exchange enormous, sustained volumes of data for the duration of a collective operation, so a single unlucky hash collision can leave one path oversubscribed while a parallel path sits idle. Turning one flow between a GPU pair into 16, and hashing on additional RoCE-header fields to spread those 16 rather than treating them as one unit, converts a small number of unsplittable elephant flows into a larger number of moderate flows that ECMP's own statistics can actually spread evenly<a class="cite" href="#ref-1">1</a>.</p>
+<p>Second, deep-buffer switches at the spine absorb the transient congestion collective communication produces and the back-pressure that slow servers create; combined with E-ECMP's better load spreading, Meta reports running the full 24,576-GPU cluster without needing traditional congestion control such as Data Center Quantized Congestion Notification (DCQCN) at all<a class="cite" href="#ref-1">1</a>. A deep-buffer switch's advantage in this setting is that it trades on-chip memory for time: rather than dropping a packet the instant an output port is momentarily oversubscribed — which is what a shallow-buffer switch does, forcing a retransmission and, at RoCE's priority-flow-control layer, a pause frame that can itself cascade into head-of-line blocking upstream — a deep-buffer switch queues the packet and sends it once the transient contention clears. Collective communication produces exactly the kind of short, synchronized contention that pattern is built for: many GPUs briefly target the same link during an all-reduce or all-gather step, the buffer absorbs the spike, and the link drains it once the collective's traffic pattern moves on. Both mechanisms are about steady-state collective traffic rather than the checkpoint burst this module is built around, but they establish the same theme Section 3 returns to for storage: at this scale, the network is engineered for the traffic pattern it actually sees, not for a hypothetical uniform load.</p>
+
+<h3 id="roce-vs-infiniband">2.4 RoCE versus InfiniBand: build the fabric, or buy it</h3>
+<p>The three-layer Clos topology in Figure 2 is not the only network Meta uses to train Llama 3 models. The 405B run uses RDMA over Converged Ethernet (RoCE), built on Arista 7800 and Minipack2 OCP switches; the smaller models in the same family train on an Nvidia Quantum2 InfiniBand fabric instead<a class="cite" href="#ref-1">1</a>. Both deliver 400 Gbps per GPU, and Meta states it explicitly tunes both fabrics "to provide equivalent performance for these large training workloads" despite the underlying technology difference<a class="cite" href="#ref-1">1</a> — from a model-training perspective, the two networks are interchangeable. What is not interchangeable is who owns the design: Meta's paper elaborates on the RoCE network specifically "since we fully own its design"<a class="cite" href="#ref-1">1</a>, which is the tell that the InfiniBand fabric is closer to a commercial, vendor-defined deployment, while the RoCE topology — the rack/pod/cluster structure, the 1:7 oversubscription decision, the E-ECMP load-balancing scheme — is Meta's own engineering to disclose in the detail Section 2.1 through 2.3 draw on.</p>
+<p>That split mirrors a build-versus-buy tension this module's storage side runs into again in Section 4: Tectonic is Meta's own general-purpose file system, built and controlled end to end, in the same way the RoCE network is; MegaScale, by contrast, deploys HDFS, an adopted open-source system, for the same role. Owning the full stack is what let Meta co-design the RoCE topology's oversubscription with its own parallelism placement in Section 2.3 — the same kind of leverage a self-built storage fabric would offer over an adopted one, and exactly the asymmetry the assessment at the end of this module returns to.</p>
+
+<h2 id="tectonic-checkpoint-burst">3. Tectonic under a synchronized checkpoint burst</h2>
+<p>A checkpoint write is qualitatively different from Tectonic's other training-cluster traffic. Module 32's data-loading pipeline reads tokenized shards continuously, at a rate the training step's compute time sets; that is closer to the steady, moderate throughput a general-purpose storage fabric is designed around. A checkpoint write is the opposite: every GPU in the job serializes and writes its local state at close to the same wall-clock moment. The reason is the same synchronization barrier Aman already has from FSDP's mechanics: a synchronous data-parallel step cannot advance until every rank has finished its gradient reduction for that step, so every rank arrives at the step boundary within a narrow window of wall-clock time regardless of how the model is sharded. Checkpointing is scheduled at that same boundary, which is exactly why it becomes a synchronized burst rather than a staggered trickle of writes spread across the step — the barrier that already exists for training correctness is the same barrier that turns thousands of independent local writes into one cluster-wide event. Meta's own framing is explicit about the consequence — <em>"a major challenge is supporting the highly bursty checkpoint writes that saturate the storage fabric for short durations"</em><a class="cite" href="#ref-1">1</a>. Two Meta storage engineers put the same point more bluntly in their own words at a 2024 systems conference: GenAI training <em>"flipped the script of all of our assumptions around 'storage at scale'"</em><a class="cite" href="#ref-4">4</a> — the traffic pattern that used to be rare (a huge, synchronized spike) became the pattern the fabric had to be built around.</p>
+<p>The same synchronization shows up outside the storage system entirely, as a physical event on the data-center power grid. Meta reports that <em>"tens of thousands of GPUs may increase or decrease power consumption at the same time, for example, due to all GPUs waiting for checkpointing or collective communications to finish,"</em> producing <em>"instant fluctuations of power consumption across the data center on the order of tens of megawatts"</em><a class="cite" href="#ref-1">1</a>. A checkpoint burst, in other words, is not a purely logical abstraction confined to a throughput graph — it is a real, synchronized step-change in cluster-wide GPU activity that a storage fabric, a network, and a power distribution system all have to absorb at the same instant.</p>
+
+<h3 id="sustained-vs-peak">3.1 Sustained throughput vs. peak, and why checkpoints see the gap</h3>
+<p>Tectonic's disclosed numbers for the Llama 3 storage fabric are 240 PB of capacity across 7,500 SSD-equipped servers, a sustainable throughput of 2 TB/s, and a peak throughput of 7 TB/s<a class="cite" href="#ref-1">1</a> — the architecture behind those numbers (hash-partitioned metadata, a flat chunk store, per-tenant tunable durability) is Module 7's territory, not re-derived here. The gap between the two throughput figures is the headroom that exists specifically to absorb bursts like a checkpoint write: 2 TB/s is what the fabric can carry indefinitely across all of its tenants combined, and 7 TB/s is the ceiling it can reach for a short interval before something else — SSD write-amplification limits, network contention on the storage side, or simply other tenants' own sustained load — starts to degrade. A checkpoint write is precisely the kind of load the 7 TB/s figure exists for: short enough that it does not have to be sustainable, large enough that the 2 TB/s figure alone would make GPUs sit idle far longer than Meta is willing to accept.</p>
+<p>Dividing the two disclosed throughput figures by the disclosed server count gives a sense of scale per machine: 2 TB/s across 7,500 SSD servers is about 267 GB/s of sustained throughput per server, and 7 TB/s peak is about 933 GB/s per server<a class="cite" href="#ref-1">1</a>. Those are the two ends of a per-server operating range a general-purpose SSD storage server has to sit inside, averaged across every tenant the server happens to be serving at that moment — Llama 3's checkpoint burst is only one of the demands landing on that range, not the only one.</p>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>Module 7 (§8.1) covers Tectonic's per-block, per-tenant tunable durability — straight replication versus Reed-Solomon erasure coding, chosen by the tenant rather than fixed cluster-wide. A checkpoint object is a natural candidate for a cheaper durability tier than a permanently retained model release or warehouse table: it only has to survive until either the next successful checkpoint supersedes it or a recovery consumes it. Neither the Llama 3 paper nor Module 7's Tectonic source discloses whether checkpoint objects actually receive a different durability setting in practice — it is simply the kind of choice the mechanism exists to make available.</p></aside>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f3t"><title id="f3t">Tectonic's throughput envelope: a 2 TB/s sustained line, a 7 TB/s peak line, and an illustrative checkpoint-write burst rising between them</title>
+    <line x1="70" y1="260" x2="760" y2="260" class="d-axis"/>
+    <line x1="70" y1="260" x2="70" y2="30" class="d-axis"/>
+    <text x="415" y="300" text-anchor="middle" class="d-text-light d-small">training wall-clock time (s) — illustrative window</text>
+    <text x="25" y="150" text-anchor="middle" class="d-text-light d-small" transform="rotate(-90 25 150)">throughput (TB/s)</text>
+    <line x1="70" y1="222" x2="760" y2="222" class="d-grid"/>
+    <line x1="70" y1="184" x2="760" y2="184" class="d-grid"/>
+    <line x1="70" y1="146" x2="760" y2="146" class="d-grid"/>
+    <line x1="70" y1="108" x2="760" y2="108" class="d-grid"/>
+    <line x1="70" y1="70" x2="760" y2="70" class="d-grid"/>
+    <text x="60" y="264" text-anchor="end" class="d-mono d-small">0</text>
+    <text x="60" y="188" text-anchor="end" class="d-mono d-small">2</text>
+    <text x="60" y="74" text-anchor="end" class="d-mono d-small">7</text>
+
+    <line x1="70" y1="184" x2="760" y2="184" class="d-line d-stroke-cyan d-dashed"/>
+    <text x="700" y="176" text-anchor="middle" class="d-mono d-small">2 TB/s sustained</text>
+    <line x1="70" y1="70" x2="760" y2="70" class="d-line d-stroke-blue d-dashed"/>
+    <text x="700" y="62" text-anchor="middle" class="d-mono d-small">7 TB/s peak</text>
+
+    <polyline points="70,232 250,232 260,232 340,90 420,90 470,90 540,232 560,232 760,232" class="d-line d-stroke-orange" style="stroke-width:2.5" fill="none"/>
+    <path d="M340,232 L340,90 L470,90 L470,232 Z" class="d-fill-orange-soft"/>
+    <text x="405" y="115" text-anchor="middle" class="d-bold d-small">checkpoint-write burst</text>
+    <text x="405" y="133" text-anchor="middle" class="d-small">≈9–33 s at 16,384 GPUs × 4 GB (§3.2)</text>
+    <text x="160" y="252" text-anchor="middle" class="d-text-light d-small">background dataset reads (Module 32)</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The 2 TB/s and 7 TB/s reference lines are Meta's disclosed sustained and peak throughput figures<a class="cite" href="#ref-1">1</a>. The burst's height and width are illustrative — Meta does not publish a throughput time series — and are drawn to match the burst-duration range derived in §3.2 from the disclosed per-GPU checkpoint size and job size.</figcaption>
+</figure>
+
+<h3 id="per-gpu-size-aggregate-burst">3.2 Per-GPU checkpoint size and the aggregate burst</h3>
+<p>Meta discloses the per-GPU checkpoint size as a range, not a single number: <em>"checkpointing saves each GPU's model state, ranging from 1 MB to 4 GB per GPU"</em><a class="cite" href="#ref-1">1</a> — a span of roughly 4,000x between the smallest and largest reported per-GPU write. Aman's own background covers why a GPU's local checkpoint shard can be that small (a rank holding almost nothing under an aggressive sharding scheme) or that large (a rank holding a large slice of parameters, gradients, and optimizer state) — this module takes the disclosed range as given and asks what it does to the aggregate write the storage fabric actually sees.</p>
+<p>Table 4 of the Llama 3 paper discloses two GPU counts training the same run: 8,192 and 16,384<a class="cite" href="#ref-1">1</a>. Multiplying each job size by both ends of the per-GPU range gives the aggregate checkpoint volume a single synchronized write has to move:</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Aggregate checkpoint-write volume and implied burst duration at Tectonic's disclosed sustained and peak throughput, for the two GPU counts Meta discloses in Table 4 of the Llama 3 paper and the disclosed 1 MB–4 GB per-GPU range<a class="cite" href="#ref-1">1</a>. Volumes and durations are this module's arithmetic, not Meta's disclosed measurements.</caption>
+<thead><tr><th>GPUs</th><th>Per-GPU state</th><th class="num">Aggregate</th><th class="num">Time @ 2 TB/s</th><th class="num">Time @ 7 TB/s</th></tr></thead>
+<tbody>
+<tr><td class="row">8,192</td><td>1 MB (low end)</td><td class="num">8.19 GB</td><td class="num">4.1 ms</td><td class="num">1.17 ms</td></tr>
+<tr><td class="row">8,192</td><td>4 GB (high end)</td><td class="num">32.77 TB</td><td class="num">16.38 s</td><td class="num">4.68 s</td></tr>
+<tr><td class="row">16,384</td><td>1 MB (low end)</td><td class="num">16.38 GB</td><td class="num">8.19 ms</td><td class="num">2.34 ms</td></tr>
+<tr><td class="row">16,384</td><td>4 GB (high end)</td><td class="num" data-worst>65.54 TB</td><td class="num" data-worst>32.77 s</td><td class="num" data-worst>9.36 s</td></tr>
+</tbody>
+</table>
+
+<p>The range is the point. At the low end of Meta's disclosed per-GPU size, a full-cluster checkpoint write is a few milliseconds of storage traffic — invisible next to a training step. At the high end, the same synchronized write is tens of seconds even at the 7 TB/s peak figure, and over half a minute if the fabric only had its 2 TB/s sustained rate to work with. That gap is exactly why Meta states the goal as minimizing <em>GPU pause time</em> during checkpointing rather than minimizing checkpoint <em>frequency</em> alone<a class="cite" href="#ref-1">1</a> — a 9-to-33-second stall, repeated every time the job checkpoints, is the cost this whole storage and network stack exists to keep as small as possible, and the arithmetic above is the reason 2 TB/s sustained alone was never going to be enough.</p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>These durations are a lower bound: they assume Tectonic's disclosed cluster-wide throughput ceiling is the only bottleneck a checkpoint write hits. In practice the path from a GPU's host memory to a Tectonic client, replication or erasure-coding overhead on the write (Module 7, §8.1), and contention from Tectonic's other tenants at that exact moment all add time that Meta does not break out separately in the Llama 3 paper.</p></aside>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">Aggregate checkpoint-write volume at 8,192 and 16,384 GPUs, low end (1 MB/GPU) and high end (4 GB/GPU), on a log scale from gigabytes to tens of terabytes</title>
+    <line x1="90" y1="240" x2="760" y2="240" class="d-axis"/>
+    <line x1="90" y1="240" x2="90" y2="30" class="d-axis"/>
+    <text x="425" y="278" text-anchor="middle" class="d-text-light d-small">job size × per-GPU checkpoint size</text>
+    <text x="35" y="140" text-anchor="middle" class="d-text-light d-small" transform="rotate(-90 35 140)">aggregate (log scale)</text>
+    <text x="80" y="244" text-anchor="end" class="d-mono d-small">1 GB</text>
+    <text x="80" y="180" text-anchor="end" class="d-mono d-small">1 TB</text>
+    <text x="80" y="116" text-anchor="end" class="d-mono d-small">10 TB</text>
+    <text x="80" y="52" text-anchor="end" class="d-mono d-small">100 TB</text>
+    <line x1="90" y1="180" x2="760" y2="180" class="d-grid"/>
+    <line x1="90" y1="116" x2="760" y2="116" class="d-grid"/>
+    <line x1="90" y1="52" x2="760" y2="52" class="d-grid"/>
+
+    <rect x="140" y="236" width="70" height="4" class="d-fill-blue"/>
+    <text x="175" y="256" text-anchor="middle" class="d-mono d-small">8.19 GB</text>
+    <text x="175" y="228" text-anchor="middle" class="d-small">8,192 × 1 MB</text>
+
+    <rect x="290" y="98" width="70" height="142" class="d-fill-blue"/>
+    <text x="325" y="90" text-anchor="middle" class="d-mono d-small">32.77 TB</text>
+    <text x="325" y="228" text-anchor="middle" class="d-small">8,192 × 4 GB</text>
+
+    <rect x="440" y="234" width="70" height="6" class="d-fill-orange"/>
+    <text x="475" y="222" text-anchor="middle" class="d-mono d-small">16.38 GB</text>
+    <text x="475" y="256" text-anchor="middle" class="d-small">16,384 × 1 MB</text>
+
+    <rect x="590" y="82" width="70" height="158" class="d-fill-orange"/>
+    <text x="625" y="74" text-anchor="middle" class="d-mono d-small">65.54 TB</text>
+    <text x="625" y="228" text-anchor="middle" class="d-small">16,384 × 4 GB</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> The four bars from Table 1: aggregate checkpoint-write volume spans roughly four orders of magnitude depending only on where each GPU's local checkpoint state falls in Meta's disclosed 1 MB–4 GB range<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="binding-constraint">3.3 The binding constraint is storage, not network</h3>
+<p>Section 2.2 derived the aggregation layer's actual provisioned capacity at roughly 702.2 Tbps of cross-pod bandwidth<a class="cite" href="#ref-1">1</a>. Converting that to bytes for a direct comparison against Tectonic's throughput figures — dividing by 8 bits per byte — gives approximately 87.8 TB/s of raw cross-pod capacity, even after the 1:7 oversubscription discount. That is roughly 12.5x Tectonic's disclosed 7 TB/s peak throughput, and roughly 44x its 2 TB/s sustained figure. In other words: the network layer this module spent Section 2 deliberately under-provisioning is still, by a wide margin, not the tightest constraint a checkpoint burst runs into. Tectonic's own throughput ceiling — not the Clos network's oversubscription ratio — is what actually sets the floor on how fast a synchronized checkpoint write can drain, which is exactly why Table 1's burst-duration arithmetic divides by Tectonic's 2 TB/s and 7 TB/s figures rather than by any network bandwidth number. This is also why Meta's own account of the checkpoint problem talks about storage-fabric saturation and GPU pause time<a class="cite" href="#ref-1">1</a> rather than about network contention: whatever headroom the network needs for checkpoint traffic specifically, it already has an order of magnitude more of it than the storage layer does.</p>
+
+<h3 id="frequency-vs-pause">3.4 What checkpoint frequency buys, and what it costs the fabric</h3>
+<p>The operational backdrop that makes this trade-off matter is disclosed separately, in Meta's account of a 54-day pre-training snapshot: 466 total job interruptions, of which 419 were unexpected, against which Meta still achieved "higher than 90% effective training time" — the fraction of elapsed time actually spent on useful training rather than recovering<a class="cite" href="#ref-1">1</a>. Reaching that number at 16,384-GPU scale, with roughly one interruption a day, depends on recovery starting from a checkpoint that is both recent and quick to write in the first place; the failure taxonomy behind those 419 interruptions and the recovery mechanics that get the job restarted are Module 35's subject, not this one's, but the >90% figure is the result this module's throughput and burst arithmetic is one of the ingredients for.</p>
+<p>Meta states the checkpointing goal in one sentence with two halves that pull in opposite directions: <em>"we aim to minimize GPU pause time during checkpointing and increase checkpoint frequency to reduce the amount of lost work after a recovery"</em><a class="cite" href="#ref-1">1</a>. The second half — checkpointing more often — is a direct multiplier on the first half's cost as this module has quantified it. Every additional checkpoint the training recipe schedules is another instance of Table 1's burst arithmetic: at the high end of the disclosed per-GPU range and the larger disclosed job size, each checkpoint costs the fabric on the order of 9 to 33 seconds of GPU pause time, depending on whether the write can reach Tectonic's peak or only its sustained rate. Checkpointing twice as often does not change that per-event cost, but it does double how many times the cluster pays it over the course of a training run — a cost this module's numbers make explicit and computable, even though the benefit side of that trade (how much wall-clock recovery time a more recent checkpoint actually saves after a failure) is Module 35's question, not this one's. What this module's arithmetic contributes to that later trade-off is the other half of the ledger: the storage-fabric cost of checkpointing more often is not free, is not hidden, and scales linearly with frequency in a way the 1 MB–4 GB per-GPU range and the 2-to-7 TB/s throughput envelope pin down exactly. Meta's disclosed training recipe for Llama 3 405B runs a cosine learning-rate schedule decaying over 1,200,000 steps<a class="cite" href="#ref-1">1</a> — over a schedule that long, even a deliberately conservative checkpoint policy still accumulates many multiples of Table 1's per-event cost before the run finishes, which is the scale at which "minimize GPU pause time" stops being a nice-to-have and starts being load-bearing for how much of a 16,384-GPU allocation is actually spent on useful compute rather than waiting on Tectonic.</p>
+
+<h2 id="megascale-second-answer">4. MegaScale's two-stage checkpoint path: a second production answer</h2>
+<p>ByteDance's MegaScale trains large models on a cluster whose largest instance exceeds 10,000 GPUs, reporting 55.2% Model FLOPs Utilization training a 175B-parameter model on 12,288 GPUs — a 1.34x improvement over Megatron-LM<a class="cite" href="#ref-3">3</a>. MegaScale's own design principle is stated directly: <em>"failures and stragglers are the norm rather than the exception for LLM training"</em> at this scale<a class="cite" href="#ref-3">3</a>, and over its production lifetime the system has "repaired and recovered the training process for over 100 times in presence of failures" on a single run while loss continued to converge<a class="cite" href="#ref-3">3</a>. Checkpointing is one of the specific mechanisms MegaScale names as part of that reliability story, and it takes a different shape from anything the Llama 3 paper discloses about Tectonic.</p>
+<p>MegaScale's write path is explicitly two-stage. In the first stage, <em>"each GPU worker writes its on-chip states to the host memory, and then continues the training process"</em>; after optimizing PyTorch's serialization and using pinned memory, that stage takes only "several seconds thanks to the high PCIe bandwidth," so the GPU resumes training almost immediately<a class="cite" href="#ref-3">3</a>. In the second stage, <em>"a background process takes over, asynchronously transferring the state from the host memory to a distributed file system (HDFS in our deployment) for centralized maintenance"</em><a class="cite" href="#ref-3">3</a> — the slow, storage-bandwidth-bound part of the write happens entirely off the GPU's critical path. Recovery has the opposite bottleneck: MegaScale states plainly that <em>"the bottleneck is the bandwidth of HDFS, especially when each GPU worker needs to read its corresponding state partition"</em><a class="cite" href="#ref-3">3</a>, and its fix is a data-parallel-group-aware read: one worker per group reads the shared state partition from HDFS and broadcasts it to the rest of the group that shares the same data, "reducing the load linearly"<a class="cite" href="#ref-3">3</a> rather than having every GPU in the group hit HDFS independently. The saving is exactly what "linearly" implies: if a data-parallel group has \(G\) GPUs sharing one state partition, G independent readers turn one logical read into \(G\) physical reads against HDFS's bandwidth ceiling, while the single-reader-then-broadcast scheme turns it back into one physical read plus a broadcast over the (much higher-bandwidth) intra-cluster network — a factor-of-\(G\) reduction in the load HDFS itself has to sustain during recovery, paid for with one extra hop of network broadcast instead.</p>
+<p>The Llama 3 paper does not disclose whether a Tectonic checkpoint write happens directly from GPU-resident state or via a comparable host-memory staging step; it states only the goal — minimize GPU pause time, increase checkpoint frequency<a class="cite" href="#ref-1">1</a> — not the mechanism that achieves it. That gap in Meta's own disclosure is exactly why MegaScale is useful as a second data point rather than a redundant one: it is the one place in this source map where the checkpoint write path's internal staging is described in enough mechanical detail to compare against Tectonic's headroom-based approach at all.</p>
+<p>MegaScale's choice of storage system is itself informative alongside its checkpoint mechanism. HDFS is the open-source, GFS-lineage system Module 7 covers as a named architectural descendant of GFS, adopted largely as-is rather than built in-house the way Tectonic was<a class="cite" href="#ref-2">2</a>. Pairing an adopted, single-NameNode-class file system with a from-scratch, two-stage checkpoint client is a coherent design: if the storage layer itself is not going to be re-engineered to expose extra burst headroom the way Tectonic's peak-over-sustained figures suggest Meta's was, then the place left to absorb burstiness is the client sitting in front of it — which is exactly where MegaScale's host-memory staging and broadcast-based recovery live. Tectonic and Tectonic-style peak headroom is a lever only available to an organization willing to build and operate its own general-purpose distributed file system; a two-stage client-side checkpoint path is a lever available to anyone, regardless of which storage system sits underneath it.</p>
+<p>The two systems' network topologies also diverge in a way worth placing side by side with the checkpoint mechanism, because both are answers to the same underlying question — where do you pay for a workload that occasionally needs more bandwidth than its average? MegaScale's datacenter network is "built with high-performance switches based on Broadcom Tomahawk 4 chips" (25.6 Tbps per chip across 64 × 400 Gbps ports), with three layers connected in a "CLOS-like topology to connect more than 10,000 GPUs," and — unlike Meta's 1:7 aggregation layer — <em>"for switches at each layer, the bandwidth percentage between downlink and uplink is 1:1"</em><a class="cite" href="#ref-3">3</a>: no layer is oversubscribed. MegaScale still has to fight ECMP hashing conflicts, and does so on the scheduling side rather than the topology side, by deliberately placing data-intensive nodes from the same job "under the same Top of Rack (ToR) switch" to cut the number of hops and the resulting conflict probability<a class="cite" href="#ref-3">3</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Meta/Llama 3's training infrastructure against ByteDance/MegaScale's, on the axes this module covers<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a>.</caption>
+<thead><tr><th>Axis</th><th>Meta (Llama 3 405B)</th><th>ByteDance (MegaScale)</th></tr></thead>
+<tbody>
+<tr><td class="row">Job / cluster scale</td><td>up to 16,384 of 24,576 GPUs</td><td>12,288 GPUs (175B model); largest cluster &gt;10,000 GPUs</td></tr>
+<tr><td class="row">Network topology</td><td>3-layer Clos, RoCE, 400 Gbps/GPU</td><td>3-layer Clos-like, Broadcom Tomahawk 4 switches</td></tr>
+<tr><td class="row">Oversubscription</td><td data-worst>1:7 at the aggregation (top) layer</td><td data-best>1:1 (no oversubscription) at every layer</td></tr>
+<tr><td class="row">Storage system</td><td>Tectonic (general-purpose, multitenant)</td><td>HDFS</td></tr>
+<tr><td class="row">Checkpoint write path</td><td>not disclosed beyond "minimize GPU pause time"</td><td data-best>2-stage: GPU → pinned host memory (seconds) → async HDFS</td></tr>
+<tr><td class="row">Checkpoint read path</td><td>not disclosed</td><td data-best>single reader per DP group, broadcast to peers</td></tr>
+<tr><td class="row">Reported reliability</td><td>466 interruptions/54 days, &gt;90% effective training time</td><td>&gt;100 repair/recovery cycles on one production run</td></tr>
+</tbody>
+</table>
+
+<p>Two rows of Table 2 are worth reading together rather than separately. The "not disclosed" checkpoint-path cells for Meta are not a gap in this module's research — they are a genuine asymmetry in what the two organizations chose to publish. Meta's Llama 3 paper is the more detailed source on network topology and reliability statistics (Table 5's full interruption taxonomy has no MegaScale equivalent), while MegaScale's NSDI paper is the more detailed source on the checkpoint write and read mechanism itself. Reading both papers side by side, as this module does, is the only way to get a mechanism-level account of the checkpoint path grounded in a topology-level account of the network it crosses; neither paper alone supplies both halves for the same system.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>At 16,000-to-24,000-GPU scale, both the network and the storage fabric face the same underlying choice: some traffic pattern is going to occasionally need far more bandwidth than its average, and someone has to decide where the money and the engineering complexity go to absorb that. Meta and ByteDance, the only two organizations in this source map that disclose numbers at this depth, make opposite choices on both axes.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Oversubscribe the network's top layer on purpose</h4>
+    <p class="who">Meta, Llama 3 405B infrastructure<a class="cite" href="#ref-1">1</a></p>
+    <p>Provision the pod layer (3,072 GPUs) at full bisection bandwidth, where the highest-bandwidth, most latency-sensitive parallelism dimensions live, and accept a 1:7-oversubscribed aggregation layer above it, because the traffic scheduled to cross that layer — outermost FSDP/data parallelism — is explicitly chosen for its tolerance of extra latency. The saving is real: §2.2's arithmetic puts the built aggregation capacity at roughly a seventh of what a fully non-blocking 24,576-GPU fabric would need.</p>
+    <ul class="pros"><li>Aggregation-layer switch, optics, and cabling cost scales with the discount, not with full cluster size — a large, direct capital saving at 24K-GPU scale.</li><li>Works only because the parallelism placement decision (Section 2.3) and the topology are co-designed; Meta controls both.</li></ul>
+    <ul class="cons"><li>Any traffic that ends up crossing pods and is <em>not</em> latency-tolerant pays the full cost of the 7x contention, with no headroom to fall back on.</li><li>Requires a topology-aware scheduler and topology-aware parallelism placement as a hard dependency, not an optional optimization — an organization without that co-design loses the saving without losing the risk.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Keep every network layer non-oversubscribed</h4>
+    <p class="who">ByteDance, MegaScale<a class="cite" href="#ref-3">3</a></p>
+    <p>Build a 1:1 downlink-to-uplink ratio at every layer of the Clos-like topology, so no traffic pattern is structurally disadvantaged, and spend the resulting scheduling complexity on cutting ECMP conflicts instead — colocating a job's data-intensive nodes under a shared ToR switch to reduce hop count, rather than relying on parallelism placement to route around a known-narrow layer.</p>
+    <ul class="pros"><li>No traffic pattern silently degrades because it happened to cross the wrong layer; the network's behavior is uniform and easier to reason about without also reasoning about parallelism placement.</li><li>Still gets a real, disclosed win against contention (ToR colocation) without touching bisection bandwidth at all.</li></ul>
+    <ul class="cons"><li>Pays for full bisection bandwidth at every layer, including layers where Meta's evidence suggests most of the traffic could tolerate less.</li><li>Switch and optics cost scales with full cluster size, not with a designed-in discount.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Absorb the checkpoint burst inside the storage fabric's own headroom</h4>
+    <p class="who">Meta, Tectonic<a class="cite" href="#ref-1">1</a></p>
+    <p>Let every GPU write its checkpoint state directly into a shared, general-purpose, multitenant storage fabric, and rely on the gap between that fabric's disclosed sustained (2 TB/s) and peak (7 TB/s) throughput to absorb the burst — no separately disclosed staging tier in front of Tectonic.</p>
+    <ul class="pros"><li>One fabric, one operational surface; the same headroom that absorbs a checkpoint burst also absorbs any other tenant's burst, and per-object durability can be tuned (Module 7, §8.1) instead of building a second storage system.</li><li>No extra software layer between the GPU and durable storage to build, monitor, or debug.</li></ul>
+    <ul class="cons"><li>§3.2's arithmetic shows the GPU-visible pause time still scales directly with per-GPU checkpoint size — the fabric's headroom buys a ceiling, not a guarantee of a short stall at the high end of the disclosed 1 MB–4 GB range.</li><li>A checkpoint burst competes for the same 7 TB/s peak that any other tenant's burst would use; nothing in Meta's disclosure isolates the two.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Decouple the GPU critical path from storage bandwidth entirely</h4>
+    <p class="who">ByteDance, MegaScale<a class="cite" href="#ref-3">3</a></p>
+    <p>Add a host-memory staging tier: the GPU only has to wait for a fast, local, PCIe-bandwidth write into pinned host memory (seconds), and the slow, HDFS-bandwidth-bound write happens asynchronously, off the critical path. Recovery gets a matching optimization — one reader per DP group, not one reader per GPU.</p>
+    <ul class="pros"><li>GPU pause time is decoupled from storage-fabric throughput almost entirely; the fabric's bandwidth only has to keep up on average, not at the instant of the write.</li><li>The DP-group broadcast read directly targets the disclosed recovery bottleneck (HDFS bandwidth) rather than working around it.</li></ul>
+    <ul class="cons"><li>A second software layer (host-memory staging, background transfer, broadcast-based recovery) to build and keep correct — more moving parts than writing straight to the fabric.</li><li>Host memory is a finite, shared resource on the same server as the GPU; staging state there is not free even if it is fast.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Both organizations agree on the substance — a synchronized, 4,000x-variable-size burst at 10,000-plus-GPU scale cannot be handled by "just provision for the average" — and disagree only on where the payment for burst tolerance is made. Meta pays in storage hardware headroom (the 2-to-7 TB/s gap) and in scheduler/parallelism sophistication (topology-aware placement that makes an oversubscribed network layer safe), keeping the client-side write path simple as far as the paper discloses. ByteDance pays in network uniformity (no oversubscription anywhere) and in client-side software complexity (a two-stage write and a group-aware read), keeping the storage fabric's required behavior simple — steady HDFS bandwidth, no special-cased burst headroom. Meta's approach wins when an organization already controls its own topology-aware scheduler and can afford (or already owns) a storage fabric with real peak-over-sustained headroom serving many tenants at once — that is a fair description of Meta's own infrastructure, but not a universal condition. ByteDance's approach wins when the storage fabric is a shared dependency the training team does not control closely (HDFS, in MegaScale's case) and the team would rather own a small, well-understood staging layer than negotiate for burst headroom on someone else's system. Neither paper discloses the one number that would let a reader rank them directly: an actual measured GPU pause-time distribution for a real checkpoint write under production load, as opposed to a stated design goal (Meta) or a "several seconds" order-of-magnitude claim for one stage only (MegaScale). That measurement, published by either organization, would settle which design actually delivers a shorter stall at the GPU, rather than which design is more elegant on paper.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Llama Team, Meta AI. <em>The Llama 3 Herd of Models</em>. arXiv:2407.21783, 2024. <a href="https://arxiv.org/pdf/2407.21783">https://arxiv.org/pdf/2407.21783</a>. Accessed 2026-09-17. <span class="ref-use">Used for: training infrastructure (§3.3.1) — Tectonic capacity/throughput, per-GPU checkpoint size range, three-layer Clos topology and oversubscription ratio, RoCE/NIC bandwidth; parallelism placement and network-aware ordering (§3.3.2); load balancing and congestion control (§3.3.1); reliability figures (§3.3.4).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Ghemawat, S., Gobioff, H., Leung, S-T. <em>The Google File System</em>. SOSP 2003. <a href="https://research.google.com/archive/gfs-sosp2003.pdf">https://research.google.com/archive/gfs-sosp2003.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: one grounding sentence on the single-metadata-authority, replicated-chunk lineage before pointing to Module 7 for full mechanics.</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Jiang, Z., Lin, H., Zhong, Y., et al. <em>MegaScale: Scaling Large Language Model Training to More Than 10,000 GPUs</em>. 21st USENIX Symposium on Networked Systems Design and Implementation (NSDI '24), 2024, pp. 745-760. <a href="https://www.usenix.org/system/files/nsdi24-jiang-ziheng.pdf">https://www.usenix.org/system/files/nsdi24-jiang-ziheng.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: two-stage checkpoint/recovery mechanism (§4.4), network topology and oversubscription (§3.6), reported MFU and reliability figures (Abstract, §1).</span></li>
+  <li id="ref-4"><span class="ref-type">talk</span>Battey, R., Gupta, S. <em>Training LLaMA: A Storage Perspective</em>. @Scale Conference, 2024-06-17. <a href="https://atscaleconference.com/videos/training-llama-a-storage-perspective/">https://atscaleconference.com/videos/training-llama-a-storage-perspective/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: one framing quote on GenAI training upending prior storage-at-scale assumptions; the video itself was not transcribed, only the published talk description.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

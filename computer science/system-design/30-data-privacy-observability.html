@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data and Observability: Conversation Storage, Retention, Privacy, and Per-Token Tracing · System Design</title>
+<meta name="description" content="Clio's four-stage privacy-preserving pipeline for learning from a million real conversations without a human ever reading one, and the per-token metrics and cross-system tracing that make an LLM platform's own behavior legible.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 30</p>
+  <h1>Data and Observability: Conversation Storage, Retention, Privacy, and Per-Token Tracing</h1>
+  <p class="lede">Every request into an LLM platform leaves two trails: a stored conversation that someone eventually has to govern, and a live execution that someone eventually has to explain. This module covers both — Anthropic's Clio pipeline for extracting aggregate insight from stored conversations without a human reading any of them, the retention and consent boundaries that decide what is even eligible to look at, and the per-token metrics and cross-system trace that make a single streamed request's latency and cost legible across the gateway, the router, and the GPU backend that served it.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>30 min</b> read</span>
+    <span class="chip"><b>14</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-18</span>
+    <span class="chip">Prerequisite: <b>Modules 11, 23</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 360" role="img" aria-labelledby="f1t"><title id="f1t">Two planes sharing one request: the data plane governs what happened, the observability plane explains what is happening</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <text x="20" y="28" class="d-title d-bold">Data plane — governs what already happened</text>
+    <rect x="20" y="45" width="150" height="60" rx="8" class="d-block-muted"/>
+    <text x="95" y="70" text-anchor="middle" class="d-text-inv d-bold d-small">Conversation</text>
+    <text x="95" y="86" text-anchor="middle" class="d-text-inv d-small">stored at rest</text>
+    <path d="M170,75 L225,75" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="225" y="45" width="150" height="60" rx="8" class="d-block-muted"/>
+    <text x="300" y="70" text-anchor="middle" class="d-text-inv d-bold d-small">Retention clock</text>
+    <text x="300" y="86" text-anchor="middle" class="d-text-inv d-small">+ consent gate</text>
+    <path d="M375,75 L430,75" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="430" y="45" width="160" height="60" rx="8" class="d-block-2"/>
+    <text x="510" y="66" text-anchor="middle" class="d-text-inv d-bold d-small">Clio: aggregate</text>
+    <text x="510" y="82" text-anchor="middle" class="d-text-inv d-small">privacy-preserving analysis</text>
+    <path d="M590,75 L645,75" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="645" y="45" width="135" height="60" rx="8" class="d-block-muted"/>
+    <text x="712" y="70" text-anchor="middle" class="d-text-inv d-bold d-small">Human analyst</text>
+    <text x="712" y="86" text-anchor="middle" class="d-text-inv d-small">sees clusters only</text>
+
+    <text x="400" y="130" text-anchor="middle" class="d-small d-text-light">Section 1 (retention/consent) and Section 2 (Clio) — data already at rest</text>
+
+    <line x1="20" y1="160" x2="780" y2="160" class="d-dashed d-outline"/>
+
+    <text x="20" y="188" class="d-title d-bold">Observability plane — explains what is happening right now</text>
+    <rect x="20" y="205" width="130" height="60" rx="8" class="d-block"/>
+    <text x="85" y="230" text-anchor="middle" class="d-text-inv d-bold d-small">Client</text>
+    <text x="85" y="246" text-anchor="middle" class="d-text-inv d-small">request</text>
+    <path d="M150,235 L200,235" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="200" y="205" width="130" height="60" rx="8" class="d-block"/>
+    <text x="265" y="230" text-anchor="middle" class="d-text-inv d-bold d-small">Gateway</text>
+    <text x="265" y="246" text-anchor="middle" class="d-text-inv d-small">span 1</text>
+    <path d="M330,235 L380,235" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="380" y="205" width="130" height="60" rx="8" class="d-block"/>
+    <text x="445" y="230" text-anchor="middle" class="d-text-inv d-bold d-small">Router /</text>
+    <text x="445" y="246" text-anchor="middle" class="d-text-inv d-small">scheduler — span 2</text>
+    <path d="M510,235 L560,235" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="560" y="205" width="140" height="60" rx="8" class="d-block-accent"/>
+    <text x="630" y="230" text-anchor="middle" class="d-text-inv d-bold d-small">GPU backend</text>
+    <text x="630" y="246" text-anchor="middle" class="d-text-inv d-small">span 3: TTFT, ITL</text>
+    <path d="M700,235 L780,300" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <text x="620" y="300" text-anchor="middle" class="d-small d-text-light">one trace ID, one bill,</text>
+    <text x="620" y="316" text-anchor="middle" class="d-small d-text-light">cost attributed per span</text>
+
+    <text x="400" y="345" text-anchor="middle" class="d-small d-text-light">Section 3 (per-token metrics) and Section 4 (cross-system trace + cost) — one live request</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> This module covers two structurally different problems that both fall under "data and observability" for an LLM platform: governing conversation data that is already stored (top row — what may be retained, for how long, under what consent, and how Anthropic's Clio extracts aggregate insight from it without a human reading a raw conversation<a class="cite" href="#ref-1">1</a>), and explaining a single live request's latency and cost as it crosses the gateway, router, and GPU backend (bottom row, extending Module 11's metrics/logs/traces triad across a boundary it did not have to cross).</figcaption>
+</figure>
+
+<h2 id="retention-consent-boundary">1. What is stored, and for how long: the retention-and-consent boundary</h2>
+<p>Before anything can be analyzed in aggregate or replayed for debugging, it has to have been stored in the first place — and "stored" is not a single state. A conversation sits behind a boundary defined by three independent variables: how long it is kept, whether it is eligible to influence a future model's training, and what exception (a legal hold, a trust-and-safety flag) can override whatever policy would otherwise apply. Getting this boundary wrong in either direction is expensive: keep everything indefinitely and every future privacy incident includes years of exposure; delete too aggressively and you lose the raw material Section 2's aggregate-analysis pipeline needs to run at all.</p>
+
+<h3 id="two-defaults">1.1 Two products, two defaults</h3>
+<p>Anthropic runs two different default policies depending on which product produced the conversation, and the difference is instructive because it shows retention and consent are a per-surface design decision, not a single company-wide constant. On the consumer side (Claude Free, Pro, and Max), a conversation a user deletes is "deleted from our back-end storage systems within 30 days"<a class="cite" href="#ref-2">2</a>. Separately, a user can opt in to letting Anthropic use chats or coding sessions to improve Claude; if they do, "we may retain your data in a de-identified format for up to 5 years in our model training pipelines"<a class="cite" href="#ref-2">2</a> — a retention window two orders of magnitude longer than the deletion default, gated behind an explicit, reversible toggle rather than applied automatically. A user who leaves that setting off gets the short retention window; a user who turns it on trades retention length for the possibility their (de-identified) conversations shape a future model.</p>
+<p>On the commercial API side, the default runs the opposite direction. Anthropic's own commitment is that "retained data is never used for model training without your express permission," and — the more consequential clause for a systems designer — "conversation content (your prompts and Claude's outputs) is not retained by default"<a class="cite" href="#ref-3">3</a>. Where the consumer product's default is a short, bounded retention window with an opt-in path to a long one, the API's default is closer to no retention at all for message content, with an explicit zero data retention (ZDR) arrangement available on request that goes further still: "Anthropic does not store customer prompts or responses at rest after the API response is returned"<a class="cite" href="#ref-3">3</a>. The one documented exception that pulls in the other direction is Anthropic's "Covered Models" designation — certain models require 30-day retention as a condition of access, and ZDR is not available for them "unless expressly authorized by Anthropic"<a class="cite" href="#ref-3">3</a>, which means a platform routing a request to one of those models has just accepted a retention obligation it would not have accepted for every other model in its fleet purely by choosing which model answered the request.</p>
+
+<h3 id="retention-exceptions">1.2 The exceptions that survive any policy</h3>
+<p>Every policy above has the same escape hatch, and it is worth stating plainly because it is easy to design around the default case and forget the exception exists. Under ZDR or HIPAA readiness, Anthropic "may retain data where required by law or where it has been flagged by Anthropic's automated trust and safety systems," and specifically "if a chat or session is flagged, Anthropic may retain inputs and outputs for up to 2 years"<a class="cite" href="#ref-3">3</a>. The consumer-side policy states the same shape of exception with a longer tail on one component: inputs and outputs for a flagged chat are retained "for up to 2 years," and the trust-and-safety classification scores derived from it for "up to 7 years"<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-2">2</a>. A platform that promises "zero retention" or "30-day retention" as a blanket customer-facing claim is describing the common case, not a hard ceiling — the actual ceiling is set by whichever exception fires, and a flagged conversation can outlive a dozen normal retention cycles of the same platform.</p>
+<p>Retention windows are not unique to conversation content, either. Module 27 covers the mechanics of an agent execution sandbox in depth; this module's angle on the same subsystem is purely the retention number attached to it: a code-execution container's data — "execution artifacts, uploaded files, and outputs" — is "retained for up to 30 days," and files pushed through the Files API "persist until explicitly deleted"<a class="cite" href="#ref-4">4</a>. That is a third retention clock, running independently of both the conversation-content clock in Section 1.1 and the flagged-content clock above, attached to a completely different kind of state (a running sandbox, not a message). A platform that thinks about retention as one number is missing that a single agentic session can be governed by three or four different clocks simultaneously — conversation content, tool-execution artifacts, trust-and-safety flags — each with its own default and its own override.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 1.</b> Retention windows are per-surface and per-exception, not a single company-wide number. Figures are Anthropic's own documented policy as of the access date below<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Surface / state</th><th>Default retention</th><th>Training-eligible?</th><th>Override available</th></tr></thead>
+<tbody>
+<tr><td class="row">Consumer chat, deleted by user</td><td class="num">30 days</td><td>No</td><td>—</td></tr>
+<tr><td class="row">Consumer chat, model-improvement opted in</td><td class="num" data-worst>Up to 5 years</td><td>Yes, de-identified</td><td>Toggle off at any time</td></tr>
+<tr><td class="row">API message content, standard</td><td class="num" data-best>Not retained by default</td><td>No, without express permission</td><td>Covered Models require 30-day retention</td></tr>
+<tr><td class="row">API message content, ZDR arrangement</td><td class="num" data-best>No storage at rest</td><td>No</td><td>Not available for Covered Models</td></tr>
+<tr><td class="row">Flagged chat/session (either surface)</td><td class="num">Up to 2 years (inputs/outputs)</td><td>No</td><td>Trust-and-safety scores: up to 7 years (consumer)</td></tr>
+<tr><td class="row">Agent code-execution container state</td><td class="num">Up to 30 days</td><td>No</td><td>Files API: until explicitly deleted</td></tr>
+</tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">A conversation's lifecycle: creation, a consent gate, a retention clock per branch, and the flagged-content exception that overrides all of them</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="20" y="110" width="130" height="55" rx="8" class="d-block"/>
+    <text x="85" y="132" text-anchor="middle" class="d-text-inv d-bold d-small">Conversation</text>
+    <text x="85" y="148" text-anchor="middle" class="d-text-inv d-small">created</text>
+
+    <path d="M150,137 L200,137" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="200" y="30" width="150" height="55" rx="8" class="d-hl"/>
+    <text x="275" y="52" text-anchor="middle" class="d-bold d-small">Consumer:</text>
+    <text x="275" y="68" text-anchor="middle" class="d-small">opt in to training?</text>
+    <path d="M200,110 L350,110" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="275" y="105" text-anchor="middle" class="d-small d-text-light">API: retained by default?</text>
+
+    <path d="M275,85 Q220,95 200,110" class="d-arrow"/>
+    <text x="175" y="95" text-anchor="middle" class="d-mono d-small">no (default)</text>
+    <path d="M275,85 Q350,95 350,150" class="d-arrow d-arrow-active"/>
+    <text x="390" y="95" text-anchor="middle" class="d-mono d-small">yes, opted in</text>
+
+    <rect x="200" y="185" width="150" height="55" rx="8" class="d-panel"/>
+    <text x="275" y="207" text-anchor="middle" class="d-bold d-small">Short window</text>
+    <text x="275" y="223" text-anchor="middle" class="d-small">30 days (consumer) /</text>
+    <text x="275" y="238" text-anchor="middle" class="d-small">not retained (API)</text>
+    <path d="M275,140 L275,185" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+    <rect x="350" y="150" width="160" height="70" rx="8" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="430" y="172" text-anchor="middle" class="d-bold d-small">De-identified training</text>
+    <text x="430" y="188" text-anchor="middle" class="d-small">pipeline, up to 5 yr</text>
+    <text x="430" y="204" text-anchor="middle" class="d-small">(consumer opt-in only)</text>
+
+    <path d="M85,165 Q85,270 600,260" class="d-arrow d-dashed d-arrow-active" marker-end="url(#f2-arr)"/>
+    <rect x="580" y="90" width="180" height="90" rx="8" class="d-fill-red-soft d-stroke-red"/>
+    <text x="670" y="112" text-anchor="middle" class="d-bold d-small">Flagged by trust &amp;</text>
+    <text x="670" y="128" text-anchor="middle" class="d-small">safety (any surface)</text>
+    <text x="670" y="146" text-anchor="middle" class="d-small">overrides everything above:</text>
+    <text x="670" y="162" text-anchor="middle" class="d-small">inputs/outputs up to 2 yr,</text>
+    <text x="670" y="178" text-anchor="middle" class="d-small">scores up to 7 yr</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> A conversation's retention window branches on a consent gate that differs by product surface (consumer opt-in vs. API default-no-retention), and a separate trust-and-safety flag can override either branch regardless of which one applied — the dashed path is not a normal state transition, it is an exception that pre-empts the whole diagram<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>The flagged-content exception is the one line item in Table 1 that a capacity plan cannot treat as a rounding error, because unlike the other rows it grows monotonically rather than staying bounded: every day adds new flagged conversations, and none of them leave the store until their individual 2-year (or 7-year) clock expires. The calculator below turns that into a concrete steady-state size — the number a storage budget actually has to plan for once the system has been running longer than the retention window itself.</p></aside>
+
+<div class="calc">
+  <p class="calc-title">Steady-state size of the flagged-content store</p>
+  <div class="calc-row"><label for="c1-vol">Daily conversations</label><input type="range" id="c1-vol" name="vol" min="10000" max="50000000" step="10000" value="5000000" data-format="si"></div>
+  <div class="calc-row"><label for="c1-rate">Flag rate (fraction)</label><input type="range" id="c1-rate" name="rate" min="0.0001" max="0.02" step="0.0001" value="0.001" data-format="fixed:4"></div>
+  <div class="calc-row"><label for="c1-days">Retention window (days)</label><input type="range" id="c1-days" name="days" min="30" max="2555" step="1" value="730"></div>
+  <div class="calc-out">
+    <div>Flagged conversations retained at steady state<output data-expr="vol * rate * days" data-format="si"></output></div>
+    <div>Flagged conversations added per day<output data-expr="vol * rate" data-format="si"></output></div>
+  </div>
+  <p class="calc-note">Steady-state store size = daily volume &times; flag rate &times; retention days, once the platform has run longer than the retention window (a queue in equilibrium: inflow equals outflow). Anthropic's own documented flagged-content retention windows are up to 2 years (730 days) for inputs/outputs and up to 7 years (2,555 days) for trust-and-safety scores<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>; daily volume and flag rate are platform-specific inputs this module does not have a published figure for, so they are left as knobs rather than assumed.</p>
+</div>
+
+<h2 id="clio-pipeline">2. Learning from a million conversations without reading one: the Clio pipeline</h2>
+<p>Section 1 established what may be kept and for how long. This section is about what a platform is allowed to learn from what it kept, without turning "we retain conversations" into "an employee reads your conversations." Anthropic built Clio to answer exactly that question for claude.ai: a system that analyzed 1 million real conversations across the Free and Pro tiers and produced aggregate, topic-level insight — the top category was web and mobile application development at over 10% of all conversations, followed by education at more than 7% and business strategy at nearly 6%<a class="cite" href="#ref-1">1</a> — while the pipeline's own design goal was that no human analyst ever reads a raw conversation to get there.</p>
+
+<h3 id="clio-four-stages">2.1 Four stages: facets, clustering, private-info-excluded description, hierarchy</h3>
+<p>Clio's own description of the pipeline names four stages in sequence. First, <b>extracting facets</b>: metadata about a conversation such as its topic or language, computed per-conversation. Second, <b>semantic clustering</b>: grouping conversations by theme using those facets, so the unit of analysis becomes a cluster of many conversations rather than any single one. Third, <b>cluster description</b>: producing a summary of each cluster that explicitly excludes private information — the pipeline's own framing is "summaries excluding private information"<a class="cite" href="#ref-1">1</a>, which makes privacy exclusion a step in the pipeline, not a property that falls out of aggregation by accident. Fourth, <b>building hierarchies</b>: organizing the resulting clusters into a browsable structure so an analyst can explore from a broad category down into narrower sub-topics<a class="cite" href="#ref-1">1</a>.</p>
+<p>The ordering matters for the same reason a data pipeline's stage ordering always matters: each stage's output is the next stage's only input, so anything a later stage needs (a privacy guarantee, a minimum sample size) has to have already been enforced by an earlier one. A cluster description generated after aggregation, from a cluster that already satisfies a minimum-size floor, is a fundamentally different privacy posture than generating per-conversation summaries and aggregating those afterward — the former never produces an artifact smaller than the floor; the latter can produce a temporary artifact (a per-conversation summary) that was never protected by the floor at all.</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 260" role="img" aria-label="Clio's four-stage pipeline from raw conversations to a browsable, privacy-preserving hierarchy">
+      <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+      <rect x="20" y="90" width="130" height="60" rx="8" class="d-block-muted"/>
+      <text x="85" y="115" text-anchor="middle" class="d-text-inv d-bold d-small">1M raw</text>
+      <text x="85" y="131" text-anchor="middle" class="d-text-inv d-small">conversations</text>
+
+      <g data-step="1">
+        <path d="M150,120 L205,120" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="205" y="90" width="130" height="60" rx="8" class="d-block"/>
+        <text x="270" y="115" text-anchor="middle" class="d-text-inv d-bold d-small">Facet</text>
+        <text x="270" y="131" text-anchor="middle" class="d-text-inv d-small">extraction</text>
+      </g>
+
+      <g data-step="2">
+        <path d="M335,120 L390,120" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="390" y="90" width="130" height="60" rx="8" class="d-block-2"/>
+        <text x="455" y="115" text-anchor="middle" class="d-text-inv d-bold d-small">Semantic</text>
+        <text x="455" y="131" text-anchor="middle" class="d-text-inv d-small">clustering</text>
+        <rect x="360" y="160" width="190" height="40" rx="6" class="d-hl"/>
+        <text x="455" y="185" text-anchor="middle" class="d-bold d-small">Minimum-cluster-size gate</text>
+      </g>
+
+      <g data-step="3">
+        <path d="M520,120 L575,120" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="575" y="90" width="150" height="60" rx="8" class="d-block-accent"/>
+        <text x="650" y="109" text-anchor="middle" class="d-text-inv d-bold d-small">Cluster description</text>
+        <text x="650" y="125" text-anchor="middle" class="d-text-inv d-small">private info</text>
+        <text x="650" y="141" text-anchor="middle" class="d-text-inv d-small">excluded</text>
+      </g>
+
+      <g data-step="4">
+        <path d="M650,150 Q650,210 500,225" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="230" y="205" width="230" height="45" rx="8" class="d-surface d-outline"/>
+        <text x="345" y="225" text-anchor="middle" class="d-bold d-small">Hierarchy: browsable</text>
+        <text x="345" y="240" text-anchor="middle" class="d-small">clusters, human-analyst-visible</text>
+      </g>
+    </svg>
+    <figcaption><b>Figure 3.</b> Clio's four-stage pipeline. The minimum-cluster-size gate sits between clustering and description — a cluster that does not clear it never reaches the description or hierarchy stages, so no summary is ever generated for a topic too small to aggregate safely<a class="cite" href="#ref-1">1</a>.</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><b>Facet extraction.</b> Per-conversation metadata — topic, language — computed once, before any cross-conversation comparison happens.</li>
+    <li><b>Semantic clustering.</b> Conversations are grouped by theme using their facets; a minimum threshold on the number of unique users or conversations in a cluster gates everything downstream, "so that low-frequency topics... aren't inadvertently exposed"<a class="cite" href="#ref-1">1</a>.</li>
+    <li><b>Cluster description.</b> A summary is generated for each cluster that survived the gate, with private information excluded by construction; Claude itself then verifies the summary "doesn't contain any overly specific or identifying information" before it goes any further<a class="cite" href="#ref-1">1</a>.</li>
+    <li><b>Building hierarchies.</b> Verified cluster descriptions are organized into a browsable structure; only these higher-level clusters — never a raw conversation — are visible to a human analyst<a class="cite" href="#ref-1">1</a>.</li>
+  </ol>
+</div>
+
+<h3 id="clio-minimum-threshold">2.2 The minimum-cluster-size floor</h3>
+<p>The gate in Figure 3 is doing specific, load-bearing work: Clio enforces "a minimum threshold for the number of unique users or conversations" a cluster must contain, precisely "so that low-frequency topics, even if they are not related to sensitive material, aren't inadvertently exposed"<a class="cite" href="#ref-1">1</a>. The mechanism is the same intuition behind k-anonymity in the general privacy literature — a fact is only reported in aggregate if enough distinct individuals contributed to it — applied at the cluster level rather than the row level. Its cost is symmetric with its benefit: the floor that keeps a three-person cluster from ever surfacing as "three people asked about X" is the same floor that makes a genuinely rare but non-sensitive topic invisible to the analysis, because Clio cannot distinguish "rare and identifying" from "rare and merely uncommon" without more information than the threshold check has access to. Section 4 of the disagreement below returns to exactly this trade-off from a different angle.</p>
+
+<h3 id="clio-self-verification">2.3 A model verifying its own output before a human sees it</h3>
+<p>The description stage does not rely solely on the aggregation floor. Anthropic's own account states that "Claude verifies that cluster summaries don't contain any overly specific or identifying information before they're displayed"<a class="cite" href="#ref-1">1</a> — a second, content-level check layered on top of the count-level check in Section 2.2. This is worth noting as a specific design choice rather than an obvious one: the floor in Section 2.2 protects against a cluster being too small in principle; the model-verification step protects against a cluster that cleared the size floor but whose generated description nonetheless leaked something specific (a name, a verbatim quote, a detail unique enough to re-identify a contributor even inside a large cluster). Neither check subsumes the other, and the published pipeline runs both.</p>
+
+<h3 id="clio-validation">2.4 Validating against an independent signal</h3>
+<p>Anthropic checked Clio's own output against a system built for an entirely different purpose: the platform's Trust and Safety classification system. "The overall correlation between the Trust and Safety and the Clio classifications was r = 0.71"<a class="cite" href="#ref-1">1</a> — a moderately strong agreement between two independently built systems looking at the same underlying conversations through different lenses (Clio's topic clusters versus Trust and Safety's policy-violation classifications), used operationally to surface disagreements as candidates for false positives or false negatives in either system. The same cross-check surfaced a genuine finding rather than just a sanity check: Clio "identified a network of automated accounts using similar prompt structures to generate spam for search engine optimization"<a class="cite" href="#ref-1">1</a> — a coordinated-abuse pattern visible only because conversations were being compared to each other in aggregate, which is the entire reason to build a privacy-preserving aggregate-analysis system instead of relying on per-conversation review alone. Module 29 covers the real-time classifier side of trust and safety; Clio's role here is the aggregate, retrospective side, correlated against it rather than replacing it.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> The three largest conversation categories Clio surfaced from 1 million claude.ai conversations (Free and Pro tiers)<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Category</th><th class="num">Share of conversations</th></tr></thead>
+<tbody>
+<tr><td class="row">Web and mobile application development</td><td class="num" data-best>&gt; 10%</td></tr>
+<tr><td class="row">Education</td><td class="num">&gt; 7%</td></tr>
+<tr><td class="row">Business strategy</td><td class="num">&approx; 6%</td></tr>
+</tbody>
+</table>
+
+<h2 id="per-token-metrics">3. Per-token metrics: the LLM-specific observability primitive</h2>
+<p>Module 11 built the general vocabulary: an SLI is "a carefully defined quantitative measure of some aspect of the level of service that is provided"<a class="cite" href="#ref-5">5</a>, and an SLO is a target range for that measure. That vocabulary does not specialize itself — it has to be handed a measure. For a request/response API, "request latency" is usually an adequate SLI: the client waits, then gets one answer, and one number describes the wait. A streamed LLM completion breaks that assumption structurally, not just by degree. The client does not wait once; it receives a sequence of tokens over time, and two requests with identical total latency can feel completely different to a caller — one that arrives instantly and then dribbles out one word every 400 milliseconds, and one that pauses for two seconds and then streams the rest at a smooth clip. "Request latency" as a single SLI cannot distinguish these, which is exactly why LLM serving needs its own SLI vocabulary rather than reusing Module 11's directly.</p>
+
+<h3 id="ttft">3.1 Time to first token: definition and what it bundles</h3>
+<p>Time to first token (TTFT) is defined, in NVIDIA's own benchmarking-tool documentation, as the elapsed time from request dispatch to the arrival of the first response chunk<a class="cite" href="#ref-6">6</a>. The same documentation is explicit about what that interval bundles together: it "includes network latency, queuing time, prompt processing, and generation of the first token"<a class="cite" href="#ref-6">6</a> — four separable causes collapsed into one number. This is a deliberate simplification, not an oversight, and Section 4 of this module is precisely about un-bundling it again once the request is traced across the systems that contribute each piece: the network and queuing components live at the gateway and router hops, prompt processing is the GPU backend's prefill phase, and only the last piece is decode. A caller sees one TTFT number; a platform operator diagnosing why it moved needs the trace that Section 4 builds.</p>
+<p>The OpenTelemetry project's semantic conventions for generative AI systems standardize this as a named, typed metric rather than an ad hoc measurement: <code>gen_ai.server.time_to_first_token</code>, a histogram in seconds, described as "time to generate first token for successful responses"<a class="cite" href="#ref-7">7</a>. Standardizing the metric name and its histogram bucket boundaries — the convention specifies buckets at 1&nbsp;ms, 5&nbsp;ms, 10&nbsp;ms, 20&nbsp;ms, 40&nbsp;ms, 60&nbsp;ms, 80&nbsp;ms, 100&nbsp;ms, 250&nbsp;ms, 500&nbsp;ms, 750&nbsp;ms, 1&nbsp;s, 2.5&nbsp;s, 5&nbsp;s, 7.5&nbsp;s, and 10&nbsp;s<a class="cite" href="#ref-7">7</a> — is what lets a metric emitted by a vLLM backend, an SGLang backend, and a hosted-API gateway all land in the same dashboard without a translation layer, the same engine-agnostic-schema argument Module 25 makes for the model-server protocol's own metric names, applied here to the observability signal instead of the routing signal.</p>
+
+<h3 id="inter-token-latency">3.2 Inter-token latency: definition, formula, and a wall-clock subtlety</h3>
+<p>Once the first token has arrived, the question changes from "how long did the caller wait" to "how smoothly does the rest arrive." Inter-token latency (ITL), also called time per output token (TPOT), is the average time between successive output tokens after the first one. NVIDIA's tooling documentation gives the formula directly:</p>
+$$ \mathrm{ITL} = \frac{\text{request\_latency} - \mathrm{TTFT}}{\text{output\_sequence\_length} - 1} $$
+<p>which is exactly the total decode-phase wall-clock time divided by the number of token-to-token gaps it contains (one fewer than the token count, since the first token has no predecessor to measure a gap against)<a class="cite" href="#ref-6">6</a>. The same documentation adds a precision point worth keeping explicit, because it is easy to misread ITL as a per-token cost rather than a normalized rate: "ITL is generated-token-normalized decode duration. It is not the total wall-clock decode duration"<a class="cite" href="#ref-6">6</a>. A request that generates 500 tokens in 10 seconds and a request that generates 50 tokens in 1 second report the identical ITL (20 ms) despite an order-of-magnitude difference in how long the caller actually waited for decode to finish — ITL characterizes the backend's steady-state generation rate, not any individual request's total experience, which is why it is reported as its own metric rather than derived on demand from total latency alone.</p>
+<p>OpenTelemetry's convention mirrors this exactly as <code>gen_ai.server.time_per_output_token</code>, a histogram in seconds with narrower buckets than TTFT's — 10&nbsp;ms up through 2.5&nbsp;s<a class="cite" href="#ref-7">7</a> — reflecting that a healthy decode step is expected to be one to two orders of magnitude faster than a healthy prefill, which is itself the direct consequence of the arithmetic-intensity asymmetry between a compute-bound prefill pass over the whole prompt and a memory-bandwidth-bound decode step generating one token at a time — vocabulary this course's multi-node-llm-inference track derives from the GPU side and this module simply measures from the outside.</p>
+
+<h3 id="token-throughput">3.3 Throughput: per-request vs. aggregate, and why batching decouples them</h3>
+<p>Throughput answers a third, different question: not how long any one caller waited, but how many tokens the system is producing per unit time. NVIDIA's tooling defines aggregate output token throughput as total output tokens generated divided by the benchmark's wall-clock duration across every concurrent request<a class="cite" href="#ref-6">6</a> — a system-level rate, not a per-request one. The distinction matters because the two move in opposite directions under exactly the mechanism Aman already knows from batched decode: continuous batching lets a GPU backend serve more concurrent streams by packing more sequences into the same decode step, which raises aggregate tokens/sec (more work retired per step) while it can simultaneously raise per-stream ITL (each individual stream's next token depends on a step that is now doing more total work, so the step itself takes longer). A dashboard that reports only the aggregate number can show "throughput is up" in the same window a per-request percentile dashboard shows "ITL is up" — both are true, and neither is more correct; they are the same batching decision viewed from the operator's side and the caller's side.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">A single streamed response's timeline: queueing and prefill before the first token, then a sequence of decode steps each separated by the inter-token latency</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="40" y1="240" x2="760" y2="240" class="d-axis"/>
+    <text x="400" y="270" text-anchor="middle" class="d-small d-text-light">wall-clock time since request sent</text>
+
+    <rect x="40" y="200" width="90" height="30" rx="4" class="d-block-muted"/>
+    <text x="85" y="220" text-anchor="middle" class="d-text-inv d-small">queue + network</text>
+    <rect x="130" y="200" width="130" height="30" rx="4" class="d-block"/>
+    <text x="195" y="220" text-anchor="middle" class="d-text-inv d-small">prefill (prompt processing)</text>
+
+    <path d="M40,180 L260,180" class="d-arrow d-arrow-active" marker-end="url(#f4-arr)"/>
+    <text x="150" y="168" text-anchor="middle" class="d-mono d-small d-bold">TTFT</text>
+
+    <circle cx="260" cy="215" r="6" class="d-fill-orange"/>
+    <text x="260" y="195" text-anchor="middle" class="d-mono d-small">tok 1</text>
+
+    <g>
+      <circle cx="320" cy="215" r="6" class="d-fill-blue"/>
+      <text x="320" y="195" text-anchor="middle" class="d-mono d-small">tok 2</text>
+      <path d="M266,215 L314,215" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <circle cx="380" cy="215" r="6" class="d-fill-blue"/>
+      <text x="380" y="195" text-anchor="middle" class="d-mono d-small">tok 3</text>
+      <path d="M326,215 L374,215" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <circle cx="440" cy="215" r="6" class="d-fill-blue"/>
+      <text x="440" y="195" text-anchor="middle" class="d-mono d-small">tok 4</text>
+      <path d="M386,215 L434,215" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <text x="350" y="235" text-anchor="middle" class="d-mono d-small d-text-light">ITL</text>
+      <text x="410" y="235" text-anchor="middle" class="d-mono d-small d-text-light">ITL</text>
+    </g>
+
+    <path d="M500,215 L680,215" class="d-line d-dashed d-stroke-blue"/>
+    <text x="590" y="205" text-anchor="middle" class="d-small d-text-light">... remaining tokens, same ITL cadence ...</text>
+    <circle cx="700" cy="215" r="6" class="d-fill-red"/>
+    <text x="700" y="195" text-anchor="middle" class="d-mono d-small">tok N (last)</text>
+
+    <path d="M40,120 L700,120" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <text x="370" y="108" text-anchor="middle" class="d-mono d-small d-bold">request_latency (end to end)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> One streamed response's timeline. TTFT covers queueing, network, and prefill, ending at the first token; every gap after that is one sample of the inter-token latency; the whole span is request_latency, from which ITL is derived as \((\text{request\_latency} - \mathrm{TTFT}) / (N-1)\)<a class="cite" href="#ref-6">6</a>. Aggregate tokens/sec is a separate, system-wide measure taken across every concurrent stream, not read off this one timeline<a class="cite" href="#ref-6">6</a>.</figcaption>
+</figure>
+
+<p>These numbers are not abstract. Google Cloud's own account of adopting load- and cache-aware routing (the mechanism Module 24 covers as backend-signal-aware routing) reports concrete, measured TTFT deltas from changing only the routing decision, not the model or the hardware: "over 35% for Qwen3-Coder" in average TTFT, and for Deepseek V3.1 under bursty chat traffic, P95 TTFT improved "2x (52%)"<a class="cite" href="#ref-8">8</a>. The same change doubled the platform's prefix-cache hit rate, from 35% to 70%<a class="cite" href="#ref-8">8</a> — a routing-quality improvement that shows up directly in the TTFT metric this section defines, because a cache-hit prefill does less compute than a cache-miss one. A platform that only tracks aggregate request latency would see this as "things got faster" without being able to say whether the improvement came from routing, from caching, or from the backend itself; a platform tracking TTFT and ITL separately, per Section 4's traced breakdown, can attribute it to the right hop.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> OpenTelemetry's semantic-convention names for the LLM-specific metrics this section defines, with their instrument type and histogram bucket range<a class="cite" href="#ref-7">7</a>.</caption>
+<thead><tr><th>Metric name</th><th>Instrument</th><th>Unit</th><th>Bucket range</th></tr></thead>
+<tbody>
+<tr><td class="row d-mono">gen_ai.server.time_to_first_token</td><td>Histogram</td><td>seconds</td><td>1 ms – 10 s</td></tr>
+<tr><td class="row d-mono">gen_ai.server.time_per_output_token</td><td>Histogram</td><td>seconds</td><td>10 ms – 2.5 s</td></tr>
+<tr><td class="row d-mono">gen_ai.server.request.duration</td><td>Histogram</td><td>seconds</td><td>10 ms – 81.92 s</td></tr>
+<tr><td class="row d-mono">gen_ai.client.token.usage</td><td>Histogram</td><td>tokens</td><td>1 – 67,108,864</td></tr>
+</tbody>
+</table>
+
+<div class="calc">
+  <p class="calc-title">Effective tokens/sec for one stream, from TTFT and ITL</p>
+  <div class="calc-row"><label for="c2-ttft">TTFT (ms)</label><input type="range" id="c2-ttft" name="ttft" min="20" max="3000" step="10" value="300"></div>
+  <div class="calc-row"><label for="c2-itl">Inter-token latency (ms)</label><input type="range" id="c2-itl" name="itl" min="5" max="200" step="1" value="25"></div>
+  <div class="calc-row"><label for="c2-n">Output tokens (N)</label><input type="range" id="c2-n" name="n" min="2" max="4096" step="1" value="500"></div>
+  <div class="calc-out">
+    <div>Total request_latency<output data-expr="ttft + itl * (n - 1)" data-format="fixed:0" data-unit="ms"></output></div>
+    <div>Effective tokens/sec (whole request)<output data-expr="n / ((ttft + itl * (n - 1)) / 1000)" data-format="fixed:1"></output></div>
+    <div>Decode-only tokens/sec (excludes TTFT)<output data-expr="1000 / itl" data-format="fixed:1"></output></div>
+  </div>
+  <p class="calc-note">Inverting Section 3.2's formula: request_latency = TTFT + ITL &times; (N &minus; 1). "Effective tokens/sec" divides the whole request by that total, so a large TTFT dilutes it on short completions; "decode-only tokens/sec" is 1/ITL and is unaffected by TTFT, matching NVIDIA's per-request throughput definition<a class="cite" href="#ref-6">6</a>.</p>
+</div>
+
+<h2 id="cross-system-trace-cost">4. Cross-system tracing and cost attribution: one span, three hops</h2>
+<p>Module 11 introduced the trace as the tool for "which of the eleven services this request touched is where the extra 400&nbsp;ms actually went" — causality across service boundaries, using a propagated identifier so a span at one hop can be attributed to the same request that entered elsewhere. Every general-purpose microservice fleet has this problem; an inference platform has a specific, narrower version of it, because Module 21, Module 24, and Module 25 already fixed exactly which hops a request crosses: a gateway that authenticates and rate-limits, a router/scheduler that picks a backend using the KV-cache-utilization and queue-depth signals Module 24 and Module 25 establish, and a GPU backend that actually runs prefill and decode. This section's job is narrow: show what a trace looks like once it is built to cross those three specific hops, and what it takes to attribute not just latency but cost to each one.</p>
+
+<h3 id="trace-across-hops">4.1 Extending a trace across a boundary Module 11 did not have to cross</h3>
+<p>The mechanism that lets a span at hop three be attributed to the same request that entered at hop one is a propagated header, and the W3C's Trace Context specification standardizes its shape: a <code>traceparent</code> header carrying a version, a trace-id, a parent-id, and trace-flags, where the trace-id "is the ID of the whole trace forest and is used to uniquely identify a distributed trace through a system," and the parent-id is "the ID of this request as known by the caller (in some tracing systems, this is known as the span-id...)"<a class="cite" href="#ref-9">9</a>. Every hop that receives a request reads the incoming parent-id, records it as its own span's parent, generates a new span-id for the work it is about to do, and passes that new id forward as the next hop's parent-id. Nothing about this mechanism is inference-specific — it is the same propagation Module 11's general trace concept assumes — but the GPU backend hop is where an ordinary microservice trace usually stops and an LLM-serving trace has to keep going, because that hop is where TTFT and ITL, Section 3's metrics, are actually generated.</p>
+<p>OpenTelemetry's semantic conventions for generative AI give that terminal hop its own span shape rather than treating it as an opaque leaf: a GenAI operation span's name follows the pattern <code>{gen_ai.operation.name} {gen_ai.request.model}</code>, it carries <code>gen_ai.provider.name</code> and, where available, <code>gen_ai.request.model</code> as required or conditional attributes, and it records <code>gen_ai.usage.input_tokens</code> and <code>gen_ai.usage.output_tokens</code> as the token counts the operation consumed and produced<a class="cite" href="#ref-8">8</a>. Those two token-count attributes are the piece Section 4.3 needs: a span that already carries "how many input and output tokens this specific hop's work consumed" is a span that already carries everything a pricing table needs to compute what that hop cost, without a separate accounting pass having to re-derive token counts from a log line after the fact.</p>
+
+<h3 id="hop-breakdown">4.2 What each hop actually contributes</h3>
+<p>Mapped onto the three-hop shape this module has been assuming since Figure 1, each span's dominant contribution is different, and each is already something a prior module in this course established rather than something new to this one. The gateway span (Module 21) is dominated by auth and budget checks against a cache, plus the parallel rate-limiter check — work that is supposed to be fast and synchronous, with the platform's own spend logging pushed off this critical path entirely, run instead as one of the asynchronous background tasks LiteLLM's own architecture documentation describes<a class="cite" href="#ref-11">11</a>. The router/scheduler span (Module 24) is dominated by whatever queueing the admission-control layer imposes plus the routing decision itself, scored against the KV-cache-utilization and queue-depth signals Module 25's model-server protocol exposes. The GPU backend span is where Section 3's TTFT and ITL actually happen — prefill inside TTFT, decode spread across every inter-token gap — and it is the only one of the three hops whose duration is a direct function of the request's own prompt and output length rather than of platform load.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 4.</b> What each hop in the trace contributes to latency, and what it needs to attribute cost, cross-referenced to the module that already established each signal.</caption>
+<thead><tr><th>Hop</th><th>Dominant latency source</th><th>Cost basis</th><th>Signal established in</th></tr></thead>
+<tbody>
+<tr><td class="row">Gateway</td><td>Auth/budget cache check, rate-limiter check</td><td>Fixed per-request overhead (not token-priced)</td><td>Module 21</td></tr>
+<tr><td class="row">Router / scheduler</td><td>Admission queueing, routing-decision compute</td><td>Fixed per-request overhead (not token-priced)</td><td>Module 24, Module 25</td></tr>
+<tr><td class="row">GPU backend</td><td>Prefill (inside TTFT) + decode (ITL &times; N&minus;1)</td><td>input_tokens &times; input price + output_tokens &times; output price</td><td>Section 3, this module</td></tr>
+</tbody>
+</table>
+
+<h3 id="cost-attribution">4.3 Attributing cost, not just latency, to each hop</h3>
+<p>Latency attribution and cost attribution use the same trace but answer different questions, and Table 4's third column is the reason: the gateway and router hops have a real infrastructure cost (compute, memory, the cache lookups Module 21 describes), but it is not priced per-token and does not vary with how long the completion turned out to be — the same auth check runs whether the model generates 10 tokens or 10,000. The GPU backend hop is the opposite: its cost is a direct, computable function of the two numbers its own span already carries, <code>gen_ai.usage.input_tokens</code> and <code>gen_ai.usage.output_tokens</code><a class="cite" href="#ref-8">8</a>, multiplied by that model's published per-token price. Using Claude Sonnet 5's current rate of $2 per million input tokens and $10 per million output tokens<a class="cite" href="#ref-10">10</a>, a request that entered with 3,000 input tokens and generated 500 output tokens attributes its cost entirely to the GPU-backend span:</p>
+$$ \text{cost} = 3{,}000 \times \frac{\$2}{1{,}000{,}000} + 500 \times \frac{\$10}{1{,}000{,}000} = \$0.006 + \$0.005 = \$0.011 $$
+<p>Every dollar of that $0.011 is attributable to one span in the trace, the GPU-backend hop, because that is the only hop whose work is priced by what it processed rather than by the fact that it ran at all. This is the same asymmetry Module 23's credit-ledger design already exploits from the billing side — a hold sized to a worst-case token count, settled against an actual token count once generation finishes — read here from the tracing side instead: the trace does not need a separate cost-computation pass, because the cost is already a deterministic function of two attributes the GenAI span convention requires it to carry.</p>
+<p>The reason this module bothers to attribute cost per hop, rather than leaving cost as a single request-level total the way Module 23's ledger already computes it, is what happens to that number next. A request-level total tells a billing system what to charge one customer. A trace with cost attributed at the hop that actually incurred it tells a capacity-planning system something different: which of the platform's own subsystems is consuming budget, at what rate, under what load — the input Module 31 needs to decide whether a given tenant's traffic pattern justifies a dedicated GPU pool or fits comfortably inside a shared one. Module 31 treats this module's cost-attribution signal as exactly that: a feedback input into a capacity decision, not a restatement of Module 23's billing ledger.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f5t"><title id="f5t">One request's trace as three spans, each carrying its own duration and its own attributed cost, linked by a shared trace-id under a W3C Trace Context propagation chain</title>
+    <defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <text x="20" y="24" class="d-small d-text-light">trace-id: 4bf92f... (shared by every span below)</text>
+
+    <rect x="20" y="40" width="190" height="70" rx="8" class="d-block"/>
+    <text x="115" y="62" text-anchor="middle" class="d-text-inv d-bold d-small">Gateway span</text>
+    <text x="115" y="80" text-anchor="middle" class="d-text-inv d-small">parent-id: (client)</text>
+    <text x="115" y="96" text-anchor="middle" class="d-text-inv d-small">span-id: a1</text>
+
+    <path d="M210,75 L245,75" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <text x="227" y="65" text-anchor="middle" class="d-mono d-small">traceparent: ...a1</text>
+
+    <rect x="245" y="40" width="200" height="70" rx="8" class="d-block"/>
+    <text x="345" y="62" text-anchor="middle" class="d-text-inv d-bold d-small">Router/scheduler span</text>
+    <text x="345" y="80" text-anchor="middle" class="d-text-inv d-small">parent-id: a1</text>
+    <text x="345" y="96" text-anchor="middle" class="d-text-inv d-small">span-id: b2</text>
+
+    <path d="M445,75 L480,75" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <text x="462" y="65" text-anchor="middle" class="d-mono d-small">traceparent: ...b2</text>
+
+    <rect x="480" y="40" width="220" height="70" rx="8" class="d-block-accent"/>
+    <text x="590" y="58" text-anchor="middle" class="d-text-inv d-bold d-small">GPU backend span</text>
+    <text x="590" y="74" text-anchor="middle" class="d-text-inv d-small">parent-id: b2, span-id: c3</text>
+    <text x="590" y="90" text-anchor="middle" class="d-text-inv d-small">input=3000, output=500</text>
+
+    <line x1="20" y1="150" x2="20" y2="290" class="d-axis"/>
+    <text x="20" y="305" text-anchor="middle" class="d-small d-text-light">time</text>
+    <line x1="20" y1="290" x2="760" y2="290" class="d-axis"/>
+
+    <rect x="30" y="170" width="60" height="30" rx="4" class="d-block"/>
+    <text x="60" y="190" text-anchor="middle" class="d-text-inv d-small">gw: 4ms</text>
+    <text x="60" y="220" text-anchor="middle" class="d-mono d-small">$0 token cost</text>
+
+    <rect x="90" y="170" width="90" height="30" rx="4" class="d-block"/>
+    <text x="135" y="190" text-anchor="middle" class="d-text-inv d-small">router: 12ms</text>
+    <text x="135" y="220" text-anchor="middle" class="d-mono d-small">$0 token cost</text>
+
+    <rect x="180" y="170" width="480" height="30" rx="4" class="d-block-accent"/>
+    <text x="420" y="190" text-anchor="middle" class="d-text-inv d-small">GPU backend: prefill (TTFT) + decode (ITL &times; 499)</text>
+    <text x="420" y="220" text-anchor="middle" class="d-mono d-small d-bold">$0.011 attributed here</text>
+
+    <path d="M30,240 L660,240" class="d-arrow d-dashed" marker-end="url(#f5-arr)"/>
+    <text x="345" y="258" text-anchor="middle" class="d-small d-text-light">Total span (request_latency) &mdash; one trace-id, cost summed across spans, only one span priced by tokens</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> A W3C Trace Context <code>traceparent</code> chain links three spans under one trace-id<a class="cite" href="#ref-9">9</a>; the GenAI span convention's token-usage attributes<a class="cite" href="#ref-8">8</a> let the GPU-backend hop carry its own attributed cost, computed here at Claude Sonnet 5's published per-token rate for 3,000 input and 500 output tokens<a class="cite" href="#ref-10">10</a>. Gateway and router latencies are illustrative order-of-magnitude figures, not measured production numbers.</figcaption>
+</figure>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Section 2.2 flagged a real tension inside Clio's own design: a minimum-cluster-size floor protects against small clusters being identifying, at the cost of making genuinely rare-but-harmless topics invisible. That tension is one instance of a broader, older disagreement in the privacy-engineering literature about what "privacy-preserving" is even allowed to mean — a heuristic property, verified after the fact, or a mathematical guarantee, bounded in advance. The three positions below are not all about Clio specifically; they are about which standard an aggregate-analysis pipeline over user conversations should be held to, and Clio, differential privacy, and plain threshold-based aggregation are three different answers already deployed at scale.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Engineered anonymization, verified after the fact, is sufficient</h4>
+    <p class="who">Anthropic's production design for Clio<a class="cite" href="#ref-1">1</a></p>
+    <p>Aggregate by theme, enforce a minimum user/conversation count before a cluster is allowed to produce a summary, generate that summary with private information excluded by construction, and have a model check the result for anything "overly specific or identifying" before a human ever sees it. No step promises a mathematical bound on worst-case leakage; the claim is that the combination of aggregation, a count floor, and content-level verification is good enough in practice, and the r = 0.71 correlation against an independently built Trust and Safety system is offered as evidence the pipeline's classifications track something real rather than noise.</p>
+    <ul class="pros"><li>Supports open-ended, exploratory topic discovery over free-text conversations — a statistic does not have to be defined in advance, which a formal-privacy mechanism generally requires</li><li>Cheap enough to run over a million conversations and re-run as the underlying model and its usage change</li><li>The verification step is done by the same kind of model that will consume the output, so it can catch semantically identifying content a purely statistical threshold cannot see</li></ul>
+    <ul class="cons"><li>No provable bound on how much information about any individual conversation could, in principle, be recovered from a cluster description — the guarantee is "we checked," not "we proved"</li><li>The minimum-count floor is itself a heuristic; nothing stops a cluster from clearing the count threshold while its generated description still leaks something specific about a minority of contributors</li></ul>
+  </article>
+  <article class="position">
+    <h4>Only a formal, bounded guarantee is defensible</h4>
+    <p class="who">Differential privacy, as Apple has implemented and disclosed it in production<a class="cite" href="#ref-12">12</a></p>
+    <p>Add calibrated statistical noise before data ever leaves the device, governed by a privacy budget quantified by the parameter epsilon, so that "it is difficult to determine whether a certain user contributed to the computation of an aggregate"<a class="cite" href="#ref-12">12</a> — a guarantee that holds regardless of what auxiliary information an adversary later obtains, because the noise is added before aggregation, not inferred as a property of the aggregate afterward. Apple's own deployment sets epsilon per feature and per contribution — epsilon of 4 for Safari-crash/energy domains and for emoji suggestions, epsilon of 8 for QuickType, epsilon of 2 for Health-type usage — and caps both the number of daily contributions per user and the total retention window (three months) for the raw donations<a class="cite" href="#ref-12">12</a>.</p>
+    <ul class="pros"><li>The privacy loss is bounded by a single number (epsilon), composable across queries, and independent of what an adversary already knows or later learns</li><li>The guarantee does not rest on trusting a downstream verification step to catch what aggregation missed</li></ul>
+    <ul class="cons"><li>Requires defining a fixed statistic — a count, a histogram bucket, a most-common-value sketch — before collection; it does not naturally support Clio's open-ended "discover what topics exist" task, where the space of possible clusters is not known in advance</li><li>The noise that makes the guarantee hold is exactly what damages the small, rare-but-real signal both this position and Clio's own minimum-count floor are trying to protect — a low-frequency true value can be swamped by injected noise before it is ever visible, so the utility cost concentrates in the same region Section 2.2 already identified as the hardest case</li></ul>
+  </article>
+  <article class="position">
+    <h4>Aggregation-and-threshold alone, without semantic abstraction, is not privacy</h4>
+    <p class="who">The de-anonymization literature, exemplified by Narayanan and Shmatikov's attack on the Netflix Prize dataset<a class="cite" href="#ref-13">13</a></p>
+    <p>A dataset that has only had identifiers stripped and been restricted to records above some count threshold is not thereby safe: the paper "present[s] a new class of statistical de-anonymization attacks against high-dimensional micro-data" and shows that "an adversary who knows only a little bit about an individual subscriber can easily identify this subscriber's record in the dataset"<a class="cite" href="#ref-13">13</a>, using nothing more than a second, independently public dataset (IMDb) as auxiliary knowledge. The lesson generalizes past Netflix ratings to any sparse, high-dimensional record of individual behavior, which a raw conversation log is.</p>
+    <ul class="pros"><li>Empirically demonstrated, not hypothetical — a real dataset, a real re-identification, using only public auxiliary information</li><li>Directly explains why Clio's designers added a content-level verification step (Section 2.3) rather than trusting the count floor alone: the floor addresses this attack's precondition (a record too rare to blend in) but not a cluster description that inadvertently repeats specific, identifying detail from within an otherwise-large cluster</li></ul>
+    <ul class="cons"><li>The attack targets released micro-data (per-record entries an analyst can query directly); it does not, by itself, show Clio's cluster-level summaries — which never expose a per-conversation record to the analyst at all — are similarly breakable, only that the naive version of the defense (strip identifiers, keep a count floor, stop there) is not</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>For open-ended, exploratory analysis of what a platform's users are actually doing — Clio's actual task, where the set of interesting clusters is not known before the pipeline runs — the engineered-and-verified approach is the only one of the three that fits the problem shape at all; differential privacy's requirement to fix a statistic in advance is a mismatch, not a missing feature waiting to be added. For a narrower, recurring, adversarially-exposed query — a public dashboard of daily active users by feature, say, that gets queried the same way every day by parties who may be motivated to extract individual information — the formal guarantee is worth its utility cost, because the same query being run repeatedly is exactly the composability regime differential privacy's bound is designed for. What the third position settles, regardless of which of the first two a platform picks, is that a bare minimum-count threshold with no content-level check is not a defensible stopping point on its own; Clio's own inclusion of a model-verification step past the count floor is implicit agreement with that. What would move this from "reasonable design choice" to "verified" is the kind of adversarial audit Apple and Google have both published against their own differential-privacy deployments — nobody has yet published an equivalent membership-inference audit attempting to recover which individual conversations contributed to a specific Clio cluster description, and until someone does, position one's central claim rests on Anthropic's own account of its verification step, not on an independent test of it.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">blog</span>Anthropic. <em>Clio: Privacy-preserving insights into real-world AI use</em>. anthropic.com/research, 2024. <a href="https://www.anthropic.com/research/clio">https://www.anthropic.com/research/clio</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the four-stage pipeline (facet extraction, semantic clustering, private-info-excluded description, hierarchy); the minimum-cluster-size floor; model self-verification of cluster summaries; the r = 0.71 correlation with Trust and Safety and the spam-network finding; the top three conversation-category shares from 1M analyzed conversations.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>Anthropic. <em>How long do you store my data?</em> Privacy Center. <a href="https://privacy.claude.com/en/articles/10023548-how-long-do-you-store-my-data">https://privacy.claude.com/en/articles/10023548-how-long-do-you-store-my-data</a>. Accessed 2026-09-18. <span class="ref-use">Used for: consumer-product 30-day deletion default; up-to-5-year retention for opted-in model-improvement data; up-to-2-year/7-year flagged-content and trust-and-safety-score retention.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>Anthropic. <em>API and data retention</em>. platform.claude.com docs. <a href="https://platform.claude.com/docs/en/manage-claude/api-and-data-retention">https://platform.claude.com/docs/en/manage-claude/api-and-data-retention</a>. Accessed 2026-09-18. <span class="ref-use">Used for: API default of no message-content retention without express permission; zero data retention (ZDR) arrangement; Covered Models' 30-day retention requirement; the flagged-content/legal-hold exception that survives ZDR and HIPAA readiness.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>Anthropic. <em>Code execution tool (Claude API)</em>. platform.claude.com docs, tool versions code_execution_20250825/20260120/20260521. <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool">https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the code-execution sandbox's own 30-day container-data retention window, as a third, independent retention clock distinct from conversation content.</span></li>
+<li id="ref-5"><span class="ref-type">textbook</span>Jones, C., Wilkes, J., Murphy, N., Smith, C. (ed. Beyer, B.) <em>Site Reliability Engineering</em>, Chapter 4: Service Level Objectives. Google / O'Reilly, 2016. <a href="https://sre.google/sre-book/service-level-objectives/">https://sre.google/sre-book/service-level-objectives/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the SLI definition this module specializes into per-token metrics.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>NVIDIA. <em>Metrics Reference</em>, AIPerf documentation. <a href="https://docs.nvidia.com/aiperf/reference/ai-perf-metrics-reference">https://docs.nvidia.com/aiperf/reference/ai-perf-metrics-reference</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the time-to-first-token definition and its bundled components (network, queuing, prompt processing, first-token generation); aggregate output-token-throughput definition; the ITL = (request_latency − TTFT) / (output_sequence_length − 1) formula and the “generated-token-normalized decode duration, not total wall-clock decode duration” precision note.</span></li>
+<li id="ref-7"><span class="ref-type">standard</span>OpenTelemetry. <em>Semantic Conventions for Generative AI Metrics</em>. semantic-conventions-genai repository, docs/gen-ai/gen-ai-metrics.md. <a href="https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-metrics.md">https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-metrics.md</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the gen_ai.server.time_to_first_token, gen_ai.server.time_per_output_token, gen_ai.server.request.duration, and gen_ai.client.token.usage metric names, instrument types, units, and histogram bucket boundaries.</span></li>
+<li id="ref-8"><span class="ref-type">standard</span>OpenTelemetry. <em>Semantic Conventions for Generative AI Systems</em> (spans). semantic-conventions-genai repository, docs/gen-ai/gen-ai-spans.md. <a href="https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md">https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the GenAI operation span-naming pattern, required/conditional attributes (gen_ai.operation.name, gen_ai.provider.name, gen_ai.request.model), and the gen_ai.usage.input_tokens/output_tokens attributes used for cost attribution.</span></li>
+<li id="ref-9"><span class="ref-type">standard</span>W3C. <em>Trace Context</em>. W3C Recommendation. <a href="https://www.w3.org/TR/trace-context/">https://www.w3.org/TR/trace-context/</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the traceparent header's version/trace-id/parent-id/trace-flags fields and the parent-id-to-span-id propagation mechanism across hops.</span></li>
+<li id="ref-10"><span class="ref-type">official</span>Anthropic. <em>Pricing</em>. platform.claude.com docs. <a href="https://platform.claude.com/docs/en/about-claude/pricing">https://platform.claude.com/docs/en/about-claude/pricing</a>. Accessed 2026-09-18. <span class="ref-use">Used for: Claude Sonnet 5's current per-token pricing ($2/MTok input, $10/MTok output) used in the cost-attribution worked example.</span></li>
+<li id="ref-11"><span class="ref-type">official</span>BerriAI / LiteLLM contributors. <em>Life of a Request (LiteLLM Proxy architecture)</em>. Live documentation. <a href="https://docs.litellm.ai/docs/proxy/architecture">https://docs.litellm.ai/docs/proxy/architecture</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the gateway hop's fixed, non-token-priced overhead (auth/budget cache check, rate-limiter check) referenced in Table 4.</span></li>
+<li id="ref-12"><span class="ref-type">official</span>Apple. <em>Differential Privacy Overview</em>. Apple privacy technical whitepaper. <a href="https://www.apple.com/privacy/docs/Differential_Privacy_Overview.pdf">https://www.apple.com/privacy/docs/Differential_Privacy_Overview.pdf</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the local differential privacy mechanism, the privacy-budget/epsilon concept, per-feature epsilon values (2, 4, 8), and the 3-month raw-donation retention window, in the "Where experts disagree" section.</span></li>
+<li id="ref-13"><span class="ref-type">paper</span>Narayanan, A., Shmatikov, V. <em>Robust De-anonymization of Large Sparse Datasets (How to Break Anonymity of the Netflix Prize Dataset)</em>. IEEE Symposium on Security and Privacy, 2008. <a href="https://arxiv.org/abs/cs/0610105">https://arxiv.org/abs/cs/0610105</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the de-anonymization attack on the Netflix Prize dataset and its implication for aggregation-and-threshold-only anonymization, in the "Where experts disagree" section.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

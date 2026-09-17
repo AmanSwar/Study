@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fault Tolerance and Elasticity: Checkpoint/Restart, Stragglers, Node Health, and Incident Patterns · System Design</title>
+<meta name="description" content="466 job interruptions in 54 days of Llama 3 405B pre-training, three-quarters of them hardware-attributed, and the heartbeat-and-checkpoint machinery that still held the cluster above 90% effective training time — read against MegaScale's production account of the same problem at 10,000+ GPUs.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 35</p>
+  <h1>Fault Tolerance and Elasticity: Checkpoint/Restart, Stragglers, Node Health, and Incident Patterns</h1>
+  <p class="lede">A 16,000-GPU synchronous training job failed 466 times in 54 days and still spent over 90% of the elapsed time doing useful work. This module is grounded entirely in the two production accounts that document how: Meta's Llama 3 infrastructure paper's reliability section, and ByteDance's MegaScale paper on the heartbeat, diagnosis, and checkpoint machinery that turns constant hardware failure into a survivable, boring event. It is also, by design, this course's only treatment of incident patterns in AI infrastructure — a coverage decision stated explicitly below, not left implicit.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>3</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-18</span>
+    <span class="chip">Prerequisite: <b>Module 33</b>, <b>Module 34</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 500" role="img" aria-labelledby="f1t"><title id="f1t">466 interruptions over 54 days of Llama 3 405B pre-training: 47 planned, 419 unexpected, split by root-cause category</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">466 job interruptions, 54 days, 16K H100s</text>
+
+    <text x="190" y="52" text-anchor="end" class="d-small d-text-light">Planned</text>
+    <rect x="200" y="40" width="67" height="24" rx="4" class="d-block-muted"/>
+    <text x="275" y="57" class="d-mono d-small">47</text>
+
+    <text x="190" y="86" text-anchor="end" class="d-small d-text-light">Unexpected</text>
+    <rect x="200" y="74" width="600" height="24" rx="4" class="d-block"/>
+    <text x="808" y="91" class="d-mono d-small" text-anchor="end">419</text>
+
+    <line x1="200" y1="110" x2="790" y2="110" class="d-axis"/>
+    <text x="400" y="128" text-anchor="middle" class="d-small d-text-light">419 unexpected interruptions, by root-cause category (Table 2 has the full 18-row list)</text>
+
+    <text x="190" y="162" text-anchor="end" class="d-small">Faulty GPU</text>
+    <rect x="200" y="150" width="600" height="20" rx="3" class="d-fill-blue"/>
+    <text x="808" y="165" text-anchor="end" class="d-mono d-small">148 (30.1%)</text>
+
+    <text x="190" y="194" text-anchor="end" class="d-small">GPU HBM3 memory</text>
+    <rect x="200" y="182" width="292" height="20" rx="3" class="d-fill-blue"/>
+    <text x="500" y="197" class="d-mono d-small">72 (17.2%)</text>
+
+    <text x="190" y="226" text-anchor="end" class="d-small">Software bug</text>
+    <rect x="200" y="214" width="219" height="20" rx="3" class="d-fill-cyan"/>
+    <text x="427" y="229" class="d-mono d-small">54 (12.9%)</text>
+
+    <text x="190" y="258" text-anchor="end" class="d-small">Network switch/cable</text>
+    <rect x="200" y="246" width="142" height="20" rx="3" class="d-fill-amber"/>
+    <text x="350" y="261" class="d-mono d-small">35 (8.4%)</text>
+
+    <text x="190" y="290" text-anchor="end" class="d-small">Host maintenance</text>
+    <rect x="200" y="278" width="130" height="20" rx="3" class="d-fill-orange"/>
+    <text x="338" y="293" class="d-mono d-small">32 (7.6%)</text>
+
+    <text x="190" y="322" text-anchor="end" class="d-small">GPU SRAM memory</text>
+    <rect x="200" y="310" width="77" height="20" rx="3" class="d-fill-blue"/>
+    <text x="285" y="325" class="d-mono d-small">19 (4.5%)</text>
+
+    <text x="190" y="354" text-anchor="end" class="d-small">GPU system processor</text>
+    <rect x="200" y="342" width="69" height="20" rx="3" class="d-fill-blue"/>
+    <text x="277" y="357" class="d-mono d-small">17 (4.1%)</text>
+
+    <text x="190" y="386" text-anchor="end" class="d-small">Other (11 categories, &#8804;7 each)</text>
+    <rect x="200" y="374" width="170" height="20" rx="3" class="d-block-muted"/>
+    <text x="378" y="389" class="d-mono d-small">42 (10.0%)</text>
+
+    <rect x="200" y="420" width="14" height="14" class="d-fill-blue"/>
+    <text x="222" y="431" class="d-small d-text-light">GPU component</text>
+    <rect x="340" y="420" width="14" height="14" class="d-fill-cyan"/>
+    <text x="362" y="431" class="d-small d-text-light">dependency/software</text>
+    <rect x="520" y="420" width="14" height="14" class="d-fill-amber"/>
+    <text x="542" y="431" class="d-small d-text-light">network</text>
+    <rect x="620" y="420" width="14" height="14" class="d-fill-orange"/>
+    <text x="642" y="431" class="d-small d-text-light">unplanned maintenance</text>
+
+    <text x="400" y="470" text-anchor="middle" class="d-small d-text-light">78% of unexpected interruptions trace to confirmed or suspected hardware; GPUs alone are the single largest source</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> Root-cause breakdown of the 466 job interruptions Meta recorded during a 54-day snapshot of Llama 3 405B pre-training on up to 16,384 H100 GPUs. 47 were planned (firmware/kernel upgrades, operator-initiated config or dataset changes); 419 were unexpected. The eight largest unexpected categories are shown individually; the remaining eleven (each &#8804;7 interruptions) are grouped as "Other." Every count is exact; the grouping is this module's, the counts are Meta's<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="synchronous-training-breaks-the-playbook">1. Why synchronous training breaks the classical fault-tolerance playbook</h2>
+<p>Incident patterns for AI infrastructure have no dedicated module anywhere in this course's source map — no company has published a standalone taxonomy of LLM-serving or LLM-training incidents at the depth of, say, Google's SRE book chapters. This module is where that gap is folded, and it is folded narrowly: everything below traces to what Meta's Llama 3 paper and ByteDance's MegaScale paper actually disclose about their own reliability engineering, not a generic incident-response framework retrofitted onto AI infrastructure. Both are the only public, numbers-bearing accounts of running training at this scale that either company has released.</p>
+<p>The reason this needs its own module, rather than a paragraph inside Module 34's scheduling material, is that training breaks an assumption every classical cluster-management system in this course relies on. Module 11's circuit breakers and bulkheads, and Module 34's Borg/Kubernetes lineage, both assume that one task's failure is cheap and containable: a request fails, a retry or a fallback absorbs it; a batch task fails, the scheduler reschedules it on another machine while its thousands of siblings keep running. Borg's own numbers reflect this design point directly — quota is checked once, at admission, not repeatedly at scheduling time, so a resource-starved job is rejected before it ever displaces a running one<a class="cite" href="#ref-2">2</a>, and when Borg does preempt a task to make room for a higher-priority one, it delivers a graceful SIGTERM roughly 80% of the time before resorting to SIGKILL<a class="cite" href="#ref-2">2</a>. The implicit assumption is that any one task's disappearance is a local event.</p>
+<p>Synchronous data- and model-parallel pre-training inverts that assumption. Every step ends in a collective — an all-reduce or reduce-scatter across the data-parallel group, a point-to-point handoff across the pipeline stages — and a collective blocks until every participant arrives. Meta states the consequence plainly: "the complexity and potential failure scenarios of 16K GPU training surpass those of much larger CPU clusters that we have operated... the synchronous nature of training makes it less fault-tolerant — a single GPU failure may require a restart of the entire job"<a class="cite" href="#ref-1">1</a>. A cluster an order of magnitude smaller than Google's median 10,000-machine Borg cell<a class="cite" href="#ref-2">2</a> can be harder to keep running than that far larger cell, because Borg's tasks are independent and training's ranks are not. MegaScale frames the same fact as a design principle rather than a complaint: "failures and stragglers are the norm rather than the exception for LLM training," and a single straggler "not only affects its own work, but slows down the entire job involving tens of thousands of GPUs"<a class="cite" href="#ref-3">3</a>.</p>
+<p>Both companies respond by building dedicated machinery rather than reusing what a general-purpose cluster manager already provides. Table 1 lays the two systems side by side; the rest of this module works through each row.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Two production answers to the same problem: keeping a large synchronous training job running despite constant hardware failure<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a>.</caption>
+<thead><tr><th>Dimension</th><th>Llama 3 405B pre-training (Meta)</th><th>MegaScale (ByteDance)</th></tr></thead>
+<tbody>
+<tr><td class="row">Cluster scale</td><td>Up to 16,384 of 24,576 H100 GPUs on the RoCE cluster<a class="cite" href="#ref-1">1</a></td><td>Largest production cluster &gt;10,000 GPUs; benchmark runs on 12,288 GPUs<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Job scheduler</td><td>MAST, Meta's global-scale training scheduler<a class="cite" href="#ref-1">1</a> (named scope only; Module 34)</td><td>A custom framework layered on Kubernetes for pod allocation<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Anomaly signal</td><td>NCCLX watchdog/heartbeat timeouts feeding PyTorch's NCCL flight recorder<a class="cite" href="#ref-1">1</a></td><td>Purpose-built heartbeat messages carrying host state, process status, and RDMA traffic metrics<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Diagnosis tooling</td><td>Flight-recorder ring buffer of collective metadata/stack traces, dumped on watchdog timeout<a class="cite" href="#ref-1">1</a></td><td>Self-check test suite (Loopback, RNIC-to-RNIC, NCCL all-to-all/all-reduce) plus a CUDA-event heat-map and a 3D dependency-visualization tool<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Recovery primitive</td><td>Checkpoint/restart; per-GPU state 1&#8201;MB&#8211;4&#8201;GB on Tectonic (Module 33)<a class="cite" href="#ref-1">1</a></td><td>Checkpoint/restart via a two-stage pipeline: GPU&#8594;host memory in seconds, async host&#8594;HDFS in the background<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Node replacement</td><td>Not detailed in the paper beyond automated cluster maintenance</td><td>Kubernetes evicts the faulty pod and replenishes with "an equivalent number of healthy ones"<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Effective training time</td><td data-best>&gt;90%, with at least one interruption daily<a class="cite" href="#ref-1">1</a></td><td data-best>&gt;90% effective training-time rate<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Manual intervention</td><td>3 of 419 unexpected interruptions<a class="cite" href="#ref-1">1</a></td><td>&gt;90% of faults auto-detected/located/recovered<a class="cite" href="#ref-3">3</a></td></tr>
+</tbody>
+</table>
+
+<p>Meta's diagnosis tooling row deserves its own mechanism, since the paper is explicit about why a generic profiler was not enough. Training runs on a mixed NVLink-and-RoCE fabric, and NVLink data transfer happens through load/store instructions issued directly by CUDA kernels rather than through an explicit send/receive call — so a failure in the remote GPU or in NVLink connectivity itself "often manifest[s] as stalled load/store operations within CUDA kernels without returning a clear error code"<a class="cite" href="#ref-1">1</a>. There is no exception to catch; the kernel just never returns. Meta's fix is NCCLX, a fork of NVIDIA's NCCL tuned for the higher latencies of a multi-hop network<a class="cite" href="#ref-1">1</a>, co-designed tightly enough with PyTorch that PyTorch can read NCCLX's internal state directly: the system watches the communication library and automatically times out on a detected stall, then dumps a snapshot of the failing collective's internal state — which ranks had finished their part of the data transfer and which were still pending<a class="cite" href="#ref-1">1</a>. That snapshot is what a human (or, per section 4, an automated loop) actually reads to localize the fault. Because this tracing has a cost, Meta can turn the more expensive collection on selectively, live, "through online configuration changes without needing a code release or job restart"<a class="cite" href="#ref-1">1</a> — the diagnostic depth is a runtime dial, not a build-time decision.</p>
+
+<h2 id="the-54-day-interruption-census">2. The 54-day interruption census: what actually breaks</h2>
+<p>Meta's Table 5 is the most granular public breakdown of what fails during frontier-scale pre-training. Table 2 reproduces it in full, unedited: eighteen root-cause categories, each tagged with a coarser <em>category</em> label, covering all 419 unexpected interruptions recorded in the 54-day snapshot<a class="cite" href="#ref-1">1</a>.</p>
+
+<table class="tbl tbl-dense">
+<caption><b>Table 2.</b> Root-cause categorization of the 419 unexpected interruptions during a 54-day period of Llama 3 405B pre-training. Reproduced in full from Table 5 of the source<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Component</th><th>Category</th><th class="num">Count</th><th class="num">% of interruptions</th></tr></thead>
+<tbody>
+<tr><td class="row">Faulty GPU</td><td>GPU</td><td class="num" data-worst>148</td><td class="num">30.1%</td></tr>
+<tr><td class="row">GPU HBM3 memory</td><td>GPU</td><td class="num">72</td><td class="num">17.2%</td></tr>
+<tr><td class="row">Software bug</td><td>Dependency</td><td class="num">54</td><td class="num">12.9%</td></tr>
+<tr><td class="row">Network switch/cable</td><td>Network</td><td class="num">35</td><td class="num">8.4%</td></tr>
+<tr><td class="row">Host maintenance</td><td>Unplanned maintenance</td><td class="num">32</td><td class="num">7.6%</td></tr>
+<tr><td class="row">GPU SRAM memory</td><td>GPU</td><td class="num">19</td><td class="num">4.5%</td></tr>
+<tr><td class="row">GPU system processor</td><td>GPU</td><td class="num">17</td><td class="num">4.1%</td></tr>
+<tr><td class="row">NIC</td><td>Host</td><td class="num">7</td><td class="num">1.7%</td></tr>
+<tr><td class="row">NCCL watchdog timeouts</td><td>Unknown</td><td class="num">7</td><td class="num">1.7%</td></tr>
+<tr><td class="row">Silent data corruption</td><td>GPU</td><td class="num">6</td><td class="num">1.4%</td></tr>
+<tr><td class="row">GPU thermal interface + sensor</td><td>GPU</td><td class="num">6</td><td class="num">1.4%</td></tr>
+<tr><td class="row">SSD</td><td>Host</td><td class="num">3</td><td class="num">0.7%</td></tr>
+<tr><td class="row">Power supply</td><td>Host</td><td class="num">3</td><td class="num">0.7%</td></tr>
+<tr><td class="row">Server chassis</td><td>Host</td><td class="num">2</td><td class="num">0.5%</td></tr>
+<tr><td class="row">IO expansion board</td><td>Host</td><td class="num">2</td><td class="num">0.5%</td></tr>
+<tr><td class="row">Dependency</td><td>Dependency</td><td class="num">2</td><td class="num">0.5%</td></tr>
+<tr><td class="row">CPU</td><td>Host</td><td class="num">2</td><td class="num">0.5%</td></tr>
+<tr><td class="row">System memory</td><td>Host</td><td class="num">2</td><td class="num">0.5%</td></tr>
+</tbody>
+</table>
+
+<p>Three things stand out. First, the distribution is heavily right-skewed: the top two rows (faulty GPU, GPU HBM3 memory) alone account for 47.3% of all unexpected interruptions, and the bottom eleven rows together account for barely 10%. A fault-tolerance system that only handled the top two categories well would already be most of the way to the observed &gt;90% effective-training-time result discussed in section 3.</p>
+<p>Second, the paper's own summary sentence states that "GPU issues are the largest category, accounting for 58.7% of all unexpected issues"<a class="cite" href="#ref-1">1</a>. Summing every row Table 2 itself tags with category <code>GPU</code> — faulty GPU, HBM3 memory, SRAM memory, system processor, silent data corruption, and the thermal interface/sensor row — gives 148+72+19+17+6+6 = 268 of 419, or 64.0%, about 5 points higher than Meta's own headline figure. The paper does not reconcile the two numbers; the most likely explanation is that Meta's 58.7% figure excludes rows it treats as "suspected" rather than "confirmed" hardware (silent data corruption is explicitly called out elsewhere in the same paragraph as a suspected rather than confirmed category<a class="cite" href="#ref-1">1</a>), but the paper does not say so explicitly. Both numbers are Meta's own; this module reports both rather than picking one.</p>
+<p>Third, approximately 78% of unexpected interruptions trace to confirmed or suspected hardware issues<a class="cite" href="#ref-1">1</a> — consistent with summing the GPU (268), Host (21), and Unplanned-maintenance (32) category rows in Table 2, which gives 321 of 419, or 76.6%, close enough to Meta's rounded "approximately 78%" to treat the two figures as the same measurement reported at different precision.</p>
+
+<aside class="callout callout-note"><span class="callout-title">Two failure modes that never trip a hardware sensor</span><p>Meta reports two effects that would not appear in any individual-component failure log. A diurnal 1&#8211;2% throughput variation shows up over the day, driven by midday ambient-temperature increases pushing GPU dynamic voltage and frequency scaling down slightly<a class="cite" href="#ref-1">1</a>. And because tens of thousands of GPUs frequently idle or resume in lockstep — waiting on a checkpoint, a collective, or a full job start/stop — instantaneous power draw across the datacenter can swing by tens of megawatts, "stretching the limits of the power grid"<a class="cite" href="#ref-1">1</a>. Neither is a discrete "interruption" in Table 2; both are reminders that at this scale, correlated behavior across thousands of synchronized GPUs creates physical-infrastructure problems that a per-component failure taxonomy cannot see. Meta's own framing of the power-swing effect is unresolved rather than solved: it is "an ongoing challenge for us as we scale training for future, even larger Llama models"<a class="cite" href="#ref-1">1</a>.</p></aside>
+
+<p>The eleven smallest categories in Table 2 (NIC, SSD, power supply, server chassis, IO expansion board, dependency, CPU, and system memory, each &#8804;7 events) are not eleven separate engineering problems worth eleven separate fixes. Each is a component that fails at some small, roughly constant rate in any sufficiently large fleet of servers — the same long tail Module 33 and Module 34 both assume exists underneath any cluster-scale system, training or otherwise. No single fix moves the needle on any one of them; that is precisely why the tooling built in sections 4 and 5 targets the categories large enough to justify dedicated engineering — faulty GPUs, HBM3 memory, software bugs, and network hardware — rather than chasing the tail.</p>
+
+<h2 id="effective-training-time-arithmetic">3. Effective training time: the metric, and the arithmetic behind &gt;90%</h2>
+<p>Neither paper reports mean-time-between-failures or mean-time-to-recovery as the headline number. Both report a single ratio instead. Meta defines it directly: "the effective training time measures the time spent on useful training over the elapsed time"<a class="cite" href="#ref-1">1</a>. It is a fraction, not a count, and it folds together failure frequency and recovery latency into one number a scheduler or a finance team can budget against.</p>
+<p>The number itself is identical in both papers, to two significant figures, despite describing two different clusters at two different companies: Meta reports "higher than 90% effective training time" across the 54-day snapshot<a class="cite" href="#ref-1">1</a>; MegaScale reports maintaining "over 90% effective training time rate" on its production runs<a class="cite" href="#ref-3">3</a>. Neither paper claims the other's number as evidence — this is an independent convergence, not a shared measurement — but it is still the strongest available signal that &gt;90% is close to what a well-engineered 2024-generation H100-class cluster running synchronous 4D/3D parallelism actually achieves, rather than a number either company rounded up for a paper.</p>
+<p>The definition is worth pausing on for what it does <em>not</em> measure. It is not an SLO in the Module 11 sense — there is no external customer with a contract, and missing 90% on a given day has no defined consequence beyond a slower run. It functions more like an internal SLI for a single long-lived job: a single number a scheduler, a finance team, or a paper's own authors can budget against, that folds together how often something breaks and how expensive each break is into one ratio, without requiring either paper to disclose a full incident log to make its reliability claim legible.</p>
+
+<details class="more">
+<summary>Worked derivation: what &gt;90% effective training time implies about the cost of a single interruption</summary>
+<p>Meta's 54-day snapshot recorded 466 total interruptions (47 planned, 419 unexpected)<a class="cite" href="#ref-1">1</a> and &gt;90% effective training time<a class="cite" href="#ref-1">1</a>. Converting the window to minutes and applying the &gt;90% floor bounds the average cost per interruption:</p>
+$$ E = 54 \times 24 \times 60 = 77{,}760 \text{ minutes elapsed} $$
+$$ \text{time lost} \le (1 - 0.90) \times E = 7{,}776 \text{ minutes} $$
+$$ \text{average cost per interruption} \le \frac{7{,}776}{466} \approx 16.7 \text{ minutes} $$
+<p>That upper bound — about 16.7 minutes of lost time per interruption, averaged over detection, diagnosis, node replacement, and resumption — is consistent with, though independently derived from, MegaScale's own directly-stated numbers: an average failure-detection-and-diagnostic-test time under 10 minutes, and a system that "can catch up to the training progress prior to the crash within 15 minutes from the latest checkpoints"<a class="cite" href="#ref-3">3</a>. The two figures describe different clusters and different companies; the arithmetic does not prove they are the same system, only that both land in the same 10&#8211;20-minute-per-incident regime, which is the order of magnitude a 90%-effective-training-time target actually requires once you have 400+ interruptions to amortize it over.</p>
+<p>Scaling that same 7,776-minute upper bound by the cluster size gives a sense of what is actually at stake. At up to 16,384 GPUs<a class="cite" href="#ref-1">1</a>, 7,776 minutes (129.6 hours) of lost time is also an upper bound on 129.6 &#215; 16,384 &#8776; 2.12 million lost GPU-hours across the 54-day run — the quantity every mechanism in sections 4 and 5 exists to keep small, and the reason a fast diagnosis loop is worth the engineering cost of building NCCLX or a custom Kubernetes controller in the first place.</p>
+</details>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 360" role="img" aria-labelledby="f2t"><title id="f2t">Effective training time exceeds 90% at both companies despite hundreds of interruptions per multi-week run</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">Effective training time: elapsed vs. useful, both systems</text>
+
+    <line x1="90" y1="280" x2="90" y2="60" class="d-axis"/>
+    <text x="60" y="65" class="d-small d-text-light">100%</text>
+    <line x1="80" y1="60" x2="740" y2="60" class="d-grid"/>
+    <text x="60" y="192" class="d-small d-text-light">50%</text>
+    <line x1="80" y1="188" x2="740" y2="188" class="d-grid"/>
+    <text x="60" y="278" class="d-small d-text-light">0%</text>
+
+    <rect x="140" y="60" width="70" height="220" class="d-outline d-dashed"/>
+    <text x="175" y="298" text-anchor="middle" class="d-small">Elapsed</text>
+    <rect x="230" y="82" width="70" height="198" class="d-fill-blue"/>
+    <text x="265" y="298" text-anchor="middle" class="d-small">Effective</text>
+    <text x="265" y="72" text-anchor="middle" class="d-mono d-small d-bold">&gt;90%</text>
+    <text x="220" y="330" text-anchor="middle" class="d-bold">Llama 3 405B (Meta)</text>
+    <text x="220" y="346" text-anchor="middle" class="d-small d-text-light">466 interruptions / 54 days &#8776; &#8804;16.7 min avg cost</text>
+
+    <rect x="460" y="60" width="70" height="220" class="d-outline d-dashed"/>
+    <text x="495" y="298" text-anchor="middle" class="d-small">Elapsed</text>
+    <rect x="550" y="82" width="70" height="198" class="d-fill-cyan"/>
+    <text x="585" y="298" text-anchor="middle" class="d-small">Effective</text>
+    <text x="585" y="72" text-anchor="middle" class="d-mono d-small d-bold">&gt;90%</text>
+    <text x="540" y="330" text-anchor="middle" class="d-bold">MegaScale (ByteDance)</text>
+    <text x="540" y="346" text-anchor="middle" class="d-small d-text-light">&lt;10 min diagnosis, &#8776;15 min resume, &gt;100 repairs</text>
+
+    <path d="M310,171 L450,171" class="d-arrow" marker-end="url(#f2-arr)" style="stroke-dasharray:4 3"/>
+    <text x="380" y="160" text-anchor="middle" class="d-small d-text-light">independently converge</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Both papers independently report &gt;90% effective training time despite hundreds of interruptions over multi-week runs. The dashed outline is the 100% elapsed-time baseline; the filled bar is the effective (useful) fraction. Left: Meta's Llama 3 405B pre-training, 466 interruptions over 54 days, implying an average interruption cost of at most &#8776;16.7 minutes (derived above). Right: MegaScale's production clusters, which report the same &gt;90% floor directly alongside a &lt;10-minute average diagnosis time and a &#8776;15-minute checkpoint-based resume<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<p>The other number worth deriving is the daily interruption rate implied by the same snapshot. Meta's own prose emphasizes only a floor — automated cluster maintenance "resulted in at least one training interruption daily"<a class="cite" href="#ref-1">1</a> — but dividing the count in Table 2 by the window gives the actual average: 419 unexpected interruptions over 54 days is &#8776;7.8 unexpected interruptions per day, an order of magnitude above the "at least one" floor the prose highlights. The floor and the average are both true; the floor is about planned maintenance specifically, the average is about everything in Table 2.</p>
+
+<h2 id="megascale-closed-loop-recovery">4. MegaScale's closed-loop recovery: heartbeat, diagnosis, eviction, resume</h2>
+<p>MegaScale is the more mechanistically detailed of the two papers on this specific question: it describes a complete, named control loop rather than a set of disconnected tools. The paper calls it the "robust training workflow"<a class="cite" href="#ref-3">3</a>, and it runs as a driver process that submits the job, allocates one Kubernetes pod per node via a custom controller, and starts one training daemon per executor<a class="cite" href="#ref-3">3</a>.</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 320" role="img" aria-label="MegaScale's fault-recovery loop: heartbeat and anomaly signal, diagnosis, checkpoint-based recovery, resumed training">
+      <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+      <rect x="20" y="50" width="150" height="56" rx="8" class="d-surface d-outline" id="f3-executors"/>
+      <text x="95" y="72" text-anchor="middle" class="d-bold">Executors</text>
+      <text x="95" y="88" text-anchor="middle" class="d-small d-text-light">per-GPU training daemon</text>
+
+      <rect x="220" y="50" width="150" height="56" rx="8" class="d-surface d-outline" id="f3-driver"/>
+      <text x="295" y="72" text-anchor="middle" class="d-bold">Driver</text>
+      <text x="295" y="88" text-anchor="middle" class="d-small d-text-light">real-time anomaly detection</text>
+
+      <rect x="420" y="50" width="170" height="56" rx="8" class="d-surface d-outline" id="f3-diag"/>
+      <text x="505" y="72" text-anchor="middle" class="d-bold">Self-check diagnostics</text>
+      <text x="505" y="88" text-anchor="middle" class="d-small d-text-light">Loopback / RNIC / NCCL tests</text>
+
+      <rect x="630" y="50" width="150" height="56" rx="8" class="d-surface d-outline" id="f3-k8s"/>
+      <text x="705" y="72" text-anchor="middle" class="d-bold">Kubernetes</text>
+      <text x="705" y="88" text-anchor="middle" class="d-small d-text-light">evict + replenish node</text>
+
+      <rect x="220" y="220" width="200" height="56" rx="8" class="d-surface d-outline" id="f3-ckpt"/>
+      <text x="320" y="242" text-anchor="middle" class="d-bold">Checkpoint store</text>
+      <text x="320" y="258" text-anchor="middle" class="d-small d-text-light">host mem &#8594; async &#8594; HDFS</text>
+
+      <rect x="480" y="220" width="200" height="56" rx="8" class="d-surface d-outline" id="f3-resume"/>
+      <text x="580" y="242" text-anchor="middle" class="d-bold">Resumed training</text>
+      <text x="580" y="258" text-anchor="middle" class="d-small d-text-light">&gt;90% effective training time</text>
+
+      <g data-step="1">
+        <rect x="20" y="50" width="150" height="56" rx="8" class="d-hl" opacity="0.35"/>
+        <path d="M170,78 L220,78" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+        <text x="195" y="66" text-anchor="middle" class="d-mono d-small">heartbeat</text>
+        <text x="195" y="115" text-anchor="middle" class="d-small d-text-light">IP, HW state, process status,</text>
+        <text x="195" y="129" text-anchor="middle" class="d-small d-text-light">RDMA traffic, stdout/stderr</text>
+      </g>
+
+      <g data-step="2">
+        <rect x="220" y="50" width="150" height="56" rx="8" class="d-hl" opacity="0.35"/>
+        <rect x="420" y="50" width="170" height="56" rx="8" class="d-hl" opacity="0.35"/>
+        <path d="M370,78 L420,78" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+        <text x="395" y="66" text-anchor="middle" class="d-mono d-small">suspend</text>
+        <text x="505" y="115" text-anchor="middle" class="d-small d-text-light">missed heartbeat or abnormal status</text>
+        <text x="505" y="129" text-anchor="middle" class="d-small d-text-light">&#8594; job suspended, tests run</text>
+      </g>
+
+      <g data-step="3">
+        <rect x="420" y="50" width="170" height="56" rx="8" class="d-hl" opacity="0.35"/>
+        <rect x="630" y="50" width="150" height="56" rx="8" class="d-hl" opacity="0.35"/>
+        <rect x="220" y="220" width="200" height="56" rx="8" class="d-hl" opacity="0.35"/>
+        <path d="M590,78 L630,78" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+        <text x="610" y="66" text-anchor="middle" class="d-mono d-small">evict IP</text>
+        <path d="M705,106 L705,150 L320,150 L320,220" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+        <text x="500" y="142" text-anchor="middle" class="d-small d-text-light">reload latest checkpoint</text>
+      </g>
+
+      <g data-step="4">
+        <rect x="480" y="220" width="200" height="56" rx="8" class="d-hl" opacity="0.35"/>
+        <path d="M420,248 L480,248" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+        <text x="450" y="206" text-anchor="middle" class="d-mono d-small">resume</text>
+        <text x="580" y="290" text-anchor="middle" class="d-small d-text-light">&gt;100 repairs over a multi-week production run</text>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Heartbeat and anomaly signal.</b> Each executor's training daemon sends the driver a periodic heartbeat carrying its IP, pod name, hardware info, the current status of the training process, filtered <code>stdout</code>/<code>stderr</code> keywords, and RDMA traffic metrics; the traffic-metric channel matters because some anomalies degrade throughput without producing an explicit error, so a step-to-step deviation in expected RDMA traffic is itself treated as a signal<a class="cite" href="#ref-3">3</a>. Monitoring runs at two granularities: second-level for overall health and configuration drift (ECN/PFC/QoS settings, link flapping), millisecond-level for detecting network congestion and whether the data-parallel/pipeline-parallel communication has hit its physical bandwidth limit<a class="cite" href="#ref-3">3</a>.</li>
+    <li><b>Diagnosis.</b> A missed heartbeat within a predefined window, or an explicitly abnormal status, triggers the driver to suspend the job across every executor and run a suite of lightweight self-check diagnostics<a class="cite" href="#ref-3">3</a>: a <em>Loopback</em> test measuring full-mesh RDMA-NIC bandwidth within a host, an <em>RNIC-to-RNIC</em> test checking connectivity and bandwidth between RNICs on different hosts, an intra-node NCCL all-to-all test, and an inter-node NCCL all-reduce test against neighboring machines under the same top-of-rack switch<a class="cite" href="#ref-3">3</a>. The tests trade completeness for speed deliberately — long diagnostics protect accuracy but cost effective training time directly, and the paper reports tuning this trade-off through iterative experimentation<a class="cite" href="#ref-3">3</a>: "extended diagnostic duration can adversely affect the effective training time, while high false positive rates can lead to unnecessary exclusion of machines that are actually functional"<a class="cite" href="#ref-3">3</a> — a test suite that is too thorough burns the same effective-training-time budget it exists to protect, and one that is too eager quarantines healthy hardware the job still needed.</li>
+    <li><b>Checkpoint-based recovery.</b> Once the driver has the IPs of the faulty nodes, it submits them to the custom Kubernetes controller, which evicts the faulty pods and replenishes the job with "an equivalent number of healthy ones which pass our diagnostic tests"<a class="cite" href="#ref-3">3</a>. The loop is not exclusively automatic even in MegaScale's own account: the driver also exposes a user interface for manual eviction, specifically for nodes identified through the section-5 tooling rather than the automated self-checks<a class="cite" href="#ref-3">3</a> — the "fully automated" framing in Table 1 describes the common path, not the only one. Either way, the job's parallel shape (its TP/PP/DP layout) is preserved; only the physical nodes filling it change. The resumed set of workers then reloads the latest checkpoint. Recovery reads are the bottleneck here, so MegaScale designates one worker per data-parallel group to read the group's shared state partition from HDFS and broadcast it to the other workers in that group, which "reduces the load linearly" on HDFS bandwidth instead of having every worker hit the file system independently<a class="cite" href="#ref-3">3</a>. (HDFS's own throughput ceiling and Meta's equivalent Tectonic fabric — 240&#8201;PB, 2&#8201;TB/s sustained, 7&#8201;TB/s peak — are Module 33's subject; the point here is what the checkpoint pipeline does to the recovery-critical path, not the storage fabric's raw capacity.)</li>
+    <li><b>Resumed training.</b> Writing checkpoints is optimized the same way recovery reads are, and for a stated reason: "it is critical to ensure that the latest checkpoint is as close as possible to the state of training progress when the faults happened... this requires us to increase the frequency of checkpointing during training. However, we also want to reduce the latency introduced by the checkpointing process, especially the time on the critical path which blocks the training progress"<a class="cite" href="#ref-3">3</a> — checkpointing more often bounds how much progress a failure can erase, but only if each checkpoint is cheap enough that writing it does not itself become the interruption. MegaScale's answer is the same two-stage pipeline as the recovery read path: first copy each GPU's on-chip state to host memory using pinned memory and an optimized serialization path, a step the paper reports reducing "to several seconds," after which a separate background process asynchronously transfers the host-memory copy to HDFS without blocking the resumed training loop<a class="cite" href="#ref-3">3</a>. Over a multi-week production run of a several-hundred-billion-parameter model on more than 10,000 GPUs, this loop repaired and resumed the job over 100 times while the training loss continued to converge<a class="cite" href="#ref-3">3</a> — the same &gt;90% effective-training-time result Section 3 quantified, now attached to the mechanism that produces it.</li>
+  </ol>
+</div>
+
+<h2 id="diagnosing-stragglers-3d-visualization">5. Diagnosing what a heartbeat can't see: stragglers and the 3D visualization tool</h2>
+<p>The self-check tests in section 4 catch faults that fail cleanly: a link that will not pass a bandwidth test, an NCCL call that errors out. They do not catch a GPU that keeps running, just slower, or one that hangs a collective without ever returning an error code. MegaScale built two additional tools specifically for that gap, and both are worth understanding on their own mechanism, not just their name.</p>
+<p>The first is a CUDA-event performance analyzer with two visualization modes<a class="cite" href="#ref-3">3</a>. It times critical code segments on every rank using CUDA events rather than CUDA synchronization, which avoids the performance hit of forcing a sync just to measure one, so it can run continuously in production<a class="cite" href="#ref-3">3</a>. The first mode aggregates this into a per-machine heat-map of computation-phase latency; MegaScale reports that this reveals a small fraction — approximately 0.5% — of machines running substantially slower than the rest, and that training efficiency is "predominantly determined by the slowest machine's performance," which is why MFU is inconsistent run to run even with identical configurations until those specific outlier machines are excluded<a class="cite" href="#ref-3">3</a>. A related investigation using the same event-timer data found specific hosts consistently taking about 10% longer to execute the same forward computation across multiple experimental setups; isolating and removing those hosts from the cluster produced roughly a 0.7 percentage-point MFU improvement<a class="cite" href="#ref-3">3</a> — a small number in isolation, but it came from a handful of machines out of thousands, which is the entire point of a straggler: its cost is disproportionate to its share of the fleet.</p>
+<p>The second mode is a distributed trace view that stitches per-rank CUDA event timelines into one unified, cross-machine timeline, showing pipeline bubbles, communication gaps, and synchronization structure across ranks that a single-node profiler like the standard PyTorch profiler cannot represent<a class="cite" href="#ref-3">3</a>. Selecting an event surfaces the dependency that produced it, which is exactly the primitive the 3D visualization tool builds on.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f4t"><title id="f4t">3D parallel training visualization: TP, PP, and DP as three logical axes, one straggler rank highlighted with its communication dependencies</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">3D parallel training visualization: TP &#215; PP &#215; DP</text>
+
+    <path d="M140,80 L420,20" class="d-outline d-dashed"/>
+    <path d="M348,80 L628,20" class="d-outline d-dashed"/>
+    <path d="M140,270 L420,210" class="d-outline d-dashed"/>
+
+    <g id="f4-front">
+      <rect x="140" y="110" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="198" y="110" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="256" y="110" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="140" y="158" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="198" y="158" width="45" height="35" rx="3" class="d-fill-orange"/>
+      <text x="220" y="180" text-anchor="middle" class="d-mono d-small d-text-inv">R20</text>
+      <rect x="256" y="158" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="140" y="206" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="198" y="206" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="256" y="206" width="45" height="35" rx="3" class="d-surface d-outline"/>
+    </g>
+    <text x="220" y="256" text-anchor="middle" class="d-small d-text-light">DP replica 0 (front)</text>
+
+    <g id="f4-back" opacity="0.75">
+      <rect x="420" y="50" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="478" y="50" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="536" y="50" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="420" y="98" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="478" y="98" width="45" height="35" rx="3" class="d-outline d-dashed" style="stroke-width:2"/>
+      <rect x="536" y="98" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="420" y="146" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="478" y="146" width="45" height="35" rx="3" class="d-surface d-outline"/>
+      <rect x="536" y="146" width="45" height="35" rx="3" class="d-surface d-outline"/>
+    </g>
+    <text x="500" y="196" text-anchor="middle" class="d-small d-text-light">DP replica 1 (back)</text>
+
+    <path d="M220,158 L162,158" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+    <path d="M220,193 L278,193" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+    <text x="220" y="146" text-anchor="middle" class="d-mono d-small">TP comm</text>
+
+    <path d="M212,158 L212,145" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+    <path d="M228,193 L228,206" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+    <text x="150" y="185" class="d-mono d-small">PP comm</text>
+
+    <path d="M243,158 L490,105" class="d-arrow-active" marker-end="url(#f4-arr)" style="stroke-dasharray:4 3"/>
+    <text x="380" y="115" text-anchor="middle" class="d-mono d-small">DP comm</text>
+
+    <rect x="600" y="240" width="185" height="110" rx="6" class="d-panel"/>
+    <text x="612" y="262" class="d-small d-bold">Rank 20 selected</text>
+    <text x="612" y="280" class="d-small d-text-light">position + dataflow direction +</text>
+    <text x="612" y="294" class="d-small d-text-light">every comm op it's part of light up</text>
+    <text x="612" y="316" class="d-small d-text-light">&#8776;0.5% of machines run</text>
+    <text x="612" y="330" class="d-small d-text-light">measurably slower<a href="#ref-3" class="cite">3</a></text>
+  </svg>
+  <figcaption><b>Figure 4.</b> MegaScale's 3D parallel training visualization logically splits the cluster into tensor-parallel (TP), pipeline-parallel (PP), and data-parallel (DP) axes; selecting a rank shows its position and every communication dependency it participates in<a class="cite" href="#ref-3">3</a>. Rank 20 (orange) is drawn here as an illustrative straggler with its TP, PP, and DP dependencies highlighted, following the mechanism the paper describes for its own Figure 7 example<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<p>The mechanism behind why this tool is necessary at all is specific and worth stating precisely. When a GPU is defective in a way that <em>probabilistically</em> blocks an NCCL communication call rather than erroring immediately, that call hangs on the faulty GPU's rank; every other rank that is waiting on a collective involving that rank hangs too, and the hang cascades outward through dependent ranks until the entire job times out<a class="cite" href="#ref-3">3</a>. From outside, this looks like one generic, cluster-wide blockage — every rank is equally stuck. MegaScale's fix is a targeted logging asymmetry: each GPU worker logs its own ongoing operation whenever it exits on a communication timeout, so every rank that was <em>waiting</em> on the faulty one produces a log entry describing what it was waiting for<a class="cite" href="#ref-3">3</a>. The faulty rank itself, still hung inside the blocked call, produces no such log — it is the one silent node in a sea of nodes that all logged the same complaint. The 3D visualization tool reconstructs the dependency graph from those logs and error messages and surfaces the silent node directly, rather than requiring an engineer to manually cross-reference which of ten thousand ranks never checked in<a class="cite" href="#ref-3">3</a>.</p>
+<p>This is the same pathology section 1 quoted from the Llama 3 paper in different words — a stalled load/store instruction with no error code<a class="cite" href="#ref-1">1</a> — and it is worth noting that Meta and ByteDance converge on the same class of fix despite building unrelated tools: neither waits for the faulty component to report its own failure, because at this layer it usually cannot. Meta's NCCLX watches the communication library from outside and snapshots state on a detected stall; MegaScale exploits the fact that every <em>other</em> rank still logs normally, and infers the faulty one by its silence. Both are answers to the same underlying fact: once a GPU or a link fails badly enough to hang a collective, the failure is legible only from everything around it, never from the thing itself.</p>
+<p>Two further production incidents in the paper illustrate the same "diagnose by elimination" pattern applied to problems that are not a single faulty part. Training efficiency gradually declined over the course of one job even though per-phase (forward/backward/optimizer) computation time stayed flat; tracing the per-step time increase to its last collective call identified the data-parallel reduce-scatter as the point where some ranks launched later than others, and the resulting time-skew grew across steps rather than staying fixed, eventually traced to irregular garbage-collection pauses and certain PyTorch operations sitting on the critical path — removing those code segments stopped the decline<a class="cite" href="#ref-3">3</a>. Separately, intermittent training stalls traced to network-interface flapping — brief but repeated link up/down cycles, during which every packet in transit is dropped for several seconds at a time. The first lesson MegaScale reports is that the NCCL retransmit timeout has to be set explicitly higher than the library default, because the default returns a completion error to the training job before the interface has a chance to come back up; the second is that the root cause is usually bad physical-layer signal quality between the network card, the AOC cable, and the switch, fixed by tightening that signal quality directly and by enabling the NIC's <code>adap_retrans</code> feature, which retransmits at a shorter interval and recovers faster specifically when the flapping period itself is short<a class="cite" href="#ref-3">3</a>. Neither problem would show up in Table 2's clean root-cause categories; both were found only because the tooling in this section made the cluster's internal state legible enough to chase a symptom back to its cause.</p>
+<p>Some of MegaScale's network engineering is preventative rather than diagnostic, and it earns its place here because congestion that looks like a stall is otherwise indistinguishable from a real fault until someone has manually ruled it out. All-to-all collective traffic at this scale produces "fat" flows that traditional equal-cost multi-path (ECMP) routing balances poorly, so MegaScale redesigns the network topology and scheduling specifically to reduce ECMP hashing conflicts — splitting each downlink port into multiple lower-bandwidth links with distinct cabling, and scheduling data-intensive nodes from the same job under the same top-of-rack switch — which lowers the chance that ordinary collective traffic gets misrouted into a congested path and manifests as exactly the kind of transient slowdown section 5.1's straggler-hunting tooling would otherwise have to spend time ruling out<a class="cite" href="#ref-3">3</a>.</p>
+
+<h2 id="checkpoint-restart-and-what-elasticity-means">6. Checkpoint/restart as the universal primitive, and what "elasticity" means when the shape is fixed</h2>
+<p>Strip away the tooling and both papers land on the same recovery primitive: reload the last checkpoint, resume the job. That is a narrower move than it might sound next to the rest of this course. Module 9's MapReduce re-executes only the specific map task whose output lived on a now-dead machine, because map tasks are independent and idempotent by construction; the other thousands of tasks in the job never notice. Module 11's retry-with-backoff absorbs a single request's failure with a blast radius of exactly one request. Training has neither luxury: because a step ends in a synchronous collective across every participating rank, there is no unit smaller than "the whole job" to re-execute once a rank has dropped out mid-collective. Checkpoint/restart is not one option among several here — given the constraint stated in section 1, it is close to the only option, which is why both an American frontier lab and a Chinese hyperscaler independently converged on it as the recovery primitive and instead spent their engineering effort on the two levers that actually move the needle inside that constraint: how fast you can detect and localize a fault (sections 4 and 5), and how little state you lose and how fast you can reload it (section 4.4's two-stage checkpoint).</p>
+<p>This also clarifies what "elasticity" means in this specific setting, and it is a narrower claim than the word usually carries elsewhere in this course. An autoscaling web tier (Module 10, Module 11) is elastic in the sense that its shape changes: more replicas under load, fewer at night, and the system's logical structure does not depend on exactly how many replicas exist at a given moment. A synchronous training job's shape is fixed by its 4D or 3D parallel configuration — a specific TP&#215;PP&#215;DP&#215;CP grid, chosen ahead of time and baked into which rank talks to which<a class="cite" href="#ref-1">1</a> — and that shape cannot flex mid-run without changing the parallelism plan itself, which neither paper describes doing. What MegaScale calls elasticity is narrower and more precise: when a node fails, Kubernetes evicts it and "replenishes the cluster with an equivalent number of healthy ones which pass our diagnostic tests"<a class="cite" href="#ref-3">3</a> — a like-for-like replacement that restores the same grid with different physical hardware, not a grid that grows or shrinks. The elastic resource is spare capacity in the fleet, held in reserve so that a replacement is available on demand; the job itself stays a fixed size throughout.</p>
+<p>Why the shape cannot flex for free is itself measurable in Meta's own numbers, not just asserted. Table 4 of the Llama 3 paper reports 43% BF16 MFU on 8,192 GPUs with a data-parallel degree of 64, versus 41% on 16,384 GPUs with a data-parallel degree of 128 — a real, measured drop from doubling the GPU count on the same job<a class="cite" href="#ref-1">1</a>. Meta attributes it directly to keeping the global tokens-per-batch constant while doubling the data-parallel degree, which forces a smaller batch size per data-parallel group and leaves each GPU doing proportionally less useful work per synchronization round<a class="cite" href="#ref-1">1</a>. That is the mechanism a naive "just add more GPUs mid-run" version of elasticity would have to solve for every single node addition, not just the two data points in Table 4 — which is exactly why neither paper attempts it, and why the elasticity both papers do build is scoped to holding the GPU count fixed and only swapping which physical GPUs occupy it.</p>
+<p>One boundary worth being explicit about, in the spirit of this module's own coverage-honesty framing: neither paper says how large that spare-capacity buffer is, how it is provisioned, or what happens if no equivalent healthy node is available when one is needed. That is a real gap in the public record, not a claim this module can fill from Meta's or ByteDance's own words. What both papers do establish, precisely, is the loop that runs once a spare is available: detect, diagnose, evict and replace, reload, resume — and that loop, run enough times in the background, is what an &gt;90% effective-training-time number is actually made of.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Neither Meta nor ByteDance frames its own paper as a rebuttal of the other, and the researcher's source map records no pre-existing disagreement for this specific topic. But the two papers make visibly different engineering bets on the same underlying question — given that a single-node fault can stall an entire synchronous job, where should the engineering investment go? — and a third position, raised by MegaScale itself only to reject it, sharpens the contrast. All three are grounded in direct statements from the two source papers, not inferred motive.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Automate the loop; do not over-diagnose</h4>
+    <p class="who">MegaScale / ByteDance<a class="cite" href="#ref-3">3</a></p>
+    <p>Treat individual nodes as interchangeable. Build a fast, generic detect&#8594;evict&#8594;replace&#8594;resume loop that acts on an IP address and a pass/fail diagnostic result, without first fully root-causing every fault. Reserve deep tooling (the CUDA-event heat-map, the 3D visualization) for the residual cases the fast loop cannot resolve — stragglers and silent hangs that pass a binary self-check.</p>
+    <ul class="pros"><li>Recovery latency does not scale with diagnostic depth; most faults never need a human or a slow investigation.</li><li>&gt;90% of faults were auto-detected, located, and recovered on MegaScale's production runs<a class="cite" href="#ref-3">3</a>.</li></ul>
+    <ul class="cons"><li>A fault that passes every self-check (a probabilistic hang, a silent straggler) defeats the fast path entirely and falls through to the slow, tool-heavy path anyway.</li><li>Requires spare, pre-validated capacity on hand to "replenish" into — a cost the paper does not quantify.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Invest in diagnosis instrumentation; accept rare manual triage</h4>
+    <p class="who">Meta / Llama 3 405B infrastructure team<a class="cite" href="#ref-1">1</a></p>
+    <p>Build deep, always-on visibility into the communication library itself — NCCLX co-designed tightly enough with PyTorch that a flight recorder can capture every collective's metadata and stack trace into a ring buffer, diagnosing hangs in minutes even on a mixed NVLink/RoCE fabric where failures "often manifest as stalled load/store operations... without returning a clear error code"<a class="cite" href="#ref-1">1</a>. Treat the rare case that instrumentation cannot resolve as an acceptable, bounded cost rather than a gap to be automated away at any price.</p>
+    <ul class="pros"><li>Only 3 of 419 unexpected interruptions needed manual intervention over the 54-day window<a class="cite" href="#ref-1">1</a> — a lower manual-intervention share than MegaScale's own stated "&gt;90% automated" figure implies.</li><li>Deep tracing generalizes to problems that were never in the diagnostic-test catalog to begin with.</li></ul>
+    <ul class="cons"><li>Requires owning and modifying the collective-communication library itself (NCCLX is a fork of NCCL) — a much larger engineering investment than a self-check test suite.</li><li>The paper does not describe an automatic node-eviction-and-replace loop comparable to MegaScale's; recovery mechanics beyond diagnosis are left unstated.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Remove the coupling instead of curing it</h4>
+    <p class="who">Cited by MegaScale as related work, and rejected<a class="cite" href="#ref-3">3</a></p>
+    <p>If a single rank's failure stalls the whole job because every step ends in a blocking collective, the more fundamental fix is to stop requiring every rank to arrive at the same collective at the same time. MegaScale's own related-work section notes that "some works introduce fixed staleness in the training pipeline for full overlapping communication and computation," which would shrink a single node's blast radius by design rather than recovering from it faster.</p>
+    <ul class="pros"><li>Attacks the root cause identified in section 1 (synchronous coupling) rather than the symptom.</li><li>Already the accepted trade-off elsewhere in this course's training material — rollout generation in RL post-training (Module 37) tolerates stale actors precisely because it is not gradient-synchronous.</li></ul>
+    <ul class="cons"><li>MegaScale's own verdict: "the staleness may degrade the model performance"<a class="cite" href="#ref-3">3</a> — for pre-training, where matching a synchronous baseline's loss curve at a given token count is the entire point, this cost is not obviously acceptable.</li><li>Neither Llama 3 nor MegaScale's production pre-training runs adopt it; it remains a literature position, not a demonstrated production one at this scale.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>For frontier pre-training specifically, where the entire point is to match a known-good loss curve at a fixed token budget, positions one and two dominate position three: both Meta and ByteDance ship synchronous training and invest in making failure recovery fast rather than making failure survivable-by-design, and neither reports adopting a staleness-tolerant pipeline for its flagship pre-training run. Between positions one and two, the public record does not cleanly separate them — both land on the same &gt;90% effective-training-time outcome by different routes (a generic automated loop versus deep, library-level instrumentation with rare manual fallback), and each paper reports a number that looks favorable by its own preferred measure (MegaScale's "&gt;90% automated," Meta's "3 of 419 manual"). What would settle it is a controlled comparison on the same hardware and the same failure mix, holding the cluster constant and varying only the recovery architecture; neither paper provides that, because each describes only its own company's fleet. The safer reading is that they are not actually competing solutions to the same problem so much as two points on a spectrum every operator at this scale eventually occupies both ends of — cheap automated eviction for the faults that fail cleanly, and library-level tracing for the ones that do not.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Llama Team, Meta AI. <em>The Llama 3 Herd of Models</em>. arXiv:2407.21783, 2024. <a href="https://arxiv.org/abs/2407.21783">https://arxiv.org/abs/2407.21783</a>. Accessed 2026-09-17. <span class="ref-use">Used for: cluster/hardware specs (&#167;3.3.1), the 54-day interruption census and full root-cause Table 5, the effective-training-time definition and &gt;90% result, diurnal throughput/power-swing observations, and the NCCLX flight-recorder diagnosis approach (all &#167;3.3.4).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Verma, A., Pedrosa, L., Korupolu, M., Oppenheimer, D., Tune, E., Wilkes, J. <em>Large-scale cluster management at Google with Borg</em>. EuroSys '15, 2015. <a href="https://research.google.com/pubs/archive/43438.pdf">https://research.google.com/pubs/archive/43438.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: quota-checked-at-admission and the ~80% graceful-SIGTERM preemption figure, as the general-purpose cluster-management baseline this module's failure model breaks from (&#167;2.3, &#167;2.5).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Jiang, Z., Lin, H., Zhong, Y., et al. <em>MegaScale: Scaling Large Language Model Training to More Than 10,000 GPUs</em>. USENIX NSDI '24, 2024. <a href="https://www.usenix.org/system/files/nsdi24-jiang-ziheng.pdf">https://www.usenix.org/system/files/nsdi24-jiang-ziheng.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the robust training workflow (&#167;4.1), heartbeat payload and monitoring granularity (&#167;4.2), self-check diagnostic tests (&#167;4.3), the two-stage checkpoint/recovery pipeline (&#167;4.4), the CUDA-event heat-map/trace tools and 3D visualization tool (&#167;5.1-5.2), production recovery experience and MFU/effective-training-time figures (&#167;6.1-6.3), and the related-work mention of staleness-tolerant pipelines (&#167;7).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

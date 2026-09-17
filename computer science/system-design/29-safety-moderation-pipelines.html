@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Safety and Moderation Pipelines: Pre/Post Filters, Classifiers, and Policy Routing · System Design</title>
+<meta name="description" content="OpenAI's decoupled moderation-scoring endpoint against Anthropic's continuous policy-to-enforcement pipeline: what each design can and cannot catch, why streaming breaks a post-hoc gate, and where CBRN/cyber risk assessment sits as its own gate.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 29</p>
+  <h1>Safety and Moderation Pipelines: Pre/Post Filters, Classifiers, and Policy Routing</h1>
+  <p class="lede">Two frontier labs answer the same question — what stops a model from producing content nobody wants it to produce — with structurally different designs. OpenAI ships a separate scoring endpoint that returns a signal and leaves the blocking decision to the caller; Anthropic embeds classifiers, training-time shaping, and pre-deployment capability testing into one continuous pipeline with the power to intervene on its own. This module builds both designs from their own documentation, shows exactly where a post-hoc score cannot catch what has already streamed to a user, and places CBRN/cyber-uplift testing as a gate distinct from ordinary content moderation.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>5</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-18</span>
+    <span class="chip">Prerequisite: <b>Module 26</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f1t"><title id="f1t">Moderation as a single post-hoc step: generate, then score against 13 categories, then decide</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="26" text-anchor="middle" class="d-title">The bolt-on filter: one linear pass, after the fact</text>
+
+    <rect x="20" y="60" width="180" height="70" rx="8" class="d-block"/>
+    <text x="110" y="88" text-anchor="middle" class="d-text-inv d-bold">Model generates</text>
+    <text x="110" y="108" text-anchor="middle" class="d-text-inv d-small">full response text</text>
+
+    <path d="M200,95 L280,95" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="280" y="50" width="220" height="90" rx="8" class="d-block-2"/>
+    <text x="390" y="74" text-anchor="middle" class="d-text-inv d-bold">Moderation endpoint</text>
+    <text x="390" y="94" text-anchor="middle" class="d-text-inv d-small">scores against 13 categories</text>
+    <text x="390" y="112" text-anchor="middle" class="d-text-inv d-small">flagged + score 0&#8211;1 per category</text>
+
+    <path d="M500,95 L580,95" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="580" y="60" width="200" height="70" rx="8" class="d-block-accent"/>
+    <text x="680" y="88" text-anchor="middle" class="d-text-inv d-bold">Caller's policy decision</text>
+    <text x="680" y="108" text-anchor="middle" class="d-text-inv d-small">show / block / log / escalate</text>
+
+    <rect x="20" y="170" width="760" height="60" rx="8" class="d-panel"/>
+    <text x="400" y="193" text-anchor="middle" class="d-small">By the time the score exists, the full text it describes already exists too &#8212;</text>
+    <text x="400" y="212" text-anchor="middle" class="d-small">the endpoint is a classifier called around generation, not a gate inside it<a class="cite" href="#ref-1">1</a>.</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> OpenAI's moderation endpoint as a three-step, one-directional pipeline: generate, then score the complete text against 13 categories, then let the calling application decide what to do<a class="cite" href="#ref-1">1</a>. Nothing in this shape prevents the endpoint from being called on an input before generation too — the endpoint does not care whether the text it scores is a prompt or a completion — but the score itself is always computed on a finished piece of text, never on generation in progress.</figcaption>
+</figure>
+
+<h2 id="moderation-bolt-on-filter">1. The moderation endpoint as a bolt-on filter</h2>
+<p>OpenAI's moderation endpoint is not part of the model that generates text. It is a separate classification call: you send it text or an image, and it sends back a judgment about that specific, already-finished piece of content<a class="cite" href="#ref-1">1</a>. Nothing about the endpoint's contract requires it to sit between a user's prompt and the generating model, or between the generating model's output and the user — it is a general-purpose scorer that a caller wires into their own pipeline wherever they choose, on inputs, on outputs, or on both. That single design decision — moderation as an independently callable classifier rather than a step baked into generation — is the fact everything else in this section follows from.</p>
+
+<h3 id="moderation-taxonomy">1.1 The 13-category taxonomy and score shape</h3>
+<p>The endpoint classifies text and (for a subset of categories) images against 13 categories, each with its own boolean flag and its own confidence score<a class="cite" href="#ref-1">1</a>. The categories are not a flat list of unrelated tags — several are parent/child pairs, where the child narrows the parent to a more severe or more specific case (harassment vs. harassment/threatening; hate vs. hate/threatening; self-harm vs. self-harm/intent vs. self-harm/instructions):</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> The 13 moderation categories, the input types each applies to, and what each detects, as OpenAI's own documentation defines them<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Category</th><th>Modalities</th><th>What it flags</th></tr></thead>
+<tbody>
+<tr><td class="row">harassment</td><td>Text</td><td>Harassing language toward any target</td></tr>
+<tr><td class="row">harassment/threatening</td><td>Text</td><td>Harassment that also includes violence or serious harm</td></tr>
+<tr><td class="row">hate</td><td>Text</td><td>Hate based on race, gender, ethnicity, religion, nationality, sexual orientation, disability, or caste</td></tr>
+<tr><td class="row">hate/threatening</td><td>Text</td><td>Hateful content that also includes violence or serious harm</td></tr>
+<tr><td class="row">illicit</td><td>Text</td><td>Advice or instructions for committing illicit acts</td></tr>
+<tr><td class="row">illicit/violent</td><td>Text</td><td>Illicit-act content that also references violence or procuring a weapon</td></tr>
+<tr><td class="row">self-harm</td><td>Text + image</td><td>Content promoting, encouraging, or depicting self-harm (suicide, cutting, eating disorders)</td></tr>
+<tr><td class="row">self-harm/intent</td><td>Text + image</td><td>The speaker expresses intent to engage in self-harm</td></tr>
+<tr><td class="row">self-harm/instructions</td><td>Text + image</td><td>Encourages self-harm and gives instructions or advice on how to do it</td></tr>
+<tr><td class="row">sexual</td><td>Text + image</td><td>Content meant to arouse sexual excitement, or that promotes sexual services</td></tr>
+<tr><td class="row">sexual/minors</td><td>Text</td><td>Sexual content involving anyone under 18</td></tr>
+<tr><td class="row">violence</td><td>Text + image</td><td>Depicts death, violence, or physical injury</td></tr>
+<tr><td class="row">violence/graphic</td><td>Text + image</td><td>Depicts death, violence, or physical injury in graphic detail</td></tr>
+</tbody>
+</table>
+
+<p>The response shape mirrors this taxonomy exactly. A single call returns a top-level <code>flagged</code> boolean, a per-category boolean map (<code>categories</code>), a per-category confidence score between 0 and 1 (<code>category_scores</code>), and — for categories that support images — which input types actually triggered each category (<code>category_applied_input_types</code>)<a class="cite" href="#ref-1">1</a>:</p>
+
+<pre class="code" data-lang="json" data-title="moderation endpoint response (abridged)"><code>{
+  "flagged": true,
+  "categories": {
+    "violence": true,
+    "violence/graphic": false,
+    "sexual": false
+  },
+  "category_scores": {
+    "violence": 0.8599265510337075,
+    "violence/graphic": 0.37701736389561064
+  },
+  "category_applied_input_types": {
+    "violence": ["image"],
+    "violence/graphic": ["image"]
+  }
+}</code></pre>
+
+<p>Two details in this shape matter more than they look. First, <code>category_scores</code> is a continuous value per category, not a single overall severity — a caller who wants a graduated response (warn at 0.3, review at 0.6, refuse at 0.9) has the raw material to build one, but the endpoint itself does not supply the thresholds; that policy choice is left entirely to the caller. Second, the model behind this endpoint is described as accepting text and image input up to 20 MB per image and explicitly not classifying audio<a class="cite" href="#ref-1">1</a> — the taxonomy above is the complete surface area, and anything outside it (audio content, or a category not on this list) gets no score at all from this endpoint.</p>
+<p>The taxonomy is also fixed, not extensible by the caller. A company with a policy violation the 13 categories do not cover — leaking a trade secret embedded in a system prompt, say, or violating a platform-specific brand-safety rule — gets nothing from this endpoint for that case; the score vector always has exactly these 13 entries, no more, no fewer. A caller whose policy needs a 14th signal has to build and operate a separate classifier for it and combine that classifier's output with the moderation endpoint's 13 scores in its own decision logic. The endpoint standardizes the general-harm surface every caller is likely to share; it does not attempt to be a general-purpose policy engine for arbitrary company-specific rules.</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>OpenAI states explicitly that known or suspected child sexual abuse material should never be sent to this endpoint, because it is not designed for CSAM detection or handling<a class="cite" href="#ref-1">1</a>. That is a different mechanism entirely — hash-matching against databases of known illegal material, which section 3 returns to in Anthropic's pipeline — and the sexual/minors category above is not a substitute for it.</p></aside>
+
+<h3 id="signal-not-gate">1.2 "Signal, not gate": why the block decision is left to the developer</h3>
+<p>OpenAI's own guidance states the design philosophy plainly: "treat moderation scores as signals for your application's policy, not as an automatic blocking decision"<a class="cite" href="#ref-1">1</a>. This is not a hedge or a liability disclaimer bolted onto an otherwise-automatic system — it describes what the endpoint actually does. The endpoint returns a score and stops. It does not withhold a response, does not refuse a request, does not modify anything downstream. Whatever happens after — showing the content anyway, holding it for human review, logging it, refusing the request, banning the account — is code the calling application has to write itself.</p>
+<p>This has a clean architectural upside: a caller can build any policy on top of the same raw signal, and different callers legitimately want different policies. A children's education product and a red-team security research tool might both call the same moderation endpoint on the same category set and land on opposite decisions for the same score, because the acceptable-risk threshold for each product is different. Centralizing the decision inside the endpoint itself would force every caller onto one policy; decoupling the score from the action lets the endpoint stay general-purpose while every caller's application logic stays specific.</p>
+<p>The corollary to "not an automatic block" is stated with equal directness: "Review the moderation results before you show the output to a user or take downstream actions"<a class="cite" href="#ref-1">1</a> — the endpoint's own documentation assumes a human or an application-level policy sits between the score and any consequence, not that the score is the consequence.</p>
+<p>The per-category granularity in Table 1 exists precisely so a caller can combine categories into a policy that is not "block if flagged" applied uniformly. Nothing forces a single global threshold across all 13 categories: a caller can require a very low score before acting on <code>sexual/minors</code> or <code>self-harm/instructions</code>, while tolerating a much higher score on <code>harassment</code> before doing anything at all, because the real-world cost of a false negative is not the same across categories. The endpoint supplies exactly the resolution needed to make that distinction — a separate boolean and a separate 0–1 score per category — but it supplies no default weighting across them; deciding that <code>sexual/minors</code> deserves a stricter bar than <code>harassment</code> is a judgment call every caller has to encode for itself, category by category, with no template from the platform.</p>
+<p>The cost of that same decoupling is that nothing is actually gated by default. A caller who does not write the review-and-decide code gets a score that goes nowhere — the moderation endpoint by itself blocks nothing, no matter how confidently it flags a category. Section 2 shows the sharper version of this cost: even a caller who <em>does</em> write that code cannot always act on the score before the content it describes has already reached a user.</p>
+
+<h2 id="streaming-breaks-post-hoc">2. Why a post-hoc gate cannot survive streaming</h2>
+<p>Module 26 derives this in detail from the wire protocol up; this section states the conclusion precisely because everything from section 3 onward is a response to it. A non-streaming completion gives a moderation layer exactly one opportunity to act: the model finishes, the complete text exists, a classifier scores that complete text, and the caller decides whether to show it — score and decision both happen before the user has seen anything. Streaming removes that opportunity by construction. OpenAI's own documentation states the consequence without qualification: "streaming the model's output in a production application makes it more difficult to moderate the content of the completions, as partial completions may be more difficult to evaluate," and, more precisely on timing, "if you request moderation scores with a generation request, the scores arrive after the full generated output is available. They aren't included with partial output deltas"<a class="cite" href="#ref-2">2</a>.</p>
+<p>Read that second sentence against what a streaming client actually does with each delta: it renders it, immediately, as it arrives — that is the entire point of streaming. So by the time a full-output moderation score exists, every token the score is computed over has already been transmitted and, in a typical client, already rendered. A moderation score in this setting cannot be a gate in the literal sense of blocking token <em>k+1</em> from being sent based on a score computed over tokens <em>1..k</em>, because the score is not defined over a prefix at all — it is defined over the complete output, so it does not exist until the complete output does, at which point there is nothing left to gate.</p>
+
+<div class="calc">
+  <p class="calc-title">Tokens exposed before a gate can act</p>
+  <div class="calc-row"><label for="s29k1">Response length N (tokens)</label><input type="range" id="s29k1" name="N" min="16" max="4000" step="16" value="512"></div>
+  <div class="calc-row"><label for="s29k2">Classifier window k (tokens per check)</label><input type="range" id="s29k2" name="k" min="1" max="256" step="1" value="32"></div>
+  <div class="calc-out">
+    <div>Full-output post-hoc score — tokens already sent when the score exists<output data-expr="N" data-format="int"></output></div>
+    <div>Interval classifier — worst-case tokens exposed before first check<output data-expr="Math.min(k, N)" data-format="int"></output></div>
+  </div>
+  <p class="calc-note">Formula: a full-output classifier's input is the whole response, so \( T_{\text{exposed}}^{\text{post-hoc}} = N \) regardless of N — the score is late by construction, not by an implementation choice a faster classifier could fix. An interval classifier that checks every \(k\) tokens instead bounds worst-case exposure to \( T_{\text{exposed}}^{\text{interval}} \le k \), independent of the total response length, at the cost of scoring a smaller, less contextualized window each time.</p>
+</div>
+
+<p>Three consequences follow directly, and none of them require speculating beyond what the source states. First, whatever a full-output score is used for once it does arrive, it is necessarily a decision about the <em>next</em> turn or the <em>account</em> — refuse a follow-up, flag for review, restrict the session — not a decision about the content the user already saw, because that content already left the server. Second, a design that wants an actual gate before anything reaches the user has to run a classifier on a much smaller window than "the full output," accepting a weaker, less-contextualized signal in exchange for actually gating in time; the calculator above makes that trade concrete — shrinking the window from N tokens to k tokens is the entire mechanism by which exposure becomes bounded instead of total. Third, this is not a defect in either provider's engineering. It is a direct consequence of the ordering constraint streaming imposes: a classifier whose input is the whole output cannot finish before the whole output exists, and by the time the whole output exists in a streaming response, the client already has all of it.</p>
+<p>This is the structural reason the four-stage design in section 3 does not rely on a full-output score as its only real-time defense. Anthropic's real-time classifiers are described as running "while the main conversation flows naturally"<a class="cite" href="#ref-3">3</a> — concurrently with generation, not after it — which is only a meaningful claim if the classifier's window is small enough to say something before the response is finished. That is the interval-classifier side of the trade-off above, not the full-output side.</p>
+<p>Concretely: for a 2,000-token response, a full-output classifier's exposure is 2,000 tokens no matter how quickly it runs after the last token lands, because \(T_{\text{exposed}}^{\text{post-hoc}} = N = 2000\) by definition — the score's input did not exist until token 2,000 was generated. An interval classifier checking every 50 tokens bounds worst-case exposure to 50 tokens, or 2.5% of the same response, before the first check can act — not because it is a faster implementation of the same classifier, but because it is answering a different, narrower question ("does this 50-token window look like a violation") instead of the full-output question ("does this entire response look like a violation"). Section 1's endpoint, as documented, only answers the second question; nothing in its published contract offers a supported interval-scoring mode over a stream of deltas. That gap is exactly what a design has to fill for itself if it wants real-time coverage on top of a decoupled, full-output-only signal.</p>
+
+<h2 id="four-stage-pipeline">3. The four-stage continuous pipeline</h2>
+<p>Anthropic's own account of its safety design does not describe a moderation endpoint at all. It describes a pipeline with four stages — policy development, training integration, pre-deployment testing, and real-time detection and enforcement — and frames these explicitly as continuous rather than as a single filter applied once: safety work happens before the model is trained, during training, before the model ships, and while it is running in production, with each stage feeding information back to the one before it<a class="cite" href="#ref-3">3</a>. The direct contrast with section 1 is the one Anthropic itself draws: a decoupled scoring endpoint applied around generation versus classifiers and behavior shaping built into training and real-time enforcement as one pipeline<a class="cite" href="#ref-3">3</a>.</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 300" role="img" aria-label="Four-stage safety pipeline in a loop: policy, training, evaluation, enforcement, feeding back into policy">
+      <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f2-arr-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+
+      <g data-step="1">
+        <rect x="30" y="40" width="170" height="80" rx="10" class="d-hl"/>
+        <text x="115" y="70" text-anchor="middle" class="d-bold">1. Policy</text>
+        <text x="115" y="90" text-anchor="middle" class="d-small">Usage Policy, Harm</text>
+        <text x="115" y="106" text-anchor="middle" class="d-small">Framework, red-teaming</text>
+      </g>
+      <g data-step="1"><path d="M200,80 L290,80" class="d-arrow-active" marker-end="url(#f2-arr-active)"/></g>
+
+      <g data-step="2">
+        <rect x="300" y="40" width="170" height="80" rx="10" class="d-block"/>
+        <text x="385" y="70" text-anchor="middle" class="d-text-inv d-bold">2. Training</text>
+        <text x="385" y="90" text-anchor="middle" class="d-text-inv d-small">reward models,</text>
+        <text x="385" y="106" text-anchor="middle" class="d-text-inv d-small">system prompts</text>
+      </g>
+      <g data-step="2-4"><path d="M470,80 L560,80" class="d-arrow" marker-end="url(#f2-arr)"/></g>
+
+      <g data-step="3">
+        <rect x="570" y="40" width="200" height="80" rx="10" class="d-block-2"/>
+        <text x="670" y="65" text-anchor="middle" class="d-text-inv d-bold">3. Pre-deployment</text>
+        <text x="670" y="85" text-anchor="middle" class="d-text-inv d-small">safety, bias, CBRN/cyber</text>
+        <text x="670" y="103" text-anchor="middle" class="d-text-inv d-small">evaluation; system cards</text>
+      </g>
+      <g data-step="3-4"><path d="M670,120 L670,170 L500,170" class="d-arrow" marker-end="url(#f2-arr)"/></g>
+
+      <g data-step="4">
+        <rect x="300" y="150" width="200" height="80" rx="10" class="d-block-accent"/>
+        <text x="400" y="175" text-anchor="middle" class="d-text-inv d-bold">4. Real-time</text>
+        <text x="400" y="195" text-anchor="middle" class="d-text-inv d-small">classifiers, steering,</text>
+        <text x="400" y="213" text-anchor="middle" class="d-text-inv d-small">account actions</text>
+      </g>
+      <g data-step="4">
+        <path d="M300,190 Q160,240 115,190 Q100,160 115,120" class="d-arrow-active d-dashed" marker-end="url(#f2-arr-active)"/>
+        <text x="150" y="260" text-anchor="middle" class="d-small">production monitoring informs the next policy revision</text>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Policy development.</b> The Usage Policy sets what Claude should and should not be used for; the Unified Harm Framework weighs physical, psychological, economic, societal, and individual-autonomy impact; external domain experts stress-test policies before they ship (Policy Vulnerability Testing)<a class="cite" href="#ref-3">3</a>.</li>
+    <li><b>Training integration.</b> The safeguards team and the fine-tuning team decide together which behaviors to build into the model itself, updating reward models or system prompts when a harmful pattern is found, rather than relying only on a downstream filter<a class="cite" href="#ref-3">3</a>.</li>
+    <li><b>Pre-deployment evaluation.</b> Safety, bias, and high-risk-capability (CBRN, cyber) evaluations run before a model family ships, with results published in system cards<a class="cite" href="#ref-3">3</a>.</li>
+    <li><b>Real-time enforcement.</b> Classifiers monitor production traffic while conversations happen, with the power to steer, refuse, or flag an account — and what they observe becomes an input to the next policy revision, closing the loop back to step 1<a class="cite" href="#ref-3">3</a>.</li>
+  </ol>
+</div>
+
+<h3 id="policy-development">3.1 Policy development</h3>
+<p>The Usage Policy is described as the framework defining how Claude should and should not be used, covering areas such as child safety, election integrity, and cybersecurity, with nuanced guidance for regulated domains like healthcare and finance<a class="cite" href="#ref-3">3</a>. The Unified Harm Framework does not attach a number to a piece of content the way a moderation-score category does; it is a qualitative lens across five dimensions — physical, psychological, economic, societal, and individual-autonomy harm — used when deciding whether and how to write a policy in the first place, weighing the likelihood and scale of misuse<a class="cite" href="#ref-3">3</a>. Policy Vulnerability Testing brings in outside domain experts — Anthropic names terrorism, radicalization, child safety, and mental-health specialists — to find gaps before the policy is finalized; the 2024 election cycle is the concrete example given, where a partnership with the Institute for Strategic Dialogue found that Claude could give outdated voting information, leading to banner notifications pointing users to authoritative sources<a class="cite" href="#ref-3">3</a>.</p>
+
+<h3 id="training-integration">3.2 Training integration</h3>
+<p>This is the stage with no equivalent in section 1's design at all: a moderation endpoint scores what a model already produced, but training integration changes what the model produces in the first place. Anthropic describes an "extensive discussion" between the safeguards team and the fine-tuning team about which behaviors to build into the model during training, with two concrete remediation paths when a harmful output pattern is found — "updating our reward models during training or adjusting system prompts for deployed models"<a class="cite" href="#ref-3">3</a>. A named example sharpens what this buys over a hard refusal: a partnership with ThroughLine, an online crisis-support provider, is credited with teaching the model nuance in self-harm and mental-health conversations, explicitly "rather than having Claude refuse to engage completely"<a class="cite" href="#ref-3">3</a> — the training-integration stage can move a behavior from blunt refusal to calibrated response, which a post-hoc score alone cannot do because a score only ever measures what the model already said, not how it says the next thing.</p>
+<p>What training actually teaches, in Anthropic's own framing, is a set of skills rather than a lookup table of banned strings: "Claude develops capabilities to decline assistance with harmful illegal activities, and it recognizes attempts to generate malicious code, create fraudulent content, or plan harmful activities. It learns how to discuss sensitive topics with care, and how to distinguish between these and attempts to cause actual harm"<a class="cite" href="#ref-3">3</a>. The distinction in that last sentence — discussing a sensitive topic versus attempting to cause harm with it — is exactly the discrimination a fixed 13-category score cannot make on its own, because the same words (a description of a self-harm method, say) can appear in a support conversation or in an instruction request, and only conversational context resolves which. A score attached after the fact to one message in isolation does not carry that context forward; a model trained to make the distinction carries it into every subsequent token it generates.</p>
+
+<h3 id="pre-deployment-evaluation">3.3 Pre-deployment evaluation</h3>
+<p>Safety evaluations test the model's adherence to the Usage Policy across "clear usage violations, ambiguous contexts, and extended multi-turn conversations," using the model itself to grade responses with human review as an accuracy check<a class="cite" href="#ref-3">3</a>. Bias evaluations run a comparable methodology for a different failure mode: political-bias testing, for instance, feeds opposing-viewpoint prompts and scores the paired responses for factuality, comprehensiveness, equivalency, and consistency, and separate tests probe whether identity attributes (gender, race, religion) skew responses on topics like jobs and healthcare<a class="cite" href="#ref-3">3</a>. A worked example from Anthropic's account shows this stage catching a problem before launch rather than after it: evaluating the computer-use tool surfaced that it "could augment spam generation and distribution," and in response Anthropic built new detection methods and enforcement options — including the ability to disable the tool for accounts showing signs of misuse — before the tool shipped<a class="cite" href="#ref-3">3</a>. Results across all of this are published in system cards released with each model family<a class="cite" href="#ref-3">3</a>. Section 5 pulls CBRN and cyber-harm testing out of this stage into its own gate, because that testing runs against a different kind of threshold than "does this violate the Usage Policy."</p>
+<p>The computer-use example is worth reading twice, because it is the one place in Anthropic's account where all four stages visibly touch the same problem. Evaluation (stage 3) found the capability could be misused for spam; enforcement (stage 4) shipped both new detection and a tool-disable option before the capability reached general availability; and the fact that this became a documented, generalizable response — "the option to disable the tool for accounts showing signs of misuse"<a class="cite" href="#ref-3">3</a> — rather than a one-off patch is what makes it policy in the stage-1 sense, feeding back into how the next capability gets evaluated before it ships. Figure 2's loop arrow from stage 4 back to stage 1 is this mechanism, not a decorative flourish: what enforcement observes in production becomes an input the next round of policy development has to account for.</p>
+
+<h3 id="real-time-enforcement">3.4 Real-time enforcement</h3>
+<p>The production-facing layer is a set of "prompted or specially fine-tuned Claude models called 'classifiers,' which are designed to detect specific types of policy violations in real-time," with several running simultaneously, each watching for a different harm category "while the main conversation flows naturally"<a class="cite" href="#ref-3">3</a>. Outside the classifier framework entirely, Anthropic also runs hash-based matching of uploaded images against known-CSAM databases on first-party products<a class="cite" href="#ref-3">3</a> — the mechanism section 1's caveat pointed to as what the moderation endpoint is explicitly not designed to do. Section 4 covers what a classifier's detection actually triggers. The stage carries an explicit engineering constraint worth stating here because it shapes every design choice downstream: classifiers "must be able to process trillions of input and output tokens, while simultaneously limiting both compute overhead and enforcement on benign content"<a class="cite" href="#ref-3">3</a> — a real-time classifier is not free, and its cost is paid on every token, flagged or not, which is the same reason section 2's interval classifier trades a smaller window for the ability to run at all.</p>
+<p>This module is about real-time classifiers and pre-deployment evaluation gates, not the retrospective side of Anthropic's monitoring. Anthropic separately runs an aggregate-analysis system, Clio, that clusters large volumes of past conversations into privacy-preserving topic summaries after the fact, for trend-spotting and validating the classifiers described above against a broader sample<a class="cite" href="#ref-4">4</a>. Clio does not gate or score any individual generation — it is a data-governance and observability mechanism operating on stored logs, and Module 30 covers its four-stage extraction/clustering/description/hierarchy pipeline in full.</p>
+
+<h2 id="policy-routing">4. Policy routing: what happens when a classifier fires</h2>
+<p>"Signal, not gate" (section 1.2) begs the question of what a gate would actually do differently, and Anthropic's real-time-enforcement description gives three concrete answers rather than a single binary block/allow. When a classifier detects a policy violation in-flight, the documented outcomes are: let generation continue unchanged, steer it, or stop it — and which one happens depends on the classifier's confidence and the category it fired on, not on a single fixed threshold applied uniformly<a class="cite" href="#ref-3">3</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">A classifier score branching a request to normal generation, steered/restricted generation, or refusal</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    <marker id="f3-arr-hit" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+
+    <rect x="20" y="110" width="150" height="60" rx="8" class="d-block"/>
+    <text x="95" y="135" text-anchor="middle" class="d-text-inv d-bold">Classifier</text>
+    <text x="95" y="153" text-anchor="middle" class="d-text-inv d-small">running mid-conversation</text>
+
+    <path d="M170,140 L230,50" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M170,140 L230,140" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M170,140 L230,230" class="d-arrow-active" marker-end="url(#f3-arr-hit)"/>
+
+    <rect x="230" y="20" width="230" height="60" rx="8" class="d-fill-green-soft d-stroke-green"/>
+    <text x="345" y="45" text-anchor="middle" class="d-bold">No violation detected</text>
+    <text x="345" y="63" text-anchor="middle" class="d-small">normal generation continues</text>
+
+    <rect x="230" y="110" width="230" height="60" rx="8" class="d-fill-amber-soft d-stroke-amber"/>
+    <text x="345" y="135" text-anchor="middle" class="d-bold">Response steering</text>
+    <text x="345" y="153" text-anchor="middle" class="d-small">system prompt amended in-flight<a class="cite" href="#ref-3">3</a></text>
+
+    <rect x="230" y="200" width="230" height="60" rx="8" class="d-fill-red-soft d-stroke-red"/>
+    <text x="345" y="225" text-anchor="middle" class="d-bold">Stop entirely</text>
+    <text x="345" y="243" text-anchor="middle" class="d-small">"narrow set of cases"<a class="cite" href="#ref-3">3</a></text>
+
+    <rect x="500" y="110" width="260" height="60" rx="8" class="d-panel"/>
+    <text x="630" y="135" text-anchor="middle" class="d-small">also: tool disabled for the account</text>
+    <text x="630" y="153" text-anchor="middle" class="d-small">(a restricted capability, same model)<a class="cite" href="#ref-3">3</a></text>
+    <path d="M460,140 L500,140" class="d-arrow" marker-end="url(#f3-arr)"/>
+  </svg>
+  <figcaption><b>Figure 3.</b> Anthropic's documented real-time-enforcement outcomes: unchanged generation, in-flight system-prompt steering, or a hard stop<a class="cite" href="#ref-3">3</a>, plus account-level tool restriction as a fourth, slower-acting lever<a class="cite" href="#ref-3">3</a>. Whether the "steered" branch is implemented as a same-model prompt edit, a disabled capability, or a swap to a separate, more constrained model is an application-level design choice — the two sources this module draws on document the first two, not the third, so the middle branch is drawn as "steered / restricted," not narrowed to a specific mechanism.</figcaption>
+</figure>
+
+<p>The clearest branch is the middle one, because it is the one most people picture wrongly as a blunt refusal. "Response steering" is described precisely: "we can adjust how Claude interprets and responds to certain user prompts in real-time to prevent harmful output. For example, if our classifier detects that a user may be attempting to generate spam or malware, we can automatically add additional instructions to Claude's system prompt to steer its response"<a class="cite" href="#ref-3">3</a>. This is not routing to a different, smaller model — it is the same model, mid-conversation, with an amended system prompt that changes how it interprets the next turn. The hard-stop branch is documented as deliberately rare: "in a narrow set of cases, we can also stop Claude from responding entirely"<a class="cite" href="#ref-3">3</a>, which reads as an escape hatch reserved for the classifier categories where steering is judged insufficient, not the default response to any flagged content.</p>
+<p>A fourth lever operates on a slower timescale than any single turn: account-level action. Beyond the per-message branches, Anthropic "investigate[s] patterns of violations and might take additional measures on the account level, including warnings or, in severe cases, account termination"<a class="cite" href="#ref-3">3</a>, and the computer-use example from section 3.3 shows the same idea applied pre-emptively — disabling a specific tool for accounts that show signs of misuse, rather than steering or stopping every message they send<a class="cite" href="#ref-3">3</a>. This is a real instance of "restrict the request to a narrower capability set," just implemented as a capability toggle on the account rather than a swap to a distinct model — the general pattern the manifest for this module calls "routing to a restricted model" is real, but the concretely documented instance of it here is a restricted <em>tool surface</em> on the same model, not a separate smaller model. A platform that wants the literal "route to a smaller, more constrained model" version of this pattern is free to build it on top of a decoupled signal like section 1's endpoint — nothing in either source rules it out — but it is an application choice layered on the signal, not a mechanism either company documents as its own default.</p>
+<p>Which branch a given category lands on traces back to the Unified Harm Framework from section 3.1: a category judged low-likelihood or low-scale under that framework is a candidate for steering, where the model keeps engaging but with adjusted instructions, while a category judged both high-likelihood and high-severity is a candidate for the rare hard-stop branch instead. There is also a fourth pathway that never touches the branching logic in Figure 3 at all: CSAM hash-matching runs outside the classifier system entirely, comparing uploaded images against databases of known illegal material rather than producing a confidence score for a human-tunable threshold to act on<a class="cite" href="#ref-3">3</a>. That is a deliberate design choice, not an oversight — a probabilistic classifier with tunable steering is the right tool when the question is "how should the model discuss this," but the wrong tool when the question is "is this a specific, already-known illegal file," which has a deterministic yes/no answer that a similarity-score threshold would only add uncertainty to.</p>
+<p>One observability consequence of Figure 3 is worth stating explicitly, because it is the opposite of section 1's transparency. OpenAI's endpoint exposes the raw 0–1 score per category and lets the caller pick where to threshold it (section 1.2) — an outside observer can see exactly how confident the classifier was. Anthropic's real-time classifiers make the continue/steer/stop decision internally; what reaches an outside observer (or a downstream integrator) is the outcome — the conversation proceeded normally, the system prompt changed, or the response stopped — not a published confidence number they can re-threshold themselves. That is a direct consequence of who owns the action: a decoupled score has to be legible to the caller because the caller is the one deciding, while an embedded gate only has to be legible to the platform that operates it.</p>
+
+<h2 id="cbrn-cyber-distinct-gate">5. CBRN and cyber-harm as a distinct pre-deployment gate</h2>
+<p>Section 3.3 named CBRN and cyber-harm testing as part of pre-deployment evaluation and deferred it here, because both labs that ground this module treat it as a structurally different gate from "does this response violate the Usage Policy," not a harder version of the same question. Anthropic states the distinction directly: "for high-risk domains, such as those associated with cyber harm, or chemical, biological, radiological, and nuclear weapons and high-yield explosives (CBRNE), we conduct AI capability uplift testing in partnership with government entities and private industry," defining threat models for what improved capability could enable and testing safeguards against those specific threat models<a class="cite" href="#ref-3">3</a>. The word doing the work is "uplift" — the question is not whether a response reads as harmful, but whether the model's capability meaningfully increases what a bad actor could already do without it.</p>
+<p>OpenAI's Preparedness Framework makes that same distinction into a formal, versioned document, entirely separate from the moderation endpoint in section 1 — the two do not share a threshold, a scoring model, or an owner. Version 2 of the framework tracks three "Tracked Categories" of frontier capability: Biological and Chemical, Cybersecurity, and AI Self-improvement, chosen because each can plausibly enable "severe harm" — defined in the document as death or grave injury of thousands of people, or hundreds of billions of dollars of economic damage<a class="cite" href="#ref-5">5</a>. A capability only qualifies as a Tracked Category if it meets five criteria simultaneously: it must be <em>plausible</em> (a causal pathway to severe harm exists), <em>measurable</em> (an evaluation can track it), <em>severe</em>, <em>net new</em> (not already achievable with 2021-era tools and resources), and <em>instantaneous or irremediable</em> (the harm lands immediately or cannot be walked back)<a class="cite" href="#ref-5">5</a>. The bar is deliberately narrow: "our safety stack addresses a broader spectrum of risks, including many with harms below this severity. In choosing to set a high bar here, we aim to ensure that the most severe risks receive attention commensurate with their magnitude"<a class="cite" href="#ref-5">5</a> — a Tracked Category is not "anything that could go wrong," it is the subset of frontier capability where getting it wrong is catastrophic and hard to reverse. Capabilities that could plausibly cause severe harm but do not yet meet all five criteria are not dropped; they become <em>Research Categories</em>, tracked at lower intensity while threat models and evaluation methods mature enough to promote them<a class="cite" href="#ref-5">5</a>.</p>
+<p>Governance for this gate is internal but structured, not left to any individual researcher's judgment: a cross-functional Safety Advisory Group (SAG) reviews and approves each Tracked Category's threat model and capability thresholds, OpenAI leadership can approve or reject SAG's recommendations, and a board-level Safety and Security Committee oversees the decisions<a class="cite" href="#ref-5">5</a>. That three-layer review sits entirely outside the request path this module otherwise describes — it runs once per model generation, not once per request — which is the clearest possible illustration of how far upstream a Critical-threshold gate sits relative to a per-message moderation score.</p>
+<p>Each Tracked Category carries two named thresholds, and the two thresholds block different things:</p>
+<ul>
+<li><b>High.</b> The model significantly increases an existing risk vector — for the biological/chemical category, "the model can provide meaningful counterfactual assistance... that enables [novices] to create known biological or chemical threats"<a class="cite" href="#ref-5">5</a>. Crossing High requires safeguards against misuse and security controls sufficient to minimize the risk <em>before external deployment</em><a class="cite" href="#ref-5">5</a>.</li>
+<li><b>Critical.</b> The model creates a qualitatively new threat vector with no precedent — for the same category, enabling "an expert to develop a highly dangerous novel threat vector... comparable to a novel CDC Class A biological agent"<a class="cite" href="#ref-5">5</a>. Crossing Critical requires safeguards sufficient <em>during development itself, irrespective of deployment plans</em> — the framework states that until safeguards meeting that standard exist, the response is to "halt further development"<a class="cite" href="#ref-5">5</a>.</li>
+</ul>
+<p>That second bullet is the sentence that makes this gate categorically different from everything else in this module. Every mechanism in sections 1 through 4 acts on a request or a response that has already been generated by an already-trained model. A Critical capability threshold acts on the decision to keep training the model at all — it is a gate on model development, sitting temporally and organizationally upstream of pre-deployment evaluation, real-time enforcement, and certainly upstream of a per-message moderation score.</p>
+<p>The Cybersecurity Tracked Category uses the same two-threshold shape with a different capability description. Its High threshold is crossed when "the model removes existing bottlenecks to scaling malicious cyber operations including by automating end-to-end cyber operations against reasonably hardened targets OR by automating the discovery and exploitation of operationally relevant vulnerabilities"<a class="cite" href="#ref-5">5</a>. The associated risk is framed in systemic terms rather than per-incident terms — removing that bottleneck "may upset the current cyberoffense-cyberdefense balance" by scaling the volume of attacks a fixed population of attackers can mount, not just making any single attack worse<a class="cite" href="#ref-5">5</a>. Crossing High here triggers the same category of obligation as biological/chemical: security controls and misuse safeguards sufficient before external deployment, plus, where the capability compounds with long-range autonomous operation, misalignment safeguards sufficient for large-scale internal deployment as well<a class="cite" href="#ref-5">5</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Two of the Preparedness Framework's three Tracked Categories, their capability-threshold definitions, and what crossing each requires<a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Tracked Category</th><th>Threshold</th><th>Capability that crosses it</th><th>What crossing it requires</th></tr></thead>
+<tbody>
+<tr><td class="row">Biological &amp; Chemical</td><td>High</td><td>Meaningful counterfactual assistance enabling a novice to create known biological/chemical threats</td><td>Security controls + misuse safeguards before external deployment</td></tr>
+<tr><td class="row">Biological &amp; Chemical</td><td>Critical</td><td>Enables an expert to develop a novel threat vector with no precedent (e.g. CDC Class A-comparable agent)</td><td>Halt further development until safeguards exist, regardless of deployment plans</td></tr>
+<tr><td class="row">Cybersecurity</td><td>High</td><td>Automates end-to-end cyberattacks on hardened targets, or automates discovery/exploitation of vulnerabilities</td><td>Security controls + misuse safeguards before external deployment</td></tr>
+</tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f4t"><title id="f4t">General safety evaluation and CBRN/cyber capability-threshold testing as two parallel, differently-gated lanes</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    <marker id="f4-arr-hit" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+
+    <text x="20" y="26" class="d-title">Lane A &#8212; general safety / bias evaluation</text>
+    <rect x="20" y="40" width="220" height="56" rx="8" class="d-block-2"/>
+    <text x="130" y="63" text-anchor="middle" class="d-text-inv d-small">Usage Policy adherence,</text>
+    <text x="130" y="80" text-anchor="middle" class="d-text-inv d-small">political-bias testing<a class="cite" href="#ref-3">3</a></text>
+    <path d="M240,68 L340,68" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+    <text x="20" y="150" class="d-title">Lane B &#8212; CBRN / cyber capability threshold</text>
+    <rect x="20" y="164" width="220" height="56" rx="8" class="d-block-accent"/>
+    <text x="130" y="187" text-anchor="middle" class="d-text-inv d-small">uplift testing vs. threat</text>
+    <text x="130" y="204" text-anchor="middle" class="d-text-inv d-small">models<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-5">5</a></text>
+    <path d="M240,192 L280,192 L280,68 L340,68" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M240,205 L280,205 L280,265" class="d-arrow-active" marker-end="url(#f4-arr-hit)"/>
+    <text x="270" y="222" text-anchor="middle" class="d-small">if Critical</text>
+
+    <rect x="340" y="30" width="220" height="76" rx="8" class="d-panel"/>
+    <text x="450" y="55" text-anchor="middle" class="d-bold d-small">Release decision</text>
+    <text x="450" y="73" text-anchor="middle" class="d-small">ship / hold / revise</text>
+    <text x="450" y="91" text-anchor="middle" class="d-small">policy</text>
+    <rect x="580" y="30" width="180" height="76" rx="8" class="d-surface"/>
+    <text x="670" y="55" text-anchor="middle" class="d-small">gates deployment</text>
+    <text x="670" y="73" text-anchor="middle" class="d-small">(ship / hold)</text>
+    <path d="M560,68 L580,68" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+    <rect x="280" y="230" width="280" height="70" rx="8" class="d-fill-red-soft d-stroke-red"/>
+    <text x="420" y="255" text-anchor="middle" class="d-bold d-small">Critical threshold crossed</text>
+    <text x="420" y="273" text-anchor="middle" class="d-small">halt further development<a class="cite" href="#ref-5">5</a></text>
+    <text x="420" y="291" text-anchor="middle" class="d-small">&#8212; irrespective of deployment plans</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> General safety/bias evaluation gates whether a model <em>ships</em><a class="cite" href="#ref-3">3</a>. CBRN/cyber capability-threshold testing runs alongside it as a separate lane with its own thresholds — crossing High still gates deployment, but crossing Critical gates <em>development itself</em>, before a deployment decision is even on the table<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> The moderation endpoint and the safety pipeline compared on the dimensions that determine what each design can and cannot do<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Dimension</th><th>OpenAI moderation endpoint</th><th>Anthropic four-stage pipeline</th></tr></thead>
+<tbody>
+<tr><td class="row">Unit of design</td><td>One classification call, decoupled from generation</td><td>Policy + training + evaluation + enforcement, one continuous system</td></tr>
+<tr><td class="row">Timing relative to generation</td><td>Always after the scored text is complete</td><td>Before training, before deployment, and concurrently with generation</td></tr>
+<tr><td class="row">Trigger granularity</td><td>13 fixed categories, per-category score 0&#8211;1</td><td>Per-classifier, deployed as many parallel monitors for different harms</td></tr>
+<tr><td class="row">Who decides the action</td><td>The calling application (signal only)</td><td>The platform (steering, refusal, and account action are automatic)</td></tr>
+<tr><td class="row">Can it autonomously stop output?</td><td>No &#8212; no automatic blocking by design<a class="cite" href="#ref-1">1</a></td><td>Yes, in a narrow set of cases<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Distinct capability-risk gate?</td><td>Not part of this endpoint</td><td>Yes &#8212; CBRNE uplift testing, separate thresholds<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-5">5</a></td></tr>
+<tr><td class="row">Published effectiveness metrics</td><td>Not disclosed in this documentation</td><td>Not disclosed in this documentation</td></tr>
+</tbody>
+</table>
+<p>The last row of Table 3 is doing real work despite saying the same thing twice: neither source this module draws on publishes a false-positive rate, a false-negative rate, or a harm-leakage rate for its own design, which is exactly the missing measurement the disagreement section below turns on.</p>
+
+<p>Both companies, in other words, keep this gate organizationally separate from ordinary content moderation, even though they arrived at that separation from different starting architectures. OpenAI's moderation endpoint has no CBRN or cyber-uplift category at all — the taxonomy in Table 1 stops at content categories a human reader would recognize as harmful on inspection, and capability-uplift risk lives in a different document with a different owner and a different decision (deploy or don't; keep training or don't) than "flag this text." Anthropic folds CBRNE testing into the same four-stage narrative as its content classifiers, but still gives it its own threat models, its own government/industry partners, and its own halt-development consequence, distinct from the Usage-Policy-adherence testing next to it in stage 3. The Preparedness Framework and Anthropic's CBRNE testing are not the same document, run by different companies, but Figure 4's shape — general evaluation in one lane, capability-threshold testing in a parallel lane with an earlier possible exit — describes both.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Every mechanism in this module answers to one underlying design question, and the two labs it draws on answer it in opposite directions: should safety moderation be a pre-generation (or concurrent, autonomously-enforced) blocking gate, or a post-generation signal that leaves the action to whoever built on top of the API? Neither side calls the other wrong outright — the sources themselves frame it as a contrast in emphasis<a class="cite" href="#ref-3">3</a> — but the two architectures put the accountability for a harmful output in different places, and that difference has real consequences once streaming (section 2) is in the picture.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Decoupled signal, developer-owned action</h4>
+    <p class="who">OpenAI's moderation endpoint design<a class="cite" href="#ref-1">1</a></p>
+    <p>Moderation is a general-purpose classifier the caller invokes wherever it wants — on a prompt, on a completion, on both — and the endpoint returns a score rather than a decision. The caller writes the policy: what threshold triggers review, what happens to a flagged response, whether a human ever sees it. No single blocking policy is imposed on every application built on the API.</p>
+    <ul class="pros">
+      <li>One endpoint serves arbitrarily different downstream policies without the platform having to encode every caller's risk tolerance.</li>
+      <li>Keeps the platform's moderation logic simple and auditable — a score is a score, not a hidden autonomous decision.</li>
+      <li>Lets a caller build a graduated response (warn, review, refuse) from the continuous 0&#8211;1 score instead of a fixed cutoff.</li>
+    </ul>
+    <ul class="cons">
+      <li>Blocks nothing by default; a caller who never writes the review code gets a score that goes nowhere.</li>
+      <li>Structurally cannot gate a streamed response before it reaches the user, because the score is computed on the complete output (section 2).</li>
+      <li>Pushes the cost of getting moderation right — and the liability if it is wrong — onto every downstream developer individually.</li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Embedded, platform-owned, real-time gate</h4>
+    <p class="who">Anthropic's four-stage pipeline<a class="cite" href="#ref-3">3</a></p>
+    <p>Safety is trained into the model, evaluated before it ships, and enforced by classifiers that run concurrently with generation and can steer or stop it — "in a narrow set of cases" — without waiting for a downstream caller to build anything<a class="cite" href="#ref-3">3</a>. The platform, not the API consumer, owns the enforcement decision.</p>
+    <ul class="pros">
+      <li>Can act while output is still being generated, which is the only way to bound exposure on a streamed response (section 2's interval-classifier argument).</li>
+      <li>Does not depend on every downstream developer correctly wiring a gate — the same protection applies uniformly across every caller.</li>
+      <li>Extends upstream of any single request: training-time shaping and Critical-threshold development gates (section 5) act before a harmful capability exists at all, not just after a harmful message is drafted.</li>
+    </ul>
+    <ul class="cons">
+      <li>Classifiers must run on every token, flagged or not, at a cost Anthropic itself flags as a constraint on "compute overhead and enforcement on benign content"<a class="cite" href="#ref-3">3</a> — real-time coverage is not free.</li>
+      <li>Removes the downstream developer's ability to set their own risk threshold; the platform's judgment call is final for the cases where it autonomously steers or stops.</li>
+      <li>A fast, in-flight classifier necessarily works on a smaller, less-contextualized window than a full-output score, so it trades some accuracy for timing (section 2).</li>
+    </ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The two designs are not actually competing for the same job. A decoupled, developer-owned signal is the right default for a platform whose customers are other businesses that need to encode their own, differing risk policies on top of a shared model — a security research tool and a children's tutoring product cannot share one hard-coded threshold, and forcing them to would be worse for both. An embedded, platform-owned gate with autonomous stop power is the right default for the categories where the platform itself — not its downstream customers — bears the accountability regardless of what any caller built: CSAM, account-level abuse patterns, and anything crossing a Critical capability threshold, where "the caller should have built a filter" is not an acceptable answer if a novel biological threat vector gets uplift. In practice, this is also why Anthropic's own architecture is not purely one design — training integration and CBRN/cyber capability gates sit upstream of any per-message decision, while response steering and account action sit downstream, closer to where OpenAI's signal-based model operates; the "signal vs. gate" question resolves differently at different points in the same pipeline rather than picking one answer for the whole system. What would settle which default is better for ordinary content moderation, as opposed to catastrophic-risk categories, is a matched-traffic measurement neither company publishes: the rate of harmful content that actually reached an end user under each design, at comparable volume and comparable category severity. Absent that number, the choice is architectural — who is accountable, and at what token volume — rather than empirical.</p>
+<p>One condition in this module resolves the question by mechanism rather than by judgment call: whether the product streams. Section 2's derivation is not a matter of preference — a full-output, decoupled signal cannot bound how much content reaches a user before it is scored, for any streamed response, regardless of how the caller wires it up. A product that streams tokens to an end user by default, which describes most modern chat interfaces, cannot get real-time coverage from a decoupled full-output endpoint alone; it needs something that scores a bounded window concurrently with generation, which is section 1's blind spot rather than a configuration a caller forgot to set. A product that does not stream to the end user directly — batch generation, or a human-in-the-loop review step before anything reaches an end user — does not face that constraint, and the decoupled-signal design's flexibility argument applies without the exposure caveat.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>OpenAI. <em>Moderation</em> (API guide). Live documentation. <a href="https://developers.openai.com/api/docs/guides/moderation">https://developers.openai.com/api/docs/guides/moderation</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the 13-category taxonomy and definitions (Table 1), the response JSON shape (flagged/categories/category_scores/category_applied_input_types), the "signal, not automatic block" design guidance, the CSAM-handling caveat, and the omni-moderation model's text/image scope.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>OpenAI. <em>Streaming API responses</em> (Responses API guide). Live documentation. <a href="https://developers.openai.com/api/docs/guides/streaming-responses">https://developers.openai.com/api/docs/guides/streaming-responses</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the exact statement that moderation scores arrive only after the full output and are not included with partial deltas, grounding the tokens-exposed derivation in section 2.</span></li>
+<li id="ref-3"><span class="ref-type">blog</span>Anthropic. <em>Building safeguards for Claude</em>. anthropic.com/news, 2025. <a href="https://www.anthropic.com/news/building-safeguards-for-claude">https://www.anthropic.com/news/building-safeguards-for-claude</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the four-stage pipeline (policy/training/evaluation/enforcement), the Usage Policy and Unified Harm Framework, Policy Vulnerability Testing, training-integration examples (ThroughLine, reward-model/system-prompt updates), pre-deployment safety/bias evaluation methodology and the computer-use tool example, real-time classifier description, response steering, the hard-stop and account-action enforcement branches, and the token-volume/compute-overhead constraint.</span></li>
+<li id="ref-4"><span class="ref-type">blog</span>Anthropic. <em>Clio: Privacy-preserving insights into real-world AI use</em>. anthropic.com/research, 2024. <a href="https://www.anthropic.com/research/clio">https://www.anthropic.com/research/clio</a>. Accessed 2026-09-18. <span class="ref-use">Used for: distinguishing Clio's retrospective, privacy-preserving aggregate-clustering pipeline (Module 30's subject) from this module's real-time classifiers and pre-deployment gates.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>OpenAI. <em>Preparedness Framework</em>. Version 2, last updated 15 April 2025. <a href="https://cdn.openai.com/pdf/18a02b5d-6b67-4cec-ab64-68cdfbddebcd/preparedness-framework-v2.pdf">https://cdn.openai.com/pdf/18a02b5d-6b67-4cec-ab64-68cdfbddebcd/preparedness-framework-v2.pdf</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the Tracked Categories (Biological and Chemical, Cybersecurity, AI Self-improvement, §2.2), the five qualifying criteria (plausible/measurable/severe/net new/instantaneous-or-irremediable, §2.1), the "severe harm" definition, and the High vs. Critical capability-threshold definitions and their deployment-vs-development consequences (§2.2, Table 1).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

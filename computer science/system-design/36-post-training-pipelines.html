@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Post-Training Pipelines: SFT/Preference Data Flows, Evaluation Gates, and Model Registries · System Design</title>
+<meta name="description" content="Llama 3's six rounds of SFT, reward modeling, rejection sampling, and DPO, with PagedAttention's rejection-sampling speedup as the point where inference-serving machinery leaks into a training pipeline.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 36</p>
+  <h1>Post-Training Pipelines: SFT/Preference Data Flows, Evaluation Gates, and Model Registries</h1>
+  <p class="lede">Post-training is not one training loop with different data — it is several distinct models (policy, reward, sometimes reference and critic) wired into a pipeline, run for several rounds, where an inference-serving technique you already know from the GPU-serving side shows up inside the training job itself. This module walks Meta's disclosed Llama 3 recipe end to end, generalizes it to the RLHF dataflow that frameworks like OpenRLHF implement, and states plainly what is not documented well enough to cover.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>5</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-18</span>
+    <span class="chip">Prerequisite: <b>Module 32</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">Llama 3's post-training loop, run six times</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    <marker id="f1-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+
+    <rect x="10" y="130" width="140" height="70" rx="8" class="d-block-muted"/>
+    <text x="80" y="158" text-anchor="middle" class="d-text-inv d-bold">Collected</text>
+    <text x="80" y="175" text-anchor="middle" class="d-text-inv d-bold">prompts</text>
+
+    <path d="M150,165 L188,165" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="192" y="130" width="140" height="70" rx="8" class="d-block"/>
+    <text x="262" y="158" text-anchor="middle" class="d-text-inv d-bold">K generations</text>
+    <text x="262" y="175" text-anchor="middle" class="d-text-inv d-bold">per prompt</text>
+    <text x="262" y="192" text-anchor="middle" class="d-text-inv d-small">K = 10–30</text>
+
+    <path d="M332,165 L370,165" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="374" y="115" width="150" height="100" rx="8" class="d-block-accent"/>
+    <text x="449" y="140" text-anchor="middle" class="d-text-inv d-bold">Reward model</text>
+    <text x="449" y="158" text-anchor="middle" class="d-text-inv d-bold">→ rejection</text>
+    <text x="449" y="176" text-anchor="middle" class="d-text-inv d-bold">sampling</text>
+    <text x="449" y="197" text-anchor="middle" class="d-text-inv d-small">PagedAttention: &gt;2×</text>
+
+    <path d="M524,165 L562,165" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="566" y="130" width="110" height="70" rx="8" class="d-block"/>
+    <text x="621" y="158" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+    <text x="621" y="175" text-anchor="middle" class="d-text-inv d-small">1e-5, 8.5–9K steps</text>
+
+    <path d="M676,165 L698,165" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="702" y="130" width="90" height="70" rx="8" class="d-block"/>
+    <text x="747" y="158" text-anchor="middle" class="d-text-inv d-bold">DPO</text>
+    <text x="747" y="175" text-anchor="middle" class="d-text-inv d-small">β = 0.1</text>
+
+    <path d="M747,130 C747,60 262,60 262,128" class="d-arrow-active" marker-end="url(#f1-arr2)"/>
+    <text x="500" y="45" text-anchor="middle" class="d-mono d-small d-text-light">best checkpoint feeds next round — looped 6×</text>
+
+    <text x="400" y="255" text-anchor="middle" class="d-text-light d-small">Each round: reward model trained fresh on all preference data so far; only the</text>
+    <text x="400" y="272" text-anchor="middle" class="d-text-light d-small">latest batches of preference data are used for DPO, so training data tracks the current policy.</text>
+    <text x="400" y="300" text-anchor="middle" class="d-small d-text-light">Boxes: model or training step. Loop: one post-training round of Llama 3 405B.</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> Llama 3's post-training pipeline: reward model selects one of K=10–30 sampled completions per prompt (rejection sampling, sped up over 2× by adopting PagedAttention), the selected completions become SFT data, and the resulting SFT model is further aligned with DPO. The whole cycle repeats six times, each round's best checkpoint seeding the next round's generations<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="pipeline-not-loop">1. Post-training is a pipeline of models, not one training loop</h2>
+<p>Pre-training, as Modules 32–35 cover it, is architecturally simple even at 16K-GPU scale: one model, one loss, one dataset streaming through a 4D-parallel training loop for months. Post-training breaks that simplicity on purpose. Meta's own description of Llama 3 alignment names it directly: <q>the backbone of our post-training strategy is a reward model and a language model</q><a class="cite" href="#ref-1">1</a> — already two models with different jobs, different training signals, and (as later sections show) different hardware access patterns. The general RLHF formulation used by frameworks like OpenRLHF and verl/HybridFlow adds two more: a reference policy (a frozen copy of the pre-DPO/pre-RL model, used to bound how far the policy can drift) and, in PPO-style setups, a critic that estimates value<a class="cite" href="#ref-2">2</a>.</p>
+<p>That plurality of models is the reason this module exists as a separate unit from Part D's pre-training modules rather than as a coda to them. A pre-training job's failure modes are about keeping one enormous matrix multiplication healthy across thousands of GPUs (Module 35's subject). A post-training pipeline's failure modes are about correctly routing data and weights between several separately-sized models that come in and out of use at different stages, sometimes on the same GPUs and sometimes on different ones. The systems question is no longer just <q>how do I parallelize one model,</q> it is <q>how do I schedule several models that depend on each other's outputs, and how much do I let their hardware footprints overlap.</q></p>
+<p>Two consequences follow immediately, and both recur through the rest of this module. First, whatever inference-serving techniques you already know — continuous batching, paged KV-cache allocation, tensor-parallel serving — become directly relevant the moment one of those models is doing autoregressive generation rather than a forward/backward pass, because generation-for-training and generation-for-serving are the same workload on the GPU. Section 3 is the concrete instance: Meta imported PagedAttention, an inference-serving mechanism, straight into Llama 3's training pipeline. Second, because several models are involved, the natural way to describe the pipeline is not a linear script but a dataflow graph — nodes are model computations, edges are data dependencies, and some of those edges require reshuffling data or weights across a differently-partitioned set of GPUs. Section 4 develops that graph view directly from the HybridFlow/verl paper's own formalism, and Section 5 shows it instantiated on real Ray-managed GPUs in OpenRLHF.</p>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>Llama 3's post-training procedure, as documented, is entirely SFT + rejection sampling + DPO — no PPO, no critic model, no reinforcement-learning rollout loop<a class="cite" href="#ref-1">1</a>. Sections 2–3 describe that pipeline exactly as disclosed. Section 4 then generalizes to the PPO-style, critic-bearing RLHF dataflow that OpenRLHF and verl are built to run, which is a different (and more expensive) pipeline shape than Llama 3 chose. The two are not the same thing, and the module is explicit throughout about which claim belongs to which pipeline.</p></aside>
+<h2 id="llama3-recipe">2. The Llama 3 recipe: six rounds of SFT, reward modeling, rejection sampling, and DPO</h2>
+<p>Llama 3 405B's post-training procedure is the single most detailed account any frontier lab has published of what actually happens after pre-training ends<a class="cite" href="#ref-1">1</a>. Figure 1 is the loop; this section is what happens inside each box, in the order Meta's paper presents it, using its own numbers.</p>
+
+<h3 id="reward-modeling">2.1 Reward modeling: one model, one job, trained on all the data you have</h3>
+<p>The reward model (RM) is trained on top of the pre-trained checkpoint using human-annotated preference data<a class="cite" href="#ref-1">1</a>. The annotation process deploys multiple models simultaneously and samples two responses from two <em>different</em> models for the same prompt, so annotators are comparing across model variants (different data mixes, different alignment recipes) rather than just across samples of one model<a class="cite" href="#ref-1">1</a>. Annotators rate preference strength on a four-level scale — significantly better, better, slightly better, marginally better — and, critically, are then asked to <em>edit</em> the chosen response to improve it further. A meaningful fraction of the preference data therefore ranks three responses per prompt: edited &gt; chosen &gt; rejected, not just two<a class="cite" href="#ref-1">1</a>.</p>
+<p>Table 6 of the paper breaks the resulting preference corpus down by capability: general English is 81.99% of comparisons, coding 6.93%, multilingual 5.19%, reasoning and tools 5.89%, averaging 3.8 turns and 284.0 tokens of response per example<a class="cite" href="#ref-1">1</a>. Two design choices in how this data is used are easy to miss and matter for what follows. First, RM training uses <em>all</em> preference data collected up to the current round, while DPO training (Section 2.3) uses only the latest batches<a class="cite" href="#ref-1">1</a> — the RM's job is calibration across the whole history, the policy's job is to move relative to where it is now. Second, the RM's training objective drops the margin term that Llama 2 used, because Meta observed diminishing returns from it once preference data scaled up<a class="cite" href="#ref-1">1</a> — a small, explicitly-stated instance of a training recipe changing as a direct function of dataset size rather than a fixed hyperparameter choice.</p>
+<p>The paper also documents a between-round process that functions as a quality gate on the annotation pipeline itself, not just on the data: <q>we implement a quality analysis and human evaluation process to rigorously assess the data collected, allowing us to refine our prompts and provide systematic, actionable feedback to annotators. For example, as Llama 3 improves after each round, we increase prompt complexity accordingly to target areas where the model lags</q><a class="cite" href="#ref-1">1</a>. This is the closest thing the paper documents to an "evaluation gate between rounds" — not a benchmark threshold a checkpoint must clear to advance, but a deliberate escalation of task difficulty timed to the model's measured progress, plus direct annotator feedback loops.</p>
+
+<h3 id="rejection-sampling-sft">2.2 Rejection sampling and SFT: the policy learns from its own filtered best-of-K</h3>
+<p>Rejection sampling (RS) is the step that turns the reward model into training data. For each prompt collected during human annotation, Meta samples <b>K</b> — <q>typically between 10 and 30</q><a class="cite" href="#ref-1">1</a> — outputs from the latest chat-model policy, usually the best-performing checkpoint from the previous post-training round or the best checkpoint for a specific capability, and uses the reward model to select the single best candidate<a class="cite" href="#ref-1">1</a>. In later rounds, system prompts are introduced during RS to steer responses toward a desired tone, style, or format, which differs by capability (code responses get instructions about comments and variable naming; general English responses do not)<a class="cite" href="#ref-1">1</a>.</p>
+<p>The selected completions, plus other data sources including synthetic data targeting specific capabilities, become the SFT dataset. SFT itself is a standard cross-entropy loss on target tokens with the loss masked on prompt tokens — the largest models are fine-tuned at a learning rate of \(10^{-5}\) over 8,500 to 9,000 steps, a setting the paper reports works well across rounds and data mixes<a class="cite" href="#ref-1">1</a>. Table 7 gives the resulting SFT corpus composition: general English 52.66%, reasoning and tools 21.19%, code 14.89%, exam-like 8.14%, multilingual 3.01%, and long context just 0.11% of examples but with by far the longest average context (38,135.6 tokens) and response (740.5 tokens)<a class="cite" href="#ref-1">1</a>. Across the whole SFT mix the average is 4.7 turns, 535.7 tokens of context, and 310.4 tokens of final response<a class="cite" href="#ref-1">1</a> — those two context/response numbers reappear in Section 3's derivation.</p>
+<p>A second, model-based quality gate runs on this data before it reaches training: a reward-model-based score (top quartile of RM scores counted as high quality) combined with a Llama-3-as-judge score (a three-point scale for general English on accuracy, instruction-following, and tone; a two-point scale for code on bug identification and intent) — samples are kept if <em>either</em> signal marks them high quality, because the paper found the two signals disagree often enough that the union gives the best recall against an internal test set<a class="cite" href="#ref-1">1</a>. A separate difficulty score (via Instag-style intention tagging and a Llama-based difficulty rating) lets Meta prioritize harder examples, and a semantic-deduplication pass — clustering complete dialogues with RoBERTa, then greedily keeping only examples below a cosine-similarity threshold to anything already kept in that cluster, sorted by quality×difficulty — removes near-duplicate examples<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="dpo-not-ppo">2.3 Direct preference optimization, and why Meta chose it over PPO</h3>
+<p>The SFT model is then further aligned with Direct Preference Optimization (DPO) using the most recent batches of preference data from the best-performing checkpoints of the previous round<a class="cite" href="#ref-1">1</a>. Using only the recent batches, rather than the full accumulated history RM training uses, is deliberate: <q>our training data conforms better to the distribution of the policy model that is being optimized in each round</q><a class="cite" href="#ref-1">1</a> — i.e., DPO wants on-policy preference data, RM wants breadth.</p>
+<p>Meta states the algorithmic choice explicitly rather than leaving it implicit: <q>we also explored on-policy algorithms such as PPO, but found that DPO required less compute for large-scale models and performed better, especially on instruction-following benchmarks like IFEval</q><a class="cite" href="#ref-1">1</a>. Llama 3 uses a learning rate of \(10^{-5}\) and \(\beta = 0.1\), plus two modifications to the standard DPO loss that the paper calls out as necessary at this scale: masking the special formatting tokens (dialog headers and turn-termination tokens) out of both the chosen and rejected sequences in the loss, because leaving them in creates a conflicting objective — the same token appears in both chosen and rejected responses, so the loss simultaneously tries to raise and lower its likelihood, producing tail repetition or premature termination — and adding a negative log-likelihood regularization term on the chosen sequences, scaled by 0.2, to stop DPO training from silently decreasing the chosen response's log-probability while still preferring it over the rejected one<a class="cite" href="#ref-1">1</a>. Finally, Meta averages models obtained from different data or hyperparameter variants at each of the RM, SFT, and DPO stages<a class="cite" href="#ref-1">1</a> — a cheap way of reducing variance across parallel experiments without additional training.</p>
+
+<h3 id="six-rounds">2.4 What "six rounds" buys</h3>
+<p>All of the above — reward modeling, rejection sampling, SFT, DPO — is applied six times<a class="cite" href="#ref-1">1</a>. Each cycle collects new preference annotations and new SFT data, sampling synthetic data from the latest models available at that point<a class="cite" href="#ref-1">1</a>. Mechanically, six rounds means six separate reward models (each trained on a strictly larger preference corpus than the last, since RM training accumulates), six rejection-sampling passes over the growing prompt set (each drawing its K completions from a better policy than the round before), and six DPO updates (each trained on that round's freshest preference batches). The loop in Figure 1 is not a fixed-point iteration in the mathematical sense — there is no convergence criterion stated in the paper — it is a fixed schedule, and the escalating prompt complexity described in Section 2.1 is the mechanism that keeps six rounds from training on a static task.</p>
+<p>What advances a checkpoint from "the best model of round \(n\)" to the seed for round \(n+1\) is, per the paper's own language, "the best performing checkpoint" — selected by whatever combination of benchmark and human evaluation Meta's evaluation suite runs, which the post-training section does not itemize as a named process, tool, or format. Section 7 returns to exactly what that gap means for anyone trying to reproduce this pipeline's operational tooling, not just its algorithm.</p>
+
+<h3 id="capability-experts">2.5 Capability experts: branching a specialist off pre-training</h3>
+<p>Figure 1's "SFT" and "DPO" boxes are drawn as if one model runs the whole loop, and for the general-English majority of the data that is accurate. For specific capabilities — code, multilingual, long context, tool use, math and reasoning — the paper describes branching a dedicated <b>expert</b> model off the main pre-training run and continuing to pre-train it on a domain-heavy data mix before ever entering the SFT/DPO loop, then using that expert two ways: to collect higher-quality human annotations in its domain, and as the model rejection sampling draws its K completions from when the prompt is in that domain<a class="cite" href="#ref-1">1</a>. The code expert, for instance, continues pre-training on a mix that is more than 85% domain-specific data, adds long-context fine-tuning to extend it to 16K tokens on repository-level code, and only then goes through the same SFT/DPO recipe as Section 2 describes, with its data mix targeted at code<a class="cite" href="#ref-1">1</a>. The multilingual expert follows the same pattern, branching off pre-training onto a data mix that is 90% multilingual tokens<a class="cite" href="#ref-1">1</a>. Figure 1's loop, in other words, runs multiple times in parallel on different specialist checkpoints, not once on a single generalist model, and rejection sampling routes each prompt to whichever checkpoint (generalist or the relevant expert) is currently best at that capability.</p>
+<p>The code expert is also the source of the clearest disclosed number on how much of the SFT data in a modern post-training pipeline is synthetic rather than human-annotated. Because training Llama 3 405B on its own unfiltered generations degraded quality, Meta added <b>execution feedback</b> as a correctness signal: generate a problem description, prompt the model for a solution, then check that solution with a parser/linter (static analysis) and with generated, containerized unit tests (dynamic analysis); when a solution fails, feed the parser/linter/test output back to the model and ask it to revise, repeating until the checks pass or the attempt is discarded<a class="cite" href="#ref-1">1</a>. Meta reports that roughly 20% of solutions were initially incorrect but self-corrected through this loop, and that this single execution-feedback pipeline alone produced on the order of one million synthetic coding dialogues, out of a total of over 2.7 million synthetic examples used in SFT for code<a class="cite" href="#ref-1">1</a>. That number is worth holding onto: for at least this one capability, the volume of model-generated, execution-verified training data dwarfs the volume of anything a human annotator produced directly, which is a data-pipeline fact as much as a modeling one — it is the post-training-stage analogue of the quality/dedup filtering Module 32 covers for pre-training corpora, applied instead to a corpus the model itself is generating.</p>
+
+<h2 id="pagedattention-leak">3. Where PagedAttention leaks into the pipeline</h2>
+<p>You already know PagedAttention as the mechanism that turned KV-cache allocation from a contiguous-buffer problem into a virtual-memory problem: fixed-size blocks ("pages"), a page table per sequence, and the ability to share physical pages between sequences via copy-on-write<a class="cite" href="#ref-3">3</a>. What matters for this module is not re-deriving that mechanism — it is what changes when the thing calling it is an offline batch-generation step inside a training pipeline instead of an online multi-tenant inference server.</p>
+<p>Meta states the adoption directly: <q>to increase the efficiency of rejection sampling, we adopt PagedAttention&nbsp;[Kwon et&nbsp;al., 2023]&hellip; together, this leads to a throughput improvement of over 2× during rejection sampling</q><a class="cite" href="#ref-1">1</a>. That much is the headline. The mechanism-level detail is where the leak becomes visible, and it runs in two directions at once: Llama 3 gets one of PagedAttention's benefits for free (page sharing across a prompt's K outputs) and explicitly declines another (its dynamic, memory-pressure-driven scheduling), because rejection sampling is not the workload PagedAttention was designed to serve.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f2t"><title id="f2t">PagedAttention used for online serving versus for Llama 3's rejection sampling</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <text x="195" y="30" text-anchor="middle" class="d-title d-bold">Inference serving (online)</text>
+    <rect x="20" y="45" width="350" height="300" rx="8" class="d-panel"/>
+    <text x="195" y="68" text-anchor="middle" class="d-small d-text-light">N independent prompts, unpredictable output length</text>
+
+    <rect x="45" y="85" width="160" height="30" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="125" y="105" text-anchor="middle" class="d-mono d-small">request A</text>
+    <rect x="45" y="130" width="260" height="30" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="175" y="150" text-anchor="middle" class="d-mono d-small">request B (long)</text>
+    <rect x="45" y="175" width="110" height="30" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="100" y="195" text-anchor="middle" class="d-mono d-small">request C</text>
+    <rect x="45" y="220" width="300" height="30" rx="4" class="d-fill-orange d-dashed"/>
+    <text x="195" y="240" text-anchor="middle" class="d-text-inv d-small">request D — memory full</text>
+
+    <path d="M195,250 L195,285" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="95" y="288" width="200" height="34" rx="6" class="d-block-muted"/>
+    <text x="195" y="309" text-anchor="middle" class="d-text-inv d-small">swap to host memory</text>
+
+    <text x="195" y="335" text-anchor="middle" class="d-small d-text-light">dynamic scheduling · arbitrary output length</text>
+    <text x="195" y="352" text-anchor="middle" class="d-small d-text-light">risk: swap-out under memory pressure</text>
+
+    <text x="605" y="30" text-anchor="middle" class="d-title d-bold">Llama 3 rejection sampling (offline)</text>
+    <rect x="430" y="45" width="350" height="300" rx="8" class="d-panel"/>
+    <text x="605" y="68" text-anchor="middle" class="d-small d-text-light">1 prompt → K = 10–30 outputs, max length fixed at admission</text>
+
+    <rect x="455" y="85" width="300" height="34" rx="4" class="d-fill-cyan-soft d-stroke-cyan"/>
+    <text x="605" y="107" text-anchor="middle" class="d-mono d-small">shared prompt pages (written once)</text>
+
+    <path d="M525,119 L525,150" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M575,119 L575,150" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M635,119 L635,150" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M685,119 L685,150" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+    <rect x="465" y="155" width="70" height="90" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="500" y="200" text-anchor="middle" class="d-mono d-small">k=1</text>
+    <rect x="545" y="155" width="70" height="140" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="580" y="225" text-anchor="middle" class="d-mono d-small">k=2</text>
+    <rect x="625" y="155" width="70" height="60" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="660" y="185" text-anchor="middle" class="d-mono d-small">k=3</text>
+    <rect x="705" y="155" width="55" height="110" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="732" y="210" text-anchor="middle" class="d-mono d-small">k=K</text>
+
+    <text x="605" y="335" text-anchor="middle" class="d-small d-text-light">static admission control · no swap</text>
+    <text x="605" y="352" text-anchor="middle" class="d-small d-text-light">prompt pages shared across all K completions</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> The same mechanism, two workloads. Online serving lets PagedAttention schedule requests dynamically and swap KV pages to host memory when GPU memory runs out; Llama 3's rejection-sampling use instead fixes a maximum output length at admission time to eliminate swap risk entirely, and relies on PagedAttention's page-sharing to give the K completions of one prompt a single copy of that prompt's KV pages<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>The admission-control choice is the more interesting half of the story, because it is Meta explicitly <em>declining</em> one of PagedAttention's headline features. The paper is specific about why: <q>PagedAttention enhances memory efficiency through dynamic key-value cache allocation. It supports arbitrary output lengths by dynamically scheduling requests based on the current cache capacity. Unfortunately, this carries the risk of swap-out when running out of memory. To eliminate such swap overhead, we define a maximum output length and perform a request only if sufficient memory is available to fit an output with that length</q><a class="cite" href="#ref-1">1</a>. An online server cannot know in advance how long a generation will run, so it must tolerate the possibility of swap or preemption to keep serving new requests under an SLO. Rejection sampling is an offline batch job with no per-request latency target and a data-dependent but boundable output length, so trading away the elasticity that swap buys you, in exchange for a predictable admission decision that never touches host memory, is a straightforward win. This is the reverse of the usual direction of technology transfer implied by "inference technique leaks into training" — Meta did not just reuse PagedAttention, it re-specified the admission policy around it for a different workload shape.</p>
+<p>The other half — <q>PagedAttention also enables us to share the key-value cache pages for a prompt across all corresponding outputs</q><a class="cite" href="#ref-1">1</a> — is the more familiar transfer, and it is a better fit for rejection sampling than for typical multi-tenant serving. In general online serving, most concurrent requests come from different users with unrelated prompts, so there is little prompt-level KV to share unless the platform layers on an explicit prefix-cache (Module 28's subject). Rejection sampling manufactures the ideal case for prompt-page sharing by construction: every one of the K=10–30 samples for a given round starts from the identical prompt, so the entire prompt-length KV cache can be written once and referenced by all K generations, with only the diverging, per-sample continuation tokens needing their own pages.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> PagedAttention's default (serving) design point versus how Llama 3 configures it for rejection sampling<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Dimension</th><th>Generic inference serving</th><th>Llama 3 rejection sampling</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Scheduling</td><td>Dynamic, based on current cache capacity</td><td>Static admission decision at request time</td></tr>
+    <tr><td class="row">Output length</td><td>Arbitrary, unknown in advance</td><td>Capped at a fixed maximum, checked before admission</td></tr>
+    <tr><td class="row">Memory pressure response</td><td>Swap-out to host memory</td><td>Swap disabled by construction — never admitted if it can't fit</td></tr>
+    <tr><td class="row">KV page sharing</td><td>Only with explicit cross-request prefix caching</td><td>Automatic: K samples share one prompt's pages by default</td></tr>
+    <tr><td class="row">Objective</td><td>Tail-latency-bounded throughput under an SLO</td><td>Maximum aggregate throughput, no latency target</td></tr>
+  </tbody>
+</table>
+
+<p>How much of the reported &gt;2× throughput improvement is plausibly attributable to page-sharing alone, as opposed to PagedAttention's other standard benefit (eliminating the internal fragmentation that a contiguous, pre-reserved KV buffer forces on every request regardless of workload)? Meta does not decompose the number, but its own disclosed data statistics make a bounding estimate possible.</p>
+
+<details class="more"><summary>Derivation: memory saved by prompt-page sharing across K rejection samples</summary>
+<p>Model the KV-cache footprint of one prompt's rejection-sampling batch in units of tokens (pages are a fixed number of tokens each, so token-count is a fair proxy for page-count). Let \(P\) be the prompt/context length shared by all K samples and \(O\) be the length of one sampled completion. Without page sharing — K independent, non-paged KV caches, one per sample — the batch needs:</p>
+$$M_{\text{naive}} = K \cdot (P + O)$$
+<p>With PagedAttention's prompt-page sharing, the \(P\)-token prefix is stored once and referenced by all K samples, so only the K diverging completions need their own pages:</p>
+$$M_{\text{shared}} = P + K \cdot O$$
+<p>The fractional memory saved is:</p>
+$$1 - \frac{M_{\text{shared}}}{M_{\text{naive}}} = 1 - \frac{P + K \cdot O}{K \cdot (P + O)}$$
+<p>Llama 3's SFT-data statistics (Table 7 of the paper) report an average context length of 535.7 tokens and an average final-response length of 310.4 tokens across the full SFT mix<a class="cite" href="#ref-1">1</a> — the SFT data is exactly the output of rejection sampling, so these are reasonable stand-ins for \(P\) and \(O\). Taking \(K = 20\), the midpoint of the paper's stated 10–30 range<a class="cite" href="#ref-1">1</a>:</p>
+$$M_{\text{naive}} = 20 \times (535.7 + 310.4) = 16{,}922 \text{ token-slots}$$
+$$M_{\text{shared}} = 535.7 + 20 \times 310.4 = 6{,}743.7 \text{ token-slots}$$
+$$1 - \frac{6{,}743.7}{16{,}922} \approx 60\%$$
+<p>A roughly 60% reduction in per-prompt KV footprint, at a fixed GPU memory budget, translates into a proportionally larger schedulable batch — and in a decode-heavy, memory-capacity-bound regime, throughput scales close to linearly with the number of sequences you can hold concurrently, which is the first-order reason a large memory saving shows up as a large throughput gain. This estimate lines up well with an independent data point: OpenRLHF's own citation of PagedAttention's benefit for the structurally identical "parallel sampling" case (multiple outputs per prompt) reports memory-usage reduction of <q>up to 55%</q><a class="cite" href="#ref-4">4</a>. Page-sharing alone is therefore plausibly responsible for most of the reported &gt;2× rejection-sampling speedup, with fragmentation elimination (the benefit PagedAttention provides on any workload, shared prompts or not) contributing the remainder.</p>
+</details>
+<h2 id="rlhf-dag">4. The general RLHF dataflow: a DAG of models, not a DAG of layers</h2>
+<p>Llama 3's pipeline (Sections 2–3) has no critic and no PPO rollout loop — DPO's whole appeal, per Meta's own statement, is that it does not need either. Most open-source RL post-training frameworks are built for the more general case that Llama 3 deliberately avoided: PPO-style RLHF, with an actor, a critic, a frozen reference policy, and a reward model all active in the same training step. The HybridFlow/verl paper's formalism for that general case is the right level of abstraction for describing what any RLHF framework — OpenRLHF included — actually has to schedule<a class="cite" href="#ref-2">2</a>.</p>
+<p>The formalism: <q>traditional RL can be modeled as a dataflow&nbsp;&hellip; a directed acyclic graph (DAG): each node in the RL dataflow represents computation of a neural network&nbsp;&hellip; each edge denotes data dependency between NN computations&nbsp;&hellip; RLHF dataflow is more complex, with more complicated models involved (e.g., LLMs for the actor/critic/reference/reward models), each running distinct computation, and more diverse data dependencies among them&nbsp;&hellip; the edge represents data resharding, which is often a many-to-many multicast</q><a class="cite" href="#ref-2">2</a>. Two words in that quote carry the whole systems argument: "resharding" and "multicast." Each of the four models is itself a distributed program (its own tensor/pipeline/data-parallel layout, chosen independently because each model has a different size and workload), so an edge in the DAG is not a simple tensor copy — it is a full re-partitioning of data (or, at the actor-generation boundary specifically, of weights) from one parallelism layout to a different one, fanned out to however many ranks the destination model is sharded across<a class="cite" href="#ref-2">2</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f3t"><title id="f3t">RLHF dataflow as a DAG of four models across three stages</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    <marker id="f3-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+
+    <text x="95" y="28" text-anchor="middle" class="d-title d-bold">1. Generation</text>
+    <text x="365" y="28" text-anchor="middle" class="d-title d-bold">2. Preparation</text>
+    <text x="680" y="28" text-anchor="middle" class="d-title d-bold">3. Training</text>
+
+    <rect x="20" y="150" width="150" height="60" rx="8" class="d-block"/>
+    <text x="95" y="175" text-anchor="middle" class="d-text-inv d-bold">Actor</text>
+    <text x="95" y="192" text-anchor="middle" class="d-text-inv d-small">generate responses</text>
+
+    <path d="M170,175 C230,175 230,85 280,85" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M170,180 L280,180" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M170,185 C230,185 230,275 280,275" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <text x="225" y="130" text-anchor="middle" class="d-mono d-small d-text-light">many-to-many</text>
+    <text x="225" y="145" text-anchor="middle" class="d-mono d-small d-text-light">resharding</text>
+
+    <rect x="280" y="60" width="170" height="50" rx="8" class="d-block-2"/>
+    <text x="365" y="80" text-anchor="middle" class="d-text-inv d-bold">Reference</text>
+    <text x="365" y="97" text-anchor="middle" class="d-text-inv d-small">ref. log-probs</text>
+
+    <rect x="280" y="155" width="170" height="50" rx="8" class="d-block-2"/>
+    <text x="365" y="175" text-anchor="middle" class="d-text-inv d-bold">Reward model</text>
+    <text x="365" y="192" text-anchor="middle" class="d-text-inv d-small">score response</text>
+
+    <rect x="280" y="250" width="170" height="50" rx="8" class="d-block-2"/>
+    <text x="365" y="270" text-anchor="middle" class="d-text-inv d-bold">Critic</text>
+    <text x="365" y="287" text-anchor="middle" class="d-text-inv d-small">value estimate</text>
+
+    <path d="M450,85 C520,85 520,130 600,130" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M450,180 L600,150" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M450,275 C520,275 520,150 600,150" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M450,275 L600,245" class="d-arrow" marker-end="url(#f3-arr)"/>
+
+    <rect x="604" y="105" width="160" height="50" rx="8" class="d-block-accent"/>
+    <text x="684" y="125" text-anchor="middle" class="d-text-inv d-bold">Actor training</text>
+    <text x="684" y="142" text-anchor="middle" class="d-text-inv d-small">policy gradient</text>
+
+    <rect x="604" y="220" width="160" height="50" rx="8" class="d-block-accent"/>
+    <text x="684" y="240" text-anchor="middle" class="d-text-inv d-bold">Critic training</text>
+    <text x="684" y="257" text-anchor="middle" class="d-text-inv d-small">value regression</text>
+
+    <path d="M684,105 C684,50 130,50 95,148" class="d-arrow-active" marker-end="url(#f3-arr2)"/>
+    <text x="400" y="45" text-anchor="middle" class="d-mono d-small d-text-light">updated actor weights, resharded again, next iteration</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The general PPO-style RLHF dataflow as a DAG: four differently-parallelized models, three stages, and many-to-many resharding edges wherever data crosses from one model's partition layout to another's<a class="cite" href="#ref-2">2</a>. Llama 3's actual pipeline (Sections 2–3) is the special case with no critic and no PPO update — DPO trains the actor directly against static preference pairs.</figcaption>
+</figure>
+
+<p>This is exactly why HybridFlow's own paper frames the systems problem as a tension between two paradigms it is trying to reconcile: a <em>single-controller</em> paradigm, where one process holds the whole DAG and dispatches to every model, gives you flexibility to change any one node's data dependencies without touching the others, but pays a large dispatch-overhead tax when the models being dispatched to are themselves billion-parameter distributed programs; a <em>multi-controller</em> paradigm, where each model's own distributed process group drives its own execution, is efficient for the intra-node computation but makes the dataflow rigid — changing how one node's output is consumed requires changing every node downstream of it<a class="cite" href="#ref-2">2</a>. That is not an abstract framework-design concern; it is the direct consequence of Figure 3's structure. A four-node DAG with many-to-many resharding edges has to be coordinated by <em>something</em>, and whatever coordinates it inherits either the flexibility problem or the dispatch-overhead problem depending on which paradigm it picks.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Llama 3's DPO-based pipeline versus the general PPO-style RLHF dataflow it deliberately avoided<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th>Dimension</th><th>DPO-style (Llama 3)</th><th>PPO-style (general RLHF DAG)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Models needed per training step</td><td>Policy only (reward model runs earlier, offline, to build the preference/SFT data)</td><td>Actor, critic, reference, and reward model, every step</td></tr>
+    <tr><td class="row">Backward passes per step</td><td>One (policy)</td><td>Two (actor and critic)</td></tr>
+    <tr><td class="row">Resharding edges per step</td><td>None at DPO-update time (data is static preference pairs)</td><td>Many-to-many, every stage-1→stage-2 and stage-2→stage-3 transition</td></tr>
+    <tr><td class="row">Data freshness requirement</td><td>Latest preference <em>batches</em>, not strictly step-by-step on-policy</td><td>Strictly on-policy per step (generation and update interleaved)</td></tr>
+    <tr><td class="row">Meta's stated reason for choosing</td><td>&mdash;</td><td>"required less compute&hellip; and performed better" going the other way<a class="cite" href="#ref-1">1</a></td></tr>
+  </tbody>
+</table>
+
+<p>OpenRLHF, verl, and the other Ray-based RL frameworks are built to run the right-hand column of Table 2 — the harder, four-model case — because their target use cases (RLVR reasoning training with a programmatic reward, multi-turn agent RL) do not have a static, offline reward model that a DPO-style pipeline can lean on the way Llama 3's helpfulness/safety alignment does. Section 5 shows what that DAG looks like once it is mapped onto actual GPUs.</p>
+<h2 id="openrlhf-gpus">5. OpenRLHF: the DAG on real GPUs</h2>
+<p>OpenRLHF is a direct, concrete instance of Figure 3's DAG, and its own description of itself is the plainest available: <q>OpenRLHF leverages Ray for efficient distributed scheduling. It separates the Actor, Reward, Reference, and Critic models across different GPUs, enabling scalable training for models up to 70B+ parameters</q><a class="cite" href="#ref-5">5</a>. Each of Figure 3's four nodes gets its own dedicated pool of GPUs; Ray is the layer that knows about all four pools and moves data (and, at the actor, weights) between them, which is exactly the "coordinator for the many-to-many resharding edges" role Section 4 argued something has to play.</p>
+<p>Within that per-role placement, OpenRLHF's architecture (its own Figure 1) defines two engine roles that cut across the four model roles: a <b>rollout engine</b>, built on vLLM, responsible for response generation; and a <b>ZeRO engine</b>, built on DeepSpeed, which computes log-probabilities (for the reference and, where needed, the actor) and runs training (for the actor and critic)<a class="cite" href="#ref-4">4</a>. The actor is the one model that needs both: it generates via the rollout engine and trains via the ZeRO engine, so its GPU pool runs both pieces of software, while the reward and reference models — which only ever need a forward pass, never a gradient — only need the ZeRO engine's inference path.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f4t"><title id="f4t">OpenRLHF's GPU layout: four model roles on separate GPU groups, coordinated by Ray</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="40" y="20" width="720" height="50" rx="8" class="d-block"/>
+    <text x="400" y="40" text-anchor="middle" class="d-text-inv d-bold">Ray</text>
+    <text x="400" y="58" text-anchor="middle" class="d-text-inv d-small">distributed scheduler &amp; controller — data and control</text>
+
+    <path d="M127,70 L127,105" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M307,70 L307,105" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M487,70 L487,105" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M662,70 L662,105" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+    <rect x="45" y="108" width="165" height="160" rx="8" class="d-panel"/>
+    <text x="127" y="128" text-anchor="middle" class="d-title d-bold">Actor GPUs</text>
+    <rect x="55" y="138" width="145" height="40" rx="4" class="d-fill-cyan-soft d-stroke-cyan"/>
+    <text x="127" y="163" text-anchor="middle" class="d-mono d-small">vLLM — rollout</text>
+    <rect x="55" y="190" width="145" height="40" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="127" y="215" text-anchor="middle" class="d-mono d-small">DeepSpeed — train</text>
+    <path d="M127,190 L127,178" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <text x="127" y="248" text-anchor="middle" class="d-small d-text-light">weight sync each round</text>
+
+    <rect x="225" y="108" width="165" height="160" rx="8" class="d-panel"/>
+    <text x="307" y="128" text-anchor="middle" class="d-title d-bold">Critic GPUs</text>
+    <rect x="235" y="160" width="145" height="60" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="307" y="195" text-anchor="middle" class="d-mono d-small">DeepSpeed — train</text>
+
+    <rect x="405" y="108" width="165" height="160" rx="8" class="d-panel"/>
+    <text x="487" y="128" text-anchor="middle" class="d-title d-bold">Reference GPUs</text>
+    <rect x="415" y="160" width="145" height="60" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="487" y="195" text-anchor="middle" class="d-mono d-small">forward pass only</text>
+
+    <rect x="585" y="108" width="150" height="160" rx="8" class="d-panel"/>
+    <text x="662" y="128" text-anchor="middle" class="d-title d-bold">Reward GPUs</text>
+    <rect x="595" y="160" width="130" height="60" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="662" y="195" text-anchor="middle" class="d-mono d-small">forward pass only</text>
+
+    <text x="400" y="300" text-anchor="middle" class="d-small d-text-light">Ray also carries the resharding edges of Figure 3 between these four pools;</text>
+    <text x="400" y="317" text-anchor="middle" class="d-small d-text-light">the Actor's own vLLM↔DeepSpeed weight-sync is Module 37's central problem.</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> OpenRLHF assigns each of Figure 3's four model roles a dedicated GPU pool and uses Ray to coordinate data and control across them<a class="cite" href="#ref-5">5</a>. Only the actor's pool runs both engines, since it is the only model that both generates and trains<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<p>PagedAttention reappears at this layer, not just inside Llama 3's bespoke rejection-sampling code path. OpenRLHF's own paper describes the same mechanism, in almost the same words as Section 3's Llama 3 quote: PagedAttention <q>significantly reduces memory waste to less than 4%&hellip; and also supports efficient memory sharing for advanced sampling methods, such as parallel sampling and beam search, reducing memory usage by up to 55%</q><a class="cite" href="#ref-4">4</a>. That is the second independent place an inference-serving KV-cache mechanism shows up load-bearing inside a training system — once inside Meta's own hand-rolled rejection-sampling loop, once inside a general-purpose open-source RL framework's rollout engine — which is a reasonable signal that this is not a one-off trick but the default way any framework doing repeated same-prompt sampling inside a training loop now handles its KV cache.</p>
+<p>OpenRLHF also documents an <em>asynchronous</em> dataflow layer on top of the per-role GPU split: <q>rollout engines, actor engines, and remote engines operate independently and communicate via message passing, enabling immediate processing as soon as data becomes available&hellip; this design reduces idle time, improves pipeline efficiency, and enhances scalability and flexibility across large distributed GPU clusters</q><a class="cite" href="#ref-4">4</a>. That single sentence is the seed of Module 37's entire subject — if generation and training can proceed independently and only exchange messages when data is ready, the question of exactly how stale the weights the rollout engine is generating from are allowed to get, before the trainer's gradient update is computed on data that no longer matches the current policy, becomes the framework's central design decision rather than an afterthought.</p>
+<p>On raw numbers, OpenRLHF's own reported comparisons (against a fixed hardware and hyperparameter setup, not against every framework the field has produced) show a 3.6× per-epoch speedup over DeepSpeed-Chat running PPO on 1,024 prompts (236.8&nbsp;s vs.&nbsp;855.09&nbsp;s) and a 3.1× speedup over TRL running GRPO on GSM8K (1,657&nbsp;s vs.&nbsp;5,189&nbsp;s), attributed to the combination of vLLM-accelerated generation and Ray-based distributed execution<a class="cite" href="#ref-4">4</a>. Against verl specifically, in a long-chain-of-thought setting, the reported speedup ranges from 1.22× at 1.5B parameters to 1.68× at 14B parameters<a class="cite" href="#ref-4">4</a>. These numbers describe one framework's benchmark of itself against three others under one set of conditions; a systematic multi-framework comparison, including verl, SkyRL, AReaL, slime, and NeMo-RL, is a different module's job, not this one's.</p>
+<h2 id="eighty-twenty">6. The 80/20 problem: generation dominates wall-clock time</h2>
+<p>Every section so far has been about correctness — which model produces what, in what order, moved between which GPUs. This section is about where the clock time actually goes once the DAG is running, because that number is what determines whether synchronous, step-locked execution (generate, then train, then generate again, waiting on each other every round) is an acceptable design or a bottleneck worth architecting around.</p>
+<p>OpenRLHF states the number plainly: <q>RLHF training spends 80% of the time on sample generation</q><a class="cite" href="#ref-5">5</a>. The asymmetry is the same one you already know from serving: generation is autoregressive decode, one token per sequence per forward pass, memory-bandwidth-bound and comparatively poor at using GPU compute; a training step, whether it is DPO's single backward pass or PPO's actor-plus-critic pair, is a fully batched forward-and-backward over already-known sequences, which is exactly the regime GPUs are best at. Running K=10–30 samples per prompt (Section 2.2) multiplies the decode-bound side of that asymmetry before a single gradient is computed.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 280" role="img" aria-labelledby="f5t"><title id="f5t">Bar chart of RLHF wall-clock time spent on generation versus the gradient update</title>
+    <line x1="70" y1="30" x2="70" y2="220" class="d-axis"/>
+    <line x1="70" y1="220" x2="760" y2="220" class="d-axis"/>
+    <line x1="70" y1="184" x2="760" y2="184" class="d-grid"/>
+    <line x1="70" y1="148" x2="760" y2="148" class="d-grid"/>
+    <line x1="70" y1="112" x2="760" y2="112" class="d-grid"/>
+    <line x1="70" y1="76" x2="760" y2="76" class="d-grid"/>
+    <text x="60" y="224" text-anchor="end" class="d-small d-text-light">0%</text>
+    <text x="60" y="152" text-anchor="end" class="d-small d-text-light">50%</text>
+    <text x="60" y="80" text-anchor="end" class="d-small d-text-light">100%</text>
+    <text x="30" y="20" class="d-small d-text-light">% of wall-clock time</text>
+
+    <rect x="170" y="76" width="140" height="144" class="d-fill-orange"/>
+    <text x="240" y="66" text-anchor="middle" class="d-mono d-small d-bold">80%</text>
+    <text x="240" y="240" text-anchor="middle" class="d-small">Sample generation</text>
+
+    <rect x="480" y="184" width="140" height="36" class="d-fill-blue"/>
+    <text x="550" y="174" text-anchor="middle" class="d-mono d-small d-bold">20%</text>
+    <text x="550" y="240" text-anchor="middle" class="d-small">Gradient update</text>
+
+    <line x1="70" y1="58" x2="760" y2="58" class="d-dashed d-stroke-red"/>
+    <text x="620" y="52" text-anchor="middle" class="d-mono d-small d-text-light">&gt;90% in long-CoT RLVR settings</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Sample generation accounts for roughly 80% of RLHF wall-clock time against 20% for the gradient update, per OpenRLHF's own framing<a class="cite" href="#ref-5">5</a>. OpenRLHF's later paper revises this upward, reporting the inference phase at over 90% of total runtime specifically in long-chain-of-thought RLVR training, where generation lengths grow substantially<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<p>That imbalance is the whole justification for not treating Figure 3's DAG as a lock-step pipeline. If four out of every five seconds of wall-clock time are spent waiting on the slowest model to finish decoding, and the fifth second is a comparatively fast, highly-parallel training step, then a scheduler that insists on strict alternation — generate a full batch, wait, train on it, wait, generate the next batch — is spending the majority of its time with the training GPUs sitting idle. Every framework's asynchronous-dataflow feature (Section 5's message-passing description of OpenRLHF's rollout/actor/remote engines is one instance) exists specifically to let the fast side of that 80/20 split stop waiting on the slow side. The moment you decouple them, though, you introduce the question that Module 37 addresses directly: the trainer may now be updating on rollouts generated by a policy that is one or more gradient steps stale, and how much staleness is tolerable before it corrupts the update is not a question this module's Llama 3/OpenRLHF pipelines had to answer, because both keep generation and training tightly coupled within a round.</p>
+<h2 id="registry-gap">7. What this module does not cover: model registries and experiment tracking</h2>
+<p>Figure 1's loop-back arrow — "best checkpoint feeds next round" — hides an operational question this module cannot answer from its source map: what system decides which checkpoint is best, where that checkpoint is stored with a stable identifier, and how six rounds of reward models, SFT models, and DPO models (plus whatever averaged variants Section 2.3 produces) are tracked well enough that a specific one can be reproduced or rolled back. Llama 3's paper names the inputs to that decision — benchmark evaluation, the quality-analysis/human-evaluation process described in Section 2.1, capability-specific checkpoint selection<a class="cite" href="#ref-1">1</a> — but does not name a registry system, a checkpoint-naming scheme, or an experiment-tracking tool anywhere in its post-training section. That silence is the honest answer: Meta's release framing documents the algorithm and the data in extraordinary detail and says nothing publicly about the MLOps tooling wrapped around it.</p>
+<p>This module does not fill that gap with a generic model-registry/experiment-tracking primer (MLflow-style registries, W&amp;B-style run tracking, artifact lineage graphs) because doing so would misrepresent a real absence in the source material as if it were something Llama 3's own disclosure covers. If your work requires that tooling, it is a separate, well-documented subject in its own right — just not one this module's grounding extends to. What can be stated with the paper's own words is the shape of the decision the tooling would need to support: pick, at the end of each round, "the best performing checkpoint from the previous post-training iteration, or the best performing checkpoint for a particular capability"<a class="cite" href="#ref-1">1</a> — a per-capability, not globally single, notion of "best," which is itself a nontrivial requirement for whatever registry a reproduction of this pipeline would need.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Two design questions run through Sections 2–5, and the sources in this module's map answer them differently depending on which workload they were built for: whether DPO or PPO-style actor-critic RL is the right algorithm for a post-training round, and whether a model's GPU footprint should be a dedicated pool or shared with other roles.</p>
+<div class="positions">
+  <article class="position">
+    <h4>DPO is the right choice once you have a good preference signal</h4>
+    <p class="who">Meta, for Llama 3 405B's post-training<a class="cite" href="#ref-1">1</a></p>
+    <p>Meta tried PPO first and switched: DPO needed less compute at 405B scale and outperformed PPO specifically on instruction-following benchmarks like IFEval. It also collapses Figure 3's four-node DAG down to one model at update time — no critic, no per-step rollout, no reference-policy forward pass during training (the reference comparison is implicit in the DPO loss's log-ratio term, computed against the same preference pairs, not a live model).</p>
+    <ul class="pros"><li>Lower compute per round; one backward pass, not two</li><li>No resharding edges at update time; simpler dataflow than Figure 3's general case</li><li>Reported better on instruction-following (IFEval) at this scale<a class="cite" href="#ref-1">1</a></li></ul>
+    <ul class="cons"><li>Needs an offline, pairwise preference signal built in advance (Sections 2.1–2.2's whole annotation-plus-rejection-sampling apparatus)</li><li>Cannot directly express a programmatic, per-example verifiable reward — only relative preference between two fixed responses</li></ul>
+  </article>
+  <article class="position">
+    <h4>PPO-style RL stays dominant once the reward is verifiable, not a learned preference</h4>
+    <p class="who">RLVR-focused frameworks<a class="cite" href="#ref-4">4</a></p>
+    <p>OpenRLHF's own related-work framing draws the line explicitly: reinforcement learning with verifiable rewards (RLVR) uses automatically-checkable signals — mathematical verification, code execution — rather than a static preference model, and <q>PPO remains dominant due to its stability</q> in that regime even as DPO is noted as more compute-efficient elsewhere<a class="cite" href="#ref-4">4</a>. A programmatic reward is available every round without a separate annotation-and-rejection-sampling pipeline, which is precisely the case DPO's design does not target.</p>
+    <ul class="pros"><li>Reward signal can be recomputed fresh every rollout, no offline preference corpus required</li><li>Online generation-and-update loop naturally incorporates new rollouts as the policy improves</li><li>Critic's value baseline handles credit assignment across long reasoning traces</li></ul>
+    <ul class="cons"><li>Four models resident every step (Table 2); higher GPU footprint and resharding overhead</li><li>Historically less stable than DPO; needs careful reward and KL-penalty tuning</li></ul>
+  </article>
+  <article class="position">
+    <h4>Dedicated GPU pool per model role</h4>
+    <p class="who">OpenRLHF's Ray-based design<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-4">4</a></p>
+    <p>Give the actor, critic, reference, and reward models each their own GPUs and let Ray move data between the pools. Each role can be scaled independently to match its own bottleneck, and debugging is straightforward because a GPU's role is fixed for the run's duration. OpenRLHF's own usability comparison reports this design at 8,523 lines of code, fewer than TRL or verl<a class="cite" href="#ref-4">4</a>.</p>
+    <ul class="pros"><li>Simple to reason about; independent scaling per role</li><li>Fault domains stay separated — a crash in one role's pool doesn't take down another's</li></ul>
+    <ul class="cons"><li>Reward/reference GPUs sit idle during the generation phase, and actor/critic GPUs sit idle during preparation, wasting reserved capacity</li></ul>
+  </article>
+  <article class="position">
+    <h4>Colocated, shared hybrid engine across roles</h4>
+    <p class="who">HybridFlow/verl<a class="cite" href="#ref-2">2</a></p>
+    <p>HybridFlow's 3D-HybridEngine explicitly targets the previous position's weakness, calling rigid model placement in multi-controller, separate-pool systems a design flaw, and instead reshards the actor model between training and generation phases on the same GPUs with zero memory redundancy, then uses a placement-optimization algorithm to map every node in the DAG onto whichever GPUs minimize idle time<a class="cite" href="#ref-2">2</a>.</p>
+    <ul class="pros"><li>Higher aggregate GPU utilization; no dedicated-but-idle pools</li><li>Reports 1.53×–20.57× throughput improvement over the multi-controller baselines it compared against<a class="cite" href="#ref-2">2</a></li></ul>
+    <ul class="cons"><li>Requires a resharding/handoff mechanism engineered into the runtime itself, not just an orchestration layer on top</li><li>Colocation ties roles' lifecycles together on shared hardware, weakening the fault isolation dedicated pools give you</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span>
+<p>On algorithm choice: DPO wins for exactly Llama 3's case — a helpfulness/safety alignment target where a reward model trained on human preference comparisons is a good enough proxy and cost matters at 405B scale. PPO-family actor-critic RL keeps winning wherever the reward is a program, not a learned model — RLVR reasoning and coding tasks, where a static preference model cannot express "this proof is valid" the way a verifier can. Neither source in this map runs both algorithms head-to-head on the same benchmark at matched compute, which is the experiment that would actually settle the boundary between them rather than each camp reporting results on its own preferred task.</p>
+<p>On GPU placement: dedicated pools win when the models differ enough in size that independent scaling matters and the team values debuggability over squeezing out the last GPU-hour — which is exactly the accessibility goal OpenRLHF states for itself. Colocated hybrid engines win when GPU budget is the hard constraint and the workload's idle-pool waste (reward/reference sitting unused during generation, actor/critic sitting unused during preparation) is large enough that verl's reported double-digit throughput multiples are worth the added engineering complexity of a resharding runtime. Both are live choices in production RL frameworks today, not a settled question — Module 37 picks the thread back up from the staleness-tolerance side of the same trainer/rollout-decoupling problem.</p>
+</div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Two trends visible even inside this module's narrow source map point the same direction. First, the generation share of RLHF wall-clock time is climbing, not staying fixed at Section 6's 80/20 split: OpenRLHF's original framing of "80% of the time on sample generation" is, in its own later paper, revised to "over 90% of the total RLHF (or RLVR) runtime," attributed specifically to chain-of-thought workloads where models generate thousands of reasoning tokens before an answer<a class="cite" href="#ref-4">4</a>. Every architectural argument Section 6 makes about why synchronous, lock-step generation-then-training wastes GPU-hours only gets stronger as that ratio moves further from 50/50.</p>
+<p>Second, the RLVR side of the "Where experts disagree" section is not a stable minority position — it is the reason recently-built frameworks default to the harder, four-model PPO-style dataflow of Section 4 rather than Llama 3's simpler DPO pipeline. Llama 3 405B's post-training, as disclosed, has no verifiable-reward stage at all<a class="cite" href="#ref-1">1</a>; HybridFlow and OpenRLHF are both built around the assumption that a reward is something you compute on the fly, not something you collect from humans in advance<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-4">4</a>. A future frontier post-training paper disclosing this level of detail for a reasoning-focused model, rather than Llama 3's primarily-helpfulness-and-safety alignment target, would be the natural next primary source to re-ground this module's Section 4/5 material against — and would likely show the PPO-style DAG, not the DPO loop of Figure 1, as the disclosed pipeline shape.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Llama Team, AI @ Meta. <em>The Llama 3 Herd of Models</em>. arXiv:2407.21783, 2024. <a href="https://arxiv.org/abs/2407.21783">https://arxiv.org/abs/2407.21783</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the six-round post-training pipeline, reward modeling and rejection-sampling mechanics, PagedAttention adoption and throughput figure, DPO hyperparameters and loss modifications, preference/SFT data statistics (§4.1–4.2, Tables 6–7).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Sheng, G., Zhang, C., Ye, Z., Wu, X., Zhang, W., Zhang, R., Peng, Y., Lin, H., Wu, C. <em>HybridFlow: A Flexible and Efficient RLHF Framework</em>. arXiv:2409.19256; EuroSys '25. 2024/2025. <a href="https://arxiv.org/abs/2409.19256">https://arxiv.org/abs/2409.19256</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the RLHF dataflow-as-DAG formalism, the single-controller/multi-controller placement trade-off, PPO's four-model structure (§1–2, Fig. 1–2).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J. E., Zhang, H., Stoica, I. <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>. SOSP 2023. arXiv:2309.06180. <a href="https://arxiv.org/abs/2309.06180">https://arxiv.org/abs/2309.06180</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the PagedAttention mechanism and its original inference-serving throughput/memory-waste claims (Abstract).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Hu, J., Wu, X., Shen, W., Liu, J. K., Zhu, Z., Wang, W., Jiang, S., Wang, H., Chen, H., Chen, B., Fang, W., Xianyu, Cao, Y., Xu, H., Liu, Y. <em>OpenRLHF: An Easy-to-use, Scalable and High-performance RLHF Framework</em>. arXiv:2405.11143v6, 2025. <a href="https://arxiv.org/abs/2405.11143">https://arxiv.org/abs/2405.11143</a>. Accessed 2026-09-18. <span class="ref-use">Used for: OpenRLHF's rollout/ZeRO engine architecture (Fig. 1), PagedAttention memory-waste and parallel-sampling figures, asynchronous dataflow description, throughput comparisons against DeepSpeed-Chat/TRL/verl, the &gt;90% generation-time figure for long-CoT RLVR (§1, §3.2, §4).</span></li>
+  <li id="ref-5"><span class="ref-type">repo</span>OpenRLHF contributors. <em>OpenRLHF README</em>. GitHub, 2026. <a href="https://github.com/OpenRLHF/OpenRLHF">https://github.com/OpenRLHF/OpenRLHF</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Actor/Reward/Reference/Critic separate-GPU placement claim and the 80%-of-time-on-generation figure.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training Data Pipelines: Crawl/Ingest, Filtering/Dedup, Tokenization, and Sharded Datasets · System Design</title>
+<meta name="description" content="The URL-level, document-level, and line-level deduplication cascade Meta disclosed for Llama 3's pre-training corpus, read as an application of the batch-processing lineage from Module 9 rather than a new mechanism.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 32</p>
+  <h1>Training Data Pipelines: Crawl/Ingest, Filtering/Dedup, Tokenization, and Sharded Datasets</h1>
+  <p class="lede">A frontier pre-training corpus is not a dataset someone assembled; it is the output of a batch job that runs URL-level, document-level, and line-level deduplication, heuristic and learned quality filters, and domain/language routing over trillions of raw web documents before a single token gets tokenized. This module reads Meta's own disclosed numbers for that job — the only pipeline-level dedup/filtering account any frontier lab has published at this depth — as a text-specialized instance of the map/reduce and RDD-lineage machinery Module 9 already built, not a new compute paradigm.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>30 min</b> read</span>
+    <span class="chip"><b>3</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-18</span>
+    <span class="chip">Prerequisite: <b>Module 9</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">The full training-data pipeline from raw crawl to sharded, tokenized dataset</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">Raw crawl to training-ready shards, one batch job</text>
+
+    <rect x="10" y="60" width="110" height="56" rx="8" class="d-block-muted"/>
+    <text x="65" y="84" text-anchor="middle" class="d-text-inv d-bold">Raw crawl</text>
+    <text x="65" y="100" text-anchor="middle" class="d-text-inv d-small">web + code + PII/safety filter</text>
+
+    <path d="M120,88 L165,88" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="165" y="60" width="110" height="56" rx="8" class="d-block"/>
+    <text x="220" y="84" text-anchor="middle" class="d-text-inv d-bold">Extract + clean</text>
+    <text x="220" y="100" text-anchor="middle" class="d-text-inv d-small">HTML parser, §2</text>
+
+    <path d="M275,88 L320,88" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="320" y="60" width="120" height="56" rx="8" class="d-block-2"/>
+    <text x="380" y="80" text-anchor="middle" class="d-text-inv d-bold">Dedup cascade</text>
+    <text x="380" y="96" text-anchor="middle" class="d-text-inv d-small">URL / doc / line, §3</text>
+
+    <path d="M440,88 L485,88" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="485" y="60" width="130" height="56" rx="8" class="d-block-accent"/>
+    <text x="550" y="80" text-anchor="middle" class="d-text-inv d-bold">Quality filter</text>
+    <text x="550" y="96" text-anchor="middle" class="d-text-inv d-small">heuristics + classifiers, §4</text>
+
+    <path d="M615,88 L660,88" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="660" y="60" width="130" height="56" rx="8" class="d-block"/>
+    <text x="725" y="80" text-anchor="middle" class="d-text-inv d-bold">Domain routing</text>
+    <text x="725" y="96" text-anchor="middle" class="d-text-inv d-small">code / math / 176 langs, §5</text>
+
+    <path d="M725,116 L725,150 L550,150 L550,168" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="410" y="168" width="280" height="52" rx="8" class="d-block-2"/>
+    <text x="550" y="190" text-anchor="middle" class="d-text-inv d-bold">Data-mix weighting + annealing</text>
+    <text x="550" y="206" text-anchor="middle" class="d-text-inv d-small">50/25/17/8 mix, §6</text>
+
+    <path d="M410,194 L360,194" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="150" y="168" width="210" height="52" rx="8" class="d-block-accent"/>
+    <text x="255" y="190" text-anchor="middle" class="d-text-inv d-bold">Tokenize</text>
+    <text x="255" y="206" text-anchor="middle" class="d-text-inv d-small">128K vocab, §7</text>
+
+    <path d="M150,194 L100,194 L100,240" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="20" y="240" width="180" height="56" rx="8" class="d-surface d-outline"/>
+    <text x="110" y="264" text-anchor="middle" class="d-bold">Sharded, tokenized</text>
+    <text x="110" y="280" text-anchor="middle" class="d-small d-text-light">dataset — this pipeline's output</text>
+
+    <path d="M200,268 L300,268" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+
+    <rect x="300" y="240" width="220" height="56" rx="8" class="d-panel d-dashed"/>
+    <text x="410" y="264" text-anchor="middle" class="d-bold">Tectonic storage fabric</text>
+    <text x="410" y="280" text-anchor="middle" class="d-small d-text-light">Module 33 — not this module's scope</text>
+
+    <text x="600" y="268" text-anchor="middle" class="d-small d-text-light">the whole job is a batch pipeline —</text>
+    <text x="600" y="284" text-anchor="middle" class="d-small d-text-light">see §8, Module 9</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> Every stage in this diagram is a documented step of Meta's Llama 3 pre-training data pipeline<a class="cite" href="#ref-1">1</a>; the dashed box is out of scope here and belongs to Module 33's storage/checkpointing treatment. Section numbers on each block point to where this module covers that stage.</figcaption>
+</figure>
+<h2 id="data-scale-framing">1. Scale, cutoff, and why this is a batch job, not a dataset</h2>
+<p>Llama 3 pre-trains on a corpus of about 15T multilingual tokens, against 1.8T tokens for Llama 2<a class="cite" href="#ref-1">1</a> — roughly an 8.3x increase in two model generations, drawn from a mix of data sources containing knowledge up to the end of 2023<a class="cite" href="#ref-1">1</a>. Meta's paper details one of those sources — the web-crawl pipeline covered in §2-§6 — at the level of specific thresholds and classifier architectures; it names "a variety of data sources" once and does not itemize what else besides web crawl contributes to the corpus, or in what proportion. This module, correspondingly, is a detailed account of the web-data pipeline specifically, not a claim that web crawl is the corpus's only input. The flagship 405B-parameter model is pre-trained on 15.6T text tokens at a compute budget of \(3.8 \times 10^{25}\) FLOPs<a class="cite" href="#ref-1">1</a>. None of that text arrives pre-cleaned. Meta's own account of how it gets from "a variety of data sources" to "high-quality tokens" is explicit about the mechanism: several rounds of de-duplication and data cleaning are applied to each data source, domains carrying large amounts of personally identifiable information (PII) are removed outright, and so are domains ranked harmful by Meta's safety standards or known to carry adult content<a class="cite" href="#ref-1">1</a>. That PII/safety domain-level pass runs before any of the dedup or quality stages this module covers in detail — it is a blocklist check, not a scored filter, and Meta's paper does not disclose the blocklist's contents or size.</p>
+<div class="kpis">
+  <div class="kpi"><b>~15T</b><span>multilingual tokens, Llama 3 pre-training corpus<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-cyan"><b>1.8T</b><span>tokens, Llama 2 corpus for comparison<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-orange"><b>15.6T</b><span>text tokens actually consumed by the 405B run<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-amber"><b>end of 2023</b><span>data cutoff across all sources<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-green"><b>176</b><span>languages identified by the fasttext language-ID model<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-red"><b>3.8 x 10<sup>25</sup></b><span>FLOPs, total pre-training compute budget<a class="cite" href="#ref-1">1</a></span></div>
+</div>
+<p>Everything downstream of that first pass is recognizable as an instance of the map/reduce contract and the RDD lineage graph Module 9 derives in full: a small number of deterministic, coarse-grained transformations (extract, filter, group-by-key, reduce) applied to an enormous, embarrassingly-parallel input, with the property that any transformation's output can be recomputed from its inputs rather than checkpointed independently. This module does not re-derive that machinery. What it adds is the specialization: which transformations, in which order, with which parameters, produce a frontier-scale pre-training corpus out of a web crawl, and which of those transformations need a shuffle (Module 9's reduce side) versus which stay embarrassingly parallel (Module 9's map side). Section 8 makes that mapping explicit once the stages themselves are on the table.</p>
+<aside class="callout callout-note"><span class="callout-title">Note on coverage</span><p>Llama 3's paper is, as of this writing, the only frontier lab's disclosure of pipeline-level deduplication and filtering parameters at this depth — specific thresholds (a repeat count, a bucket size, a classifier architecture), not just a one-line description of "extensive filtering." "Where experts disagree" below contrasts it with two smaller, single-purpose open corpora (RefinedWeb and FineWeb) that disclose comparable pipeline detail at a smaller scale. No source in this course's map documents experiment-tracking or evaluation-pipeline tooling for the pre-training data stage specifically — not "how Meta's data pipeline is monitored," not "how a candidate data mix gets promoted from experiment to production." That is a real gap in what any lab has published, not a simplification made for this module, and nothing below fills it with invented mechanics.</p></aside>
+<h2 id="text-extraction-cleaning">2. Text extraction and cleaning</h2>
+<p>The pipeline's first transformation is not deduplication — it is turning raw HTML into text worth deduplicating. Meta built a custom parser rather than adopting an existing one, and optimized it specifically for precision in boilerplate removal balanced against content recall, evaluating that trade-off against popular third-party HTML parsers tuned for generic article-style content and finding their own parser performed favorably<a class="cite" href="#ref-1">1</a>. The choice to build rather than buy here is the same category of decision Module 10 covers for service infrastructure generally (build a bespoke component when the general-purpose one optimizes for the wrong thing), applied to a parsing library instead of a gateway.</p>
+<p>Two specific extraction decisions are worth carrying forward because they resurface later in the pipeline. First, pages containing mathematics and code content get their structure preserved rather than flattened to plain text, and the parser retains image <code>alt</code> attribute text specifically because mathematical content on the web is frequently rendered as pre-rendered images with the math also present in the <code>alt</code> attribute — dropping <code>alt</code> text would silently delete a large fraction of the web's actual math content<a class="cite" href="#ref-1">1</a>. Second, after experimenting with different cleaning configurations, Meta found markdown markup actively harmful to a model trained primarily on web data compared to plain text, and removes all markdown markers as a result<a class="cite" href="#ref-1">1</a>. That is a data-pipeline decision with a training-time consequence Aman will recognize from the inference side: a model that never saw markdown syntax in pre-training does not "know" what a bullet list or a code fence means as a distributional pattern, which is one reason post-training (Module 36) has to teach formatting behavior explicitly rather than assuming pre-training supplied it for free.</p>
+<p>Everything in this section is a per-document, side-effect-free transformation: given one HTML page, produce one cleaned-text document, with no dependency on any other document in the corpus. In Module 9's vocabulary this is exactly a map — embarrassingly parallel, and the cheapest stage in the whole pipeline to scale out, because it never needs a shuffle. The stages that follow are not all so simple.</p>
+<h2 id="dedup-cascade">3. The three-level de-duplication cascade</h2>
+<p>Deduplication is not one pass; Llama 3's pipeline runs three, each at a different grain, each catching a different kind of repetition, and each with a different cost profile<a class="cite" href="#ref-1">1</a>. Coarser levels run first because they are cheap and remove the most volume per unit of work; finer levels run last because they are the only ones that can see the kind of repetition that survives the coarser passes. The ordering also tracks algorithmic cost directly: comparing a URL string against a set of previously-seen URLs is a single key lookup; computing a MinHash signature requires shingling and hashing an entire document's content before any comparison happens; counting line repetitions requires holding a frequency table across every line in a bucket, not just a signature per document. Running the cheapest check first and only handing survivors to the next, more expensive check is the same early-filtering discipline a query planner applies when it pushes a cheap predicate ahead of an expensive join — the general principle transfers even though nothing here is literally a database query.</p>
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 300" role="img" aria-label="Five-stage deduplication cascade narrowing a sample corpus from raw crawl to tagged output">
+      <g data-step="1-1">
+        <text x="400" y="50" text-anchor="middle" class="d-title d-small">Step 1 — raw crawl: duplicates and repeated boilerplate are still present</text>
+        <rect x="40" y="90" width="130" height="70" rx="8" class="d-block-muted"/><text x="105" y="118" text-anchor="middle" class="d-text-inv d-bold">D1</text><text x="105" y="136" text-anchor="middle" class="d-text-inv d-small">unique</text>
+        <rect x="190" y="90" width="130" height="70" rx="8" class="d-block-muted"/><text x="255" y="118" text-anchor="middle" class="d-text-inv d-bold">D2</text><text x="255" y="136" text-anchor="middle" class="d-text-inv d-small">dup URL of D1</text>
+        <rect x="340" y="90" width="130" height="70" rx="8" class="d-block-muted"/><text x="405" y="118" text-anchor="middle" class="d-text-inv d-bold">D3</text><text x="405" y="136" text-anchor="middle" class="d-text-inv d-small">near-dup text</text>
+        <rect x="490" y="90" width="130" height="70" rx="8" class="d-block-muted"/><text x="555" y="118" text-anchor="middle" class="d-text-inv d-bold">D4</text><text x="555" y="136" text-anchor="middle" class="d-text-inv d-small">unique + repeated nav line</text>
+        <rect x="640" y="90" width="130" height="70" rx="8" class="d-block-muted"/><text x="705" y="118" text-anchor="middle" class="d-text-inv d-bold">D5</text><text x="705" y="136" text-anchor="middle" class="d-text-inv d-small">unique (French)</text>
+      </g>
+      <g data-step="2-2">
+        <text x="400" y="50" text-anchor="middle" class="d-title d-small">Step 2 — URL-level dedup: keep the most recent version per URL</text>
+        <rect x="40" y="90" width="130" height="70" rx="8" class="d-block"/><text x="105" y="130" text-anchor="middle" class="d-text-inv d-bold">D1</text>
+        <rect x="190" y="90" width="130" height="70" rx="8" class="d-outline d-dashed"/><text x="255" y="120" text-anchor="middle" class="d-dim d-small">D2 removed:</text><text x="255" y="136" text-anchor="middle" class="d-dim d-small">same URL as D1</text>
+        <rect x="340" y="90" width="130" height="70" rx="8" class="d-block"/><text x="405" y="122" text-anchor="middle" class="d-text-inv d-bold">D3</text><text x="405" y="140" text-anchor="middle" class="d-text-inv d-small">survives (diff. URL)</text>
+        <rect x="490" y="90" width="130" height="70" rx="8" class="d-block"/><text x="555" y="130" text-anchor="middle" class="d-text-inv d-bold">D4</text>
+        <rect x="640" y="90" width="130" height="70" rx="8" class="d-block"/><text x="705" y="130" text-anchor="middle" class="d-text-inv d-bold">D5</text>
+      </g>
+      <g data-step="3-3">
+        <text x="400" y="50" text-anchor="middle" class="d-title d-small">Step 3 — document-level global MinHash: near-duplicate documents removed corpus-wide</text>
+        <rect x="40" y="90" width="130" height="70" rx="8" class="d-block"/><text x="105" y="130" text-anchor="middle" class="d-text-inv d-bold">D1</text>
+        <rect x="190" y="90" width="130" height="70" rx="8" class="d-outline d-dashed"/><text x="255" y="130" text-anchor="middle" class="d-dim d-small">D2 removed</text>
+        <rect x="340" y="90" width="130" height="70" rx="8" class="d-outline d-dashed"/><text x="405" y="120" text-anchor="middle" class="d-dim d-small">D3 removed:</text><text x="405" y="136" text-anchor="middle" class="d-dim d-small">MinHash dup of D1</text>
+        <rect x="490" y="90" width="130" height="70" rx="8" class="d-block"/><text x="555" y="130" text-anchor="middle" class="d-text-inv d-bold">D4</text>
+        <rect x="640" y="90" width="130" height="70" rx="8" class="d-block"/><text x="705" y="130" text-anchor="middle" class="d-text-inv d-bold">D5</text>
+      </g>
+      <g data-step="4-4">
+        <text x="400" y="50" text-anchor="middle" class="d-title d-small">Step 4 — line-level ccNet-style dedup: lines repeated &gt;6x per 30M-doc bucket stripped</text>
+        <rect x="40" y="90" width="130" height="70" rx="8" class="d-block"/><text x="105" y="130" text-anchor="middle" class="d-text-inv d-bold">D1</text>
+        <rect x="190" y="90" width="130" height="70" rx="8" class="d-outline d-dashed"/><text x="255" y="130" text-anchor="middle" class="d-dim d-small">D2 removed</text>
+        <rect x="340" y="90" width="130" height="70" rx="8" class="d-outline d-dashed"/><text x="405" y="130" text-anchor="middle" class="d-dim d-small">D3 removed</text>
+        <rect x="490" y="90" width="130" height="70" rx="8" class="d-block"/><text x="555" y="112" text-anchor="middle" class="d-text-inv d-bold">D4</text>
+        <rect x="510" y="120" width="90" height="14" class="d-outline d-dashed"/><line x1="510" y1="127" x2="600" y2="127" class="d-stroke-red" style="stroke-width:1.5"/><text x="555" y="150" text-anchor="middle" class="d-text-inv d-small">nav line stripped</text>
+        <rect x="640" y="90" width="130" height="70" rx="8" class="d-block"/><text x="705" y="130" text-anchor="middle" class="d-text-inv d-bold">D5</text>
+      </g>
+      <g data-step="5-5">
+        <text x="400" y="50" text-anchor="middle" class="d-title d-small">Step 5 — output: quality-classified, language-tagged documents feed §4-§6</text>
+        <rect x="40" y="90" width="130" height="70" rx="8" class="d-block"/><text x="105" y="122" text-anchor="middle" class="d-text-inv d-bold">D1</text>
+        <rect x="45" y="165" width="120" height="22" rx="4" class="d-fill-green-soft d-stroke-green"/><text x="105" y="180" text-anchor="middle" class="d-small d-mono">en · scored ✓</text>
+        <rect x="190" y="90" width="130" height="70" rx="8" class="d-outline d-dashed"/><text x="255" y="130" text-anchor="middle" class="d-dim d-small">D2 — never reaches output</text>
+        <rect x="340" y="90" width="130" height="70" rx="8" class="d-outline d-dashed"/><text x="405" y="130" text-anchor="middle" class="d-dim d-small">D3 — never reaches output</text>
+        <rect x="490" y="90" width="130" height="70" rx="8" class="d-block"/><text x="555" y="122" text-anchor="middle" class="d-text-inv d-bold">D4</text>
+        <rect x="495" y="165" width="120" height="22" rx="4" class="d-fill-green-soft d-stroke-green"/><text x="555" y="180" text-anchor="middle" class="d-small d-mono">en · scored ✓</text>
+        <rect x="640" y="90" width="130" height="70" rx="8" class="d-block"/><text x="705" y="122" text-anchor="middle" class="d-text-inv d-bold">D5</text>
+        <rect x="645" y="165" width="120" height="22" rx="4" class="d-fill-green-soft d-stroke-green"/><text x="705" y="180" text-anchor="middle" class="d-small d-mono">fr · scored ✓</text>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Raw crawl.</b> Web documents enter the pipeline with URL-level repeats (re-crawled pages), cross-URL near-duplicates, and boilerplate lines all still present.</li>
+    <li><b>URL-level de-duplication.</b> Across the entire dataset, only the most recent version of each URL is kept<a class="cite" href="#ref-1">1</a>. This is a single group-by-key on the URL string — cheap, and it removes exact re-crawls before any content comparison runs.</li>
+    <li><b>Document-level de-duplication.</b> Global MinHash (following Broder, 1997, as Llama 3's paper cites it) runs across the entire corpus to remove near-duplicate documents<a class="cite" href="#ref-1">1</a> — text that differs in wording but carries the same content, which a URL check cannot see because it can originate from a different URL entirely.</li>
+    <li><b>Line-level de-duplication.</b> An aggressive pass similar to ccNet (Wenzek et al., 2019, as cited) removes any line that appeared more than 6 times within each bucket of 30M documents<a class="cite" href="#ref-1">1</a>. Manual qualitative review confirmed this catches leftover boilerplate — navigation menus, cookie warnings — but also frequent high-quality text; Meta kept it anyway because empirical evaluations showed strong improvements<a class="cite" href="#ref-1">1</a>.</li>
+    <li><b>Tagged output.</b> Surviving documents carry forward into quality classification and language identification (§4-§5), which is where the retained fraction narrows again on a different axis.</li>
+  </ol>
+</div>
+<figure class="fig fig-plain"><figcaption><b>Figure 2.</b> The dedup cascade narrows a sample corpus from raw crawl through URL-level, document-level MinHash, and line-level ccNet-style de-duplication to a quality-classified, language-tagged output; box positions are illustrative, the stage order and parameters are Llama 3's own<a class="cite" href="#ref-1">1</a>.</figcaption></figure>
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> The three de-duplication levels in Llama 3's pipeline, what each catches, and its parallel-execution shape in Module 9's terms<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Level</th><th>Technique</th><th>Catches</th><th>Misses</th><th>Execution shape</th></tr></thead>
+  <tbody>
+    <tr><td class="row">URL-level</td><td>keep most recent per URL</td><td>exact re-crawls of one page</td><td>same content at a different URL</td><td>group-by-key on URL (shuffle)</td></tr>
+    <tr><td class="row">Document-level</td><td>global MinHash</td><td>near-duplicate documents corpus-wide</td><td>a locally repeated single line inside an otherwise unique document</td><td>shuffle into MinHash-signature buckets, then group</td></tr>
+    <tr><td class="row">Line-level</td><td>ccNet-style, &gt;6 repeats / 30M-doc bucket</td><td>boilerplate (nav, cookie banners) repeated within a bucket</td><td>content that is not literally repeated but is still low quality</td><td>bucketed local reduce (fixed 30M-doc partition)</td></tr>
+  </tbody>
+</table>
+<h3 id="dedup-cascade-minhash">3.1 Why MinHash and bucketed counting scale to a trillion documents</h3>
+<p>Both the document-level and line-level passes solve the same underlying problem: deciding whether two pieces of text are "the same enough" without ever comparing every pair of documents directly, which is quadratic and hopeless at corpus scale. MinHash<a class="cite" href="#ref-1">1</a> sidesteps the pairwise comparison by turning each document into a small, fixed-size signature. Represent a document as a set of shingles (overlapping n-grams of words or characters); for \(k\) independent hash functions, compute the minimum hash value each function produces over that document's shingle set. A standard result for this construction is that the probability two documents share the same minimum hash value, for one fixed hash function, equals their Jaccard similarity \(J(A,B) = |A \cap B| / |A \cup B|\) — the fraction of shingles the two documents have in common relative to their combined vocabulary. Averaging agreement across \(k\) independent hash functions gives an unbiased estimator of \(J(A,B)\) that only requires comparing \(k\) small numbers per document pair, not the underlying text. For illustration — not a parameter Llama 3's paper discloses — take \(k = 128\) hash functions: two documents that are 90% similar by this measure would be expected to agree on roughly 115 of 128 minhash values, while two unrelated documents at 10% similarity would be expected to agree on roughly 13 of 128; the separation between those two expected counts is what makes a fixed similarity threshold usable as an automated near-duplicate test at any corpus size, without ever materializing the full intersection or union of two documents' shingle sets. In Module 9's execution-shape terms, computing the signatures is a map (one document in, one \(k\)-length signature out); grouping documents whose signatures collide into the same near-duplicate bucket is the shuffle-plus-group-by-key that makes this stage a reduce, not a map, even though no single "value" gets summed.</p>
+<p>Line-level ccNet-style dedup is structurally the same computation Module 9 uses as its own introductory example, word count, with lines substituted for words. Map each line in a document to a (line-hash, 1) pair; group by line-hash within a fixed partition — Llama 3 fixes that partition at a bucket of 30M documents<a class="cite" href="#ref-1">1</a> specifically so the count stays a bounded, local reduce rather than a global one across the entire multi-trillion-document corpus; sum the 1s per line-hash inside the bucket; filter out any line whose count exceeds 6<a class="cite" href="#ref-1">1</a>. Bucketing trades recall for tractability: a boilerplate line repeated thousands of times across the whole corpus but fewer than 7 times inside any single 30M-document bucket would not be caught by this pass. Meta's manual qualitative review found the technique still removed frequent high-quality text alongside boilerplate, and kept it anyway because the net empirical effect was a strong improvement<a class="cite" href="#ref-1">1</a> — a case where the aggregate result justified a mechanism known to have false positives.</p>
+<h2 id="quality-filtering">4. Filtering for quality: heuristics, then trained classifiers</h2>
+<p>Deduplication removes repetition; it does nothing about a document that is unique but useless — a log dump, an SEO-spam page, a listing of outlier tokens no tokenizer should be spending vocabulary capacity on. Llama 3's pipeline handles that with two families of filter, run in sequence: cheap rule-based heuristics first, then trained classifiers on what survives<a class="cite" href="#ref-1">1</a>.</p>
+<p>The heuristics are all pattern checks with a fixed, cheap-to-evaluate rule, not a learned model. A duplicated n-gram coverage ratio, following Rae et al. (2021) as Llama 3's paper cites it, removes lines made of repeated content such as logging or error messages — text that can be very long and unique enough to slip past line-level dedup's exact-repeat threshold, but still algorithmically detectable as "mostly the same n-gram over and over"<a class="cite" href="#ref-1">1</a>. A "dirty word" count, following Raffel et al. (2020)'s C4 methodology as cited, filters adult websites not already caught by domain block lists<a class="cite" href="#ref-1">1</a>. A token-distribution Kullback-Leibler divergence check filters documents containing an excessive share of outlier tokens relative to the training corpus's overall token distribution<a class="cite" href="#ref-1">1</a> — a statistical anomaly filter rather than a content-based one.</p>
+<p>What survives the heuristics goes to two model-based classifiers that Meta describes evaluating for this stage. The first is a fast classifier family (fasttext, following Joulin et al., 2017) trained to predict whether a given piece of text would be referenced by Wikipedia, following the same recognition target Llama 2's paper used<a class="cite" href="#ref-1">1</a> — cheap enough to run over the entire post-heuristic corpus. The second is a more compute-intensive family built on RoBERTa (Liu et al., 2019a): Meta builds a training set of cleaned web documents, writes down the quality requirements in natural language, and has Llama 2's chat model judge whether each document satisfies them; a DistilRoBERTa model is then trained to reproduce those judgments and generate a quality score for every document at serving-time efficiency<a class="cite" href="#ref-1">1</a>. The paper describes both as classifier options it experimentally evaluated for this quality-filtering step; it does not specify whether production filtering runs them as a strict sequential funnel or combines their scores — that is a real gap in the disclosure, not a simplification made here.</p>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>In Module 9's map/reduce vocabulary, running a classifier over every document is "just a map" — one document in, one score out, no shuffle. Cost-wise it is nothing like the cheap hash comparisons the dedup stages run. Scoring a corpus that survives dedup and heuristic filtering with even a distilled model like DistilRoBERTa is a batch-inference workload at a scale Aman would recognize from the serving side: one forward pass per surviving document, batched for throughput, with the same batch-size/latency and (at this volume) hardware-utilization considerations that apply to any other transformer inference job. The classic MapReduce/Spark cost model — dominated by shuffle/IO, with map and reduce functions themselves treated as cheap — does not hold for this particular map. The compute asymmetry this creates across the whole pipeline is worth its own accounting; §8.1 returns to it once every stage is on the table.</p></aside>
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f3t"><title id="f3t">Quality filtering narrows from heuristic rule checks to two classifier families</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">Quality filter: heuristics narrow the pool, then two classifier families score it</text>
+
+    <polygon points="80,50 720,50 640,120 160,120" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="400" y="80" text-anchor="middle" class="d-bold">Post-dedup documents (§3 output)</text>
+    <text x="400" y="100" text-anchor="middle" class="d-small d-text-light">width is illustrative — exact retained fraction is not disclosed</text>
+
+    <polygon points="160,130 640,130 540,200 260,200" class="d-fill-cyan-soft d-stroke-cyan"/>
+    <text x="400" y="158" text-anchor="middle" class="d-bold">Heuristic filters</text>
+    <text x="400" y="176" text-anchor="middle" class="d-small">n-gram coverage ratio · "dirty word" count · token-KL outliers</text>
+    <text x="400" y="192" text-anchor="middle" class="d-small d-text-light">rule-based, no training required</text>
+
+    <path d="M330,210 L220,250" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M470,210 L580,250" class="d-arrow" marker-end="url(#f3-arr)"/>
+
+    <rect x="100" y="255" width="240" height="70" rx="8" class="d-block"/>
+    <text x="220" y="280" text-anchor="middle" class="d-text-inv d-bold">fasttext classifier</text>
+    <text x="220" y="298" text-anchor="middle" class="d-text-inv d-small">cheap; Wikipedia-reference</text>
+    <text x="220" y="314" text-anchor="middle" class="d-text-inv d-small">likelihood</text>
+
+    <rect x="460" y="255" width="240" height="70" rx="8" class="d-block-accent"/>
+    <text x="580" y="280" text-anchor="middle" class="d-text-inv d-bold">DistilRoBERTa classifier</text>
+    <text x="580" y="298" text-anchor="middle" class="d-text-inv d-small">compute-heavier; scores</text>
+    <text x="580" y="314" text-anchor="middle" class="d-text-inv d-small">Llama 2's quality judgments</text>
+
+    <path d="M240,325 L330,355" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M560,325 L470,355" class="d-arrow" marker-end="url(#f3-arr)"/>
+
+    <rect x="290" y="358" width="220" height="34" rx="6" class="d-surface d-outline"/>
+    <text x="400" y="380" text-anchor="middle" class="d-bold d-small">Quality-scored documents → §5</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Heuristic filters run first and are cheap enough to apply to the entire post-dedup corpus; the two classifier families Llama 3's paper describes are evaluated as separate signals, not disclosed as a fixed sequential order<a class="cite" href="#ref-1">1</a>. Trapezoid widths are illustrative of the general shape of the funnel, not a measured retained-fraction plot — Meta's paper does not publish per-stage retention percentages.</figcaption>
+</figure>
+<h2 id="domain-multilingual-pipelines">5. Domain-specific pipelines: code, math, and 176 languages</h2>
+<p>General web text and code or mathematical text have different statistics — different token distributions, different structural markers (indentation, LaTeX delimiters, code fences) — so a single quality classifier tuned on generic web prose is the wrong tool for either. Following the same approach DeepSeek-AI et al. (2024) took, as Llama 3's paper frames the comparison, Meta builds separate domain-specific pipelines that extract code- and math-relevant web pages<a class="cite" href="#ref-1">1</a>. Both the code and the reasoning classifiers are themselves DistilRoBERTa models, trained on web data annotated by Llama 2, but the annotation prompts are tuned specifically to target pages containing mathematical deduction or reasoning in STEM areas, and code interleaved with natural language<a class="cite" href="#ref-1">1</a>. Because the token distribution of code and math differs substantially from natural language, these pipelines also implement their own domain-specific HTML extraction, custom text features, and filtering heuristics rather than reusing the general web pipeline's extraction and heuristic stages unmodified<a class="cite" href="#ref-1">1</a>. This is a second full instance of the same map/reduce shape §2-§4 already described, forked on document type rather than chained after it. The custom HTML extraction matters concretely for this fork in a way it does not for the general web pipeline: a generic extractor tuned to preserve article-style prose will happily strip the indentation a code block's semantics depend on, or drop the LaTeX delimiters around an equation as if they were formatting noise rather than content — exactly the failure mode §2 already flagged for markdown, but sharper here, because indentation in Python or a missing closing delimiter in LaTeX does not just look worse, it changes what the text means.</p>
+<p>Multilingual data gets its own parallel pipeline rather than a language-agnostic pass with a translation step bolted on. A fasttext-based language identification model categorizes documents into 176 languages<a class="cite" href="#ref-1">1</a> — that count is the ceiling on how many distinct languages this pipeline can even route, since anything the classifier does not recognize cannot be assigned a language-specific downstream path. Within each identified language, Meta reruns document-level and line-level de-duplication independently<a class="cite" href="#ref-1">1</a> — the same two algorithms from §3, re-applied per language rather than once globally, because a near-duplicate detector tuned on one language's byte and token statistics does not transfer cleanly to another. Language-specific heuristics and model-based filters remove low-quality documents within each language bucket, and a final multilingual quality-ranking classifier, itself based on Llama 2, ranks documents to make sure high-quality content is prioritized before the corpus-wide data-mix decision in §6<a class="cite" href="#ref-1">1</a>. The actual proportion of multilingual tokens used in pre-training was determined experimentally, balancing English-benchmark performance against multilingual-benchmark performance<a class="cite" href="#ref-1">1</a> — an empirical trade-off, not a fixed target set in advance.</p>
+<p>Both forks — domain and language — feed back into one corpus before the model ever sees a token; §6 covers how the resulting categories get weighted against each other.</p>
+<h2 id="data-mix-annealing">6. Determining the data mix, and annealing</h2>
+<p>Every stage so far decides whether a document survives. A separate decision — orthogonal to survival — is how much weight each surviving category gets once combined into one training stream. Meta's tool for this is a knowledge classifier: a model built specifically to categorize the kinds of information in the web corpus, used to identify categories over-represented relative to their training value (the paper names arts and entertainment as an example) so they can be downsampled rather than left to dominate the mix by raw crawl volume<a class="cite" href="#ref-1">1</a>. The classifier answers "what kind of knowledge is this," not "is this good," which is why it is a separate model from the quality classifiers in §4 rather than an extra output head on one of them.</p>
+<p>The actual mix weights are not set by the knowledge classifier alone. Meta runs scaling-law experiments: train several small models on a candidate data mix, use the resulting scaling-law fit to predict how a much larger model would perform on that mix, evaluate the predicted-best candidate by actually training a larger model on it and checking benchmark performance, and repeat across mix candidates<a class="cite" href="#ref-1">1</a>. That loop — small-model proxy, extrapolate, validate at larger scale, repeat — is a search procedure over a low-dimensional space (category weights), not a filtering rule, and it is the step in this entire pipeline for which no source in this course's map documents any tracking or orchestration tooling: how many candidate mixes were tried, how long each proxy run took, or what infrastructure managed the search is not disclosed. Llama 3's own paper is explicit that this is not a bespoke technique invented for data-mix selection: it is the identical scaling-law methodology the paper uses elsewhere to pick the flagship model's parameter count, cross-referenced directly by Meta's own text<a class="cite" href="#ref-1">1</a>. One search procedure, reused for two different low-dimensional decisions — how big to make the model, and how to weight the categories that feed it — is itself a small illustration of this pipeline's general character: almost nothing about it is a novel algorithm, and almost everything about it is the disciplined reapplication of a small number of general techniques (hashing-based dedup, statistical heuristics, learned classifiers, scaling-law extrapolation) at a scale few organizations operate at.</p>
+<table class="tbl">
+  <caption><b>Table 2.</b> Llama 3's final pre-training data mix by category, after knowledge-classifier downsampling and scaling-law-driven mix search<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Category</th><th class="num">Share of tokens</th></tr></thead>
+  <tbody>
+    <tr><td class="row">General knowledge</td><td class="num" data-best>~50%</td></tr>
+    <tr><td class="row">Mathematical and reasoning</td><td class="num">~25%</td></tr>
+    <tr><td class="row">Code</td><td class="num">~17%</td></tr>
+    <tr><td class="row">Multilingual</td><td class="num">~8%</td></tr>
+  </tbody>
+</table>
+<p>One more transformation runs after the main mix is fixed: annealing. Late in pre-training, following Li et al. (2024b) as cited, Meta upsamples a small amount of high-quality data in select domains while linearly decaying the learning rate<a class="cite" href="#ref-1">1</a>. Deliberately, the annealing data excludes any training sets from commonly used benchmarks, specifically so that annealing's effect measures genuine few-shot and out-of-domain generalization rather than memorized benchmark answers<a class="cite" href="#ref-1">1</a>. Following OpenAI's own reported practice, Meta evaluates annealing's effect using the GSM8K and MATH training sets<a class="cite" href="#ref-1">1</a>: on the pre-trained Llama 3 8B model, annealing improved GSM8K validation performance by 24.0% and MATH validation performance by 6.4%; on the 405B model, the improvement was negligible<a class="cite" href="#ref-1">1</a>.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 3.</b> Annealing's measured effect on two benchmark validation sets, by model scale<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Model</th><th class="num">GSM8K delta</th><th class="num">MATH delta</th><th>Interpretation</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Llama 3 8B</td><td class="num" data-best>+24.0%</td><td class="num" data-best>+6.4%</td><td>meaningful gain from late upsampling</td></tr>
+    <tr><td class="row">Llama 3 405B</td><td class="num">negligible</td><td class="num">negligible</td><td>flagship model already strong in-context, does not need domain samples to reach that performance</td></tr>
+  </tbody>
+</table>
+<p>The negligible effect on the 405B model is itself informative about the shape of the data pipeline's return: at flagship scale, the model's in-context learning and reasoning capabilities are already strong enough that specific in-domain training samples add little<a class="cite" href="#ref-1">1</a> — annealing's leverage is concentrated on smaller models trained on the same mix, not the frontier model the mix was primarily designed for. Meta also reports using annealing as a cheaper substitute for a full scaling-law sweep when judging whether a new candidate dataset is worth adding at all: anneal a partially-trained 8B model's learning rate linearly to zero over 40B tokens, weighting the candidate dataset at 30% against the default mix's 70%, and read the resulting benchmark delta as the dataset's marginal value<a class="cite" href="#ref-1">1</a> — one 40B-token run standing in for what would otherwise require training multiple models across a range of compute budgets.</p>
+<h2 id="tokenization-sharding">7. Tokenization and sharded-dataset production</h2>
+<p>Tokenization is the pipeline's last content-changing transformation, and the first one whose output format is dictated by the training system rather than by data quality. Llama 3 uses a 128,000-token vocabulary: 100K tokens come from the OpenAI tiktoken tokenizer, and 28K additional tokens are added specifically to improve support for non-English languages<a class="cite" href="#ref-1">1</a>. Compared to the Llama 2 tokenizer, this new vocabulary improves compression on a sample of English data from 3.17 to 3.94 characters per token<a class="cite" href="#ref-1">1</a>, and Meta reports that adding the 28K non-English tokens improved both multilingual compression ratios and downstream multilingual performance with no measured impact on English tokenization<a class="cite" href="#ref-1">1</a>.</p>
+<dl class="spec-grid">
+  <div class="spec"><dt>Vocabulary size</dt><dd>128,000 tokens<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Base vocabulary</dt><dd>100K tokens from tiktoken<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Added vocabulary</dt><dd>28K non-English tokens<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Compression, Llama 2 tokenizer</dt><dd>3.17 chars/token<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Compression, Llama 3 tokenizer</dt><dd>3.94 chars/token<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>English tokenization impact of the 28K addition</dt><dd>none measured<a class="cite" href="#ref-1">1</a></dd></div>
+</dl>
+<p>A tokenizer's compression ratio is not a cosmetic statistic; it is a direct multiplier on how much raw text a fixed training-compute budget can cover, since compute scales with the number of tokens processed, not the number of characters those tokens represent.</p>
+<details class="more">
+<summary>Worked derivation: what a 3.17 → 3.94 chars/token improvement is worth</summary>
+<p>Define the compression ratio \(c\) as characters per token. For a fixed token budget \(N\), the amount of raw text "read" during training is</p>
+<p style="text-align:center">$$ \text{characters read} = N \times c $$</p>
+<p>The relative improvement from Llama 2's tokenizer (\(c_2 = 3.17\)) to Llama 3's tokenizer (\(c_3 = 3.94\)) is</p>
+<p style="text-align:center">$$ \frac{c_3 - c_2}{c_2} = \frac{3.94 - 3.17}{3.17} \approx 0.243 $$</p>
+<p>— about 24.3% more raw text represented per token, for the same training-compute cost, since training FLOPs are set by token count and model size, not by how many characters each token happens to encode<a class="cite" href="#ref-1">1</a>. Applying this to Llama 3 405B's actual pre-training budget of 15.6T text tokens<a class="cite" href="#ref-1">1</a>:</p>
+<p style="text-align:center">$$ 15.6\text{T} \times 3.94 \approx 61.5\text{T characters, vs. } 15.6\text{T} \times 3.17 \approx 49.5\text{T characters under the old tokenizer} $$</p>
+<p>The same 15.6T-token compute budget corresponds to roughly 12 trillion more characters of raw text under the new tokenizer than it would have under Llama 2's — a real increase in how much of the curated corpus the model gets to see, purchased entirely at the tokenization stage, with no change to the dedup or quality-filtering stages upstream of it. This derivation combines two disclosed numbers from the same source<a class="cite" href="#ref-1">1</a>; Meta does not itself publish the "characters read" framing or the 12-trillion-character figure.</p>
+</details>
+<p>One packing detail belongs to this stage rather than to the storage layer, because it changes what the tokenized output actually represents. Independent documents get concatenated into fixed-length training sequences to avoid wasting positions on padding, and Llama 3 adds an attention mask that prevents self-attention between different documents packed into the same sequence<a class="cite" href="#ref-1">1</a>. Meta reports this had limited effect during standard pre-training, but found it important once continued pre-training moved to very long sequences<a class="cite" href="#ref-1">1</a> — without it, a token near the start of one document could attend across a packing boundary into an unrelated document merely because they happen to share a training sequence, an artifact of how the sharding job packs documents rather than anything about the documents' actual content. This is the one place where a decision made by this pipeline (how documents get packed into sequences) has a direct architectural consequence downstream (a mask the model applies at every layer), rather than only a data-quality consequence.</p>
+<p>What tokenization actually produces, mechanically, is the pipeline's terminal artifact: for every surviving, quality-scored, language-tagged, mix-weighted document, a sequence of integer token IDs, written out in the sharded, training-cluster-ready form the storage fabric in Module 33 serves from. Nothing in Llama 3's paper details the shard file format, shard size, or the sharding scheme's relationship to the parallelism-dimension layout (TP/CP/PP/DP) Aman already knows from distributed-training practice — that boundary is deliberately where this module stops and Module 33 picks up, since shard layout is a storage-and-serving concern, not a data-curation one.</p>
+<h2 id="pipeline-as-batch-job">8. This pipeline as a MapReduce/Spark batch job</h2>
+<p>Nothing in §2-§7 needs a new execution model. Every stage is either a deterministic function of one document (extraction, heuristic checks, classifier scoring, tokenization) or a deterministic grouping over a key derived from the documents (URL string, MinHash signature bucket, line-repeat bucket). Module 9 already named these two shapes precisely: <code>map (k1,v1) -> list(k2,v2)</code> for the per-record transformation, and the shuffle-plus-<code>reduce (k2,list(v2)) -> list(v2)</code> pattern for anything that has to group records by a derived key before it can finish. This module does not re-derive that contract or Spark's RDD-lineage fault-tolerance mechanism on top of it — Module 9 does that in full — it only places each stage from §2-§7 on one side of the map/shuffle line.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f4t"><title id="f4t">Text-specific pipeline stages mapped onto the generic map/filter/shuffle/action primitives from Module 9</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">Text-specific stages (top) run on generic batch primitives (bottom)</text>
+    <text x="400" y="42" text-anchor="middle" class="d-small d-text-light">this module specializes; Module 9 supplies the execution engine and its fault tolerance</text>
+
+    <rect x="15" y="60" width="85" height="50" rx="6" class="d-block-2"/><text x="57" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">Extract</text><text x="57" y="96" text-anchor="middle" class="d-text-inv d-small">+ clean</text>
+    <rect x="110" y="60" width="85" height="50" rx="6" class="d-block-2"/><text x="152" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">Heuristic</text><text x="152" y="96" text-anchor="middle" class="d-text-inv d-small">filter</text>
+    <rect x="205" y="60" width="85" height="50" rx="6" class="d-block-accent"/><text x="247" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">URL</text><text x="247" y="96" text-anchor="middle" class="d-text-inv d-small">dedup</text>
+    <rect x="300" y="60" width="85" height="50" rx="6" class="d-block-accent"/><text x="342" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">MinHash</text><text x="342" y="96" text-anchor="middle" class="d-text-inv d-small">dedup</text>
+    <rect x="395" y="60" width="85" height="50" rx="6" class="d-block-accent"/><text x="437" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">Line</text><text x="437" y="96" text-anchor="middle" class="d-text-inv d-small">dedup</text>
+    <rect x="490" y="60" width="85" height="50" rx="6" class="d-block-2"/><text x="532" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">Classifier</text><text x="532" y="96" text-anchor="middle" class="d-text-inv d-small">score</text>
+    <rect x="585" y="60" width="85" height="50" rx="6" class="d-block-2"/><text x="627" y="86" text-anchor="middle" class="d-text-inv d-small d-bold">Tokenize</text>
+    <rect x="680" y="60" width="105" height="50" rx="6" class="d-block-muted"/><text x="732" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">Write</text><text x="732" y="96" text-anchor="middle" class="d-text-inv d-small">shards</text>
+
+    <rect x="30" y="250" width="170" height="55" rx="8" class="d-panel"/><text x="115" y="272" text-anchor="middle" class="d-bold d-small">map</text><text x="115" y="288" text-anchor="middle" class="d-small d-text-light">per-document, no shuffle</text>
+    <rect x="220" y="250" width="170" height="55" rx="8" class="d-panel"/><text x="305" y="272" text-anchor="middle" class="d-bold d-small">filter</text><text x="305" y="288" text-anchor="middle" class="d-small d-text-light">per-document keep/drop</text>
+    <rect x="410" y="250" width="170" height="55" rx="8" class="d-panel"/><text x="495" y="272" text-anchor="middle" class="d-bold d-small">groupByKey + shuffle</text><text x="495" y="288" text-anchor="middle" class="d-small d-text-light">URL / MinHash / line bucket</text>
+    <rect x="600" y="250" width="170" height="55" rx="8" class="d-panel"/><text x="685" y="272" text-anchor="middle" class="d-bold d-small">action</text><text x="685" y="288" text-anchor="middle" class="d-small d-text-light">write to storage fabric</text>
+
+    <text x="115" y="320" text-anchor="middle" class="d-small d-text-light">Module 9: MapReduce map / Spark map or filter transformation</text>
+    <text x="495" y="336" text-anchor="middle" class="d-small d-text-light">Module 9: MapReduce reduce / Spark groupByKey-reduceByKey, needs a network shuffle</text>
+
+    <path d="M57,110 L115,248" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M152,110 L305,248" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M247,110 L470,248" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M342,110 L495,248" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M437,110 L520,248" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M532,110 L140,248" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M627,110 L165,248" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M732,110 L685,248" class="d-arrow" marker-end="url(#f4-arr)"/>
+  </svg>
+  <figcaption><b>Figure 4.</b> Only the three dedup stages need a shuffle; extraction, heuristic filtering, classifier scoring, and tokenization are all per-document maps or filters, which is exactly the "coarse-grained transformation" restriction Module 9 shows makes cheap, lineage-based fault recovery possible<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<p>The fault-tolerance corollary follows directly from that placement, and Module 9 already proves it in general: if this pipeline is expressed as a chain of RDD-style transformations — map for extraction, filter for the heuristic and classifier stages, groupByKey/reduceByKey for the three dedup levels — then losing a partition of the final tokenized-shard output at any point does not require a checkpoint of that stage. It requires recomputing that one partition by replaying the same deterministic chain of transformations from the raw-crawl input, because every transformation in the chain is a pure function of its inputs and its position in the lineage graph. Nothing about operating this pipeline at trillion-document scale needs a different fault-tolerance mechanism than the one Module 9 already derived for cluster batch jobs generally; scale is a matter of how many machines run the same map and reduce tasks, not a change to what a map or reduce task is.</p>
+<h3 id="pipeline-as-batch-job-compute">8.1 The compute asymmetry hidden inside the funnel</h3>
+<p>Figure 4 places every stage on one side of a map/shuffle line, and that placement is the right one for reasoning about fault tolerance and parallelism shape. It says nothing about cost, and the cost profile across those stages is wildly uneven. URL-level dedup, MinHash-signature computation, and the line-repeat counts are all bounded by hashing and integer comparison — CPU-cheap, memory-cheap, and (per §3.1) already parallel by construction. The heuristic filters in §4 are the same: an n-gram coverage ratio, a dirty-word count, and a KL-divergence check are all closed-form statistics over a document's own token stream, computed in time linear in document length with a small constant.</p>
+<p>The classifier-scoring stage breaks that pattern. Running DistilRoBERTa — Meta's own choice specifically for the "efficiency reasons" the paper names<a class="cite" href="#ref-1">1</a>, meaning even the compute-intensive classifier family was distilled down from a full RoBERTa to make scoring the whole corpus tractable — over every document that survives dedup and heuristic filtering is a forward pass through a transformer encoder, for every one of what is, before this stage's own filtering narrows it further, a corpus on the order of the roughly 15T output tokens the final mix contains<a class="cite" href="#ref-1">1</a>. The domain-specific code and math classifiers and the multilingual quality-ranking classifier in §5 add three more full-corpus passes through a similarly shaped model. None of Module 9's classic cost intuition — that map and reduce functions are cheap and the shuffle is where the money goes — transfers to this stage without qualification: here, a "map" is a batch-inference job whose FLOPs count is plausibly comparable to some of the training runs that consume the corpus it filters. Meta's paper does not disclose the compute spent on classifier scoring itself, which is consistent with the coverage gap §1 already names: the data pipeline's own resource accounting is not part of what any frontier lab has published.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Llama 3's own recipe already blends heuristics, trained classifiers, and a knowledge-based downsampling classifier<a class="cite" href="#ref-1">1</a>, so it does not itself sit at either extreme of a live methodological split in how much a pre-training pipeline should lean on trained ML classifiers versus rule-based heuristics and rigorous deduplication. Two smaller, openly published corpora sit closer to the poles, and the gap between them is a real, cited disagreement about where the marginal engineering effort in a data pipeline is best spent.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Classifier-first: score hard, accept a much smaller corpus</h4>
+    <p class="who">Llama 3 (Meta, 2024)<a class="cite" href="#ref-1">1</a> and FineWeb-Edu (HuggingFace, 2024)<a class="cite" href="#ref-2">2</a></p>
+    <p>Train a model to recognize what "high quality" looks like — Llama 3's DistilRoBERTa classifier scored against Llama 2's own quality judgments<a class="cite" href="#ref-1">1</a>; FineWeb-Edu's classifier scored against Llama3-70B-Instruct's educational-quality judgments on a 0-5 scale<a class="cite" href="#ref-2">2</a> — and accept that a large share of the crawl will fail the classifier's bar. FineWeb-Edu is the sharper illustration precisely because it is a single, disclosed transformation: the 15-trillion-token FineWeb corpus becomes a 1.3-trillion-token FineWeb-Edu subset<a class="cite" href="#ref-2">2</a>, an 8.7% retained fraction computed directly from those two published numbers, in exchange for what the paper reports as dramatically better performance on knowledge- and reasoning-intensive benchmarks such as MMLU and ARC<a class="cite" href="#ref-2">2</a>.</p>
+    <ul class="pros"><li>a learned classifier can encode a quality judgment (encyclopedic, educational, well-argued) that no fixed heuristic rule expresses directly</li><li>large, measured benchmark gains on knowledge/reasoning tasks specifically, not just perplexity</li></ul>
+    <ul class="cons"><li>discards the large majority of the input corpus by construction — FineWeb-Edu keeps roughly 1 in 11 FineWeb tokens<a class="cite" href="#ref-2">2</a></li><li>the classifier's notion of "quality" is itself a training artifact (judged by another LLM's preferences) and can homogenize style/topic distribution toward whatever that judge favored</li></ul>
+  </article>
+  <article class="position">
+    <h4>Scale-first: filter with heuristics and dedup, keep almost everything that survives</h4>
+    <p class="who">RefinedWeb / Falcon LLM (TII, 2023)<a class="cite" href="#ref-3">3</a></p>
+    <p>The paper's own title states the position directly: "Outperforming Curated Corpora with Web Data, and Web Data Only"<a class="cite" href="#ref-3">3</a>. RefinedWeb's MacroData Refinement pipeline runs document preparation, URL filtering, text extraction, language identification, and exact-plus-fuzzy deduplication over CommonCrawl, extracting five trillion tokens without a trained quality classifier deciding document-by-document retention<a class="cite" href="#ref-3">3</a>. The claim is that properly filtered and deduplicated web data alone — no curated books/Wikipedia/social-media corpus, no ML quality judge — can match or exceed models trained on curated corpora such as The Pile<a class="cite" href="#ref-3">3</a>.</p>
+    <ul class="pros"><li>preserves far more of the raw crawl's token mass, which matters once the target token budget (Llama 3 405B: roughly 15T tokens<a class="cite" href="#ref-1">1</a>) is itself close to or beyond what a classifier-first pass would leave behind</li><li>no dependency on another model's judgment (and that model's biases) to decide what counts as quality</li></ul>
+    <ul class="cons"><li>heuristics and dedup alone cannot detect the specific kind of "low information density but not literally duplicated" text a learned classifier is built to catch</li><li>the paper's own benchmark comparison is against The Pile, not against a classifier-filtered corpus at equal token count, so it does not directly settle which approach wins at matched scale</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The deciding variable is the ratio between the target pre-training token budget and the size of the pool a classifier-first pass would leave. When that pool comfortably exceeds the budget — a small or mid-sized model, or a benchmark-driven project like FineWeb-Edu where the goal is maximizing knowledge-benchmark density rather than covering a fixed multi-trillion-token plan — classifying hard is close to free: you were going to discard most of the crawl anyway, so discard it on a quality signal instead of at random. When the budget approaches or exceeds the classifier-filtered pool's size — which is precisely Llama 3 405B's situation at roughly 15T tokens<a class="cite" href="#ref-1">1</a> against a raw CommonCrawl that a hard classifier bar could shrink well below that — heuristics-and-dedup-first preserves the token mass a frontier run actually needs, and a classifier becomes a re-ranking or downsampling signal (as Llama 3's knowledge classifier and quality scores actually function, §4 and §6) rather than a hard gate. Llama 3's own pipeline is evidence for this reading, not a counterexample to it: it uses classifiers for scoring and category rebalancing, at a scale where a FineWeb-Edu-style 91% discard rate would leave far too little text for a 15T-token budget. What would settle this more cleanly than either paper alone: a head-to-head at matched token count and matched model size, classifier-filtered against heuristics-and-dedup-only, which neither RefinedWeb nor the FineWeb/FineWeb-Edu papers run against each other directly. Absent that experiment, the honest reading of the evidence available is that the two positions are not actually competing for the same design point — RefinedWeb and FineWeb argue about how to get the most out of a web crawl treated as the entire data supply, while Llama 3's mix (§6) treats "how aggressively to filter" as one tunable input to a scaling-law search alongside model size, sitting a level above either paper's single-axis claim.</p>
+</div>
+</section>
+<h2 id="what-is-changing">What is changing</h2>
+<p>The direction of travel since Llama 3's July 2024 disclosure<a class="cite" href="#ref-1">1</a> is toward more labs publishing pipeline-level detail, not less — FineWeb's own stated goal is to document and evaluate deduplication and filtering strategies openly enough that others can reproduce them<a class="cite" href="#ref-2">2</a>, and RefinedWeb published its MacroData Refinement pipeline specifically to make a scale-first, minimal-curated-data claim checkable<a class="cite" href="#ref-3">3</a>. Neither closes the gap this module opened with: both are single-purpose research corpora built to test one hypothesis, not the disclosed pipeline behind a shipped frontier model trained on the resulting data at 405B-parameter, multi-trillion-FLOP scale. As of this writing, that combination — pipeline-level dedup/filtering parameters and the frontier model actually trained on the output — still has exactly one public source. Experiment-tracking and evaluation-pipeline tooling for the pre-training-data stage specifically (as opposed to training-run monitoring generally, which is a different subject) remains undocumented by any lab in any source available for this course; a change worth watching for is any frontier lab publishing that layer with the same specificity Llama 3 gave the dedup cascade.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Llama Team, AI @ Meta. <em>The Llama 3 Herd of Models</em>. arXiv:2407.21783, 2024. <a href="https://arxiv.org/pdf/2407.21783">https://arxiv.org/pdf/2407.21783</a>. Accessed 2026-09-17. <span class="ref-use">Used for: pre-training data curation and dedup cascade (§3.1.1), data mix and annealing (§3.1.2-3.1.3), tokenizer and compression ratio (§3.2, Table 3), total token/compute scale (abstract, §3.3.1).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Penedo, G., Kydlíček, H., Ben Allal, L., Lozhkov, A., Mitchell, M., Raffel, C., Von Werra, L., Wolf, T. <em>The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale</em>. arXiv:2406.17557, 2024 (v2, Oct. 2024). <a href="https://arxiv.org/abs/2406.17557">https://arxiv.org/abs/2406.17557</a>. Accessed 2026-09-18. <span class="ref-use">Used for: FineWeb/FineWeb-Edu token counts and the educational-quality classifier claim, in "Where experts disagree" and the "What is changing" section.</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Penedo, G., Malartic, Q., Hesslow, D., Cojocaru, R., Cappelli, A., Alobeidli, H., Pannier, B., Almazrouei, E., Launay, J. <em>The RefinedWeb Dataset for Falcon LLM: Outperforming Curated Corpora with Web Data, and Web Data Only</em>. arXiv:2306.01116, 2023. <a href="https://arxiv.org/abs/2306.01116">https://arxiv.org/abs/2306.01116</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the RefinedWeb/MacroData Refinement pipeline and its scale-first, heuristics-and-dedup-only claim, in "Where experts disagree".</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>
