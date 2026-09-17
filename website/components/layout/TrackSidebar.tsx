@@ -2,180 +2,90 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { useState, useEffect, useRef } from 'react'
-import { ChevronRight } from 'lucide-react'
-import type { NavTrack, NavPart, NavModule } from '@/lib/registry-types'
-import { colorClasses } from '@/lib/track-theme'
+import { useEffect, useRef } from 'react'
+import type { NavTrack, NavModule } from '@/lib/registry-types'
+import { ReadState } from '@/components/content/ReadState'
 
-interface TrackSidebarProps {
-  track: NavTrack
-}
-
-export function TrackSidebar({ track }: TrackSidebarProps) {
+/** Course contents, shown inside the drawer: parts, modules, reading time, read state. */
+export function TrackSidebar({ track }: { track: NavTrack }) {
   const pathname = usePathname()
-  const activeItemRef = useRef<HTMLAnchorElement | null>(null)
-  const theme = colorClasses(track.color)
+  const activeRef = useRef<HTMLAnchorElement | null>(null)
 
-  // Scroll active item into view on mount
   useEffect(() => {
-    if (activeItemRef.current) {
-      activeItemRef.current.scrollIntoView({ block: 'nearest', behavior: 'instant' })
-    }
+    activeRef.current?.scrollIntoView({ block: 'center', behavior: 'instant' })
   }, [])
 
-  return (
-    <nav className="py-4 pr-2">
-      {/* Track title */}
+  const row = (m: NavModule) => {
+    const active = pathname === m.href
+    return (
       <Link
-        href={`/${track.id}`}
-        className={`block px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.1em] transition-colors
-          ${pathname === `/${track.id}`
-            ? theme.text
-            : 'text-text-tertiary hover:text-text-secondary'}`}
+        key={m.id}
+        href={m.href}
+        ref={active ? activeRef : null}
+        aria-current={active ? 'page' : undefined}
+        className={`flex items-baseline gap-2.5 px-2 py-1.5 rounded-md text-[13.5px] leading-snug transition-colors
+          ${active ? 'bg-accent-blue-subtle text-accent-blue' : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover'}`}
       >
-        {track.shortTitle}
+        <span className={`font-mono text-[11px] w-5 text-right shrink-0 ${active ? 'text-accent-blue' : 'text-text-tertiary'}`}>
+          {String(m.number).padStart(2, '0')}
+        </span>
+        <span className="flex-1 min-w-0">{m.shortTitle}</span>
+        {m.readingTime && <span className="text-[11px] text-text-tertiary shrink-0">{m.readingTime}</span>}
+        <ReadState href={m.href} />
+      </Link>
+    )
+  }
+
+  return (
+    <nav className="ui font-sans px-4 pt-4 pb-8" aria-label="Course contents">
+      <Link href={track.href} className="block pr-8 mb-3 font-serif font-semibold text-[15px] leading-snug tracking-tight text-text-primary hover:text-accent-blue transition-colors">
+        {track.title}
       </Link>
 
-      <div className="mt-2 space-y-0.5">
-        {/* Parts */}
-        {track.parts?.map((part) => (
-          <PartSection
-            key={part.id}
-            part={part}
-            trackId={track.id}
-            currentPath={pathname}
-            activeItemRef={activeItemRef}
-          />
-        ))}
+      {track.parts?.map((part) => (
+        <section key={part.id} className="mt-3">
+          <Link
+            href={part.href}
+            className={`block px-2 pb-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] transition-colors
+              ${pathname.startsWith(part.href) ? 'text-text-secondary' : 'text-text-tertiary hover:text-text-secondary'}`}
+          >
+            Part {part.number} · {part.shortTitle}
+          </Link>
+          <div className="space-y-px">{part.modules.map(row)}</div>
+        </section>
+      ))}
 
-        {/* Flat tracks (deep dives, Qualcomm, Quant) */}
-        {track.modules?.map((module) => (
-          <ModuleLink
-            key={module.id}
-            module={module}
-            isActive={pathname === module.href}
-            activeItemRef={activeItemRef}
-          />
-        ))}
-      </div>
+      {track.modules && <div className="space-y-px mt-1">{track.modules.map(row)}</div>}
 
       {(track.appendices.length > 0 || track.hasSources) && (
-        <div className="mt-4 pt-3 border-t border-border-primary space-y-0.5">
-          {track.appendices.length > 0 && (
-            <Link
-              href={`/${track.id}/appendices`}
-              className={`block px-4 py-1.5 text-[11px] font-semibold uppercase tracking-[0.1em] transition-colors
-                ${pathname === `/${track.id}/appendices` ? theme.text : 'text-text-tertiary hover:text-text-secondary'}`}
-            >
-              Appendices
-            </Link>
-          )}
-          {track.appendices.map((a) => (
-            <Link
-              key={a.id}
-              href={a.href}
-              ref={pathname === a.href ? activeItemRef : null}
-              className={`flex items-center gap-2.5 px-3 py-1.5 text-sm rounded-md mx-1 transition-all
-                ${pathname === a.href
-                  ? 'bg-accent-blue-subtle text-accent-blue font-medium'
-                  : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover'}`}
-            >
-              <span className={`text-[10px] font-mono shrink-0 ${pathname === a.href ? 'text-accent-blue' : 'text-text-tertiary'}`}>{a.letter}</span>
-              <span className="truncate">{a.title}</span>
-            </Link>
-          ))}
-          {track.hasSources && (
-            <Link
-              href={`/${track.id}/sources`}
-              className={`flex items-center gap-2.5 px-3 py-1.5 text-sm rounded-md mx-1 transition-all
-                ${pathname === `/${track.id}/sources`
-                  ? 'bg-accent-blue-subtle text-accent-blue font-medium'
-                  : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover'}`}
-            >
-              <span className="text-[10px] font-mono shrink-0 text-text-tertiary">§</span>
-              <span className="truncate">Sources</span>
-            </Link>
-          )}
-        </div>
+        <section className="mt-4 pt-3 border-t border-border-primary">
+          <div className="px-2 pb-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-text-tertiary">Appendices</div>
+          <div className="space-y-px">
+            {track.appendices.map((a) => (
+              <Link
+                key={a.id}
+                href={a.href}
+                aria-current={pathname === a.href ? 'page' : undefined}
+                className={`flex items-baseline gap-2.5 px-2 py-1.5 rounded-md text-[13.5px] leading-snug transition-colors
+                  ${pathname === a.href ? 'bg-accent-blue-subtle text-accent-blue' : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover'}`}
+              >
+                <span className="font-mono text-[11px] w-5 text-right shrink-0 text-text-tertiary">{a.letter}</span>
+                <span className="flex-1 min-w-0">{a.title}</span>
+              </Link>
+            ))}
+            {track.hasSources && (
+              <Link
+                href={`${track.href}/sources`}
+                className={`flex items-baseline gap-2.5 px-2 py-1.5 rounded-md text-[13.5px] leading-snug transition-colors
+                  ${pathname === `${track.href}/sources` ? 'bg-accent-blue-subtle text-accent-blue' : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover'}`}
+              >
+                <span className="font-mono text-[11px] w-5 text-right shrink-0 text-text-tertiary">§</span>
+                <span className="flex-1 min-w-0">Sources</span>
+              </Link>
+            )}
+          </div>
+        </section>
       )}
     </nav>
-  )
-}
-
-function PartSection({
-  part,
-  trackId,
-  currentPath,
-  activeItemRef,
-}: {
-  part: NavPart
-  trackId: string
-  currentPath: string
-  activeItemRef: React.MutableRefObject<HTMLAnchorElement | null>
-}) {
-  const partPath = `/${trackId}/${part.id}`
-  const isInPart = currentPath.startsWith(partPath)
-  const [isOpen, setIsOpen] = useState(isInPart)
-
-  return (
-    <div>
-      <button
-        onClick={() => setIsOpen(!isOpen)}
-        className={`w-full flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md mx-1 transition-all
-          ${isInPart ? 'text-text-primary' : 'text-text-secondary hover:text-text-primary'}
-          hover:bg-bg-surface-hover`}
-      >
-        <ChevronRight
-          className={`w-3.5 h-3.5 shrink-0 text-text-tertiary transition-transform duration-200 ${isOpen ? 'rotate-90' : ''}`}
-        />
-        <span className="text-left flex items-baseline gap-1.5 truncate">
-          <span className="text-[10px] font-semibold text-text-tertiary tabular-nums">
-            {String(part.number).padStart(2, '0')}
-          </span>
-          <span className="truncate">{part.shortTitle}</span>
-        </span>
-      </button>
-
-      {isOpen && (
-        <div className="ml-4 border-l border-border-primary pl-2 py-1 space-y-0.5 animate-fade-in">
-          {part.modules.map((module) => (
-            <ModuleLink
-              key={module.id}
-              module={module}
-              isActive={currentPath === module.href}
-              activeItemRef={activeItemRef}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function ModuleLink({
-  module,
-  isActive,
-  activeItemRef,
-}: {
-  module: NavModule
-  isActive: boolean
-  activeItemRef: React.MutableRefObject<HTMLAnchorElement | null>
-}) {
-  return (
-    <Link
-      ref={isActive ? activeItemRef : null}
-      href={module.href}
-      className={`flex items-center gap-2.5 px-3 py-1.5 text-sm rounded-md mx-1 transition-all
-        ${isActive
-          ? 'bg-accent-blue-subtle text-accent-blue font-medium'
-          : 'text-text-secondary hover:text-text-primary hover:bg-bg-surface-hover'}`}
-    >
-      <span className={`text-[10px] font-mono tabular-nums shrink-0 ${
-        isActive ? 'text-accent-blue' : 'text-text-tertiary'
-      }`}>
-        {String(module.number).padStart(2, '0')}
-      </span>
-      <span className="truncate">{module.shortTitle}</span>
-    </Link>
   )
 }

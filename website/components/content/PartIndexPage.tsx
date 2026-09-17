@@ -1,70 +1,18 @@
-import Link from 'next/link'
-import { ArrowRight, Clock } from 'lucide-react'
-import { Breadcrumbs, BreadcrumbItem } from '@/components/layout/Breadcrumbs'
-import type { Part } from '@/lib/registry-types'
-import { colorClasses } from '@/lib/track-theme'
+import type { Part, Track } from '@/lib/registry-types'
+import { ModuleRow } from '@/components/content/TrackIndex'
 
-interface PartIndexPageProps {
-  part: Part
-  color: string
-  breadcrumbs: BreadcrumbItem[]
-}
-
-export function PartIndexPage({ part, color, breadcrumbs }: PartIndexPageProps) {
-  const theme = colorClasses(color)
+/** One part of a course: its modules as numbered rows. */
+export function PartIndexPage({ part, track }: { part: Part; track: Track }) {
   return (
-    <>
-      <Breadcrumbs items={breadcrumbs} />
-
-      {/* Part Header */}
-      <div className="mb-8">
-        <div className={`inline-flex items-center gap-2 ${theme.text} text-sm font-semibold mb-2`}>
-          Part {part.number}
-        </div>
-        <h1 className="text-3xl font-extrabold tracking-tight text-text-primary mb-3">
-          {part.title}
-        </h1>
-        <p className="text-lg text-text-secondary">{part.description}</p>
-      </div>
-
-      {/* Module List */}
-      <div className="space-y-3">
-        {part.modules.map((module, i) => (
-          <Link
-            key={module.id}
-            href={module.href}
-            className={`group block rounded-xl border border-border-primary bg-bg-surface
-              ${theme.hoverBorder} hover:shadow-md transition-all duration-200 p-5`}
-            style={{ animationDelay: `${i * 50}ms` }}
-          >
-            <div className="flex items-start gap-4">
-              {/* Module number */}
-              <div className={`w-10 h-10 rounded-lg ${theme.subtle}
-                flex items-center justify-center shrink-0`}>
-                <span className={`text-sm font-bold ${theme.text}`}>{module.number}</span>
-              </div>
-
-              <div className="flex-1 min-w-0">
-                <h3 className={`text-base font-bold text-text-primary ${theme.hoverText} transition-colors mb-1`}>
-                  {module.title}
-                </h3>
-                <p className="text-sm text-text-secondary leading-relaxed mb-2">
-                  {module.description}
-                </p>
-                <div className="flex items-center gap-3 text-xs text-text-tertiary">
-                  <span className="flex items-center gap-1">
-                    <Clock className="w-3 h-3" />
-                    {module.readingTime}
-                  </span>
-                </div>
-              </div>
-
-              <ArrowRight className={`w-4 h-4 text-text-tertiary ${theme.hoverText}
-                group-hover:translate-x-1 transition-all shrink-0 mt-2`} />
-            </div>
-          </Link>
-        ))}
-      </div>
-    </>
+    <div className="max-w-[46rem] mx-auto px-6 sm:px-8 pt-10 pb-24">
+      <header className="mb-8">
+        <p className="ui font-sans text-[12px] font-medium uppercase tracking-[0.06em] text-text-tertiary mb-3">
+          {track.shortTitle} · Part {part.number}
+        </p>
+        <h1 className="font-serif text-[2.125rem] font-semibold tracking-[-0.02em] leading-[1.15] text-text-primary text-balance mb-4">{part.title}</h1>
+        <p className="text-[1.1em] leading-[1.5] text-text-secondary text-pretty">{part.description}</p>
+      </header>
+      <div>{part.modules.map((m) => <ModuleRow key={m.id} module={m} />)}</div>
+    </div>
   )
 }

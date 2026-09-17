@@ -1,35 +1,34 @@
-import { Breadcrumbs, BreadcrumbItem } from '@/components/layout/Breadcrumbs'
 import { MarkdownRenderer } from '@/components/content/MarkdownRenderer'
 import { TableOfContents } from '@/components/content/TableOfContents'
 import { StudyRuntime } from '@/components/content/StudyRuntime'
 import { AppendixCards } from '@/components/content/TrackIndex'
+import { ReadingProgress } from '@/components/layout/ReadingProgress'
 import { loadMarkdown, extractHeadings, stripFirstH1 } from '@/lib/markdown'
 import { loadHtmlModule } from '@/lib/html-module'
-import { colorClasses } from '@/lib/track-theme'
 import type { Appendix, Track } from '@/lib/registry-types'
 
-export function AppendixIndexPage({ track, breadcrumbs }: { track: Track; breadcrumbs: BreadcrumbItem[] }) {
+export function AppendixIndexPage({ track }: { track: Track }) {
   return (
-    <>
-      <Breadcrumbs items={breadcrumbs} />
-      <h1 className="text-3xl font-extrabold tracking-tight text-text-primary mb-2">Appendices</h1>
-      <p className="text-text-secondary mb-6">{track.title}</p>
-      <AppendixCards appendices={track.appendices} theme={colorClasses(track.color)} title="" />
-    </>
+    <div className="max-w-[46rem] mx-auto px-6 sm:px-8 pt-10 pb-24">
+      <header className="mb-4">
+        <p className="ui font-sans text-[12px] font-medium uppercase tracking-[0.06em] text-text-tertiary mb-3">{track.shortTitle}</p>
+        <h1 className="font-serif text-[2.125rem] font-semibold tracking-[-0.02em] leading-[1.15] text-text-primary">Appendices</h1>
+      </header>
+      <AppendixCards appendices={track.appendices} title="" />
+    </div>
   )
 }
 
-export async function AppendixPage({ appendix, breadcrumbs }: { track: Track; appendix: Appendix; breadcrumbs: BreadcrumbItem[] }) {
+export async function AppendixPage({ track, appendix }: { track: Track; appendix: Appendix }) {
   if (appendix.format === 'html') {
     const { html, headings } = await loadHtmlModule(appendix.absPath)
     return (
       <>
-        <link rel="stylesheet" href="/study/study.css" precedence="study" />
-        <Breadcrumbs items={breadcrumbs} />
-        <div className="flex gap-0">
-          <article className="flex-1 min-w-0">
-            <StudyRuntime html={html} />
-          </article>
+        <ReadingProgress />
+        <div className="reading-page">
+          <div className="reading-article">
+            <article><StudyRuntime html={html} /></article>
+          </div>
           <TableOfContents items={headings.filter((h) => h.level === 2)} />
         </div>
       </>
@@ -40,15 +39,17 @@ export async function AppendixPage({ appendix, breadcrumbs }: { track: Track; ap
   const tocItems = extractHeadings(content).filter((h) => h.level === 2)
   return (
     <>
-      <Breadcrumbs items={breadcrumbs} />
-      <div className="flex gap-0">
-        <article className="flex-1 min-w-0">
-          <div className="mb-10 pb-8 border-b border-border-primary">
-            <div className="text-xs text-text-tertiary uppercase tracking-wider mb-2">Appendix {appendix.letter}</div>
-            <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-text-primary">{appendix.title}</h1>
-          </div>
-          <MarkdownRenderer content={content} />
-        </article>
+      <ReadingProgress />
+      <div className="reading-page">
+        <div className="reading-article">
+          <article className="study markdown reading-narrow">
+            <header className="study-header">
+              <p className="kicker">{track.shortTitle} · Appendix {appendix.letter}</p>
+              <h1>{appendix.title}</h1>
+            </header>
+            <MarkdownRenderer content={content} />
+          </article>
+        </div>
         <TableOfContents items={tocItems} />
       </div>
     </>

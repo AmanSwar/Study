@@ -61,5 +61,5 @@ export function StudyRuntime({ html }: { html: string }) {
     }
   }, [pathname, html])
 
-  return <div key={pathname} ref={ref} className="study" dangerouslySetInnerHTML={{ __html: html }} />
+  return <div key={pathname} ref={ref} className="study reading-narrow" dangerouslySetInnerHTML={{ __html: html }} />
 }

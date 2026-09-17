@@ -8,7 +8,6 @@ import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
 import { useState, ReactNode } from 'react'
 import dynamic from 'next/dynamic'
-import { Copy, Check, Link2 } from 'lucide-react'
 
 // AsciiDiagram parses diagrams into large SVG trees. Rendering that during
 // SSR (×60 diagrams × 141 pages) blows the Vercel build budget. Load it
@@ -16,47 +15,29 @@ import { Copy, Check, Link2 } from 'lucide-react'
 // the real SVG.
 const AsciiDiagram = dynamic(
   () => import('./AsciiDiagram').then((m) => m.AsciiDiagram),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
-        <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary bg-bg-surface/50">
-          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider bg-cyan-500/20 text-cyan-400">
-            Diagram
-          </span>
-        </div>
-        <div className="p-4 text-xs text-text-tertiary font-mono">Loading diagram…</div>
-      </div>
-    ),
-  }
+  { ssr: false, loading: () => <Placeholder label="Diagram" /> }
 )
 
 // Visualizations carry interactive SVG charts. Same SSR-cost reasoning as
 // AsciiDiagram — load on the client.
 const Visualization = dynamic(
   () => import('./Visualization').then((m) => m.Visualization),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
-        <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary bg-bg-surface/50">
-          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider bg-amber-500/20 text-amber-400">
-            Visualization
-          </span>
-        </div>
-        <div className="p-4 text-xs text-text-tertiary font-mono">Loading visualization…</div>
-      </div>
-    ),
-  }
+  { ssr: false, loading: () => <Placeholder label="Visualization" /> }
 )
+
+function Placeholder({ label }: { label: string }) {
+  return (
+    <div className="code-block">
+      <div className="code-head"><span className="lang">{label}</span></div>
+      <pre className="code"><code className="text-text-tertiary">Loading…</code></pre>
+    </div>
+  )
+}
 
 interface MarkdownRendererProps {
   content: string
 }
 
-/**
- * Generate a URL-friendly slug from text content (for heading anchors)
- */
 function slugify(text: string): string {
   return text
     .toLowerCase()
@@ -67,9 +48,6 @@ function slugify(text: string): string {
     .substring(0, 60)
 }
 
-/**
- * Extract plain text from React children (for heading IDs).
- */
 function childrenToText(children: ReactNode): string {
   if (typeof children === 'string') return children
   if (typeof children === 'number') return String(children)
@@ -82,335 +60,135 @@ function childrenToText(children: ReactNode): string {
 }
 
 /**
- * Detect if a block is an ASCII diagram worth trying to render as SVG.
- * We require actual box-drawing characters (U+2500–257F) — stray arrows or
- * geometric glyphs in comments (common in asm/C code) don't count.
+ * A block is an ASCII diagram only if it contains box-drawing characters
+ * (U+2500–257F) — stray arrows in asm/C comments don't count.
  */
 function isAsciiDiagram(content: string): boolean {
-  // Box-drawing block only (corners, edges, junctions)
-  const boxDrawingChars = /[\u2500-\u257F]/
-  return boxDrawingChars.test(content)
+  return /[\u2500-\u257F]/.test(content)
+}
+
+const LANG_LABELS: Record<string, string> = {
+  python: 'Python', py: 'Python', c: 'C', cpp: 'C++', 'c++': 'C++',
+  asm: 'Assembly', assembly: 'Assembly', bash: 'Shell', shell: 'Shell', sh: 'Shell',
+  rust: 'Rust', typescript: 'TypeScript', ts: 'TypeScript', js: 'JavaScript',
+  javascript: 'JavaScript', go: 'Go', cuda: 'CUDA', metal: 'Metal',
+  json: 'JSON', yaml: 'YAML', sql: 'SQL', text: 'Text', '': 'Text',
+  plain: 'Text', ascii: 'Diagram', diagram: 'Diagram',
 }
 
 /**
- * CodeBlock component matching the existing site style.
- * - ASCII/text blocks render as clean scrollable <pre> with no line numbers
- *   (line numbers destroy the alignment of box-drawing characters).
- * - Code blocks (with a language) get line numbers via a grid layout
- *   that doesn't constrain content width, so long lines scroll horizontally
- *   instead of wrapping.
+ * Fenced code in the same markup study.css styles for HTML modules
+ * (.code-block > .code-head + pre.code). Diagrams and visualisations hand off
+ * to their components inside a .md-wide plate.
  */
 function MarkdownCodeBlock({ language, children }: { language: string; children: string }) {
   const [copied, setCopied] = useState(false)
   const code = children.replace(/\n$/, '')
-  const lines = code.split('\n')
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(children)
+      await navigator.clipboard.writeText(code)
       setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
+      setTimeout(() => setCopied(false), 1600)
     } catch {}
   }
 
-  const langLabels: Record<string, string> = {
-    python: 'Python', py: 'Python', c: 'C', cpp: 'C++', 'c++': 'C++',
-    asm: 'Assembly', assembly: 'Assembly', bash: 'Bash', shell: 'Shell',
-    rust: 'Rust', typescript: 'TypeScript', ts: 'TypeScript', js: 'JavaScript',
-    javascript: 'JavaScript', go: 'Go', cuda: 'CUDA', metal: 'Metal',
-    json: 'JSON', yaml: 'YAML', sql: 'SQL', text: 'Diagram', '': 'Diagram',
-    plain: 'Diagram', ascii: 'Diagram', diagram: 'Diagram',
-  }
-  const langColors: Record<string, string> = {
-    python: 'bg-yellow-500/20 text-yellow-400', py: 'bg-yellow-500/20 text-yellow-400',
-    c: 'bg-blue-500/20 text-blue-400', cpp: 'bg-blue-500/20 text-blue-400', 'c++': 'bg-blue-500/20 text-blue-400',
-    asm: 'bg-purple-500/20 text-purple-400', assembly: 'bg-purple-500/20 text-purple-400',
-    bash: 'bg-green-500/20 text-green-400', shell: 'bg-green-500/20 text-green-400',
-    rust: 'bg-orange-500/20 text-orange-400',
-    typescript: 'bg-blue-500/20 text-blue-400', ts: 'bg-blue-500/20 text-blue-400',
-    cuda: 'bg-green-500/20 text-green-400',
-  }
-
-  // `viz` blocks are visualization placeholders synthesised by the markdown
-  // preprocessor from `[VISUALIZATION: <Title>]` lines. The body is the slug.
+  // `viz` blocks are synthesised by the markdown preprocessor from `[VISUALIZATION: …]` lines.
   if (language === 'viz') {
-    return <Visualization id={code.trim()} />
+    return <div className="md-wide"><Visualization id={code.trim()} /></div>
   }
-
-  // A block is a "diagram" only if it actually contains box-drawing characters.
-  // Previously we classified any unlabeled block as a diagram, but many of those
-  // are structured text / tables / data — those should render as regular code.
-  const isDiagram = isAsciiDiagram(code)
-
-  // For diagram blocks, hand off to the AsciiDiagram component which parses
-  // and renders as SVG (with fallback to styled ASCII if parsing fails).
-  if (isDiagram) {
-    return <AsciiDiagram code={code} language={language} />
+  if (isAsciiDiagram(code)) {
+    return <div className="md-wide"><AsciiDiagram code={code} language={language} /></div>
   }
-
-  const label = langLabels[language] || language || 'Code'
-  const colorClass = langColors[language] || 'bg-gray-500/20 text-gray-400'
 
   return (
-    <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary bg-bg-surface/50">
-        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider ${colorClass}`}>
-          {label}
-        </span>
-        <button
-          onClick={handleCopy}
-          className="flex items-center gap-1 text-xs text-text-tertiary hover:text-text-secondary transition-colors px-2 py-1 rounded-md hover:bg-bg-surface-hover"
-          aria-label="Copy code"
-        >
-          {copied ? (
-            <>
-              <Check className="w-3.5 h-3.5 text-accent-green" />
-              <span className="text-accent-green">Copied</span>
-            </>
-          ) : (
-            <>
-              <Copy className="w-3.5 h-3.5" />
-              <span>Copy</span>
-            </>
-          )}
+    <div className="code-block">
+      <div className="code-head">
+        <span className="lang">{LANG_LABELS[language] || language || 'Code'}</span>
+        <button type="button" onClick={handleCopy} className={`copy${copied ? ' is-done' : ''}`} aria-label="Copy code">
+          {copied ? 'Copied' : 'Copy'}
         </button>
       </div>
-
-      {/* Real code: line numbers on the left, scrollable code on the right.
-          Uses inline-flex so content expands to its natural width (no wrapping),
-          and the outer div provides overflow scroll. */}
-      <div className="overflow-x-auto">
-        <div className="inline-flex min-w-full">
-          <div
-            className="select-none flex-none py-4 pl-4 pr-3 text-right text-text-tertiary/50 text-xs font-mono bg-bg-code"
-            style={{ lineHeight: 1.625 }}
-          >
-            {lines.map((_, i) => (
-              <div key={i}>{i + 1}</div>
-            ))}
-          </div>
-          <pre
-            className="flex-none py-4 pr-4 pl-2 text-sm font-mono text-text-primary"
-            style={{ whiteSpace: 'pre', lineHeight: 1.625 }}
-          >
-            <code>{code}</code>
-          </pre>
-        </div>
-      </div>
+      <pre className="code"><code>{code}</code></pre>
     </div>
   )
 }
 
 /**
- * MarkdownRenderer — renders source markdown with all the styling of the
- * existing curated module components. Maps markdown elements to:
- *   # / ## / ### → styled headings with anchor links
- *   tables → DataTable-styled wrappers
- *   code fences → CodeBlock with copy button + line numbers
- *   blockquotes → CalloutBox style
- *   lists, paragraphs, links, etc → prose styling
- *   $$ math $$ / $math$ → KaTeX
+ * MarkdownRenderer — renders source markdown onto the study.css components, so
+ * markdown tracks read exactly like HTML modules. Elements are emitted without
+ * a wrapper: they must be direct children of the .study column for the wide
+ * plate rules to apply.
  */
 export function MarkdownRenderer({ content }: MarkdownRendererProps) {
   return (
-    <div className="markdown-content">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[
-          [
-            rehypeKatex,
-            {
-              // Don't throw on parse errors — render the failing TeX as-is
-              // (colored/highlighted) so the rest of the page still renders.
-              throwOnError: false,
-              // Display errors inline (as colored text) rather than popup tooltips
-              errorColor: 'var(--accent-red)',
-              // Be permissive with non-standard macros
-              strict: false as const,
-              // Enable common extensions like \begin{cases}, \begin{align*}, etc.
-              trust: true,
-            },
-          ],
-          rehypeRaw,
-        ]}
-        components={{
-          h1: ({ children, ...props }) => {
-            const text = childrenToText(children)
-            const id = slugify(text)
-            return (
-              <h1
-                id={id}
-                className="text-3xl sm:text-4xl font-extrabold tracking-tight text-text-primary mb-6 mt-8 scroll-mt-20"
-                {...props}
-              >
-                {children}
-              </h1>
-            )
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[
+        [
+          rehypeKatex,
+          {
+            // Don't throw on parse errors — render the failing TeX as-is so the rest of the page still renders.
+            throwOnError: false,
+            errorColor: 'var(--accent-red)',
+            strict: false as const,
+            trust: true,
           },
-          h2: ({ children, ...props }) => {
-            const text = childrenToText(children)
-            const id = slugify(text)
-            return (
-              <h2
-                id={id}
-                className="group flex items-center gap-2 text-[1.75rem] font-bold tracking-tight text-text-primary border-b border-border-primary pb-3 mb-6 mt-12 scroll-mt-20"
-                {...props}
-              >
-                <a href={`#${id}`} className="hover:text-accent-blue transition-colors">{children}</a>
-                <a href={`#${id}`} className="opacity-0 group-hover:opacity-100 transition-opacity" aria-label="Permalink">
-                  <Link2 className="w-4 h-4 text-text-tertiary hover:text-accent-blue" />
-                </a>
-              </h2>
-            )
-          },
-          h3: ({ children, ...props }) => {
-            const text = childrenToText(children)
-            const id = slugify(text)
-            return (
-              <h3
-                id={id}
-                className="group flex items-center gap-2 text-[1.375rem] font-semibold text-text-primary mb-4 mt-8 scroll-mt-20"
-                {...props}
-              >
-                <a href={`#${id}`} className="hover:text-accent-blue transition-colors">{children}</a>
-                <a href={`#${id}`} className="opacity-0 group-hover:opacity-100 transition-opacity" aria-label="Permalink">
-                  <Link2 className="w-3.5 h-3.5 text-text-tertiary hover:text-accent-blue" />
-                </a>
-              </h3>
-            )
-          },
-          h4: ({ children, ...props }) => (
-            <h4 className="text-lg font-semibold text-text-primary mt-6 mb-3" {...props}>
+        ],
+        rehypeRaw,
+      ]}
+      components={{
+        h1: ({ children, ...props }) => <h1 id={slugify(childrenToText(children))} {...props}>{children}</h1>,
+        h2: ({ children, ...props }) => {
+          const id = slugify(childrenToText(children))
+          return (
+            <h2 id={id} {...props}>
               {children}
-            </h4>
-          ),
-          h5: ({ children, ...props }) => (
-            <h5 className="text-base font-semibold text-text-primary mt-4 mb-2" {...props}>
+              <a href={`#${id}`} className="anchor" aria-label="Permalink">#</a>
+            </h2>
+          )
+        },
+        h3: ({ children, ...props }) => {
+          const id = slugify(childrenToText(children))
+          return (
+            <h3 id={id} {...props}>
               {children}
-            </h5>
-          ),
-          h6: ({ children, ...props }) => (
-            <h6 className="text-sm font-semibold text-text-secondary mt-4 mb-2 uppercase tracking-wider" {...props}>
-              {children}
-            </h6>
-          ),
-          p: ({ children, ...props }) => (
-            <p className="mb-5 leading-relaxed text-text-primary" {...props}>
-              {children}
-            </p>
-          ),
-          a: ({ children, href, ...props }) => (
-            <a
-              href={href}
-              target={href?.startsWith('http') ? '_blank' : undefined}
-              rel={href?.startsWith('http') ? 'noopener noreferrer' : undefined}
-              className="text-accent-blue hover:text-accent-blue-hover underline underline-offset-2 transition-colors"
-              {...props}
-            >
-              {children}
-            </a>
-          ),
-          strong: ({ children, ...props }) => (
-            <strong className="font-bold text-text-primary" {...props}>
-              {children}
-            </strong>
-          ),
-          em: ({ children, ...props }) => (
-            <em className="italic" {...props}>
-              {children}
-            </em>
-          ),
-          ul: ({ children, ...props }) => (
-            <ul className="list-disc pl-6 my-5 space-y-1.5 text-text-primary" {...props}>
-              {children}
-            </ul>
-          ),
-          ol: ({ children, ...props }) => (
-            <ol className="list-decimal pl-6 my-5 space-y-1.5 text-text-primary" {...props}>
-              {children}
-            </ol>
-          ),
-          li: ({ children, ...props }) => (
-            <li className="leading-relaxed" {...props}>
-              {children}
-            </li>
-          ),
-          blockquote: ({ children }) => (
-            <div className="my-6 rounded-xl border-l-4 border-accent-blue bg-accent-blue-subtle/30 p-5 not-prose">
-              <div className="text-sm leading-relaxed text-text-primary">
-                {children}
-              </div>
-            </div>
-          ),
-          hr: () => (
-            <hr className="my-10 border-t border-border-primary" />
-          ),
-          code: ({ className, children, ...props }) => {
-            const childrenStr = String(children)
-            const match = /language-(\w+)/.exec(className || '')
-            // Treat as a code BLOCK if:
-            //   - It has a language- class (typical ```lang fenced block), OR
-            //   - Its content contains a newline (fenced block with no lang).
-            // Otherwise render as inline code.
-            const isBlock = match !== null || childrenStr.includes('\n')
-            if (isBlock) {
-              const language = match ? match[1] : ''
-              return <MarkdownCodeBlock language={language}>{childrenStr.replace(/\n$/, '')}</MarkdownCodeBlock>
-            }
-            return (
-              <code className="px-1.5 py-0.5 rounded bg-bg-code text-accent-cyan text-[0.9em] font-mono break-words" {...props}>
-                {children}
-              </code>
-            )
-          },
-          pre: ({ children }) => {
-            // Check if this <pre> contains a <code> with a language class — if so,
-            // the <code> handler above already renders it as MarkdownCodeBlock,
-            // so we just pass through to avoid double-wrapping
-            return <>{children}</>
-          },
-          table: ({ children, ...props }) => (
-            <div className="my-6 rounded-xl border border-border-primary overflow-hidden not-prose">
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm" {...props}>
-                  {children}
-                </table>
-              </div>
-            </div>
-          ),
-          thead: ({ children, ...props }) => (
-            <thead className="bg-bg-surface border-b border-border-primary" {...props}>
-              {children}
-            </thead>
-          ),
-          tbody: ({ children, ...props }) => (
-            <tbody className="divide-y divide-border-subtle" {...props}>
-              {children}
-            </tbody>
-          ),
-          tr: ({ children, ...props }) => (
-            <tr className="hover:bg-bg-surface-hover transition-colors" {...props}>
-              {children}
-            </tr>
-          ),
-          th: ({ children, ...props }) => (
-            <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-text-tertiary" {...props}>
-              {children}
-            </th>
-          ),
-          td: ({ children, ...props }) => (
-            <td className="px-4 py-3 text-sm text-text-secondary align-top" {...props}>
-              {children}
-            </td>
-          ),
-          img: ({ src, alt, ...props }) => (
-            <img src={src} alt={alt} className="my-6 rounded-lg border border-border-primary max-w-full" {...props} />
-          ),
-        }}
-      >
-        {content}
-      </ReactMarkdown>
-    </div>
+              <a href={`#${id}`} className="anchor" aria-label="Permalink">#</a>
+            </h3>
+          )
+        },
+        a: ({ children, href, ...props }) => (
+          <a
+            href={href}
+            target={href?.startsWith('http') ? '_blank' : undefined}
+            rel={href?.startsWith('http') ? 'noopener noreferrer' : undefined}
+            {...props}
+          >
+            {children}
+          </a>
+        ),
+        blockquote: ({ children }) => <aside className="callout callout-note">{children}</aside>,
+        code: ({ className, children, ...props }) => {
+          const childrenStr = String(children)
+          const match = /language-(\w+)/.exec(className || '')
+          // A code BLOCK has a language- class (```lang) or contains a newline (bare fence).
+          const isBlock = match !== null || childrenStr.includes('\n')
+          if (isBlock) {
+            return <MarkdownCodeBlock language={match ? match[1] : ''}>{childrenStr.replace(/\n$/, '')}</MarkdownCodeBlock>
+          }
+          return <code {...props}>{children}</code>
+        },
+        // the <code> handler above already produced the block; avoid a double <pre>
+        pre: ({ children }) => <>{children}</>,
+        table: ({ children, ...props }) => (
+          <div className="tbl-wrap">
+            <table className="tbl" {...props}>{children}</table>
+          </div>
+        ),
+        img: ({ src, alt, ...props }) => <img src={src} alt={alt} loading="lazy" {...props} />,
+      }}
+    >
+      {content}
+    </ReactMarkdown>
   )
 }

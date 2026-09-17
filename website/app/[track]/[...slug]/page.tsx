@@ -92,23 +92,19 @@ export default async function SlugPage({ params }: { params: Params }) {
   const hit = await load(params)
   if (!hit) notFound()
   const { track, r } = hit
-  const root = { label: track.shortTitle, href: track.href }
 
   switch (r.kind) {
     case 'part':
-      return <PartIndexPage part={r.part} color={track.color} breadcrumbs={[root, { label: `Part ${r.part.number}: ${r.part.shortTitle}` }]} />
+      return <PartIndexPage part={r.part} track={track} />
     case 'module': {
-      const breadcrumbs = [
-        root,
-        ...(r.part ? [{ label: `Part ${r.part.number}: ${r.part.shortTitle}`, href: r.part.href }] : []),
-        { label: `${track.unitLabel} ${r.module.number}` },
-      ]
       const common = {
         absPath: r.module.absPath,
-        breadcrumbs,
+        href: r.module.href,
         moduleNumber: r.module.number,
         title: r.module.title,
         track: track.id,
+        trackTitle: track.title,
+        unitLabel: track.unitLabel,
         part: r.module.partNumber,
         readingTime: r.module.readingTime,
         prerequisites: r.module.prerequisites,
@@ -118,10 +114,10 @@ export default async function SlugPage({ params }: { params: Params }) {
       return r.module.format === 'html' ? <HtmlModulePage {...common} /> : <MarkdownModulePage {...common} />
     }
     case 'appendix-index':
-      return <AppendixIndexPage track={track} breadcrumbs={[root, { label: 'Appendices' }]} />
+      return <AppendixIndexPage track={track} />
     case 'appendix':
-      return <AppendixPage track={track} appendix={r.appendix} breadcrumbs={[root, { label: 'Appendices', href: `${track.href}/appendices` }, { label: `Appendix ${r.appendix.letter}` }]} />
+      return <AppendixPage track={track} appendix={r.appendix} />
     case 'sources':
-      return <SourcesPage track={track} breadcrumbs={[root, { label: 'Sources' }]} />
+      return <SourcesPage track={track} />
   }
 }

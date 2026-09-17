@@ -1,88 +1,56 @@
-import { Breadcrumbs, BreadcrumbItem } from '@/components/layout/Breadcrumbs'
 import { ModuleHeader } from '@/components/content/ModuleHeader'
 import { MarkdownRenderer } from '@/components/content/MarkdownRenderer'
 import { TableOfContents } from '@/components/content/TableOfContents'
 import { ModuleNav } from '@/components/layout/ModuleNav'
 import { ReadingProgress } from '@/components/layout/ReadingProgress'
+import { ReadingPosition } from '@/components/layout/ReadingPosition'
+import type { ModulePageProps } from '@/components/content/HtmlModulePage'
 import { loadMarkdown, extractHeadings, stripFirstH1 } from '@/lib/markdown'
 
-interface MarkdownModulePageProps {
-  /** Absolute path to the source markdown (from the registry) */
-  absPath: string
-  /** Breadcrumb items leading to this module */
-  breadcrumbs: BreadcrumbItem[]
-  /** Module number for the header */
-  moduleNumber: number
-  /** Module title */
-  title: string
-  /** Track ID */
-  track: string
-  /** Part number (0 for flat tracks like Qualcomm) */
-  part: number
-  /** Estimated reading time */
-  readingTime: string
-  /** Prerequisites array */
-  prerequisites?: string[]
-  /** Optional description */
-  description?: string
-  /** Previous module link */
-  prev?: { href: string; label: string }
-  /** Next module link */
-  next?: { href: string; label: string }
-}
-
 /**
- * MarkdownModulePage — a server component that loads a source markdown file
- * and renders it inside the standard module page layout:
- *
- *   [ReadingProgress bar at top]
- *   [Breadcrumbs]
- *   [ModuleHeader with number, title, description, metadata]
- *   [MarkdownRenderer — full content]
- *   [TableOfContents — right rail on wide screens]
- *   [ModuleNav — rich prev/next cards with arrow key shortcuts]
+ * A markdown module in the reading layout: the site supplies the header (same
+ * markup as HTML modules), the body renders through MarkdownRenderer onto the
+ * study.css components, plus progress, on-this-page rail, position memory and
+ * prev/next.
  */
 export async function MarkdownModulePage({
-  absPath,
-  breadcrumbs,
-  moduleNumber,
-  title,
-  track,
-  part,
-  readingTime,
-  prerequisites = [],
-  description,
-  prev,
-  next,
-}: MarkdownModulePageProps) {
+  absPath, href, moduleNumber, title, track, trackTitle, unitLabel, part, readingTime, prerequisites = [], description, prev, next, index, count,
+}: ModulePageProps) {
   const rawContent = await loadMarkdown(absPath)
   const content = stripFirstH1(rawContent)
-  const tocItems = extractHeadings(content).filter((h) => h.level === 2)
+  const sections = extractHeadings(content).filter((h) => h.level === 2)
 
   return (
     <>
       <ReadingProgress />
-      <Breadcrumbs items={breadcrumbs} />
-
-      <div className="flex gap-0">
-        <article className="flex-1 min-w-0">
-          <ModuleHeader
-            number={moduleNumber}
-            title={title}
-            track={track}
-            part={part}
-            readingTime={readingTime}
-            prerequisites={prerequisites}
-            description={description}
-          />
-
-          <MarkdownRenderer content={content} />
-
-          <ModuleNav prev={prev} next={next} />
-        </article>
-
-        <TableOfContents items={tocItems} />
+      <div className="reading-page">
+        <div className="reading-article">
+          <article className="study markdown reading-narrow">
+            <ModuleHeader
+              number={moduleNumber}
+              title={title}
+              trackTitle={trackTitle}
+              unitLabel={unitLabel}
+              part={part}
+              readingTime={readingTime}
+              prerequisites={prerequisites}
+              description={description}
+            />
+            <MarkdownRenderer content={content} />
+          </article>
+          <ModuleNav prev={prev} next={next} unitLabel={unitLabel} />
+        </div>
+        <TableOfContents
+          items={sections}
+          meta={
+            <>
+              {readingTime && <><b className="font-medium text-text-secondary">{readingTime}</b> read<br /></>}
+              {unitLabel} {index + 1} of {count}
+            </>
+          }
+        />
       </div>
+      <ReadingPosition href={href} title={title} track={track} sections={sections} />
     </>
   )
 }

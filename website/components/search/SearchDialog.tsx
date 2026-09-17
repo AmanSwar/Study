@@ -4,7 +4,6 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { Search, X, ArrowRight, CornerDownLeft } from 'lucide-react'
 import { SearchItem, searchItems } from '@/lib/search-index'
-import { colorClasses } from '@/lib/track-theme'
 
 interface SearchDialogProps {
   open: boolean
@@ -21,6 +20,13 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
 
   // Results: if query, filtered; else recent/all tracks grouped
   const results = query ? searchItems(items, query) : items.slice(0, 12)
+  const active = Math.min(activeIndex, Math.max(0, results.length - 1))
+
+  const close = useCallback(() => {
+    setQuery('')
+    setActiveIndex(0)
+    onClose()
+  }, [onClose])
 
   // Focus input when dialog opens
   useEffect(() => {
@@ -29,35 +35,22 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
     }
   }, [open])
 
-  // Reset state when dialog closes
-  useEffect(() => {
-    if (!open) {
-      setQuery('')
-      setActiveIndex(0)
-    }
-  }, [open])
-
-  // Keep active index in bounds
-  useEffect(() => {
-    setActiveIndex((i) => Math.min(i, Math.max(0, results.length - 1)))
-  }, [results.length])
-
   // Scroll active item into view
   useEffect(() => {
     const list = listRef.current
     if (!list) return
-    const activeEl = list.querySelector<HTMLElement>(`[data-index="${activeIndex}"]`)
+    const activeEl = list.querySelector<HTMLElement>(`[data-index="${active}"]`)
     if (activeEl) {
       activeEl.scrollIntoView({ block: 'nearest' })
     }
-  }, [activeIndex])
+  }, [active])
 
   const handleSelect = useCallback(
     (item: SearchItem) => {
       router.push(item.href)
-      onClose()
+      close()
     },
-    [router, onClose]
+    [router, close]
   )
 
   const handleKeyDown = useCallback(
@@ -70,27 +63,27 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
         setActiveIndex((i) => Math.max(i - 1, 0))
       } else if (e.key === 'Enter') {
         e.preventDefault()
-        const selected = results[activeIndex]
+        const selected = results[active]
         if (selected) handleSelect(selected)
       } else if (e.key === 'Escape') {
         e.preventDefault()
-        onClose()
+        close()
       }
     },
-    [results, activeIndex, handleSelect, onClose]
+    [results, active, handleSelect, close]
   )
 
   if (!open) return null
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-start justify-center p-4 pt-[15vh] bg-black/50 backdrop-blur-sm animate-fade-in"
-      onClick={onClose}
+      className="ui fixed inset-0 z-[100] flex items-start justify-center p-4 pt-[15vh] bg-bg-primary/60 backdrop-blur-sm animate-fade-in font-sans"
+      onClick={close}
       role="dialog"
       aria-label="Search"
     >
       <div
-        className="w-full max-w-xl rounded-xl bg-bg-elevated border border-border-primary shadow-2xl overflow-hidden"
+        className="w-full max-w-xl rounded-lg bg-bg-elevated border border-border-primary shadow-lg overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Search input */}
@@ -103,12 +96,12 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Search modules, chapters, topics..."
-            className="flex-1 bg-transparent text-base text-text-primary placeholder:text-text-tertiary outline-none"
+            className="flex-1 bg-transparent text-[15px] text-text-primary placeholder:text-text-tertiary outline-none"
             autoComplete="off"
             spellCheck="false"
           />
           <button
-            onClick={onClose}
+            onClick={close}
             className="flex items-center justify-center w-6 h-6 rounded hover:bg-bg-surface-hover text-text-tertiary hover:text-text-secondary transition-colors"
             aria-label="Close search"
           >
@@ -131,7 +124,7 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
           ) : (
             <div className="py-2">
               {!query && (
-                <div className="px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-text-tertiary">
+                <div className="px-4 py-1.5 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-text-tertiary">
                   Browse
                 </div>
               )}
@@ -142,15 +135,15 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
                   onClick={() => handleSelect(item)}
                   onMouseEnter={() => setActiveIndex(idx)}
                   className={`w-full flex items-center gap-3 px-4 py-2.5 text-left transition-colors ${
-                    activeIndex === idx
+                    active === idx
                       ? 'bg-accent-blue-subtle'
                       : 'hover:bg-bg-surface-hover'
                   }`}
                 >
-                  <TrackBadge label={item.trackLabel} color={item.color} />
+                  <TrackBadge label={item.trackLabel} />
                   <div className="flex-1 min-w-0">
-                    <div className={`text-sm font-medium truncate ${
-                      activeIndex === idx ? 'text-accent-blue' : 'text-text-primary'
+                    <div className={`text-[14px] font-medium truncate ${
+                      active === idx ? 'text-accent-blue' : 'text-text-primary'
                     }`}>
                       {item.title}
                     </div>
@@ -158,7 +151,7 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
                       {item.subtitle}
                     </div>
                   </div>
-                  {activeIndex === idx && (
+                  {active === idx && (
                     <ArrowRight className="w-4 h-4 text-accent-blue shrink-0" />
                   )}
                 </button>
@@ -191,9 +184,9 @@ export function SearchDialog({ open, onClose, items }: SearchDialogProps) {
   )
 }
 
-function TrackBadge({ label, color }: { label: string; color: string }) {
+function TrackBadge({ label }: { label: string }) {
   return (
-    <span className={`text-[10px] font-semibold px-2 py-1 rounded-md uppercase tracking-wider shrink-0 ${colorClasses(color).badge}`}>
+    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase tracking-[0.08em] shrink-0 border border-border-primary text-text-tertiary">
       {label}
     </span>
   )

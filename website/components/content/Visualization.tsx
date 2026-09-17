@@ -27,7 +27,7 @@ export function Visualization({ id }: VisualizationProps) {
   // Unknown id — render a friendly placeholder so the gap is obvious in dev
   // but the page still renders cleanly in prod.
   return (
-    <div className="my-6 rounded-xl border border-dashed border-border-primary bg-bg-code/50 p-5 not-prose">
+    <div className="ui my-6 rounded-lg border border-dashed border-border-primary p-5 font-sans">
       <div className="text-[10px] font-semibold uppercase tracking-wider text-text-tertiary mb-1">
         Visualization placeholder
       </div>

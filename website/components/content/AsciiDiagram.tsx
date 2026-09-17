@@ -47,14 +47,10 @@ function DiagramSVG({ diagram }: { diagram: Diagram }) {
   const height = diagram.rows * CELL_H + PADDING * 2
 
   return (
-    <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary bg-bg-surface/50">
-        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider bg-cyan-500/20 text-cyan-400">
-          Diagram
-        </span>
-        <span className="text-[10px] text-text-tertiary uppercase tracking-wider">
-          {diagram.rectangles.length} {diagram.rectangles.length === 1 ? 'node' : 'nodes'}
-        </span>
+    <div className="code-block">
+      <div className="code-head">
+        <span className="lang">Diagram</span>
+        <span className="code-title">{diagram.rectangles.length} {diagram.rectangles.length === 1 ? 'node' : 'nodes'}</span>
       </div>
 
       <div className="overflow-x-auto p-4">
@@ -62,7 +58,7 @@ function DiagramSVG({ diagram }: { diagram: Diagram }) {
           viewBox={`0 0 ${width} ${height}`}
           width={width}
           height={height}
-          className="block"
+          className="block mx-auto"
           style={{ maxWidth: '100%', height: 'auto' }}
         >
           <defs>
@@ -302,20 +298,13 @@ function ArrowGlyph({ arrow }: { arrow: { r: number; c: number; dir: string } })
 
 function AsciiFallback({ code, language }: { code: string; language?: string }) {
   return (
-    <div className="my-6 rounded-xl border border-border-primary bg-bg-code overflow-hidden not-prose">
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary bg-bg-surface/50">
-        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md uppercase tracking-wider bg-cyan-500/20 text-cyan-400">
-          {language || 'Diagram'}
-        </span>
+    <div className="code-block">
+      <div className="code-head">
+        <span className="lang">{language || 'Diagram'}</span>
       </div>
-      <div className="overflow-x-auto">
-        <pre
-          className="p-4 text-sm font-mono text-text-primary"
-          style={{ whiteSpace: 'pre', lineHeight: 1.25, letterSpacing: '-0.02em' }}
-        >
-          <code>{code.replace(/\n$/, '')}</code>
-        </pre>
-      </div>
+      <pre className="code" style={{ lineHeight: 1.25, letterSpacing: '-0.02em' }}>
+        <code>{code.replace(/\n$/, '')}</code>
+      </pre>
     </div>
   )
 }

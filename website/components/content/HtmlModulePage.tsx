@@ -1,51 +1,60 @@
-import { Breadcrumbs, BreadcrumbItem } from '@/components/layout/Breadcrumbs'
 import { TableOfContents } from '@/components/content/TableOfContents'
-import { ModuleNav } from '@/components/layout/ModuleNav'
+import { ModuleNav, type ModuleLink } from '@/components/layout/ModuleNav'
 import { ReadingProgress } from '@/components/layout/ReadingProgress'
+import { ReadingPosition } from '@/components/layout/ReadingPosition'
 import { StudyRuntime } from '@/components/content/StudyRuntime'
 import { loadHtmlModule } from '@/lib/html-module'
 
 export interface ModulePageProps {
   absPath: string
-  breadcrumbs: BreadcrumbItem[]
+  href: string
   moduleNumber: number
   title: string
   track: string
+  trackTitle: string
+  unitLabel: string
   part: number
   readingTime: string
   prerequisites?: string[]
   description?: string
-  prev?: { href: string; label: string }
-  next?: { href: string; label: string }
+  prev?: ModuleLink
+  next?: ModuleLink
+  /** position in the track's reading order */
+  index: number
+  count: number
 }
 
 /**
- * HtmlModulePage — same chrome as MarkdownModulePage, but the body is a
- * self-contained HTML module (design system in /study/). The module's own
- * <head> is ignored; the site loads study.css here (React hoists and dedupes
- * the link) and study.js through StudyRuntime. The module carries its own
- * header (kicker, title, lede, meta chips), so the site's ModuleHeader is not
- * rendered — the manifest's title/readingTime still feed <title>, cards and
- * the sidebar.
+ * A self-contained HTML module inside the reading layout. The module carries its
+ * own header (kicker, title, lede, meta); the site adds the progress hairline,
+ * the on-this-page rail, position memory and prev/next. study.css is loaded
+ * globally; study.js runs through StudyRuntime.
  */
-export async function HtmlModulePage({ absPath, breadcrumbs, prev, next }: ModulePageProps) {
+export async function HtmlModulePage({ absPath, href, title, track, unitLabel, readingTime, prev, next, index, count }: ModulePageProps) {
   const { html, headings } = await loadHtmlModule(absPath)
-  const tocItems = headings.filter((h) => h.level === 2)
+  const sections = headings.filter((h) => h.level === 2)
 
   return (
     <>
-      <link rel="stylesheet" href="/study/study.css" precedence="study" />
       <ReadingProgress />
-      <Breadcrumbs items={breadcrumbs} />
-
-      <div className="flex gap-0">
-        <article className="flex-1 min-w-0">
-          <StudyRuntime html={html} />
-          <ModuleNav prev={prev} next={next} />
-        </article>
-
-        <TableOfContents items={tocItems} />
+      <div className="reading-page">
+        <div className="reading-article">
+          <article>
+            <StudyRuntime html={html} />
+          </article>
+          <ModuleNav prev={prev} next={next} unitLabel={unitLabel} />
+        </div>
+        <TableOfContents
+          items={sections}
+          meta={
+            <>
+              {readingTime && <><b className="font-medium text-text-secondary">{readingTime}</b> read<br /></>}
+              {unitLabel} {index + 1} of {count}
+            </>
+          }
+        />
       </div>
+      <ReadingPosition href={href} title={title} track={track} sections={sections} />
     </>
   )
 }

@@ -129,15 +129,16 @@ export async function getTrack(id: string): Promise<Track | undefined> {
 
 export function getPrevNext(track: Track, moduleId: string) {
   const i = track.allModules.findIndex((m) => m.id === moduleId)
-  const toLink = (m?: Module) => (m ? { href: m.href, label: m.shortTitle } : undefined)
-  return { prev: toLink(track.allModules[i - 1]), next: toLink(track.allModules[i + 1]) }
+  const toLink = (m?: Module) => (m ? { href: m.href, label: m.title, number: m.number } : undefined)
+  return { prev: toLink(track.allModules[i - 1]), next: toLink(track.allModules[i + 1]), index: i, count: track.allModules.length }
 }
 
 /** Strip filesystem paths before handing a track to client components. */
 export function toNavTrack(t: Track): NavTrack {
-  const nm = (m: Module) => ({ id: m.id, number: m.number, shortTitle: m.shortTitle, href: m.href })
+  const nm = (m: Module) => ({ id: m.id, number: m.number, shortTitle: m.shortTitle, href: m.href, readingTime: m.readingTime })
   return {
     id: t.id,
+    title: t.title,
     shortTitle: t.shortTitle,
     href: t.href,
     color: t.color,

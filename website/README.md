@@ -22,9 +22,19 @@ Two module formats:
 - `format: "md"` — legacy markdown, rendered by `components/content/MarkdownModulePage.tsx` (react-markdown + KaTeX + ASCII→SVG diagrams).
 - `format: "html"` — self-contained HTML modules written by the study skills. `lib/html-module.ts` extracts the inner HTML of `<main class="study">`, `components/content/HtmlModulePage.tsx` injects it, and `StudyRuntime.tsx` loads `/study/study.js` and runs `Study.init(root)` after every navigation. The module's own `<head>` is ignored; the site supplies `/study/study.css`.
 
+## Reading layout
+
+The site is built for reading 5–12k-word modules for hours, so the chrome stays out of the way:
+
+- **One prose column** (`--measure`, 40 rem ≈ 72 characters) in Source Serif 4 at 18 px; Inter for labels, navigation and captions; JetBrains Mono for data. Figures, tables, steppers, KPI rows and comparison grids are *plates* that break out to `--wide` (56 rem) — the rule is the last section of `study.css`, measured with container queries against `.reading-article`. Code keeps the prose's left edge and grows rightward only as far as its longest line needs.
+- **Chrome**: a 48 px bar (breadcrumb, Contents, search, `Aa`, theme) that hides on scroll-down; the course contents as a drawer (`c`); an "on this page" rail at ≥ 80 rem with the current section marked and past sections dimmed; a 2 px progress hairline.
+- **Reader settings** (`Aa`): serif/sans, 15–21 px, narrow/normal/wide, theme — stored under `aman.study:reader` and applied to `<html data-font data-size data-width>` before first paint by a script in `app/layout.tsx`.
+- **Reading position** (`lib/reading-state.ts`, `aman.study:positions` in localStorage): each module remembers scroll % and current section; reopening offers "Resume § … · 43 %"; ≥ 92 % marks it read. The home page lists *Continue reading*; the syllabus and drawer show read state.
+- Markdown tracks render through `MarkdownRenderer` onto the same `study.css` components (`.code-block`, `.tbl`, `.callout`) as HTML modules, so both formats look identical; ASCII diagrams and visualisations sit in `.md-wide` plates.
+
 ## Design system for HTML modules — `public/study/`
 
-`study.css` (tokens shared with `app/globals.css`; components scoped under `.study`), `study.js` (code headers/copy, highlight.js, KaTeX auto-render, tables, figure zoom, tabs, steppers, calculators, citation popovers; standalone TOC/theme/progress), `demo.html` (gallery of every component), `vendor/` (KaTeX 0.16, highlight.js 11 — copied from npm, see `../.claude/study/references/components.md`).
+`study.css` (tokens shared with `app/globals.css` — change both together; components scoped under `.study`; the wide-plate rules are the last section on purpose), `study.js` (code headers/copy, highlight.js, KaTeX auto-render, tables, figure zoom, tabs, steppers, calculators, citation popovers; standalone TOC/theme/progress and web-font loading), `demo.html` (gallery of every component), `vendor/` (KaTeX 0.16, highlight.js 11 — copied from npm, see `../.claude/study/references/components.md`). `study.css` is loaded globally from `app/layout.tsx`.
 
 ## Commands
 
