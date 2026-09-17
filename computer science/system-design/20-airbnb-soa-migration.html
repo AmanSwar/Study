@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airbnb: Search Ranking, Payment Idempotency, and the Monolith-to-SOA Migration · System Design</title>
+<meta name="description" content="Airbnb's own published account of three engineering problems inside one two-sided marketplace: replacing a hand-tuned scoring function with a two-tower deep network, keeping a guest's payment from executing twice across a service-oriented architecture, and the monolith-to-SOA migration that let both evolve independently.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 20</p>
+  <h1>Airbnb: Search Ranking, Payment Idempotency, and the Monolith-to-SOA Migration</h1>
+  <p class="lede">Airbnb has published three separate, detailed engineering accounts of the same two-sided marketplace: how its search ranker went from a hand-tuned scoring function through five model generations to a two-tower deep network, how its payments system stops a guest's card from being charged twice when a network call is retried inside a service-oriented architecture, and why it split a single Rails monolith into many independently-deployed services in the first place. After this module you can read any of the three source papers or posts directly and place its numbers in context, and you have the idempotency vocabulary Module 18 (Stripe) and Module 23 (AI-platform billing) build on next.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>40 min</b> read</span>
+    <span class="chip"><b>10</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 10</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f1t"><title id="f1t">Three engineering problems inside one Airbnb marketplace</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="260" y="20" width="280" height="56" rx="10" class="d-block-accent"/>
+    <text x="400" y="44" text-anchor="middle" class="d-text-inv d-bold">Two-sided marketplace</text>
+    <text x="400" y="64" text-anchor="middle" class="d-text-inv d-small">guests search, book, and pay hosts</text>
+    <path d="M330,76 L200,140" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M400,76 L400,140" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M470,76 L600,140" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="70" y="140" width="260" height="90" rx="10" class="d-block"/>
+    <text x="200" y="164" text-anchor="middle" class="d-text-inv d-bold">1. Search ranking</text>
+    <text x="200" y="184" text-anchor="middle" class="d-text-inv d-small">GBDT to two-tower DNN</text>
+    <text x="200" y="202" text-anchor="middle" class="d-text-inv d-small">2018-2020</text>
+    <text x="200" y="220" text-anchor="middle" class="d-text-inv d-small d-mono">KDD 2019 / KDD 2020</text>
+
+    <rect x="270" y="140" width="260" height="90" rx="10" class="d-block-2"/>
+    <text x="400" y="164" text-anchor="middle" class="d-text-inv d-bold">2. Payments consistency</text>
+    <text x="400" y="184" text-anchor="middle" class="d-text-inv d-small">Orpheus idempotency library</text>
+    <text x="400" y="202" text-anchor="middle" class="d-text-inv d-small">2019-2022</text>
+    <text x="400" y="220" text-anchor="middle" class="d-text-inv d-small d-mono">five nines consistency</text>
+
+    <rect x="470" y="140" width="260" height="90" rx="10" class="d-block-2"/>
+    <text x="600" y="164" text-anchor="middle" class="d-text-inv d-bold">3. Service architecture</text>
+    <text x="600" y="184" text-anchor="middle" class="d-text-inv d-small">Rails monolith to Thrift SOA</text>
+    <text x="600" y="202" text-anchor="middle" class="d-text-inv d-small">2017</text>
+    <text x="600" y="220" text-anchor="middle" class="d-text-inv d-small d-mono">3-week service creation</text>
+
+    <path d="M200,230 L400,270" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <path d="M600,230 L440,270" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <rect x="260" y="270" width="280" height="36" rx="8" class="d-panel"/>
+    <text x="400" y="293" text-anchor="middle" class="d-small d-text-light">3 made independent deployment of 1 and 2 possible</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> Three problems inside one marketplace, each with its own primary source and its own numbers: search ranking's evolution to a two-tower network<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-4">4</a>, the Orpheus idempotency library that keeps payments from double-executing<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-7">7</a>, and the 2017 service-oriented-architecture migration that let those two teams ship independently<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="search-ranking-evolution">1. Search ranking: from a hand-tuned function to a two-tower deep network</h2>
+<p>Airbnb's search ranker decides which handful of listings, out of the thousands available for a guest's dates and location, gets shown and in what order. Airbnb calls this "one of the biggest machine learning success stories" at the company<a class="cite" href="#ref-2">2</a>, and it is one of the few large-scale ranking systems where the operating company has published the full sequence of models it shipped, including the ones that failed, with the reasoning behind each step. That makes it a useful case study for anyone who has only read the polished final architecture of a production ranker: you get to see the two-year path, not just the destination.</p>
+
+<h3 id="search-ranking-evolution-gbdt-plateau">1.1 The GBDT plateau and five model generations</h3>
+<p>The very first Airbnb search ranker was a manually crafted scoring function<a class="cite" href="#ref-2">2</a> — no learned model at all, just a formula an engineer wrote down. Replacing it with a gradient-boosted decision tree (GBDT) model produced, in Airbnb's words, "one of the largest step improvements in homes bookings in Airbnb's history," with many successful GBDT iterations following it<a class="cite" href="#ref-2">2</a>. Over time those GBDT gains saturated: "long spells of neutral experiments" is how the paper describes the plateau that made the company willing to try something as disruptive as replacing the model family entirely<a class="cite" href="#ref-2">2</a>.</p>
+<p>The transition to deep learning was not one jump from GBDT to a deep network. It was five generations, each motivated by a specific failure of the previous one<a class="cite" href="#ref-2">2</a>:</p>
+<ol>
+<li><b>Simple NN.</b> A single hidden layer of 32 fully-connected ReLU units, fed the exact same features as the GBDT model, trained with L2 regression loss (booked listings assigned utility 1.0, unbooked 0.0). It was deliberately unambitious — Airbnb frames the decision as following Andrej Karpathy's advice not to be a hero on your first production neural network. Result: booking-neutral against GBDT. Its only value was proving the serving pipeline could carry live traffic end to end<a class="cite" href="#ref-2">2</a>.</li>
+<li><b>LambdaRank NN.</b> The same network, but with two changes to the training objective: (a) a pairwise formulation over {booked, not-booked} listing pairs from the same search, instead of independent regression targets, and (b) each pair's loss weighted by the change in NDCG that would result from swapping the two listings' rank positions — so moving a booked listing from rank 2 to rank 1 matters far more than moving one from rank 10 to rank 9<a class="cite" href="#ref-2">2</a>. This was the first architecture Airbnb calls a "breakthrough."</li>
+<li><b>GBDT + FM + NN.</b> A hybrid that fed the NN two additional signals: the leaf-node index activated per tree from the GBDT model (as a categorical feature) and the booking-probability prediction from a separately-trained 32-dimensional factorization machine<a class="cite" href="#ref-2">2</a>. It matched the simpler models on test-set metrics but up-ranked a noticeably different set of listings — evidence that the three model families were each finding different signal in the same data.</li>
+<li><b>Deep NN (2 layers).</b> Rather than adding more architectural complexity on top of generation 3, Airbnb deprecated all of it and instead scaled the training data 10x, landing on a plain two-hidden-layer network: 195 input features (after expanding categorical features to embeddings) feeding a 127-unit ReLU layer, then an 83-unit ReLU layer<a class="cite" href="#ref-2">2</a>. Training on 1.7 billion listing pairs closed the gap between training and test NDCG that had appeared in earlier, smaller-data models<a class="cite" href="#ref-2">2</a>.</li>
+<li><b>Two-tower architecture (2020).</b> Covered in <a href="#search-ranking-evolution-abc">1.4</a> below — a query/user tower and a listing tower scored by Euclidean distance, motivated by a specific pricing failure the deep NN exhibited.</li>
+</ol>
+<p>The pattern across generations 1 through 4 is not "add more layers." Airbnb explicitly tested adding depth, residual connections, and batch normalization to the fully-connected network later on and got neutral offline NDCG every time<a class="cite" href="#ref-4">4</a> — its own conclusion was that going deeper is "an effective technique for convolutional neural networks, but not necessarily for all DNNs," and that for a fully-connected ranking network, two hidden layers were already enough capacity<a class="cite" href="#ref-4">4</a>. The gains instead came from fixing the training objective (LambdaRank weighting), fixing the data scale (10x, then Protobuf/<code>tf.data</code> pipelines), and — as sections 1.2 through 1.4 show — fixing what the features looked like before they reached the network at all.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f2t"><title id="f2t">Timeline of Airbnb search-ranking model generations</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="40" y1="140" x2="760" y2="140" class="d-axis"/>
+    <g>
+      <circle cx="80" cy="140" r="6" class="d-fill-blue"/>
+      <text x="80" y="120" text-anchor="middle" class="d-small d-bold">Hand-tuned</text>
+      <text x="80" y="105" text-anchor="middle" class="d-small d-text-light">scoring fn</text>
+      <text x="80" y="165" text-anchor="middle" class="d-mono d-small">gen 0</text>
+    </g>
+    <g>
+      <circle cx="220" cy="140" r="6" class="d-fill-blue"/>
+      <text x="220" y="120" text-anchor="middle" class="d-small d-bold">GBDT</text>
+      <text x="220" y="105" text-anchor="middle" class="d-small d-text-light">largest single gain</text>
+      <text x="220" y="165" text-anchor="middle" class="d-mono d-small">gen 1</text>
+    </g>
+    <g>
+      <circle cx="360" cy="140" r="6" class="d-fill-cyan"/>
+      <text x="360" y="120" text-anchor="middle" class="d-small d-bold">Simple NN</text>
+      <text x="360" y="105" text-anchor="middle" class="d-small d-text-light">booking-neutral</text>
+      <text x="360" y="165" text-anchor="middle" class="d-mono d-small">gen 2</text>
+    </g>
+    <g>
+      <circle cx="480" cy="140" r="6" class="d-fill-cyan"/>
+      <text x="480" y="120" text-anchor="middle" class="d-small d-bold">LambdaRank NN</text>
+      <text x="480" y="105" text-anchor="middle" class="d-small d-text-light">first breakthrough</text>
+      <text x="480" y="165" text-anchor="middle" class="d-mono d-small">gen 3</text>
+    </g>
+    <g>
+      <circle cx="600" cy="140" r="6" class="d-fill-cyan"/>
+      <text x="600" y="120" text-anchor="middle" class="d-small d-bold">GBDT+FM+NN</text>
+      <text x="600" y="105" text-anchor="middle" class="d-small d-text-light">hybrid features</text>
+      <text x="600" y="165" text-anchor="middle" class="d-mono d-small">gen 4</text>
+    </g>
+    <g>
+      <circle cx="720" cy="140" r="7" class="d-fill-orange"/>
+      <text x="700" y="120" text-anchor="middle" class="d-small d-bold">Deep NN</text>
+      <text x="700" y="105" text-anchor="middle" class="d-small d-text-light">2 layers, 10x data</text>
+      <text x="720" y="165" text-anchor="middle" class="d-mono d-small">gen 5</text>
+    </g>
+    <path d="M86,140 L214,140" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M226,140 L354,140" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M366,140 L474,140" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M486,140 L594,140" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M606,140 L713,140" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="400" y="210" text-anchor="middle" class="d-small d-text-light">Each step was motivated by a specific failure of the previous step, not by adding architectural complexity</text>
+    <text x="400" y="230" text-anchor="middle" class="d-small d-text-light">(the 2020 two-tower architecture, generation 6, is covered in §1.4)</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Airbnb's own account of its five model generations before the 2020 two-tower architecture, each launched to production traffic and tested against the previous generation in an online A/B test<a class="cite" href="#ref-2">2</a>. Airbnb's original figure plots relative NDCG and booking gains per generation but does not publish the exact percentages, so this timeline shows sequence and motivation rather than invented magnitudes.</figcaption>
+</figure>
+
+<h3 id="search-ranking-evolution-features">1.2 What broke when GBDT features met a neural network</h3>
+<p>The first attempt to train the Simple NN on the exact same features used for the GBDT model went "very badly": training loss saturated partway through and additional steps had no effect<a class="cite" href="#ref-2">2</a>. The root cause was feature scale. A decision tree only cares about a feature's relative ordering — a price of \$500 versus \$5,000 only matters through which side of a threshold it lands on. A neural network's first layer computes a weighted sum of raw feature values, so an unnormalized feature with occasional huge values can produce huge gradients, which in turn can permanently zero out a ReLU unit through vanishing-gradient dynamics<a class="cite" href="#ref-2">2</a>.</p>
+<p>The fix was a normalization discipline applied to essentially every input feature, so that the bulk of each feature's distribution sits inside \([-1, 1]\) with the median mapped to 0<a class="cite" href="#ref-2">2</a>:</p>
+<ul>
+<li>Features that look roughly normal: standard z-score, \((x - \mu)/\sigma\).</li>
+<li>Features that look like a power law (most price-like and count-like features at Airbnb's scale): \(\log\!\big(\frac{1+x}{1+\text{median}}\big)\).</li>
+</ul>
+<p>Airbnb also used the <em>smoothness</em> of a feature's distribution as a debugging tool in its own right, independent of whether the model trained successfully: a spike in an otherwise-smooth distribution was, in practice, how the team found bugs like prices logged in the wrong currency for certain geographies, or monthly prices being mistakenly logged as daily prices for stays over 28 days<a class="cite" href="#ref-2">2</a>. This is a case where a data-quality check and a modeling-quality check turned out to be the same plot.</p>
+<p>The other feature-engineering pattern worth naming is what Airbnb did with location. Raw latitude/longitude has a heavily skewed distribution once you account for how zoomed-out a map view is; converting to an offset from the displayed map's center and then taking the log of that offset produced a usably smooth feature<a class="cite" href="#ref-2">2</a>. For within-city location preference, instead of maintaining a hand-built hierarchical pipeline tracking booking distributions by neighborhood and city, Airbnb hashed the pair (query city, listing's level-12 S2 geometry cell) into an integer and fed that integer straight into a learned embedding — the specific example the paper gives is the query "San Francisco" combined with a listing's S2 cell 539058204 hashing to categorical id 71829521<a class="cite" href="#ref-2">2</a>. The learned embedding for that feature turned out to visibly encode neighborhood preference, including a preference for locations slightly further into the west bay over locations across traffic-heavy bridges — a pattern nobody hand-engineered<a class="cite" href="#ref-2">2</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Airbnb's search-ranking model generations, in the order they shipped to production<a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Generation</th><th>Architecture</th><th>Training signal</th><th>What changed vs. previous</th></tr></thead>
+<tbody>
+<tr><td class="row">GBDT</td><td>Gradient-boosted trees</td><td>Regression on booked = 1</td><td>Replaced a hand-tuned scoring function</td></tr>
+<tr><td class="row">Simple NN</td><td>1 hidden layer, 32 ReLU units</td><td>L2 regression, same GBDT features</td><td>Proved the NN serving pipeline production-ready</td></tr>
+<tr><td class="row">LambdaRank NN</td><td>Same network</td><td>Pairwise, ΔNDCG-weighted</td><td>Directly optimizes rank position of booked listing</td></tr>
+<tr><td class="row">GBDT+FM+NN</td><td>NN + GBDT leaf index + FM score as features</td><td>Pairwise</td><td>Combines three model families' signal</td></tr>
+<tr><td class="row">Deep NN</td><td>2 hidden layers (127, 83 units), 195 inputs</td><td>Pairwise, 1.7B pairs</td><td>10x more training data instead of more layers</td></tr>
+<tr><td class="row" data-best>Two-tower</td><td>Separate query/user and listing towers, Euclidean distance</td><td>Pairwise, triplet-style</td><td>Fixes a pricing interpretability problem (§1.4)</td></tr>
+</tbody>
+</table>
+
+<h3 id="search-ranking-evolution-embeddings">1.3 Listing embeddings: a skip-gram model over click sessions</h3>
+<p>In parallel with the ranker's own model evolution, Airbnb built a second representation-learning system: 32-dimensional embeddings for listings, trained not on hand-engineered features but on the sequence of listings a user clicked through during a search session<a class="cite" href="#ref-3">3</a>. The technique is a direct adaptation of skip-gram word embeddings from NLP — anyone who has trained word2vec will recognize the mechanism immediately, which is why it is worth drawing explicitly for an ML-systems reader rather than describing in prose alone.</p>
+<p>A click session is defined as an uninterrupted sequence of listing clicks by one user, with a new session starting after any 30-minute gap<a class="cite" href="#ref-3">3</a>. Training uses negative sampling with a sliding window of length \(m = 5\): at each step, the vector of the <em>central listing</em> is pushed toward the vectors of listings clicked within the window before and after it (positive context), and pushed away from the vectors of randomly sampled listings (negative context)<a class="cite" href="#ref-3">3</a>. Two domain-specific modifications were needed on top of the base algorithm<a class="cite" href="#ref-3">3</a>:</p>
+<ul>
+<li><b>Booked listing as global context.</b> If a session ends in a booking, the booked listing's vector is pulled toward the central listing at every step of that session, not just when it happens to fall inside the sliding window — it is a "global" context term that never leaves the objective as the window slides.</li>
+<li><b>Market-level negatives.</b> Guests searching within one destination market produce positive-context listings almost entirely from that market, while random negative sampling draws from the entire global inventory. Without correction, this imbalance taught the model that "different market" and "dissimilar" were the same thing, degrading within-market similarity. The fix adds an explicit extra negative set sampled specifically from the central listing's own market.</li>
+</ul>
+<p>The resulting embeddings were trained for 4.5 million active listings from more than 800 million search click sessions<a class="cite" href="#ref-3">3</a> — using only 32 floating-point numbers per listing, small enough to keep every listing's vector resident in the RAM of a search-serving machine for real-time cosine-similarity computation<a class="cite" href="#ref-3">3</a>. New listings, which by definition have no click history to train from, get a cold-start embedding by averaging the vectors of the 3 geographically nearest listings that share the same listing type and price range<a class="cite" href="#ref-3">3</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">Skip-gram training mechanism for Airbnb listing embeddings</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-small d-text-light">One click session, sliding window m = 5</text>
+    <g>
+      <rect x="40" y="50" width="70" height="40" rx="6" class="d-block-muted"/><text x="75" y="74" text-anchor="middle" class="d-text-inv d-small">L1</text>
+      <rect x="120" y="50" width="70" height="40" rx="6" class="d-fill-cyan-soft d-stroke-cyan"/><text x="155" y="74" text-anchor="middle" class="d-small">L2</text>
+      <rect x="200" y="50" width="70" height="40" rx="6" class="d-hl"/><text x="235" y="74" text-anchor="middle" class="d-small d-bold">L3 (central)</text>
+      <rect x="280" y="50" width="70" height="40" rx="6" class="d-fill-cyan-soft d-stroke-cyan"/><text x="315" y="74" text-anchor="middle" class="d-small">L4</text>
+      <rect x="360" y="50" width="70" height="40" rx="6" class="d-block-muted"/><text x="395" y="74" text-anchor="middle" class="d-text-inv d-small">L5</text>
+      <rect x="440" y="50" width="70" height="40" rx="6" class="d-block-muted"/><text x="475" y="74" text-anchor="middle" class="d-text-inv d-small">L6</text>
+    </g>
+    <path d="M155,50 Q235,20 315,50" class="d-arrow d-stroke-cyan" marker-end="url(#f3-arr)" style="fill:none"/>
+    <path d="M270,90 Q235,120 200,90" class="d-arrow d-stroke-cyan" marker-end="url(#f3-arr)" style="fill:none"/>
+    <text x="235" y="140" text-anchor="middle" class="d-small d-text-light">positive context (within window, pushed closer)</text>
+
+    <rect x="560" y="50" width="90" height="40" rx="6" class="d-fill-orange"/>
+    <text x="605" y="74" text-anchor="middle" class="d-text-inv d-small d-bold">Booked listing</text>
+    <path d="M235,90 Q400,150 600,90" class="d-arrow d-arrow-active" marker-end="url(#f3-arr)" style="fill:none"/>
+    <text x="420" y="160" text-anchor="middle" class="d-small d-text-light">global context: pulled toward central listing at every step, all session long</text>
+
+    <rect x="680" y="50" width="90" height="40" rx="6" class="d-fill-red-soft d-stroke-red"/>
+    <text x="725" y="68" text-anchor="middle" class="d-small">Random</text>
+    <text x="725" y="82" text-anchor="middle" class="d-small">listing</text>
+    <path d="M270,60 L680,60" class="d-arrow" marker-end="url(#f3-arr)" style="fill:none"/>
+    <text x="500" y="195" text-anchor="middle" class="d-small d-text-light">negative context (random, pushed away); an extra set is drawn from the same market</text>
+    <text x="500" y="215" text-anchor="middle" class="d-small d-text-light">as the central listing to fix within-market similarity</text>
+
+    <rect x="120" y="240" width="560" height="40" rx="8" class="d-panel"/>
+    <text x="400" y="264" text-anchor="middle" class="d-small">4.5M listings · &gt;800M click sessions · d = 32 · k = 12 nearest neighbors for Similar Listings</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The skip-gram mechanism behind Airbnb's listing embeddings, adapted from word2vec's negative-sampling objective with two Airbnb-specific terms — booked-listing global context and market-level negatives<a class="cite" href="#ref-3">3</a>. An A/B test of the resulting embedding-based Similar Listings feature raised carousel click-through by 21% and increased the share of guests who discovered the listing they eventually booked through that carousel by 4.9%<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<p>The same embeddings feed back into the main search ranker as two real-time personalization features, computed from a rolling 2-week history maintained in Kafka for each user: <code>EmbClickSim</code>, the similarity between a candidate listing and the market-level centroid of listings the user recently clicked, and <code>EmbSkipSim</code>, the similarity to listings the user was shown but skipped in favor of a lower-ranked click<a class="cite" href="#ref-3">3</a>. Partial-dependence plots on the trained ranking model confirmed the features were used as intended — higher <code>EmbClickSim</code> pushed the model's score up, higher <code>EmbSkipSim</code> pushed it down — and the features launched to production search ranking in the summer of 2017<a class="cite" href="#ref-3">3</a>.</p>
+
+<h3 id="search-ranking-evolution-abc">1.4 The ABCs: architecture, bias, and cold start</h3>
+<p>Shipping the deep NN did not end the ranking team's work; it changed what the work was. Airbnb's 2020 follow-up paper frames the two years after the initial deep-learning launch as three separate problems it names architecture, bias, and cold start<a class="cite" href="#ref-4">4</a>.</p>
+<p><b>Architecture.</b> The team noticed that each successful ranking-model launch had been associated with a drop in the average price of search results, and hypothesized the model still hadn't converged on guests' true price preference. Removing price as a direct input and replacing it with an explicit monotonically-decreasing \(\tanh(\text{price})\) output term made the model's price behavior interpretable, but online it traded bookings for cheapness in the wrong direction: average price fell 5.7% and bookings fell 1.5%<a class="cite" href="#ref-4">4</a>. A "generalized monotonicity" architecture — squared weights that provably preserve a monotonic path from price to output, alongside an unconstrained subnet for everything else — produced a similar 1.6% booking drop online<a class="cite" href="#ref-4">4</a>. Both failures pointed to the same conclusion: forcing the network's price behavior to obey a hand-specified constraint was actively worse than whatever the unconstrained network had already learned. Individual Conditional Expectation (ICE) plots — sweeping one listing's price across a range while holding every other feature fixed, then plotting model score — showed the plain fully-connected DNN already understood "cheaper is better" on its own<a class="cite" href="#ref-4">4</a>; the real problem was that Airbnb's global price preference estimate was biased toward high-volume markets, and the fix was a two-tower architecture (a 100-dimensional query/user vector and a 100-dimensional listing vector, scored by Euclidean distance) that let the model learn the right price <em>for a given query</em> rather than a single global price preference<a class="cite" href="#ref-4">4</a>. Tested online against the fully-connected deep NN, the two-tower model produced +0.6% bookings, +0.7% online NDCG, and an overall +0.75% revenue increase, with average price falling 2.3% as a side effect of better relevance rather than as a direct objective<a class="cite" href="#ref-4">4</a>.</p>
+<p><b>Bias.</b> A model trained on logs of a previous model's rankings inherits that model's positional bias: a listing that was booked partly because it happened to be ranked first, not because it was the best match, teaches the next model that "ranked first" and "should be ranked first" are the same signal. Airbnb's fix adds position as an explicit input feature — regularized away from the relevance signal using dropout at a rate tuned to 0.15 — and fixes the position input to 0 at serving time, so relevance and positional-bias contributions to the score can be estimated and then separated<a class="cite" href="#ref-4">4</a>. Tested online, this produced +0.7% bookings and, unexpectedly, +1.8% revenue, plus a +1.1% booking increase specifically for boutique hotels and bed-and-breakfasts, a segment that had been quietly penalized by inherited positional bias<a class="cite" href="#ref-4">4</a>.</p>
+<p><b>Cold start.</b> New listings, by definition, lack the historical engagement features (past bookings, clicks, reviews) that the DNN leans on heavily — removing those features entirely dropped overall NDCG by 4.5%<a class="cite" href="#ref-4">4</a>, and new listings' booked-listing NDCG ran 6% below established listings' before any fix<a class="cite" href="#ref-4">4</a>. Rather than treating this as an explore/exploit ranking-boost problem, Airbnb reframed it as an estimation problem: predict what a new listing's engagement features <em>will</em> converge to, using the average of nearby listings matched on guest capacity and adjusted for seasonality. That estimator cut offline engagement-estimation error by 42% versus hand-set default values, and in an online test increased bookings of newly-created listings by 14%, increased their first-page impression share by 14%, and lifted overall bookings by 0.38%<a class="cite" href="#ref-4">4</a>.</p>
+
+<details class="more">
+<summary>Worked derivation: why the two-tower architecture cut p99 scoring latency 33%</summary>
+<p>Airbnb reports that separating the query/user tower from the listing tower reduced the computational complexity of the first hidden layer from \(O(N \cdot H \cdot (Q + L))\) to \(O(N \cdot H_l \cdot L + H_q \cdot Q)\), where \(N\) is the number of listings being scored in one search, \(Q\) and \(L\) are the number of query/user-only and listing-only input features, and \(H\), \(H_l\), \(H_q\) are hidden-layer widths<a class="cite" href="#ref-4">4</a>. The intuition is that in the fully-connected architecture, the query and user features — identical for every listing in the search result — get recomputed through the first hidden layer once <em>per listing</em>, even though their value never changes within that search; the two-tower split lets the query/user tower be evaluated exactly once per search and reused across every listing.</p>
+<p>Airbnb does not publish the exact \(N\), \(H\), \(Q\), \(L\) values it ran in production, so the following plugs in illustrative, clearly-labeled numbers just to show the shape of the saving, not Airbnb's real configuration. Take a search result of \(N = 50\) listings, a fully-connected hidden width of \(H = 200\), and roughly balanced feature counts \(Q = 50\) (query/user) and \(L = 150\) (listing):</p>
+$$ \text{Fully connected: } N \cdot H \cdot (Q+L) = 50 \times 200 \times (50+150) = 2{,}000{,}000 \text{ multiply-adds} $$
+<p>Now split into a two-tower model with a listing-tower width \(H_l = 100\) and a query-tower width \(H_q = 100\):</p>
+$$ \text{Two-tower: } N \cdot H_l \cdot L + H_q \cdot Q = (50 \times 100 \times 150) + (100 \times 50) = 750{,}000 + 5{,}000 = 755{,}000 $$
+<p>That is roughly a 2.6x reduction in first-layer multiply-adds under these illustrative sizes — the same direction and rough order of magnitude as the -33% p99 latency figure Airbnb reports online<a class="cite" href="#ref-4">4</a>, without claiming to reproduce Airbnb's exact number, since the real \(H\), \(Q\), and \(L\) are not published. The mechanism generalizes past this one architecture: any feature that is constant across all \(N\) candidates being scored in one pass is a candidate for hoisting out of the per-candidate loop, which is the same optimization a retrieval-and-rerank pipeline gets from computing a query embedding once and reusing it against every candidate's precomputed embedding.</p>
+</details>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f4t"><title id="f4t">Reported online A/B-test results for the architecture, bias, and cold-start fixes</title>
+    <line x1="90" y1="270" x2="770" y2="270" class="d-axis"/>
+    <line x1="90" y1="20" x2="90" y2="270" class="d-axis"/>
+    <line x1="90" y1="145" x2="770" y2="145" class="d-grid"/>
+    <text x="60" y="150" text-anchor="end" class="d-small d-text-light">0%</text>
+    <text x="60" y="35" text-anchor="end" class="d-small d-text-light">+15%</text>
+    <text x="60" y="265" text-anchor="end" class="d-small d-text-light">-3%</text>
+
+    <g><rect x="115" y="129" width="34" height="16" class="d-fill-blue"/><text x="132" y="122" text-anchor="middle" class="d-mono d-small">+0.6%</text><text x="132" y="290" text-anchor="middle" class="d-small">bookings</text></g>
+    <g><rect x="155" y="126" width="34" height="19" class="d-fill-blue"/><text x="172" y="119" text-anchor="middle" class="d-mono d-small">+0.7%</text><text x="172" y="290" text-anchor="middle" class="d-small">NDCG</text></g>
+    <g><rect x="195" y="145" width="34" height="52" class="d-fill-red-soft d-stroke-red"/><text x="212" y="210" text-anchor="middle" class="d-mono d-small">-2.3%</text><text x="212" y="290" text-anchor="middle" class="d-small">price</text></g>
+    <g><rect x="235" y="112" width="34" height="33" class="d-fill-blue"/><text x="252" y="105" text-anchor="middle" class="d-mono d-small">+0.75%</text><text x="252" y="290" text-anchor="middle" class="d-small">revenue</text></g>
+    <text x="192" y="308" text-anchor="middle" class="d-small d-bold">A: two-tower</text>
+
+    <g><rect x="325" y="129" width="34" height="16" class="d-fill-cyan"/><text x="342" y="122" text-anchor="middle" class="d-mono d-small">+0.7%</text><text x="342" y="290" text-anchor="middle" class="d-small">bookings</text></g>
+    <g><rect x="365" y="105" width="34" height="40" class="d-fill-cyan"/><text x="382" y="98" text-anchor="middle" class="d-mono d-small">+1.8%</text><text x="382" y="290" text-anchor="middle" class="d-small">revenue</text></g>
+    <g><rect x="405" y="120" width="34" height="25" class="d-fill-cyan"/><text x="422" y="113" text-anchor="middle" class="d-mono d-small">+1.1%</text><text x="422" y="290" text-anchor="middle" class="d-small">boutique</text></g>
+    <text x="382" y="308" text-anchor="middle" class="d-small d-bold">B: position dropout</text>
+
+    <g><rect x="500" y="0" width="34" height="145" class="d-fill-orange"/><text x="517" y="-8" text-anchor="middle" class="d-mono d-small" transform="translate(0,20)">+14%</text><text x="517" y="290" text-anchor="middle" class="d-small">new-listing bookings</text></g>
+    <g><rect x="540" y="0" width="34" height="145" class="d-fill-orange"/><text x="557" y="12" text-anchor="middle" class="d-mono d-small">+14%</text><text x="557" y="290" text-anchor="middle" class="d-small">1st-page share</text></g>
+    <g><rect x="580" y="129" width="34" height="16" class="d-fill-orange"/><text x="597" y="122" text-anchor="middle" class="d-mono d-small">+0.38%</text><text x="597" y="290" text-anchor="middle" class="d-small">overall bookings</text></g>
+    <text x="555" y="308" text-anchor="middle" class="d-small d-bold">C: cold start</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Online A/B-test deltas Airbnb reports for each of the three 2020 fixes, each measured against the previous production model<a class="cite" href="#ref-4">4</a>. The two-tower architecture (A) trades a small price drop for relevance and revenue gains; position dropout (B) recovers bookings that inherited positional bias had suppressed, concentrated in under-ranked segments like boutique hotels; the cold-start engagement estimator (C) moves the metric it targets by far more than it moves overall bookings, because it only touches inventory without engagement history.</figcaption>
+</figure>
+<h2 id="payments-idempotency">2. Booking and payments: making "charge the guest" happen at most once</h2>
+<p>The search-ranking case study is about getting a probability estimate right. The payments case study is about something with a much harder failure mode: getting a probability estimate wrong costs you a slightly worse-ranked listing; getting a payment operation wrong charges a real guest's card twice or fails to pay a real host at all. Airbnb's own account of this problem, and the library it built to solve it, is a direct, concrete instance of the idempotency vocabulary Module 8 introduced in general terms<a class="cite" href="#ref-1">1</a> — this section is where that vocabulary meets a production payments system end to end.</p>
+
+<h3 id="payments-idempotency-distributed-transaction">2.1 Why SOA turned a function call into a distributed transaction</h3>
+<p>Module 10 covers why Airbnb split its Rails monolith into independently-deployed services and what that migration cost and bought back in general<a class="cite" href="#ref-1">1</a>. One specific consequence Module 10 does not chase down is what happens to a single logical operation — "charge this guest" — once it stops being one function call inside one process and becomes a chain of network calls across several services, each of which can change state and have side effects. Airbnb's payments engineers describe this plainly: such a chain "is equivalent to executing a complex distributed transaction," and without a coordination protocol such as two-phase commit, distributed transactions in this shape threaten data integrity, graceful degradation, and consistency all at once<a class="cite" href="#ref-5">5</a>. Requests also simply fail sometimes — connections drop, calls time out — and that failure mode gets more likely, not less, the more network hops a logical operation crosses<a class="cite" href="#ref-5">5</a>.</p>
+<p>Airbnb explicitly did not reach for two-phase commit — the coordination protocol Module 4 covers, and the one Spanner runs underneath every cross-shard transaction to get synchronous, externally-consistent commits at the cost of blocking every participant until every other participant is ready<a class="cite" href="#ref-9">9</a>. Airbnb's payments system instead relies on <em>write repair</em>: every write call from a client to a server is built to be safely retriable, and a client that suspects something went wrong simply fires the same call again<a class="cite" href="#ref-5">5</a>. This shifts the entire correctness burden onto one property: the server-side operation has to behave identically no matter how many times the same logical request arrives. That property is idempotency, and it is the same always-writeable, retry-tolerant philosophy Dynamo built its entire replication design around a decade earlier, just applied to a single service's request handling instead of a whole key-value store's replica set<a class="cite" href="#ref-10">10</a>. Getting idempotency right is what the rest of this section is about. <a href="#where-experts-disagree">Where experts disagree</a> returns to why Airbnb chose this path over 2PC.</p>
+
+<h3 id="payments-idempotency-orpheus">2.2 Orpheus: three phases, two rules</h3>
+<p>Airbnb's requirements for an idempotency mechanism were specific enough to rule out the two obvious options<a class="cite" href="#ref-5">5</a>. A single custom solution per use case wasn't acceptable, because Airbnb runs many payments services on SOA and wanted one generic mechanism all of them could adopt. A separate, stand-alone idempotency <em>service</em> wasn't acceptable either, for a reason worth sitting with: payments needed ultra-low latency, and a dedicated idempotency service sitting in the request path would itself be a distributed dependency subject to exactly the network failures the mechanism was supposed to protect against<a class="cite" href="#ref-5">5</a>. The solution Airbnb shipped, called Orpheus, is therefore a library: code that runs inside each payments service's own process, reading and writing that service's own database, adding no extra network hop<a class="cite" href="#ref-5">5</a>.</p>
+<p>Orpheus is built on the observation that almost any API request that talks to an external system decomposes into three phases<a class="cite" href="#ref-5">5</a>:</p>
+<ol>
+<li><b>Pre-RPC.</b> Record the details of the incoming request in the local database, before anything is sent over the network.</li>
+<li><b>RPC.</b> Make the live network call — to an external payment processor, an acquiring bank, or any downstream service — and receive its response.</li>
+<li><b>Post-RPC.</b> Record the outcome of that call in the local database, including whether a failure response is retryable or not.</li>
+</ol>
+<p>Two ground rules keep this decomposition safe<a class="cite" href="#ref-5">5</a>: no service call over the network happens during the Pre-RPC or Post-RPC phases, and no database interaction happens during the RPC phase itself. Network calls and database transactions are never mixed in the same phase. The Pre-RPC and Post-RPC database writes are each wrapped in their own single atomic transaction (implemented with Java lambdas so the library, not the application developer, owns transaction boundaries), so each phase can only fully succeed or fully fail — there is no partially-committed state for a crash to leave behind<a class="cite" href="#ref-5">5</a>. The reasoning behind separating network calls from database work this strictly is operational, not theoretical: Airbnb found that RPCs issued from inside a database-transaction context were "vulnerable" in practice, causing rapid connection-pool exhaustion and performance degradation when a downstream call was slow<a class="cite" href="#ref-5">5</a> — mixing an unreliable, variable-latency operation (the network call) with a resource that has to be held open and returned quickly (a database connection inside a transaction) is a bad combination regardless of which framework you use.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f5t"><title id="f5t">Orpheus three-phase request structure</title>
+    <defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="30" y="60" width="220" height="90" rx="10" class="d-block"/>
+    <text x="140" y="88" text-anchor="middle" class="d-text-inv d-bold">Pre-RPC</text>
+    <text x="140" y="108" text-anchor="middle" class="d-text-inv d-small">record request</text>
+    <text x="140" y="126" text-anchor="middle" class="d-text-inv d-small">DB transaction only</text>
+
+    <rect x="290" y="60" width="220" height="90" rx="10" class="d-block-accent"/>
+    <text x="400" y="88" text-anchor="middle" class="d-text-inv d-bold">RPC</text>
+    <text x="400" y="108" text-anchor="middle" class="d-text-inv d-small">call downstream service</text>
+    <text x="400" y="126" text-anchor="middle" class="d-text-inv d-small">network only, no DB</text>
+
+    <rect x="550" y="60" width="220" height="90" rx="10" class="d-block"/>
+    <text x="660" y="88" text-anchor="middle" class="d-text-inv d-bold">Post-RPC</text>
+    <text x="660" y="108" text-anchor="middle" class="d-text-inv d-small">record response</text>
+    <text x="660" y="126" text-anchor="middle" class="d-text-inv d-small">retryable? DB transaction</text>
+
+    <path d="M250,105 L290,105" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <path d="M510,105 L550,105" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+    <rect x="30" y="170" width="220" height="26" rx="6" class="d-panel"/>
+    <text x="140" y="188" text-anchor="middle" class="d-small d-mono">no network calls here</text>
+    <rect x="290" y="170" width="220" height="26" rx="6" class="d-panel"/>
+    <text x="400" y="188" text-anchor="middle" class="d-small d-mono">no DB writes here</text>
+    <rect x="550" y="170" width="220" height="26" rx="6" class="d-panel"/>
+    <text x="660" y="188" text-anchor="middle" class="d-small d-mono">no network calls here</text>
+
+    <text x="400" y="232" text-anchor="middle" class="d-small d-text-light">A retry re-enters at whichever phase the previous attempt did not commit past</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Orpheus's phase separation: every payments API request is split into Pre-RPC, RPC, and Post-RPC, with database transactions strictly confined to the two RPC-free phases so that a network failure can never leave a half-committed database write behind<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<p>Exception handling gets the same discipline. Airbnb classifies every error as either <b>retryable</b> — transient network/infrastructure failures (its own description maps these to 5XX-style statuses), where a later retry might succeed — or <b>non-retryable</b> — validation or state errors (4XX-style), such as trying to refund a payment that was already refunded, where every retry will fail identically<a class="cite" href="#ref-5">5</a>. Misclassifying in either direction has a real cost: labeling a transient error non-retryable strands the request in permanent failure, while labeling a permanent error retryable is exactly the kind of mistake that produces a double payment<a class="cite" href="#ref-5">5</a>.</p>
+
+<h3 id="payments-idempotency-replica-lag">2.3 The replica-lag double payment, and why idempotency state lives on master</h3>
+<p>The single design decision Airbnb calls out as most consequential is where idempotency state is read from. It would be natural, especially for a read-heavy table, to serve idempotency lookups from a read replica instead of the master database. Airbnb explicitly avoids this, and the failure mode it describes is worth drawing out in full<a class="cite" href="#ref-5">5</a>: a client submits a payment request; the request succeeds downstream and the response is written to the master database; but the client never receives that response, because the network itself failed on the way back. The client, following the idempotency contract, retries with the same key. If that retry is served by a replica that has not yet caught up to the master's write — replica lag of even a few seconds — the replica reports "no response found for this key," and the service concludes the original request never happened. It executes the payment again. The guest is charged twice, and the mechanism that was supposed to prevent exactly this is the thing that let it through, because it was reading from the wrong copy of the data.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f6t"><title id="f6t">Replica-lag double payment versus master-only reads</title>
+    <defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="200" y="24" text-anchor="middle" class="d-small d-bold">Reading from a lagging replica</text>
+    <text x="600" y="24" text-anchor="middle" class="d-small d-bold">Reading from master only</text>
+    <line x1="60" y1="45" x2="60" y2="270" class="d-dashed d-outline"/>
+    <text x="60" y="42" text-anchor="middle" class="d-mono d-small">client</text>
+    <line x1="200" y1="45" x2="200" y2="270" class="d-dashed d-outline"/>
+    <text x="200" y="42" text-anchor="middle" class="d-mono d-small">master DB</text>
+    <line x1="340" y1="45" x2="340" y2="270" class="d-dashed d-outline"/>
+    <text x="340" y="42" text-anchor="middle" class="d-mono d-small">replica</text>
+
+    <path d="M60,70 L200,70" class="d-arrow" marker-end="url(#f6-arr)"/><text x="130" y="63" text-anchor="middle" class="d-small">Request 1 (charge)</text>
+    <rect x="185" y="85" width="30" height="16" class="d-fill-green" rx="3"/><text x="240" y="97" class="d-small">success, written</text>
+    <path d="M200,105 L340,140" class="d-arrow d-dashed" marker-end="url(#f6-arr)"/><text x="290" y="128" class="d-small d-text-light">replicates, lagged</text>
+    <text x="60" y="130" class="d-small d-text-light" text-anchor="start">(response lost to client)</text>
+    <path d="M60,175 L340,175" class="d-arrow" marker-end="url(#f6-arr)"/><text x="130" y="168" text-anchor="middle" class="d-small">Retry (same key)</text>
+    <rect x="325" y="188" width="30" height="16" class="d-fill-red" rx="3"/><text x="200" y="200" text-anchor="middle" class="d-small">"not found" — replica not caught up yet</text>
+    <path d="M60,225 L340,225" class="d-arrow d-arrow-active" marker-end="url(#f6-arr)"/><text x="200" y="245" text-anchor="middle" class="d-small d-bold">Payment executed again — duplicate charge</text>
+
+    <line x1="460" y1="45" x2="460" y2="270" class="d-dashed d-outline"/>
+    <text x="460" y="42" text-anchor="middle" class="d-mono d-small">client</text>
+    <line x1="600" y1="45" x2="600" y2="270" class="d-dashed d-outline"/>
+    <text x="600" y="42" text-anchor="middle" class="d-mono d-small">master DB</text>
+
+    <path d="M460,70 L600,70" class="d-arrow" marker-end="url(#f6-arr)"/><text x="530" y="63" text-anchor="middle" class="d-small">Request 1 (charge)</text>
+    <rect x="585" y="85" width="30" height="16" class="d-fill-green" rx="3"/><text x="640" y="97" class="d-small">success, written</text>
+    <text x="460" y="130" class="d-small d-text-light" text-anchor="start">(response lost to client)</text>
+    <path d="M460,175 L600,175" class="d-arrow" marker-end="url(#f6-arr)"/><text x="530" y="168" text-anchor="middle" class="d-small">Retry (same key)</text>
+    <rect x="585" y="188" width="30" height="16" class="d-fill-green" rx="3"/><text x="530" y="200" text-anchor="middle" class="d-small">found immediately on master</text>
+    <path d="M600,225 L460,225" class="d-arrow" marker-end="url(#f6-arr)"/><text x="530" y="245" text-anchor="middle" class="d-small d-bold">Cached response returned — no duplicate</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> The exact failure mode Airbnb describes: a retry served from a lagging replica cannot see a response the master already committed, so the service re-executes the payment<a class="cite" href="#ref-5">5</a>. Reading and writing idempotency state only on the master database eliminates this window entirely, at the cost of routing every idempotency check to the single most-loaded copy of the data.</figcaption>
+</figure>
+
+<p>Orpheus's tables of idempotency information are therefore always read from and written to the sharded master database, never a replica<a class="cite" href="#ref-5">5</a>. Because Airbnb's underlying databases are MySQL and are not configured for strong read-after-write consistency on replicas, this was the only option that closed the race outright rather than narrowing its window<a class="cite" href="#ref-5">5</a>. Routing every idempotency read to master obviously does not scale on one box forever, so the idempotency tables are themselves sharded — by the idempotency key, chosen specifically because idempotency keys have high cardinality and an even distribution, which is exactly what a shard key needs<a class="cite" href="#ref-5">5</a>.</p>
+
+<h3 id="payments-idempotency-keys-and-result">2.4 Choosing a key, leasing a retry, and the five-nines result</h3>
+<p>Orpheus supports two different notions of what "the same request" means, and the choice is a business decision, not a technical one<a class="cite" href="#ref-5">5</a>:</p>
+<ul>
+<li><b>Request-level idempotency.</b> The client generates a fresh random key (a UUID is the given example) for every logically distinct request. This is the default, and it is what you want when a guest could legitimately make several different payments against the same reservation — Airbnb's own example is <em>Pay Less Upfront</em>, where a single booking is deliberately split into multiple separate charges over time.</li>
+<li><b>Entity-level idempotency.</b> The client derives a deterministic key from the entity being acted on, such as <code>payment-1234-refund</code>. Every refund request against payment 1234 collapses onto the same key, so even if two literally separate client calls both try to refund it, only one refund executes.</li>
+</ul>
+<p>Once a key arrives, the request that owns it acquires a database row-level lock on that key, which grants a time-bounded lease<a class="cite" href="#ref-5">5</a>. If the server side never responds — the exact race a timeout produces — a retry using the same key is only allowed to proceed after the current lease expires; Airbnb's stated rule of thumb is to set the lease expiration longer than the RPC timeout, so a slow-but-eventually-successful call cannot be raced by its own retry<a class="cite" href="#ref-5">5</a>. On top of the lease, Orpheus enforces a maximum total retryable window per key, as a backstop against a client whose retry logic has gone rogue and is hammering the same key indefinitely<a class="cite" href="#ref-5">5</a>.</p>
+<p>The result Airbnb reports, measured after the framework had been in production use, is five nines — 99.999% — of consistency for its payments, achieved while annual payment volume simultaneously doubled<a class="cite" href="#ref-5">5</a>. A 2022 follow-up post describes the same framework carried into a fully rebuilt payment-orchestration system, where every major payment workflow is now structured as a directed acyclic graph of retryable idempotent steps built on Orpheus, and the same five-nines figure is reported again years into that rebuild<a class="cite" href="#ref-7">7</a>. That post also extends Orpheus past synchronous request/response calls: for asynchronous communication over Airbnb's Kafka-based event bus between payments services, event processors apply the same idempotency framework to turn Kafka's at-least-once delivery guarantee (Module 8) into an effectively-exactly-once one from the payments system's point of view<a class="cite" href="#ref-7">7</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Two production idempotency mechanisms solving the same problem — a retried request must not execute twice — at different layers of the stack<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-6">6</a>. Module 18 covers Stripe's ledger and metering design in full; this row is a preview.</caption>
+<thead><tr><th>Dimension</th><th>Airbnb Orpheus</th><th>Stripe Idempotency-Key</th></tr></thead>
+<tbody>
+<tr><td class="row">Enforcement point</td><td>Inside each payments microservice, as an embedded library</td><td>At Stripe's API edge, keyed by a client-supplied HTTP header</td></tr>
+<tr><td class="row">Key granularity</td><td>Request-level (random) or entity-level (deterministic), chosen per use case</td><td>Client-generated unique ID per logical operation</td></tr>
+<tr><td class="row">In-flight state</td><td>Row-level lock with a time-bounded lease on the key</td><td>Treated as a distinct third state between absent and complete</td></tr>
+<tr><td class="row">Where state lives</td><td>Sharded master database, by design never a replica</td><td>Stripe-operated cache of the first response, including cached error responses</td></tr>
+<tr><td class="row">Client retry policy</td><td>Client-implemented; Airbnb specifies backoff/jitter as a client responsibility</td><td>Stripe's own client libraries retry automatically with exponential backoff and jitter</td></tr>
+<tr><td class="row" data-best>Reported result</td><td>Five nines (99.999%) payment consistency at 2x volume growth</td><td>Not separately quantified in the source used here (see Module 18)</td></tr>
+</tbody>
+</table>
+<h2 id="soa-migration-case-study">3. The monolith-to-SOA migration, as the case study that made 1 and 2 possible</h2>
+<p>Module 10 already did the general work this topic needs: it uses this exact Airbnb source to build the vocabulary for what a monolith-to-SOA migration costs (partial failure, coordination moving from compiler to wire, operational multiplication) and what it buys back (independent deployability), and it walks through why Airbnb built a customized Thrift-based Service IDL running over HTTP instead of adopting an existing RPC framework outright<a class="cite" href="#ref-1">1</a>. This section does not repeat that analysis. It exists to close the loop on the two case studies above: neither the two-year search-ranking iteration in Section 1 nor the payments rebuild in Section 2 could have happened as independent, separately-shipped efforts without the service boundary this migration drew.</p>
+
+<h3 id="soa-migration-case-study-topology">3.1 What's specific to this case study</h3>
+<p>Airbnb's own framing of the migration is candid about cost: moving off a monolithic Rails service while simultaneously shipping new products and features is, in the company's words, "not without its challenges"<a class="cite" href="#ref-1">1</a>. What Module 10 treats generically, this module can now make concrete: search ranking and payments are exactly the two domains where that cost bought back the most, because they are the two domains this module has just shown evolving on their own two-year-plus timelines, each with its own model-iteration or framework-rebuild cadence, independent of whatever the rest of the product was doing.</p>
+<p>The payments organization's own account of its slice of the migration adds one detail Module 10's general treatment does not need: Airbnb's legacy payment data model was tightly coupled to the concept of a single-product reservation for a stay, so every new product (the example given is Airbnb Experiences) required rebuilding payment logic with its own product-specific quirks<a class="cite" href="#ref-7">7</a>. Payments used the SOA migration as an opportunity to redesign around a product-agnostic model instead of doing a one-to-one lift of the existing code, which is why its migration ran in four broad phases — Pricing, Payouts, Bookings, and Data Migration — rather than the smaller independent functional blocks other teams used, with the Bookings phase alone further subdivided into more than 30 separate milestones<a class="cite" href="#ref-7">7</a>. Because historical bookings were not moved as part of the initial cutover, Airbnb ran the legacy monolith and the new SOA payment system in parallel for most of the migration, which required a transformation layer that could serve a unified data model to client services regardless of which backend actually held a given booking's data<a class="cite" href="#ref-7">7</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> The payments organization's four-phase SOA migration, a redesign-first path rather than a one-to-one port<a class="cite" href="#ref-7">7</a>.</caption>
+<thead><tr><th>Phase</th><th>What it did</th></tr></thead>
+<tbody>
+<tr><td class="row">Pricing</td><td>Remodeled per-product pricing logic into one generic pricing model usable across all Airbnb products</td></tr>
+<tr><td class="row">Payouts</td><td>Redesigned host money-movement orchestration around a product-agnostic model</td></tr>
+<tr><td class="row" data-best>Bookings</td><td>Redesigned guest-side payment orchestration; subdivided into 30+ independently-testable milestones</td></tr>
+<tr><td class="row">Data Migration</td><td>Moved existing bookings/payouts from the legacy system once the new system was validated, allowing monolith deprecation</td></tr>
+</tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f7t"><title id="f7t">Monolith splitting into three independently-deployed service domains</title>
+    <defs><marker id="f7-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="60" y="90" width="180" height="80" rx="10" class="d-block-muted"/>
+    <text x="150" y="122" text-anchor="middle" class="d-text-inv d-bold">Rails</text>
+    <text x="150" y="142" text-anchor="middle" class="d-text-inv d-bold">monolith</text>
+    <text x="150" y="160" text-anchor="middle" class="d-text-inv d-small">one deploy, one blast radius</text>
+    <path d="M240,130 L300,130" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <text x="270" y="120" text-anchor="middle" class="d-mono d-small">Service IDL</text>
+    <text x="270" y="108" text-anchor="middle" class="d-mono d-small">(Thrift/HTTP)</text>
+
+    <rect x="320" y="20" width="160" height="60" rx="10" class="d-block"/>
+    <text x="400" y="44" text-anchor="middle" class="d-text-inv d-bold">Search service</text>
+    <text x="400" y="62" text-anchor="middle" class="d-text-inv d-small">ships model gens independently</text>
+
+    <rect x="320" y="100" width="160" height="60" rx="10" class="d-block-2"/>
+    <text x="400" y="124" text-anchor="middle" class="d-text-inv d-bold">Payments service</text>
+    <text x="400" y="142" text-anchor="middle" class="d-text-inv d-small">runs Orpheus, own deploy cadence</text>
+
+    <rect x="320" y="180" width="160" height="60" rx="10" class="d-block-muted"/>
+    <text x="400" y="204" text-anchor="middle" class="d-text-inv d-bold">N other services</text>
+    <text x="400" y="222" text-anchor="middle" class="d-text-inv d-small">messaging, pricing, ...</text>
+
+    <path d="M300,130 L320,50" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <path d="M300,130 L320,130" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <path d="M300,130 L320,210" class="d-arrow" marker-end="url(#f7-arr)"/>
+
+    <text x="620" y="60" text-anchor="middle" class="d-small d-text-light" style="font-size:11px">Each box independently</text>
+    <text x="620" y="76" text-anchor="middle" class="d-small d-text-light" style="font-size:11px">deployable, its own release</text>
+    <text x="620" y="92" text-anchor="middle" class="d-small d-text-light" style="font-size:11px">cadence -- Module 10 covers</text>
+    <text x="620" y="108" text-anchor="middle" class="d-small d-text-light" style="font-size:11px">the general cost/benefit here</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> The general monolith-to-SOA topology Module 10 introduces<a class="cite" href="#ref-1">1</a>, specialized to this module's two case studies: search ranking and payments become services that can each run a multi-year iteration cadence (Sections 1 and 2) without coordinating a release with every other team.</figcaption>
+</figure>
+
+<h3 id="soa-migration-case-study-timeline">3.2 Service creation in three weeks, and the bridge to Module 21</h3>
+<p>The mechanism that made splitting cheap enough to be worth doing at all — rather than a one-time investment nobody could afford to repeat — was tooling, not the IDL by itself. Airbnb's "make-me-a-service" scaffolding tool took several new Java services from inception to handling real production traffic in three weeks, an estimated savings of two to three weeks of engineering time per service compared to the prior manual process<a class="cite" href="#ref-1">1</a>. That is the number that turns "split the monolith" from a one-off architectural decision into a repeatable pattern a team can apply every time a new bounded problem (a new payments phase, a new ranking-model serving path) needs its own deploy cadence.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 200" role="img" aria-labelledby="f8t"><title id="f8t">Service creation timeline using the make-me-a-service scaffolding tool</title>
+    <defs><marker id="f8-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="60" y1="110" x2="740" y2="110" class="d-axis"/>
+    <circle cx="100" cy="110" r="6" class="d-fill-blue"/>
+    <text x="100" y="90" text-anchor="middle" class="d-small d-bold">Service</text>
+    <text x="100" y="76" text-anchor="middle" class="d-small d-bold">inception</text>
+    <circle cx="300" cy="110" r="6" class="d-fill-blue"/>
+    <text x="300" y="90" text-anchor="middle" class="d-small d-bold">IDL</text>
+    <text x="300" y="76" text-anchor="middle" class="d-small d-bold">defined</text>
+    <circle cx="500" cy="110" r="6" class="d-fill-blue"/>
+    <text x="500" y="90" text-anchor="middle" class="d-small d-bold">Scaffolded</text>
+    <text x="500" y="76" text-anchor="middle" class="d-small d-bold">via make-me-a-service</text>
+    <circle cx="700" cy="110" r="7" class="d-fill-orange"/>
+    <text x="700" y="90" text-anchor="middle" class="d-small d-bold">Production</text>
+    <text x="700" y="76" text-anchor="middle" class="d-small d-bold">traffic</text>
+    <path d="M106,110 L294,110" class="d-arrow" marker-end="url(#f8-arr)"/>
+    <path d="M306,110 L494,110" class="d-arrow" marker-end="url(#f8-arr)"/>
+    <path d="M506,110 L693,110" class="d-arrow" marker-end="url(#f8-arr)"/>
+    <text x="400" y="140" text-anchor="middle" class="d-mono d-bold">3 weeks, end to end</text>
+    <text x="400" y="162" text-anchor="middle" class="d-small d-text-light">vs. an estimated 2-3 additional weeks of engineering time under the prior process</text>
+  </svg>
+  <figcaption><b>Figure 8.</b> Airbnb's reported timeline for taking a new Java service from inception to production traffic using its Service IDL and scaffolding tooling<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>The theme that carries forward past this module is the interface layer, not the transport underneath it. Airbnb's Service IDL made the compile-time contract a monolith gives you for free into something explicit and machine-checkable at a network boundary, without touching the HTTP stack every existing piece of infrastructure already knew how to operate<a class="cite" href="#ref-1">1</a> — and Borg's job/task abstraction, already introduced in Module 10 as the general admission-control and deployment-unit precedent, is the model for what a "service" becomes as an operational unit once it is deployed this way<a class="cite" href="#ref-8">8</a>. Module 21 picks up a structurally similar problem one layer up the stack: an AI gateway has to define a request/response contract for a "provider call" the same way Airbnb's Service IDL defined one for a Thrift-over-HTTP call, except the callee on the other side of that boundary is a model-serving backend instead of another internal microservice. The lifecycle discipline this module's Section 2 built for payments — a request that must execute at most once, retried safely by a client that owns an idempotency key — reappears there almost unchanged, applied to a token-generating request instead of a money-moving one.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Two genuine disagreements run through this module, both visible inside Airbnb's own published record rather than imported from outside it: whether deep learning actually retires feature engineering or just moves it somewhere less visible, and whether idempotency belongs inside each service as a library or at the edge of the API as a gateway-level contract.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Deep learning retires feature engineering</h4>
+    <p class="who">The optimism Airbnb itself describes at the launch of its first deep NN<a class="cite" href="#ref-2">2</a>, and the general framing behind representation-learning approaches like listing embeddings<a class="cite" href="#ref-3">3</a></p>
+    <p>A neural network fed with minimally-processed features and enough data will learn the interactions and transformations an engineer used to derive by hand. Airbnb's own account of the payoff is direct: "trying to do better math on the features manually has lost its luster," freeing the team to work on the optimization objective and user representation instead of endless per-feature transforms<a class="cite" href="#ref-2">2</a>. The listing-embedding work is the strongest version of this claim put into production: 32 learned numbers per listing implicitly encode location, price tier, and even architectural style, replacing what would otherwise be a hand-built similarity function<a class="cite" href="#ref-3">3</a>.</p>
+    <ul class="pros"><li>Removes a large, ongoing maintenance burden of hand-derived ratios and windowed aggregates.</li><li>Learned representations (embeddings) generalize to uses nobody hand-designed them for, such as real-time personalization features built on top of a similarity model trained for a different purpose.</li></ul>
+    <ul class="cons"><li>What the network actually learned is opaque: Airbnb's own attempts at score decomposition, ablation testing, and permutation importance each produced results the team judged nonsensical or misleading before landing on a workable tool (TopBot)<a class="cite" href="#ref-2">2</a>.</li><li>Opacity is not free when a feature has business consequences: nobody could confirm from a partial-dependence plot alone whether the model understood "cheaper is better" correctly, because partial dependence itself assumes feature independence that does not hold in a DNN<a class="cite" href="#ref-4">4</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Structure has to be engineered back in</h4>
+    <p class="who">Airbnb's own 2020 architecture, bias, and cold-start work, documented as a direct response to problems the "pure" deep NN created<a class="cite" href="#ref-4">4</a></p>
+    <p>Once the deep NN was in production, Airbnb had to reintroduce exactly the kind of explicit structure the first position claims deep learning made obsolete: a price-monotonicity constraint (twice, in two different forms, both of which made things worse), an explicit position-as-control-variable term regularized with dropout to counter inherited positional bias, and a hand-designed engagement-estimation model to patch a data gap the network could not learn its way around<a class="cite" href="#ref-4">4</a>. The pattern across all three fixes is that the network's <em>architecture</em>, not just its input features, needed engineering attention driven by a concretely observed user problem, not by importing an architecture from a literature survey<a class="cite" href="#ref-4">4</a>.</p>
+    <ul class="pros"><li>Every fix Airbnb reports came with a real, cited online A/B-test number, which is a higher bar than "the offline metric improved."</li><li>The failures of the two stricter monotonicity architectures are informative on their own: they show that naively re-imposing hand-specified structure can be worse than the unconstrained network, which the first position's critics often assume is never true.</li></ul>
+    <ul class="cons"><li>Constructing each fix required first localizing a specific user problem (skewed price preference, an under-ranked segment, missing engagement history) through ad hoc analysis tools built for the occasion — this is not a repeatable recipe so much as a research process that happened to produce three results.</li><li>The interpretability tools this position leans on (ICE plots, TopBot) are themselves homegrown and unvalidated against ground truth, since Airbnb states plainly that it has no objective record of which listing a guest "should" have booked<a class="cite" href="#ref-2">2</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Idempotency as an embedded per-service library</h4>
+    <p class="who">Airbnb's Orpheus design<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-7">7</a></p>
+    <p>Put the idempotency mechanism inside each service's own process, reading and writing that service's own database. Airbnb explicitly rejected a stand-alone idempotency service specifically because payments needed ultra-low latency and did not want to introduce a new distributed dependency subject to the very failures the mechanism exists to survive<a class="cite" href="#ref-5">5</a>. This keeps idempotency logic close to the data it protects and lets each service shard its own idempotency table by its own key space.</p>
+    <ul class="pros"><li>No added network hop or dependency in the critical path.</li><li>Generalizes past simple request/response: the same framework was later extended to make Kafka event processing effectively exactly-once, which a purely edge-level mechanism could not reach<a class="cite" href="#ref-7">7</a>.</li></ul>
+    <ul class="cons"><li>Every service that wants idempotency has to adopt the library and follow its two ground rules correctly; Airbnb's own retrospective admits the phase-separation discipline can become "spaghetti" without careful engineering<a class="cite" href="#ref-5">5</a>.</li><li>Provides no protection for a caller that talks to a service which has not adopted the library — idempotency is a property of the specific service, not of the API surface as a whole.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Idempotency as an API-edge contract</h4>
+    <p class="who">Stripe's Idempotency-Key header design, covered in full in Module 18<a class="cite" href="#ref-6">6</a></p>
+    <p>Put the mechanism at the boundary the client actually calls: a client-generated key travels in a request header, and the API layer itself caches and replays the first response — including a cached error — for any retry carrying the same key<a class="cite" href="#ref-6">6</a>. Stripe's own client libraries handle the retry loop (exponential backoff with jitter) automatically, so the idempotency contract is something every caller gets by default rather than something each internal service has to separately implement correctly<a class="cite" href="#ref-6">6</a>.</p>
+    <ul class="pros"><li>One place to get the contract right; every endpoint behind the same API gateway inherits it uniformly.</li><li>The client-visible header makes the contract explicit and auditable from outside the company, which matters for a payments API with external integrators, unlike Orpheus's fully internal library.</li></ul>
+    <ul class="cons"><li>Caching a full response at the edge assumes the edge layer can safely see and store that response, which is a harder assumption for a deep internal call chain with side effects fanning out to several downstream services than for a single external-facing API call.</li><li>Does not, by itself, solve the internal fan-out problem Airbnb describes — a client-facing key can guarantee the outer call executes once without guaranteeing every downstream RPC inside that call also executes exactly once, which is what pushed Airbnb to solve idempotency at each internal hop instead of only at the edge.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Both disagreements resolve to "it depends on where the hard constraint actually binds," and Airbnb's own record is unusually explicit about where that turned out to be for a two-sided marketplace. On feature engineering: representation learning wins decisively wherever the target signal is genuinely high-dimensional and only weakly constrained by domain knowledge (listing similarity, personalization) — the embeddings needed almost no domain-specific structure and outperformed a hand-built similarity function outright<a class="cite" href="#ref-3">3</a>. But wherever a feature has an externally-known, one-directional relationship with the business outcome (price should not increase a ranking score, holding everything else equal) and getting that relationship visibly wrong has revenue or fairness consequences, unconstrained representation learning is the wrong default: Airbnb tried the constrained version twice, watched both attempts underperform the unconstrained network, and only succeeded once it stopped trying to force behavior and instead built an architecture (two towers) that let the network discover the query-conditional right answer on its own<a class="cite" href="#ref-4">4</a>. The lesson generalizes past search ranking: constrain the objective or the architecture's inductive bias, not the feature's raw value, when you need guaranteed monotonic behavior. On idempotency: an embedded per-service library is the right choice specifically when a single client-visible operation fans out into multiple independent side-effecting calls across service boundaries, because only per-hop idempotency can stop a partial failure from re-executing one of those inner calls while leaving the others alone — which is Airbnb's actual situation. An edge-level header is the right choice when the API surface is genuinely one call in, one side effect out, from the caller's point of view, which describes most of Stripe's charge/refund API and explains why Stripe's simpler mechanism is sufficient for its use case without needing Orpheus's internal phase discipline. Evidence that would settle which layer matters more for a given system: count the number of independently-failing network hops behind one client-visible API call — one hop favors the edge-level header, several hops favor the embedded library, and Airbnb's own move to wrap Kafka event processing in the same framework is direct evidence its hop count was large enough to need it<a class="cite" href="#ref-7">7</a>.</p></div>
+</section>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">blog</span>Guo, Liang. <em>Building Services at Airbnb, Part 1</em>. The Airbnb Tech Blog, published 2017-12-12. <a href="https://medium.com/airbnb-engineering/building-services-at-airbnb-part-1-c4c1d8fa811b">https://medium.com/airbnb-engineering/building-services-at-airbnb-part-1-c4c1d8fa811b</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the monolith-to-SOA migration framing, Service IDL/Thrift-over-HTTP design, and the make-me-a-service scaffolding tool's measured 3-week/2-3-week-saved figures (§3; also the primary source for Module 10).</span></li>
+<li id="ref-2"><span class="ref-type">paper</span>Haldar, Malay, Mustafa Abdool, Prashant Ramanathan, Tao Xu, Shulin Yang, Huizhong Duan, Qing Zhang, Nick Barrow-Williams, Bradley C. Turnbull, Brendan M. Collins, and Thomas Legrand. <em>Applying Deep Learning To Airbnb Search</em>. Proceedings of the 25th ACM SIGKDD International Conference on Knowledge Discovery &amp; Data Mining (KDD '19), pp. 1927-1935; arXiv:1810.09591v2. <a href="https://arxiv.org/abs/1810.09591">https://arxiv.org/abs/1810.09591</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the five search-ranking model generations (§1.1), feature normalization and S2-cell hashing (§1.2), and the failed listing-id/multi-task attempts and interpretability tools discussed in the disagreement section.</span></li>
+<li id="ref-3"><span class="ref-type">blog</span>Grbovic, Mihajlo, Haibin Cheng, Qing Zhang, Lynn Yang, Phillippe Siclait, and Matt Jones. <em>Listing Embeddings in Search Ranking</em>. The Airbnb Tech Blog, published 2018-03-13 (companion post to Grbovic &amp; Cheng, <em>Real-time Personalization using Embeddings for Search Ranking at Airbnb</em>, KDD 2018, pp. 311-320). <a href="https://medium.com/airbnb-engineering/listing-embeddings-for-similar-listing-recommendations-and-real-time-personalization-in-search-601172f7603e">https://medium.com/airbnb-engineering/listing-embeddings-for-similar-listing-recommendations-and-real-time-personalization-in-search-601172f7603e</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the skip-gram listing-embedding mechanism, training scale, cold-start rule, and the 21%/4.9% Similar Listings A/B-test results (§1.3).</span></li>
+<li id="ref-4"><span class="ref-type">paper</span>Haldar, Malay, Prashant Ramanathan, Tyler Sax, Mustafa Abdool, Lanbo Zhang, Aamir Mansawala, Shulin Yang, Bradley Turnbull, and Junshuo Liao. <em>Improving Deep Learning For Airbnb Search</em>. Proceedings of the 26th ACM SIGKDD International Conference on Knowledge Discovery &amp; Data Mining (KDD 2020); arXiv:2002.05515v1. <a href="https://arxiv.org/abs/2002.05515">https://arxiv.org/abs/2002.05515</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the architecture/bias/cold-start fixes and their reported online A/B-test deltas (§1.4), and the two-tower latency-complexity formula used in the worked derivation.</span></li>
+<li id="ref-5"><span class="ref-type">blog</span>Chew, Jon, and Ninad Khisti. <em>Avoiding double payments in a distributed payments system</em>. The Airbnb Tech Blog, published 2019-04-16. <a href="https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb">https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the write-repair framing, the Orpheus three-phase design and its two ground rules, the replica-lag double-payment failure mode, request-level vs. entity-level keys, lease/retry mechanics, and the five-nines result (§2.1-§2.4).</span></li>
+<li id="ref-6"><span class="ref-type">blog</span>Stripe (Brandur Leach et al.). <em>Designing robust and predictable APIs with idempotency</em>. Stripe, 2017. <a href="https://stripe.com/blog/idempotency">https://stripe.com/blog/idempotency</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Stripe Idempotency-Key header contrast in Table 2 and the disagreement section (§2.4; full treatment in Module 18).</span></li>
+<li id="ref-7"><span class="ref-type">blog</span>Ross, Bryon, Feifeng Yang, Sophie Behr, Theresa Johnson, Xin Lin, and Yun Jin Cho. <em>Rebuilding Payment Orchestration at Airbnb</em>. The Airbnb Tech Blog, published 2022-02-24. <a href="https://medium.com/airbnb-engineering/rebuilding-payment-orchestration-at-airbnb-341d194a781b">https://medium.com/airbnb-engineering/rebuilding-payment-orchestration-at-airbnb-341d194a781b</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the DAG-of-idempotent-steps redesign, the Kafka-exactly-once extension, the four-phase payments migration (Pricing/Payouts/Bookings/Data Migration), and the parallel-systems/transformation-layer detail (§2.4, §3.1).</span></li>
+<li id="ref-8"><span class="ref-type">paper</span>Verma, Abhishek, Luis Pedrosa, Madhukar Korupolu, David Oppenheimer, Eric Tune, and John Wilkes. <em>Large-scale cluster management at Google with Borg</em>. EuroSys '15. <a href="https://research.google.com/pubs/archive/43438.pdf">https://research.google.com/pubs/archive/43438.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the job/task deployment-unit precedent referenced when bridging to Module 21 (§3.2).</span></li>
+<li id="ref-9"><span class="ref-type">paper</span>Corbett, James C., Jeffrey Dean, Michael Epstein, et al. <em>Spanner: Google's Globally-Distributed Database</em>. OSDI '12. <a href="https://research.google.com/archive/spanner-osdi2012.pdf">https://research.google.com/archive/spanner-osdi2012.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the two-phase-commit/distributed-transaction alternative named in §2.1.</span></li>
+<li id="ref-10"><span class="ref-type">paper</span>DeCandia, Giuseppe, Deniz Hastorun, Madan Jampani, et al. <em>Dynamo: Amazon's Highly Available Key-value Store</em>. SOSP '07. <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the always-writeable, eventually-consistent design point that Airbnb's write-repair approach resembles (§2.1).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

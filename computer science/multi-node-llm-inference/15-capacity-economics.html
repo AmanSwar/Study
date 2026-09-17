@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capacity Planning and Economics: Goodput, Tokens/s/$, and Little's-Law Reasoning at Rack Scale · Multi-Node LLM Inference</title>
+<meta name="description" content="The arithmetic for sizing a multi-node deployment from published numbers: goodput under TTFT/ITL SLOs as the sizing target, how tokens/s/$ actually moves as node count grows, the TCO-per-million-tokens crossover as a planning tool, and DistServe's M/D/1 queueing result applied to replica sizing.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 15</p>
+<h1>Capacity Planning and Economics: Goodput, Tokens/s/$, and Little's-Law Reasoning at Rack Scale</h1>
+<p class="lede">Every earlier module in this course answered a mechanism question -- why disaggregate, how KV cache moves, how wide expert parallelism dispatches tokens. This module answers the question a capacity plan actually has to answer: given a target SLO and a handful of published per-node numbers, how many nodes do you provision, and what does each million tokens served actually cost. It pulls together DistServe's queueing math, DeepSeek's own disclosed economics, and the InferenceMAX TCO crossover into one sizing methodology, and is explicit about a claim it declined to use because nobody could source it.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>30 min</b> read</span>
+<span class="chip"><b>9</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 3</b></span>
+<span class="chip">Prerequisite: <b>Module 6</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f1t"><title id="f1t">The sizing pipeline: an SLO target and a published per-node throughput number flow through queueing math to a node count and a cost per million tokens</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="10" y="90" width="140" height="80" rx="8" class="d-block"/>
+<text x="80" y="120" text-anchor="middle" class="d-text-inv d-bold">SLO target</text>
+<text x="80" y="140" text-anchor="middle" class="d-text-inv d-small">TTFT / ITL,</text>
+<text x="80" y="155" text-anchor="middle" class="d-text-inv d-small">goodput %</text>
+<path d="M150,130 L195,130" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="200" y="90" width="150" height="80" rx="8" class="d-block-2"/>
+<text x="275" y="115" text-anchor="middle" class="d-text-inv d-bold">Per-node</text>
+<text x="275" y="133" text-anchor="middle" class="d-text-inv d-small">throughput</text>
+<text x="275" y="150" text-anchor="middle" class="d-text-inv d-small">(published, &#167;2-3)</text>
+<path d="M350,130 L395,130" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="400" y="90" width="150" height="80" rx="8" class="d-block-accent"/>
+<text x="475" y="115" text-anchor="middle" class="d-text-inv d-bold">Queueing math</text>
+<text x="475" y="133" text-anchor="middle" class="d-text-inv d-small">M/D/1, R&#8594;R/N</text>
+<text x="475" y="150" text-anchor="middle" class="d-text-inv d-small">(&#167;5)</text>
+<path d="M550,130 L595,130" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="600" y="60" width="190" height="55" rx="8" class="d-panel"/>
+<text x="695" y="92" text-anchor="middle" class="d-bold">Node count N</text>
+<path d="M695,120 L695,150" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="600" y="155" width="190" height="55" rx="8" class="d-panel"/>
+<text x="695" y="187" text-anchor="middle" class="d-bold">Cost / M tokens</text>
+<line x1="80" y1="175" x2="80" y2="230" class="d-outline d-dashed"/>
+<line x1="80" y1="230" x2="695" y2="230" class="d-outline d-dashed"/>
+<path d="M695,230 L695,220" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+<text x="380" y="250" text-anchor="middle" class="d-small d-text-light">feedback: at a fixed interactivity target, TCO/M-tokens (&#167;4) tells you whether to size disaggregated or aggregated</text>
+<text x="80" y="270" text-anchor="middle" class="d-small d-text-light">Module 3, 6, 7 supply the</text>
+<text x="80" y="285" text-anchor="middle" class="d-small d-text-light">numbers this pipeline consumes</text>
+</svg>
+<figcaption><b>Figure 1.</b> This module's structure as a pipeline: an SLO target and a published per-node throughput figure (from Modules 3, 6, and 7's worked numbers) feed a queueing-theoretic sizing step, producing a node count and a cost per million tokens -- with the TCO-per-million-tokens crossover (&#167;4) acting as a feedback check on whether the disaggregated or aggregated topology is even the right one to size in the first place.</figcaption>
+</figure>
+
+<h2 id="goodput-sizing-target">1. Goodput as the sizing target</h2>
+<p>Module 3 defined the vocabulary this module builds on: time to first token (TTFT), the elapsed time between submitting a prompt and receiving the first output token; TPOT/ITL, the average time between successive output tokens, computed per request as \((\text{E2E latency} - \text{TTFT}) / (\#\text{output tokens} - 1)\); and goodput, the percentage of requests meeting every defined SLO, \(\text{Goodput} = (\#\text{requests meeting all SLOs} / \text{total requests}) \times 100\%\)<a class="cite" href="#ref-2">2</a>. Averaged across N unequal-length requests, mean TPOT (the average of each request's own TPOT) and mean ITL (the sum of every inter-token gap divided by total output tokens) diverge whenever output lengths differ<a class="cite" href="#ref-2">2</a> -- a distinction Module 3 covers in full and this module assumes.</p>
+<p>What Module 3 used goodput for was a mechanism argument: colocating prefill and decode caps per-GPU goodput at a low ceiling because of interference. This module uses the same quantity for a different purpose -- as the thing you size against. DistServe's own per-GPU goodput framing makes the connection explicit: it is <q>the maximum request rate that can be served adhering to the SLO attainment goal (say, 90%) for each GPU provisioned</q><a class="cite" href="#ref-1">1</a>. Read backwards, a per-GPU goodput ceiling of \(g\) requests/s at a given SLO tells you directly how many GPUs a target aggregate rate \(R_\text{total}\) requires: \(N \geq R_\text{total} / g\). Every worked example in this module is some version of that inversion -- take a published per-node or per-GPU rate at a stated SLO attainment, and solve for the node count a target load requires, then price it.</p>
+<p>Precision in the metric matters here in a way it does not for a mechanism explanation, because the inversion is only as good as the number fed into it. A published "throughput" figure that does not state its SLO-attainment bar, its TTFT/TPOT targets, or whether it is measuring mean TPOT or mean ITL (&#167;1's divergence, restated from Module 3) is not a usable sizing input -- it tells you a system moved a lot of tokens, not whether any individual request stayed inside a latency bound you can promise a caller. Every per-node and per-GPU number this module inverts into a node count in &#167;3, &#167;5, and &#167;6 is one that states, or is paired with, an explicit SLO-attainment condition: DistServe's ceilings are stated at a 90% attainment bar<a class="cite" href="#ref-1">1</a>, and DeepSeek's per-node throughput figures are stated as live production averages rather than best-case benchmark peaks<a class="cite" href="#ref-4">4</a>. A sizing exercise built on a number without that qualifier is not wrong so much as unfalsifiable -- there is no way to check after the fact whether the deployment it produced actually meets the SLO it was supposed to hit.</p>
+
+<h2 id="single-node-baseline">2. The single-node baseline every planner needs</h2>
+<p>Before sizing across nodes, two single-node facts bound what scaling out can and cannot buy, and both come from the same source: Databricks' Mosaic Research team's 2023 engineering post on LLM inference performance, still the most-cited source for this specific arithmetic<a class="cite" href="#ref-3">3</a>.</p>
+<h3 id="batch-latency-throughput">2.1 Batch size trades latency for throughput, and the exchange rate is not 1:1</h3>
+<p>Serving MPT-7B on an A100 at 512 input / 64 output tokens, pushing the batch size to 64 (from a batch of roughly 1) increases per-request latency by 4x while increasing aggregate throughput by 14x<a class="cite" href="#ref-3">3</a>. That 4x-for-14x exchange is the single-instance version of the goodput-vs-throughput distinction from &#167;1: a batch-64 deployment posts an enormous throughput number, but any individual request now waits roughly four times longer for its tokens, which is exactly the kind of number that fails a tight TTFT/TPOT SLO even while the aggregate-throughput dashboard looks excellent. Continuous batching (the scheduling discipline every serving engine in this course ships) captures a large fraction of that throughput gain without forcing every request through a fixed, synchronized batch boundary: Databricks reports continuous batching achieving 10-20x better throughput than static or dynamic batching<a class="cite" href="#ref-3">3</a>, which is why static batching is not a live option for anything sized in this module -- every node-count calculation below already assumes continuous batching as the floor, not an upgrade to consider.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Schematic latency-throughput curve: relative latency and relative throughput as batch size rises from 1 to 64</title>
+<line x1="80" y1="250" x2="740" y2="250" class="d-axis"/>
+<line x1="80" y1="250" x2="80" y2="30" class="d-axis"/>
+<text x="410" y="284" text-anchor="middle" class="d-small d-text-light">relative latency (batch 1 &#8594; 64)</text>
+<text x="30" y="140" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 30 140)">relative throughput</text>
+<path d="M110,235 C 220,225 340,190 460,140 C 560,100 640,65 700,50" class="d-line d-stroke-blue" fill="none"/>
+<circle cx="110" cy="235" r="6" class="d-fill-blue"/>
+<text x="110" y="220" text-anchor="middle" class="d-mono d-small">1x, 1x</text>
+<text x="90" y="266" text-anchor="middle" class="d-mono d-small">batch 1</text>
+<circle cx="460" cy="140" r="6" class="d-fill-orange"/>
+<text x="500" y="130" class="d-mono d-small d-bold">4x latency, 14x throughput</text>
+<text x="460" y="266" text-anchor="middle" class="d-mono d-small">batch 64<a class="cite" href="#ref-3">3</a></text>
+<line x1="460" y1="140" x2="460" y2="250" class="d-outline d-dashed"/>
+</svg>
+<figcaption><b>Figure 2.</b> Latency and throughput both rise with batch size, but not proportionally: pushing batch size from roughly 1 to 64 on an A100 serving MPT-7B (512 in / 64 out tokens) costs 4x the per-request latency to gain 14x the aggregate throughput. Curve shape is illustrative between the two labelled, cited points<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+<h3 id="gpu-count-sublinear">2.2 Doubling GPU count does not halve latency at low batch size</h3>
+<p>The second trap: it is tempting to assume that adding parallelism degree scales latency down linearly, the way it scales aggregate throughput up. It does not, at small batch sizes. Databricks measured Llama2-70B time-to-first-token at batch size 1 (a 512-token input) across GPU counts on A100-40GB: 2 GPUs is the smallest configuration the model fits in and serves as the 1x baseline (154 ms); 4 GPUs brings that down to 0.74x (114 ms); going from 4 to 8 GPUs brings it down by only a further 0.7x<a class="cite" href="#ref-3">3</a>. Doubling the GPU count a second time returns barely more than doubling it the first time did in absolute terms, and both fall well short of the naive expectation that 2x the parallelism degree gives 2x less latency.</p>
+<p>Chaining the two measured ratios gives the cumulative effect of going from 2 to 8 GPUs directly: \(0.74 \times 0.7 = 0.518\) -- an 8-GPU configuration's TTFT at batch size 1 is only about half the 2-GPU baseline's, not an eighth of it<a class="cite" href="#ref-3">3</a>. This is the mechanism-level reason inter-op (pipeline) and intra-op (tensor) parallelism both show diminishing latency returns as you add GPUs -- communication overhead and reduced per-GPU utilization after each additional partition eat into the theoretical linear speedup<a class="cite" href="#ref-1">1</a> -- and it is the reason "just add more GPUs" is not, by itself, a latency-SLO strategy. It is a throughput strategy (&#167;2.1's other axis), and the two have to be sized separately.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f3t"><title id="f3t">Bar chart of relative TTFT at batch size 1 for Llama2-70B across 2, 4, and 8 A100-40GB GPUs, showing sublinear latency reduction</title>
+<line x1="80" y1="210" x2="700" y2="210" class="d-axis"/>
+<line x1="80" y1="210" x2="80" y2="30" class="d-axis"/>
+<text x="30" y="215" class="d-small d-text-light">0</text>
+<line x1="75" y1="150" x2="700" y2="150" class="d-grid"/><text x="30" y="154" class="d-small d-text-light">0.5x</text>
+<line x1="75" y1="90" x2="700" y2="90" class="d-grid"/><text x="30" y="94" class="d-small d-text-light">1.0x</text>
+<rect x="160" y="90" width="110" height="120" class="d-fill-blue"/>
+<text x="215" y="82" text-anchor="middle" class="d-mono d-small">1.0x</text>
+<text x="215" y="230" text-anchor="middle" class="d-small">2 GPUs (154 ms)</text>
+<rect x="360" y="134" width="110" height="76" class="d-fill-cyan"/>
+<text x="415" y="126" text-anchor="middle" class="d-mono d-small">0.74x</text>
+<text x="415" y="230" text-anchor="middle" class="d-small">4 GPUs (114 ms)</text>
+<rect x="560" y="152" width="110" height="58" class="d-fill-orange"/>
+<text x="615" y="144" text-anchor="middle" class="d-mono d-small">0.52x</text>
+<text x="615" y="230" text-anchor="middle" class="d-small">8 GPUs (derived)</text>
+<text x="390" y="248" text-anchor="middle" class="d-small d-text-light">relative TTFT, Llama2-70B, batch 1, 512-token input, A100-40GB<a class="cite" href="#ref-3">3</a></text>
+</svg>
+<figcaption><b>Figure 3.</b> Relative time-to-first-token at batch size 1 for Llama2-70B as GPU count doubles: 2&#8594;4 GPUs buys a 0.74x reduction, 4&#8594;8 GPUs a further 0.7x -- the 0.52x figure at 8 GPUs is this module's own arithmetic (0.74 &#215; 0.7) chaining Databricks' two disclosed ratios, not a separately measured point<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<h2 id="tokens-per-dollar-vs-n">3. Tokens/s/$ as a function of N</h2>
+<p>The question this section answers directly: as a deployment grows from a handful of GPUs to hundreds, does the number of tokens served per dollar improve, degrade, or plateau? The honest answer, grounded in the only two organizations that have published matched cost and throughput numbers at scale, is: it depends which mechanism dominates, and the published data shows both directions at once.</p>
+<h3 id="blended-cost-comparison">3.1 Two real $/token numbers, and why they are not directly comparable</h3>
+<p>Module 6 established the primitives: over a 24-hour production window, DeepSeek's disclosed infrastructure cost was $87,072/day (226.75 average H800 nodes at an assumed $2/GPU-hour), and it generated 168 billion output tokens in that window<a class="cite" href="#ref-4">4</a>. Module 6 does not itself divide one by the other; doing so gives a blended infrastructure cost of</p>
+$$ \frac{\$87{,}072}{168{,}000\ \text{(million tokens)}} \approx \$0.518\ \text{per million output tokens} $$
+<p>SGLang's independent 96-H100 reproduction of the same wide-EP, PD-disaggregated design reports its own figure directly: $0.20 per million output tokens<a class="cite" href="#ref-6">6</a>, about 2.6x cheaper than the blended DeepSeek figure above. Neither the SGLang blog post nor DeepSeek's own disclosure documents the exact accounting behind its respective number in enough detail to make this a clean apples-to-apples comparison, and the gap is very plausibly an artifact of what each denominator and numerator actually include, not evidence that SGLang's stack is 2.6x more cost-efficient:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Two published cost-per-output-token figures and what is known and unknown about each<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-6">6</a>.</caption>
+<thead><tr><th>Figure</th><th>DeepSeek blended (derived)</th><th>SGLang reproduction</th></tr></thead>
+<tbody>
+<tr><td class="row">Value</td><td class="num">$0.518 / 1M output tok</td><td class="num" data-best>$0.20 / 1M output tok</td></tr>
+<tr><td class="row">Source</td><td>$87,072/day &#247; 168B output tok<a class="cite" href="#ref-4">4</a></td><td>Stated directly<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">Scope</td><td>Whole fleet: all prefill + decode nodes, averaged over a live 24h window with real traffic variance</td><td>Not disclosed -- likely the 96-GPU benchmark deployment (12 nodes) under controlled load</td></tr>
+<tr><td class="row">Hardware</td><td>H800 (export-limited NVLink)<a class="cite" href="#ref-5">5</a></td><td>H100<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">GPU-hour rate</td><td>$2/hr, stated as an assumption, not a quoted price<a class="cite" href="#ref-4">4</a></td><td>Not disclosed</td></tr>
+<tr><td class="row">Includes prefill infra cost?</td><td>Yes -- numerator is the entire fleet's cost, denominator is output tokens only</td><td>Not disclosed</td></tr>
+</tbody>
+</table>
+<p>The one directionally reliable takeaway is the one both figures agree on despite their different accounting: a wide-EP, PD-disaggregated DeepSeek-class deployment prices out somewhere in the low tens of cents per million output tokens on current-generation Hopper hardware, roughly a fifth of DeepSeek's own metered R1 API price<a class="cite" href="#ref-6">6</a> -- both numbers are evidence the deployment strategy this course has spent five modules on is not merely reproducible mechanically (Module 6's 5.6%/6.6% throughput match), it is reproducible economically too.</p>
+<h3 id="ep-degree-throughput-trend">3.2 Per-node throughput falls as expert-parallel degree (and node count) rises</h3>
+<p>A cleaner, better-controlled comparison sits inside Module 6's own data: three separate measurements of DeepSeek-class decode throughput per node, at three different node counts for the decode pool specifically. SGLang's EP72 reproduction across 9 nodes measured 22,282 tokens/s per node at 2K input length<a class="cite" href="#ref-6">6</a>; DeepSeek's own separately released profiling snapshot, run across 16 nodes, measured 18,598 tokens/s per node<a class="cite" href="#ref-6">6</a>; and DeepSeek's Day-6 production disclosure, averaged over its EP144/18-node configuration, measured about 14,800 tokens/s per node<a class="cite" href="#ref-4">4</a>. Per-node decode throughput falls monotonically as node count rises across these three points:</p>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">Bar chart of decode tokens per second per node against decode node count, for three published DeepSeek-class deployments</title>
+<line x1="80" y1="250" x2="720" y2="250" class="d-axis"/>
+<line x1="80" y1="250" x2="80" y2="30" class="d-axis"/>
+<text x="30" y="255" class="d-small d-text-light">0</text>
+<line x1="75" y1="190" x2="720" y2="190" class="d-grid"/><text x="20" y="194" class="d-small d-text-light">10k</text>
+<line x1="75" y1="130" x2="720" y2="130" class="d-grid"/><text x="20" y="134" class="d-small d-text-light">20k</text>
+<line x1="75" y1="70" x2="720" y2="70" class="d-grid"/><text x="20" y="74" class="d-small d-text-light">tok/s/node</text>
+<rect x="150" y="117" width="110" height="133" class="d-fill-cyan"/>
+<text x="205" y="109" text-anchor="middle" class="d-mono d-small">22,282</text>
+<text x="205" y="270" text-anchor="middle" class="d-small">9 nodes (EP72)</text>
+<text x="205" y="286" text-anchor="middle" class="d-small d-text-light">SGLang, H100<a class="cite" href="#ref-6">6</a></text>
+<rect x="360" y="140" width="110" height="110" class="d-fill-blue"/>
+<text x="415" y="132" text-anchor="middle" class="d-mono d-small">18,598</text>
+<text x="415" y="270" text-anchor="middle" class="d-small">16 nodes</text>
+<text x="415" y="286" text-anchor="middle" class="d-small d-text-light">DeepSeek profile, H800<a class="cite" href="#ref-6">6</a></text>
+<rect x="570" y="161" width="110" height="89" class="d-fill-orange"/>
+<text x="625" y="153" text-anchor="middle" class="d-mono d-small">14,800</text>
+<text x="625" y="270" text-anchor="middle" class="d-small">18 nodes (EP144)</text>
+<text x="625" y="286" text-anchor="middle" class="d-small d-text-light">DeepSeek production, H800<a class="cite" href="#ref-4">4</a></text>
+</svg>
+<figcaption><b>Figure 4.</b> Per-node decode throughput across three published DeepSeek-class configurations, ordered by decode node count: 22,282 tok/s/node at 9 nodes, 18,598 at 16 nodes, 14,800 at 18 nodes. Hardware (H100 vs. H800), input length, and benchmark-vs-live-production conditions differ across the three points -- see caveats in prose<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+<p>Read this cautiously: the three points are not a controlled sweep. SGLang's 9-node figure runs on H100 (more NVLink bandwidth than the H800 the other two points use), at 2K input length under benchmark conditions; the 18-node figure is a live 24-hour production average that necessarily blends in real traffic's idle gaps, mixed request shapes, and headroom that a benchmark run does not carry. Still, the direction is consistent with a mechanism this course has already established: DeepEP's own measured bandwidth collapses as the all-to-all crosses more RDMA domains -- 726 GB/s dispatch within one 8-GPU NVLink domain (EP8), falling to 90 GB/s once the all-to-all spans two RDMA domains (EP8x2), and 61 GB/s across four (EP8x4)<a class="cite" href="#ref-8">8</a>. A wider decode expert-parallel degree spreads the same all-to-all traffic across more inter-node hops, and each hop pays the RDMA-not-NVLink tax Module 1 quantified as an roughly 8x cliff at the node boundary. More decode nodes does not linearly translate to more decode throughput per node for a fixed model and a fixed all-to-all mechanism -- the communication tax scales with the parallelism degree, not just the compute does.</p>
+<h3 id="cache-hit-economics">3.3 Cache-hit ratio pulls the other way</h3>
+<p>Section 3.2's trend is specific to MoE decode's all-to-all-bound traffic. A different mechanism, also already established in this course, moves tokens/s/$ in the opposite direction as cluster size grows: cache-hit economics. Mooncake's own production-trace analysis found KV-cache hit ratio rising from about 30% at 1,000 cache blocks of capacity to about 50% at 50,000 blocks, essentially flattening beyond that -- a workload-specific ceiling the paper states can reach 90% for long-document, high-repeat traffic such as chat-to-paper<a class="cite" href="#ref-9">9</a>. Cluster-wide KV-cache capacity is, mechanically, a function of how many nodes' worth of HBM/DRAM/SSD Module 7's tiered hierarchy can pool -- more nodes participating in a shared cache pool means more addressable cache capacity, which (up to the workload's own reuse ceiling) means a higher fraction of prefill tokens served from cache instead of recomputed. DeepSeek's own disclosed traffic makes the dollar consequence concrete: 56.3% of its 608 billion daily input tokens were cache hits, billed at $0.14 per million tokens against $0.55 per million for a cache miss<a class="cite" href="#ref-5">5</a> -- a cache hit is roughly a quarter the cost of a miss on the same input token, at DeepSeek's published API rates.</p>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Tokens/s/$ vs. N is not one curve, it is the sum of at least two curves moving in opposite directions: the all-to-all communication tax (&#167;3.2) degrades per-node throughput as expert-parallel degree/node count rises, while cluster-wide cache-pool capacity (&#167;3.3) improves effective cost per token as node count rises, up to the workload's own reuse ceiling. Which one dominates your deployment depends on whether your traffic is EP-heavy decode-bound (&#167;3.2 dominates, more nodes per decode unit degrades $/token) or long-context, high-repeat prefill-bound (&#167;3.3 dominates, more cache capacity improves $/token). Neither published dataset in this course sizes both effects on the same workload at the same time -- treat this as a framework for reasoning about your own traffic, not a formula with a single published answer.</p></aside>
+
+<h2 id="tco-crossover-planning">4. TCO-per-million-tokens as a planning tool</h2>
+<p>Module 3 established SemiAnalysis's InferenceMAX result in full: comparing a GB200 NVL72 rack running disaggregated prefill against single-node 8-GPU B200 servers running aggregated (colocated) serving, disaggregation wins on TCO per million tokens below roughly 90 tokens/s/user of interactivity, and the aggregated server wins above it<a class="cite" href="#ref-7">7</a>. This module does not re-derive that crossover -- it turns the finding into the sizing decision it implies.</p>
+<p>Read as a planning tool rather than a benchmark result, the crossover collapses to a single question to ask before sizing anything else: what interactivity (tokens/s/user) does the product actually need to hit? A batch-oriented workload -- summarization, document processing, agentic pipelines with high tolerance for per-token latency -- sits below the crossover, and the sizing exercise should default toward a disaggregated topology with the node-count arithmetic in &#167;3 and &#167;6 applied to a dedicated prefill pool and a dedicated decode pool. An interactive chat product with a tight per-token latency target sits above the crossover, and the sizing exercise should default toward provisioning more aggregated 8-GPU units rather than paying for a dedicated prefill pool's fixed overhead at a scale where an aggregated server's simpler topology already wins on cost.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f5t"><title id="f5t">TCO-per-million-tokens crossover reprised as a sizing decision rule, with regions annotated for which topology to size</title>
+<line x1="70" y1="240" x2="740" y2="240" class="d-axis"/>
+<line x1="70" y1="240" x2="70" y2="30" class="d-axis"/>
+<text x="405" y="278" text-anchor="middle" class="d-small d-text-light">interactivity target (tokens/s/user, low &#8594; high)</text>
+<text x="30" y="140" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 30 140)">TCO / M tokens (lower better)</text>
+<rect x="70" y="35" width="390" height="15" class="d-fill-blue-soft"/>
+<text x="265" y="46" text-anchor="middle" class="d-small d-bold">Size disaggregated (prefill + decode pools, &#167;6)</text>
+<rect x="460" y="35" width="280" height="15" class="d-fill-orange-soft"/>
+<text x="600" y="46" text-anchor="middle" class="d-small d-bold">Size aggregated 8-GPU units</text>
+<path d="M100,60 C 280,80 380,160 460,180 C 560,205 650,215 720,220" class="d-line d-stroke-blue" fill="none"/>
+<path d="M100,200 C 250,190 360,178 460,180 C 560,182 650,150 720,90" class="d-line d-stroke-cyan" fill="none"/>
+<line x1="460" y1="60" x2="460" y2="240" class="d-outline d-dashed"/>
+<circle cx="460" cy="180" r="6" class="d-fill-orange"/>
+<text x="460" y="60" text-anchor="middle" class="d-mono d-small">~90 tok/s/user<a class="cite" href="#ref-7">7</a></text>
+<rect x="580" y="200" width="150" height="46" class="d-label-bg"/>
+<line x1="590" y1="210" x2="614" y2="210" class="d-line d-stroke-blue"/><text x="620" y="214" class="d-small">GB200 NVL72 disagg</text>
+<line x1="590" y1="232" x2="614" y2="232" class="d-line d-stroke-cyan"/><text x="620" y="236" class="d-small">8&#215;GPU B200 aggregated</text>
+</svg>
+<figcaption><b>Figure 5.</b> The InferenceMAX crossover from Module 3, reprised here as a sizing rule: below about 90 tokens/s/user of interactivity, the node-count arithmetic in &#167;3 and &#167;6 should target a disaggregated prefill/decode split; above it, aggregated 8-GPU units are the better-costing default. Curve shape illustrative between the cited crossover point and endpoints; the 90 tok/s/user threshold is the cited number<a class="cite" href="#ref-7">7</a>.</figcaption>
+</figure>
+<p>Two qualifiers carry over from Module 3 unchanged and matter just as much here: the crossover is specific to the model, workload shape, and software stack InferenceMAX benchmarked, and it is a snapshot of how far NVIDIA's Dynamo and TensorRT-LLM teams have optimized the disaggregated-prefill code path at the time of measurement, not a hardware constant<a class="cite" href="#ref-7">7</a>. Treat 90 tokens/s/user as this module's working threshold, not a number to hard-code into a sizing spreadsheet past this year.</p>
+
+<h2 id="queueing-rack-scale">5. Queueing-theoretic capacity reasoning at rack scale</h2>
+<p>Module 3 derived why a colocated engine's goodput ceiling is so much lower than a disaggregated one, using DistServe's M/D/1 queueing model: with Poisson arrivals at rate \(R\) and a deterministic per-request service time \(D\) (the case once a phase runs alone on its own GPU and \(D\) stops fluctuating), average TTFT is</p>
+$$ \text{Avg\_TTFT} = D + \frac{RD^2}{2(1-RD)} $$
+<p>where the second term is queueing delay and \(RD\) is utilization<a class="cite" href="#ref-1">1</a>. This module does not re-derive that result. It extends it in a direction Module 3 does not cover: what the same equation says about adding replicas, which is the rack-scale version of Little's-Law-style capacity reasoning this module is scoped to provide.</p>
+<h3 id="replication-substitution">5.1 Replicate, and the arrival rate each replica sees drops by a factor of N</h3>
+<p>DistServe's own practical-deployment discussion states the mechanism directly, in the paper's section on replication as a first-class alternative to model parallelism: <q>it is worth noting that when the model can fit into the memory of a single GPU, replication is a competitive option in addition to model parallelism for both prefill and decoding instances, to linearly scale the system's rate capacity. It may also reduce the queuing delay -- as indicated by Eq. 1 -- by substituting R with R/N assuming requests are equally dispatched to N replicas, at the cost of maintaining additional replicas of the model weights in GPU memory</q><a class="cite" href="#ref-1">1</a>. This is the load-bearing sentence for this section, and it is worth being precise about what "equally dispatched" is doing: the R/N substitution is only valid if the router in front of the N replicas actually balances arrival rate evenly across them (Module 2's territory) -- a router that skews load toward a subset of replicas (a stale prefix-cache index, a hot session pinned to one pod) effectively raises that replica's local R above R/N even while the fleet-wide average sits comfortably under the SLO, which is exactly the kind of failure mode that a fleet-average utilization metric on a dashboard will not surface. Substituting \(R \to R/N\) into Eq. 1 gives the rack-scale sizing formula directly:</p>
+$$ \text{Avg\_TTFT}(N) = D + \frac{(R/N) D^2}{2\left(1 - (R/N) D\right)} $$
+<p>Two things follow immediately, and both are the reason "add more replicas" is a substantively different lever than "add more parallelism degree" (&#167;2.2). First, the queueing term is convex in utilization \(RD/N\), not linear -- halving the per-replica arrival rate by doubling \(N\) more than halves the queueing delay, because the denominator \(1 - RD/N\) grows faster than the numerator shrinks as utilization drops. Second, this is a pure request-routing effect, independent of the parallelism-degree diminishing returns from &#167;2.2: replication does not fight the same communication-overhead tax that intra-op/inter-op parallelism does, because each replica is a full, independent copy of the model rather than a shard, at the cost of the extra HBM those copies consume.</p>
+<p>That convexity has a direct operational consequence: the closer a fleet runs to \(RD/N = 1\), the more expensive each additional unit of arrival-rate growth becomes in queueing-delay terms, so a sizing plan built on a per-instance ceiling (&#167;6.1) should not provision to land exactly at that ceiling. Module 3's own evaluation of Eq. 1 at two utilization points makes the size of the effect concrete: at \(\rho=0.8\), queueing delay is already 1.6\(D\), for a total Avg TTFT of roughly 2.6\(D\); at \(\rho=0.95\), queueing delay alone is 9\(D\), for a total of roughly 10\(D\)<a class="cite" href="#ref-1">1</a> -- a further 15 percentage points of utilization multiplies the queueing penalty by more than five. A fleet sized to run its replicas at 95% average utilization to save on GPU count is one traffic spike away from a queueing blow-up that no amount of additional replicas fixes quickly, because bringing a new replica online (provisioning, weight loading, warm-up) is not instantaneous the way the formula's \(N\) is. Sizing headroom -- provisioning for a target utilization meaningfully under 1, not the theoretical ceiling -- is the practical takeaway Figure 6's curve argues for, independent of which topology (&#167;4) or which node-count arithmetic (&#167;6) produced the ceiling in the first place.</p>
+<div class="calc">
+<p class="calc-title">Rack-scale M/D/1: how replica count collapses queueing delay</p>
+<div class="calc-row"><label for="k1">Arrival rate R (req/s)</label><input type="range" id="k1" name="R" min="1" max="8" step="1" value="6"><span></span></div>
+<div class="calc-row"><label for="k2">Per-request service time D (s)</label><input type="range" id="k2" name="D" min="0.02" max="0.08" step="0.01" value="0.05"><span></span></div>
+<div class="calc-row"><label for="k3">Replicas N</label><input type="range" id="k3" name="N" min="1" max="8" step="1" value="1"><span></span></div>
+<div class="calc-out">
+<div>Utilization per replica (RD/N)<output data-expr="R*D/N" data-format="pct"></output></div>
+<div>Avg TTFT<output data-expr="D + (R*D*D/N)/(2*(1-(R*D/N)))" data-format="fixed:4" data-unit="s"></output></div>
+</div>
+<p class="calc-note">Formula: \(\text{Avg\_TTFT}(N) = D + \dfrac{(R/N)D^2}{2(1-(R/N)D)}\), DistServe Eq. 1 with the R&#8594;R/N replication substitution from &#167;3.3 of the paper<a class="cite" href="#ref-1">1</a>. Default values (R=6, D=0.05s, N=1) give Avg TTFT &#8776; 60.7 ms; moving N to 4 alone -- no change to R or D -- drops it to about 51.1 ms, and to about 50.3 ms at N=8, illustrating the convex collapse as utilization per replica falls.</p>
+</div>
+<figure class="fig">
+<svg viewBox="0 0 800 280" role="img" aria-labelledby="f6t"><title id="f6t">Avg TTFT normalized by D, plotted against utilization RD, showing the convex blow-up as utilization approaches 1 and the effect of splitting arrival rate across replicas</title>
+<line x1="80" y1="230" x2="720" y2="230" class="d-axis"/>
+<line x1="80" y1="230" x2="80" y2="30" class="d-axis"/>
+<text x="400" y="264" text-anchor="middle" class="d-small d-text-light">utilization &#961; = RD/N</text>
+<text x="30" y="130" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 30 130)">Avg_TTFT / D</text>
+<path d="M80,220 C 250,215 400,195 500,160 C 580,125 640,80 670,40" class="d-line d-stroke-blue" fill="none"/>
+<circle cx="500" cy="160" r="5" class="d-fill-orange"/>
+<text x="500" y="145" text-anchor="middle" class="d-mono d-small">&#961;=0.8, &#8776;2.6D</text>
+<circle cx="640" cy="60" r="5" class="d-fill-orange"/>
+<text x="640" y="45" text-anchor="middle" class="d-mono d-small">&#961;=0.95, &#8776;10D</text>
+<line x1="80" y1="220" x2="80" y2="220" class="d-outline"/>
+<text x="80" y="245" text-anchor="middle" class="d-small d-text-light">0</text>
+<text x="670" y="245" text-anchor="middle" class="d-small d-text-light">1</text>
+<path d="M320,220 L320,200" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+<text x="320" y="192" text-anchor="middle" class="d-small d-bold">replicating (N&#8593;) moves</text>
+<text x="320" y="205" text-anchor="middle" class="d-small d-bold">operating point left along this curve</text>
+</svg>
+<figcaption><b>Figure 6.</b> Avg TTFT (normalized by service time D) as a function of utilization &#961;=RD, per DistServe's Eq. 1. The curve is convex: at &#961;=0.8, queueing already adds 1.6D to give &#8776;2.6D total; at &#961;=0.95, it adds 9D to give &#8776;10D total, both figures from Module 3's evaluation of the same equation<a class="cite" href="#ref-1">1</a>. Replicating across N instances divides R by N, moving the operating point left along this curve -- the mechanism &#167;5.1 quantifies.</figcaption>
+</figure>
+<h3 id="excluded-littles-law">5.2 Why an unsourced Little's-Law claim was excluded</h3>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>A widely circulated personal-blog post applies Little's Law to LLM serving and claims work-conserving schedulers unlock 30-70% more GPU throughput. That figure does not appear in this module, and not by oversight: the post is by an individual author on a personal domain, carries no institutional review, and states its headline statistic without a traceable derivation or citation of its own -- exactly the profile this course's source hierarchy excludes (no Medium/Substack/personal-blog posts as a primary source for a number). DistServe's Eq. 1 and the R/N substitution in &#167;5.1, plus Anyscale's and Databricks' goodput/batch-size formulas already used throughout this module, are the sourced alternative for every claim in this section, and they say something more specific and more useful than a single across-the-board percentage: exactly how much queueing delay a given utilization or replica count buys or costs you, as a function of your own R and D, not someone else's average.</p></aside>
+<p>The general shape of the claim -- that keeping a scheduler saturated and work-conserving matters a great deal for throughput -- is not in dispute; it is the specific, unsourced 30-70% figure that fails this course's bar. Where you need a number for how much a scheduling or replication choice is worth, derive it from Eq. 1 and your own \(R\) and \(D\), the way &#167;5.1's calculator does, rather than importing a round number from a source that cannot show its work.</p>
+
+<h2 id="worked-sizing-example">6. A worked sizing example, end to end</h2>
+<p>Two different sizing questions use two different published number types, and it is worth keeping them separate rather than forcing one formula to answer both.</p>
+<h3 id="request-rate-sizing">6.1 Sizing from a request-rate SLO: DistServe's goodput ceilings</h3>
+<p>Suppose a target load of 50 requests/s at a 90% SLO-attainment bar, on hardware and a model class matched to DistServe's own OPT-13B/A100 evaluation (Module 3). Using the per-GPU goodput ceilings DistServe measured directly -- 1.6 requests/s/GPU colocated, 5.6 requests/s/GPU for a prefill-only pool, 10 requests/s/GPU for a decode-only pool, all at 90% SLO attainment<a class="cite" href="#ref-1">1</a> -- the inversion from &#167;1 (\(N \geq R_\text{total}/g\)) gives:</p>
+<div class="grid-2">
+<div><p class="small muted">Colocated:</p>
+$$ N = \left\lceil \frac{50}{1.6} \right\rceil = 32\ \text{GPUs} $$</div>
+<div><p class="small muted">Disaggregated (prefill + decode pools):</p>
+$$ N_p = \left\lceil \frac{50}{5.6} \right\rceil = 9,\quad N_d = \left\lceil \frac{50}{10} \right\rceil = 5,\quad N = 14\ \text{GPUs} $$</div>
+</div>
+<p>At this target rate and SLO bar, disaggregation needs 14 GPUs against colocation's 32 -- a 2.3x reduction in provisioned GPU count to hit the identical 90%-attainment target, using nothing but the ceilings DistServe already published and the same inversion arithmetic every row of Table 2 below uses. (This is a different quantity from Module 3's 3.5x/6.25x goodput-ratio framing -- that number compares ceilings directly; this one compares the GPU count required to hit a fixed external target rate, which is the number a capacity plan actually needs.)</p>
+<h3 id="token-volume-sizing">6.2 Sizing from a token-volume target: DeepSeek's per-node throughput</h3>
+<p>For a token-throughput target rather than a request-rate target, use a published per-node tokens/s figure and the same $2/GPU-hour assumption Module 6 uses for DeepSeek's own cost reconstruction<a class="cite" href="#ref-4">4</a>. At DeepSeek's Feb-2025 production average of 14,800 output tokens/s per 8-GPU node<a class="cite" href="#ref-4">4</a>, a target sustained output rate of 100,000 tokens/s requires \(\lceil 100{,}000 / 14{,}800 \rceil = 7\) nodes (56 GPUs), at \(7 \times 8 \times \$2/\text{hr} \times 24\,\text{h} = \$2{,}688\)/day. At that throughput and cost, tokens/s/$ works out to \(100{,}000 / (2{,}688/86{,}400) \approx 3.22\) million tokens per dollar per day of sustained serving -- or, inverted into the unit &#167;3.1 used, about $0.311 per million output tokens, a figure that sits between the two data points in Table 1, as it should: it is built from the same per-node production throughput number as the DeepSeek blended figure, but without that figure's prefill-cost cross-subsidy diluting the denominator.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Worked sizing examples: target SLO or volume, the published per-node/per-GPU number consumed, the derived node count, and the resulting economics<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Target</th><th>Published input</th><th class="num">Derived node/GPU count</th><th class="num">Cost or tokens/s/$</th></tr></thead>
+<tbody>
+<tr><td class="row">50 req/s @ 90% SLO, colocated</td><td>1.6 rps/GPU ceiling<a class="cite" href="#ref-1">1</a></td><td class="num" data-worst>32 GPUs</td><td class="num">--</td></tr>
+<tr><td class="row">50 req/s @ 90% SLO, disaggregated</td><td>5.6 / 10 rps/GPU ceilings<a class="cite" href="#ref-1">1</a></td><td class="num" data-best>14 GPUs</td><td class="num">--</td></tr>
+<tr><td class="row">100k output tok/s sustained</td><td>14,800 tok/s/node<a class="cite" href="#ref-4">4</a></td><td class="num">7 nodes (56 GPUs)</td><td class="num">$0.311 / 1M tok</td></tr>
+</tbody>
+</table>
+<p>Neither row substitutes for the other. The request-rate calculation answers "how many GPUs to hit an SLO-constrained arrival rate," which is the number that determines whether requests queue past their TTFT/TPOT bound at all (&#167;5). The token-volume calculation answers "what does a sustained throughput target cost," which is the number a budget line item actually needs. A complete capacity plan runs both: size the node count against the SLO first (&#167;5, &#167;6.1), then price that node count against a token-volume or dollar target (&#167;6.2) to check the SLO-driven topology is also the cost-competitive one at your interactivity target (&#167;4).</p>
+<p>One more asymmetry is worth stating plainly, because it is easy to lose when the two rows of Table 2 sit next to each other: the request-rate row produces a hard floor (fewer GPUs than 14 and DistServe's own measured ceilings say the 90% SLO-attainment bar is not met, full stop), while the token-volume row produces a soft target (fewer than 7 nodes and the deployment still serves tokens, just below the 100,000 tokens/s design point, with no SLO violated because none was specified). Treating the two rows as interchangeable -- for instance, rounding the request-rate-derived GPU count down because the token-volume math "looks cheaper" at a slightly smaller footprint -- silently converts a hard latency guarantee into a soft one. The ordering in this section's opening paragraph (topology from &#167;4, node count from the SLO in &#167;5/&#167;6.1, price-check via &#167;6.2) exists specifically so that the hard constraint is fixed before the soft one is allowed to trade against it.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Module 3 covered whether disaggregation pays off as a mechanism question, with three positions. This module's stake in the same underlying disagreement is narrower and more practical: which published framework should actually drive a capacity plan's node count -- a goodput-first sizing method, or a TCO-first one? The two frameworks do not always recommend the same topology at the same operating point, and a planner has to pick one to lead.</p>
+<div class="positions">
+<article class="position">
+<h4>Size against per-GPU goodput ceilings first</h4>
+<p class="who">DistServe's own framing<a class="cite" href="#ref-1">1</a>, and the methodology &#167;6.1 applies directly</p>
+<p>Goodput-first sizing asks "how many GPUs does an SLO-constrained request rate require" and answers it with a published per-GPU ceiling and a division -- the &#167;6.1 arithmetic, 14 GPUs versus 32. It is the more conservative framework in one specific sense: it guarantees the SLO attainment target is met at the target request rate before any dollar figure is computed, so a plan built this way cannot silently under-provision below the queueing-delay cliff in Figure 6. It generalizes cleanly to the replication reasoning in &#167;5.1: once you have a per-instance ceiling, adding replicas to hit a higher aggregate rate is direct arithmetic, not a new benchmark.</p>
+<ul class="pros"><li>Directly enforces the SLO-attainment target the deployment is contractually or practically bound to</li><li>Composes cleanly with the M/D/1 replication result in &#167;5, since both operate on request rate and per-instance service time</li><li>Ceilings are measured, not modeled -- DistServe's 1.6/5.6/10 rps figures come from a real evaluation, not a projection</li></ul>
+<ul class="cons"><li>Says nothing about dollar cost directly -- two topologies that both clear the SLO can still differ sharply in $/token, and this framework alone will not surface which one to prefer</li><li>The published ceilings are model- and hardware-specific (OPT-13B, A100); porting them to a different model or GPU generation requires re-measuring, not just re-scaling</li></ul>
+</article>
+<article class="position">
+<h4>Size against TCO-per-million-tokens and the interactivity crossover first</h4>
+<p class="who">SemiAnalysis, InferenceMAX<a class="cite" href="#ref-7">7</a>, applied as the &#167;4 decision rule</p>
+<p>TCO-first sizing asks "what does this workload's interactivity target imply is the cheapest topology" before computing a node count at all, using the crossover from &#167;4 to choose disaggregated or aggregated, then sizes node count against that topology's own per-node throughput and cost. It directly answers the budget-line-item question &#167;6.2's worked example produces, and it is the only framework in this module that lets a genuine crossover -- disaggregation stops being the cheaper choice above roughly 90 tok/s/user -- change which topology gets sized at all, rather than assuming disaggregation (or colocation) is the answer and only asking how many units of it to buy.</p>
+<ul class="pros"><li>Directly answers the dollar-cost question a budget actually needs, not just an SLO-attainment guarantee</li><li>Can flip the topology decision itself (disaggregated vs. aggregated), which goodput-ceiling sizing alone cannot do</li><li>Uses current-generation hardware (GB200/B200) rather than the A100-era ceilings goodput-first sizing is grounded in</li></ul>
+<ul class="cons"><li>Third-party analysis, and the crossover point is an explicit snapshot of an actively-optimized software stack, not a durable hardware property<a class="cite" href="#ref-7">7</a></li><li>Optimizing dollar cost alone does not guarantee SLO attainment at the target request rate -- a TCO-optimal topology still needs the &#167;5/&#167;6.1 queueing check run against it before it is provisioned</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Neither framework alone is a complete sizing methodology, and the published sources do not disagree so much as answer different halves of the same question. Goodput-first sizing (DistServe) guarantees the SLO is met at a target request rate but is silent on cost; TCO-first sizing (InferenceMAX) picks the cheapest topology at a target interactivity but does not itself verify that topology clears the SLO once real arrival-rate variance (&#167;5's queueing math) is accounted for. The defensible sequence, and the one &#167;6's worked table follows, is: use the interactivity target to pick a topology (&#167;4), use goodput ceilings and the M/D/1 replication result to size that topology's node count against the SLO (&#167;5, &#167;6.1), then verify the resulting node count against a token-volume/dollar target (&#167;6.2). What would let a planner skip running both is a single published study that sweeps interactivity the way InferenceMAX does and reports SLO attainment the way DistServe does, on the same hardware generation -- Module 3 already noted nobody has published that; it is the same missing study this module's sizing methodology has to work around.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Three numbers in this module are the most likely to move within a year. The EP-degree-vs-per-node-throughput trend in &#167;3.2 is built from three snapshots on two hardware generations, not a controlled study -- a fourth data point at a fourth EP degree, especially on GB200-class hardware with a higher-bandwidth all-to-all fabric, could change the slope or flatten it entirely. The $0.518-vs-$0.20 gap in Table 1 is exactly the kind of number that a future disclosure with matched accounting methodology could either close or explain outright; right now it is evidence of an accounting difference, not a stack-efficiency difference, and that reading could reverse with better data. And the 90 tok/s/user crossover this module leans on as a sizing rule in &#167;4 is, per Module 3, a snapshot of how far Dynamo and TensorRT-LLM's disaggregated-prefill code paths have been optimized -- track InferenceMAX's published results directly before treating that threshold as durable past 2027<a class="cite" href="#ref-7">7</a>.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">paper</span>Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X., Zhang, H. <em>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</em>. USENIX OSDI 2024. arXiv:2401.09670v3. <a href="https://arxiv.org/pdf/2401.09670">https://arxiv.org/pdf/2401.09670</a>. Accessed 2026-09-17. <span class="ref-use">Used for: per-GPU goodput definition and 1.6/5.6/10 rps ceilings (&#167;1, Fig. 1), M/D/1 queueing model Eq. 1 (&#167;3.1), parallelism diminishing-returns framing (&#167;3.2), the R&#8594;R/N replication substitution (&#167;3.3, quoted in &#167;5.1).</span></li>
+<li id="ref-2"><span class="ref-type">official</span>Anyscale. <em>Understand LLM latency and throughput metrics</em>. docs.anyscale.com, 2026. <a href="https://docs.anyscale.com/llm/serving/benchmarking/metrics">https://docs.anyscale.com/llm/serving/benchmarking/metrics</a>. Accessed 2026-09-17. <span class="ref-use">Used for: TTFT, TPOT/ITL, and goodput formula definitions (&#167;1).</span></li>
+<li id="ref-3"><span class="ref-type">blog</span>Databricks Mosaic Research team. <em>LLM Inference Performance Engineering: Best Practices</em>. Databricks Blog, 2023-10-12. <a href="https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices">https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices</a>. Accessed 2026-09-17. <span class="ref-use">Used for: batch-size/latency/throughput trade-off (4x latency/14x throughput at batch 64), continuous-batching 10-20x gain, GPU-count TTFT ratios for Llama2-70B (2&#8594;4 GPUs 0.74x, 4&#8594;8 GPUs 0.7x).</span></li>
+<li id="ref-4"><span class="ref-type">repo</span>DeepSeek-AI. <em>Day 6 (One More Thing): DeepSeek-V3/R1 Inference System Overview</em>. open-infra-index, #OpenSourceWeek, 2025-02. <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: $87,072/day cost, 226.75-node average, 14,800 tok/s/node decode throughput, 168B daily output tokens, $2/GPU-hr assumption -- consumed here to derive the blended $/1M-token figure and &#167;6.2's worked example.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>DeepSeek-AI. <em>DeepSeek-R1 Release</em> (API pricing announcement). api-docs.deepseek.com/news, 2025-01-20. <a href="https://api-docs.deepseek.com/news/news250120">https://api-docs.deepseek.com/news/news250120</a>. Accessed 2026-09-17. <span class="ref-use">Used for: R1 cache-hit vs. cache-miss input token pricing ($0.14 vs. $0.55/1M), underlying the &#167;3.3 cache-hit cost-ratio point; H800 hardware note (Table 1).</span></li>
+<li id="ref-6"><span class="ref-type">blog</span>LMSYS Org. <em>Deploying DeepSeek with PD Disaggregation and Large-Scale Expert Parallelism on 96 H100 GPUs</em>. lmsys.org, 2025-05-05. <a href="https://www.lmsys.org/blog/2025-05-05-large-scale-ep/">https://www.lmsys.org/blog/2025-05-05-large-scale-ep/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: $0.20/1M output-token figure, EP72/9-node and 16-node-profile decode throughput (22,282 and 18,598 tok/s/node) used in &#167;3.1-3.2.</span></li>
+<li id="ref-7"><span class="ref-type">analysis</span>SemiAnalysis. <em>InferenceMAX: Open Source Inference Benchmarking</em>. InferenceMAX v1, 2026. <a href="https://newsletter.semianalysis.com/p/inferencemax-open-source-inference">https://newsletter.semianalysis.com/p/inferencemax-open-source-inference</a>. Accessed 2026-09-17. <span class="ref-use">Used for: TCO-per-million-tokens framing and the ~90 tok/s/user crossover, reprised as a sizing decision rule (&#167;4) and disagreement position (&#167;7).</span></li>
+<li id="ref-8"><span class="ref-type">repo</span>DeepSeek-AI. <em>deepseek-ai/DeepEP (README)</em>. GitHub, main branch. <a href="https://github.com/deepseek-ai/DeepEP">https://github.com/deepseek-ai/DeepEP</a>. Accessed 2026-09-17. <span class="ref-use">Used for: measured all-to-all bandwidth by configuration (NVLink EP8 726 GB/s vs. RDMA EP8x2 90 GB/s vs. RDMA EP8x4 61 GB/s), the mechanistic explanation in &#167;3.2.</span></li>
+<li id="ref-9"><span class="ref-type">paper</span>Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., Xu, X. <em>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</em>. USENIX FAST 2025 (Best Paper). arXiv:2407.00079v4. <a href="https://arxiv.org/pdf/2407.00079">https://arxiv.org/pdf/2407.00079</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 30%&#8594;50% cache-hit-ratio-vs-capacity curve underlying the &#167;3.3 cache-hit economics point.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

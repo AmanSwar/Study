@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek's Production Inference System · Multi-Node LLM Inference</title>
+<meta name="description" content="DeepSeek-V3's two published production deployments -- the December 2024 technical report (prefill EP32, decode EP320) and the February 2025 Day-6 disclosure (decode EP144) -- with real cost/revenue numbers and SGLang's independent 96-H100 reproduction.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 6</p>
+<h1>DeepSeek's Production Inference System: EP Configurations, Economics, and Reproduction</h1>
+<p class="lede">DeepSeek published two different decode expert-parallel configurations for the same model family two months apart, plus real per-node throughput, real daily cost, and real theoretical revenue. SGLang then reproduced the deployment independently on rented H100s and landed within single-digit percent of DeepSeek's own numbers. This module works through both disclosures, the arithmetic that turns node-hours into dollars, and what changed between them.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>25 min</b> read</span>
+<span class="chip"><b>6</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 5</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f1t"><title id="f1t">DeepSeek-V3 deployment footprint, December 2024 versus February 2025</title>
+<line x1="60" y1="280" x2="740" y2="280" class="d-axis"/>
+<line x1="400" y1="40" x2="400" y2="280" class="d-dashed d-outline"/>
+<text x="200" y="30" text-anchor="middle" class="d-title d-bold">Dec 2024 -- Technical Report</text>
+<text x="200" y="46" text-anchor="middle" class="d-text-light d-small">arXiv:2412.19437, §3.4</text>
+<text x="600" y="30" text-anchor="middle" class="d-title d-bold">Feb 2025 -- Day-6 Disclosure</text>
+<text x="600" y="46" text-anchor="middle" class="d-text-light d-small">Open Source Week, #OpenSourceWeek</text>
+<!-- Dec column -->
+<rect x="110" y="248" width="70" height="32" class="d-block-2" rx="4"/>
+<text x="145" y="268" text-anchor="middle" class="d-text-inv d-small d-bold">Prefill</text>
+<text x="145" y="238" text-anchor="middle" class="d-mono d-small">EP32</text>
+<text x="145" y="300" text-anchor="middle" class="d-small d-text-light">4 nodes / 32 GPU</text>
+<rect x="200" y="80" width="70" height="200" class="d-block" rx="4"/>
+<text x="235" y="185" text-anchor="middle" class="d-text-inv d-small d-bold">Decode</text>
+<text x="235" y="70" text-anchor="middle" class="d-mono d-small">EP320</text>
+<text x="235" y="300" text-anchor="middle" class="d-small d-text-light">40 nodes / 320 GPU</text>
+<!-- Feb column -->
+<rect x="490" y="248" width="70" height="32" class="d-block-2" rx="4"/>
+<text x="525" y="268" text-anchor="middle" class="d-text-inv d-small d-bold">Prefill</text>
+<text x="525" y="238" text-anchor="middle" class="d-mono d-small">EP32</text>
+<text x="525" y="300" text-anchor="middle" class="d-small d-text-light">4 nodes / 32 GPU</text>
+<rect x="580" y="190" width="70" height="90" class="d-block-accent" rx="4"/>
+<text x="615" y="240" text-anchor="middle" class="d-text-inv d-small d-bold">Decode</text>
+<text x="615" y="180" text-anchor="middle" class="d-mono d-small">EP144</text>
+<text x="615" y="300" text-anchor="middle" class="d-small d-text-light">18 nodes / 144 GPU</text>
+</svg>
+<figcaption><b>Figure 1.</b> Bar height is proportional to node count. Prefill's minimum deployment unit is identical in both disclosures (EP32, 4 nodes); decode shrinks from EP320 across 40 nodes to EP144 across 18 nodes between the two publications, two months apart<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>. §5 works through why that is a sizing choice, not a correction.</figcaption>
+</figure>
+
+<p>DeepSeek is the only organization that has published, in detail, both the expert-parallel configuration it uses to serve a production trillion-parameter-class MoE model across nodes and the real cost and revenue numbers behind that deployment. Module 5 covered the general mechanism -- DeepEP's dispatch/combine kernels, EPLB's redundant-expert placement, group-limited routing -- that makes wide EP tractable at all. This module treats DeepSeek-V3 and R1 as the grounded instance of that mechanism: two dated disclosures, exact node counts, exact per-node throughput, and an independent third-party reproduction that checks all of it against real hardware rented from a cloud provider. Every EP degree, GPU count, and dollar figure below is traceable to one of three public artifacts -- a peer-published technical report, a company blog post, and an outside team's reproduction -- so the numbers can be checked, not just quoted.</p>
+<h2 id="two-disclosures">1. Two disclosures, two months apart</h2>
+<p>The first disclosure is the DeepSeek-V3 technical report, posted to arXiv on 2024-12-26, with the deployment strategy in §3.4<a class="cite" href="#ref-1">1</a>. It describes what the report calls the <b>minimum deployment unit</b> for prefill and for decode: the smallest node count at which each stage's parallelism plan is valid. The second disclosure is "Day 6 (One More Thing)," the closing post of DeepSeek's February 2025 Open Source Week, published as a markdown file in the <code>open-infra-index</code> repository<a class="cite" href="#ref-2">2</a>. It describes the parallelism configuration DeepSeek was actually running in production on 2025-02-27/28, together with throughput, cost, and revenue for a 24-hour window.</p>
+<p>Both documents describe the same model family (DeepSeek-V3 / R1) on the same GPU (H800, the export-compliant Hopper variant with reduced NVLink bandwidth relative to H100) using the same two-stage prefill/decode split. Prefill's configuration is identical across both: EP32 across 4 nodes. Decode's configuration is not: EP320 across 40 nodes in December, EP144 across 18 nodes in February. That single number -- the decode expert-parallel degree -- is the fact this module keeps coming back to, because it is the one place the two primary sources disagree on their face, and because getting the reason right is the point of reading both documents instead of one.</p>
+<p>§2 works through the December configuration and the mechanism (IBGDA, memory-bound decode) that makes EP320 make sense. §3 covers the two-microbatch overlap technique both documents describe. §4 covers the February production configuration. §5 explains why EP320 becoming EP144 is a sizing decision, not an inconsistency. §6 reproduces DeepSeek's own cost and revenue arithmetic from the primitives it discloses. §7 covers SGLang's independent reproduction at smaller scale, which validates the entire chain of numbers against real hardware nobody at DeepSeek touched.</p>
+<h2 id="december-deployment">2. The December 2024 deployment: prefill EP32, decode EP320</h2>
+<p>The technical report is explicit that DeepSeek-V3 runs on an H800 cluster where GPUs within a node are connected by NVLink and all GPUs across the cluster are fully interconnected via InfiniBand<a class="cite" href="#ref-1">1</a>. Prefill and decode are deployed as separate stages with separate parallelism plans, consistent with the general disaggregation case made in Module 3 and the KV-transfer mechanics of Module 4 -- this module only adds the specific numbers DeepSeek used for an MoE model at this scale.</p>
+<p>The model shape behind every EP number in this module: DeepSeek-V3 has 671B total parameters with 37B activated per token<a class="cite" href="#ref-1">1</a>. Every transformer block after the first three (which stay dense) replaces its FFN with an MoE layer of 1 shared expert and 256 routed experts, with 8 of the 256 routed experts selected per token<a class="cite" href="#ref-1">1</a>. That 256-routed-expert count is why EP32 gives 8 native experts per GPU (256/32) and EP320 gives roughly 1 (256/320, with the remainder absorbed by the 64-GPU redundancy tier) -- every EP degree in this module is a different way of partitioning the same 256 routed experts across a different number of GPUs.</p>
+<h3 id="december-prefill">2.1 Prefill: EP32 across 4 nodes</h3>
+<p>The prefilling stage's minimum deployment unit is 4 nodes, 32 GPUs<a class="cite" href="#ref-1">1</a>. Attention uses 4-way tensor parallelism with sequence parallelism (TP4+SP), combined with 8-way data parallelism (DP8) -- the attention-DP+EP layout pattern from Module 5, with a deliberately small TP degree to limit TP communication overhead. The MoE part uses 32-way expert parallelism (EP32), chosen, in the report's words, to ensure each expert processes a large enough batch to keep GEMMs efficient. Dense MLPs in the model's shallow layers (DeepSeek-V3 keeps its first three layers dense, not MoE) use 1-way TP to avoid unnecessary communication<a class="cite" href="#ref-1">1</a>.</p>
+<p>Load balancing at this stage uses DeepSeek's redundant-experts strategy: high-load experts, identified from online statistics, are duplicated and packed onto GPUs to equalize load, re-evaluated roughly every 10 minutes<a class="cite" href="#ref-1">1</a>. For DeepSeek-V3 specifically, 32 redundant experts are deployed for the prefilling stage -- one per GPU, on top of the 8 experts each of the 32 GPUs already hosts natively (256 routed experts / 32 GPUs = 8 each), for 9 experts per GPU total<a class="cite" href="#ref-1">1</a>. This is the hierarchical load-balancing policy from EPLB (pack expert groups to nodes evenly, then replicate within a node), which Module 5 covers as a general algorithm; here it is applied at a fixed EP32/4-node granularity.</p>
+<p>The report also mentions an unshipped-at-time-of-writing extension called <i>dynamic redundancy</i>: each GPU would host more experts than it activates per step (for example 16 hosted, 9 activated), with the routing scheme for which 9 to use computed on the fly before each layer's all-to-all. The report frames this as still being explored, not as the deployed configuration, and notes the overhead of computing the routing scheme is negligible given how much compute prefill already does per step<a class="cite" href="#ref-1">1</a>.</p>
+<h3 id="december-decode">2.2 Decode: EP320 across 40 nodes, and IBGDA</h3>
+<p>Decode's minimum deployment unit is much larger: 40 nodes, 320 GPUs<a class="cite" href="#ref-1">1</a>. Attention still uses TP4+SP, now combined with 80-way data parallelism (DP80). The MoE part uses EP320 -- one routed expert per GPU, with 64 of the 320 GPUs also responsible for hosting redundant experts and the shared expert<a class="cite" href="#ref-1">1</a>. Every GPU that is not one of those 64 hosts exactly one expert and nothing else.</p>
+<p>At EP320 with one expert per GPU, the all-to-all dispatch and combine is performed as <b>direct point-to-point transfers over InfiniBand</b>, using IBGDA -- InfiniBand GPUDirect Async -- to minimize latency<a class="cite" href="#ref-1">1</a>. IBGDA lets a GPU's streaming multiprocessors write NIC work-queue descriptors directly into GPU memory and ring the NIC's doorbell register themselves, instead of routing every RDMA operation through a CPU-side proxy thread<a class="cite" href="#ref-3">3</a>. Without it, the proxy thread becomes the bottleneck for the small, frequent messages that a one-expert-per-GPU decode all-to-all generates: NVIDIA's own measurements on NVSHMEM put a proxy-based path at roughly 1.7 million RDMA operations per second regardless of how many thread blocks or queue pairs issue them, versus up to 180 million operations per second with IBGDA at sub-1&nbsp;KiB message sizes -- close to the 215 million ops/s ceiling of the NIC itself<a class="cite" href="#ref-3">3</a>. Decode's per-token, per-expert dispatch messages are exactly this small-message regime, which is why the report calls out IBGDA specifically for decode and not for prefill's coarser NVLink-then-IB forwarding path (the DeepEP "normal" kernel mode from Module 5).</p>
+<p>The two paths exist for different reasons, not as a strict better/worse pair. Prefill's forwarding path batches many tokens' worth of dispatch traffic through a node's NVLink domain before handing it to IB, which amortizes IB message overhead across a large payload -- the right trade when each GPU is already doing enough attention and MoE compute to keep the pipeline full. Decode's point-to-point IBGDA path skips that staging step entirely, because at one expert per GPU and a per-expert batch of at most 256 tokens (§2.3) there is no larger payload to batch into: the message is already as small as decode traffic gets, and the fastest way to move it is to let the GPU talk to the NIC directly rather than queue behind a forwarding hop.</p>
+<h3 id="december-memory-bound">2.3 Why decode is memory-bound, not compute-bound</h3>
+<p>At EP320, each GPU's one resident expert sees a small slice of the global decode batch. The report states the batch size per expert is typically within 256 tokens, and that the bottleneck at this batch size is memory access, not computation<a class="cite" href="#ref-1">1</a>. Because the MoE part only has to load one expert's parameters per GPU, the memory-access overhead is small enough that using fewer streaming multiprocessors for dispatch, MoE compute, and combine does not measurably hurt throughput -- so DeepSeek deliberately allocates only a small portion of each GPU's SMs to that work, protecting the bulk of the SMs for the attention part of the step<a class="cite" href="#ref-1">1</a>.</p>
+<p>That SM allocation is not free, and the report quantifies it: the all-to-all communication implementation (forwarding data between the IB and NVLink domains, staging into and out of RDMA buffers, running the reduction for combine, and managing the fine-grained memory layout of chunked transfers to multiple experts) occupies 20 of the 132 SMs available on an H800 GPU<a class="cite" href="#ref-1">1</a>. That is the communication tax paid on every GPU in the deployment, prefill and decode alike, for as long as all-to-all is implemented in SM-resident kernels rather than dedicated hardware. The report explicitly asks accelerator vendors for a GPU or network co-processor -- analogous to NVIDIA SHARP's in-network reduction -- that could take over forwarding, RDMA buffer transport, and reduce operations, freeing those 20 SMs for compute<a class="cite" href="#ref-1">1</a>.</p>
+<div class="kpis">
+<div class="kpi"><b>&le;256 tok</b><span>decode batch size per expert at EP320<a class="cite" href="#ref-1">1</a></span></div>
+<div class="kpi kpi-amber"><b>20 / 132</b><span>H800 SMs spent on all-to-all comm<a class="cite" href="#ref-1">1</a></span></div>
+<div class="kpi kpi-cyan"><b>64 / 320</b><span>decode GPUs also hosting redundant/shared experts<a class="cite" href="#ref-1">1</a></span></div>
+</div>
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> DeepSeek-V3's minimum deployment units, prefill and decode, as published in the December 2024 technical report<a class="cite" href="#ref-1">1</a> and the February 2025 Day-6 disclosure<a class="cite" href="#ref-2">2</a>. The February column for decode is filled in §4.</caption>
+<thead><tr><th>Stage / disclosure</th><th class="num">Nodes</th><th class="num">GPUs</th><th>Attention layout</th><th>MoE layout</th><th>Experts / GPU</th></tr></thead>
+<tbody>
+<tr><td class="row">Prefill -- Dec 2024</td><td class="num">4</td><td class="num">32</td><td>TP4+SP, DP8</td><td>EP32</td><td>8 routed + 1 redundant</td></tr>
+<tr><td class="row">Prefill -- Feb 2025</td><td class="num">4</td><td class="num">32</td><td>TP1, DP32 (MLA)</td><td>EP32</td><td>9 routed + 1 shared</td></tr>
+<tr><td class="row">Decode -- Dec 2024</td><td class="num" data-worst>40</td><td class="num" data-worst>320</td><td>TP4+SP, DP80</td><td>EP320</td><td>1 routed (64 GPUs also host redundant/shared)</td></tr>
+<tr><td class="row">Decode -- Feb 2025</td><td class="num" data-best>18</td><td class="num" data-best>144</td><td>TP1, DP144 (MLA)</td><td>EP144</td><td>2 routed + 1 shared</td></tr>
+</tbody>
+</table>
+<h2 id="two-microbatch-overlap">3. The two-microbatch overlap technique</h2>
+<p>Both disclosures describe the same idea for hiding all-to-all latency behind compute, applied differently at each stage. The mechanism: split the batch scheduled for one forward step into two microbatches, A and B, and interleave their execution so that the GPU issues the compute-heavy work of one microbatch while the network is busy carrying the communication-heavy work of the other. Neither microbatch waits on the other's network traffic, because the two are never doing the same kind of work at the same time.</p>
+<p>At prefill, the report overlaps the <b>attention and MoE computation</b> of one microbatch with the <b>dispatch and combine</b> communication of the other<a class="cite" href="#ref-1">1</a>. Prefill has plenty of compute per step (large batches, full sequences), so pairing an entire compute phase against an entire communication phase keeps both the SMs and the network busy without either stalling the other.</p>
+<p>At decode, the split is different: the report overlaps just the <b>attention</b> of one microbatch with the <b>dispatch, MoE, and combine</b> of the other<a class="cite" href="#ref-1">1</a>. This follows directly from §2.3 -- decode's dispatch+MoE+combine is memory-bound and cheap in SM terms (a small slice of 132 SMs), while attention is comparatively larger, so attention is the phase worth overlapping against the communication-heavy phase rather than a step's entire compute budget.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Two-microbatch overlap schedule for prefill and decode</title>
+<text x="20" y="24" class="d-title d-bold">Prefill overlap</text>
+<line x1="140" y1="70" x2="740" y2="70" class="d-axis"/>
+<rect x="140" y="42" width="270" height="24" class="d-block" rx="3"/>
+<text x="275" y="58" text-anchor="middle" class="d-text-inv d-small d-bold">A: attention + MoE (compute)</text>
+<rect x="410" y="42" width="270" height="24" class="d-block-2" rx="3"/>
+<text x="545" y="58" text-anchor="middle" class="d-text-inv d-small d-bold">A: dispatch + combine (comm)</text>
+<rect x="140" y="78" width="270" height="24" class="d-block-2" rx="3"/>
+<text x="275" y="94" text-anchor="middle" class="d-text-inv d-small d-bold">B: dispatch + combine (comm)</text>
+<rect x="410" y="78" width="270" height="24" class="d-block" rx="3"/>
+<text x="545" y="94" text-anchor="middle" class="d-text-inv d-small d-bold">B: attention + MoE (compute)</text>
+<text x="20" y="60" class="d-mono d-small">MB A</text>
+<text x="20" y="96" class="d-mono d-small">MB B</text>
+<text x="20" y="138" class="d-title d-bold">Decode overlap</text>
+<line x1="140" y1="185" x2="740" y2="185" class="d-axis"/>
+<rect x="140" y="157" width="270" height="24" class="d-block" rx="3"/>
+<text x="275" y="173" text-anchor="middle" class="d-text-inv d-small d-bold">A: attention</text>
+<rect x="410" y="157" width="270" height="24" class="d-block-2" rx="3"/>
+<text x="545" y="173" text-anchor="middle" class="d-text-inv d-small d-bold">A: dispatch+MoE+combine</text>
+<rect x="140" y="193" width="270" height="24" class="d-block-2" rx="3"/>
+<text x="275" y="209" text-anchor="middle" class="d-text-inv d-small d-bold">B: dispatch+MoE+combine</text>
+<rect x="410" y="193" width="270" height="24" class="d-block" rx="3"/>
+<text x="545" y="209" text-anchor="middle" class="d-text-inv d-small d-bold">B: attention</text>
+<text x="20" y="175" class="d-mono d-small">MB A</text>
+<text x="20" y="211" class="d-mono d-small">MB B</text>
+<text x="140" y="240" class="d-small d-text-light">Blue = SM compute · cyan = network-bound all-to-all. Each column is one GPU-time slice; the two microbatches never contend for the same resource simultaneously.</text>
+<text x="140" y="262" class="d-small d-text-light">Decode overlaps only attention (not the full compute phase) against comm, because dispatch+MoE+combine already uses few SMs (§2.3).</text>
+</svg>
+<figcaption><b>Figure 2.</b> Prefill overlaps a full compute phase against a full communication phase; decode overlaps only attention, since dispatch+MoE+combine is cheap in SM terms once experts are memory-bound. Both schedules are described in DeepSeek-V3's technical report §3.4.1-3.4.2<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<p>The open-source ecosystem has since given this pattern a name -- <b>Two-Batch Overlap (TBO)</b> -- and SGLang's reproduction (§7) measures its effect directly: a 27-35% prefill throughput increase and a 25.5% decode throughput increase from turning TBO on<a class="cite" href="#ref-4">4</a>. That result is worth flagging here because it is the closest thing to an isolated ablation of a technique DeepSeek describes but does not itself benchmark in isolation -- the technical report states the mechanism, SGLang's reproduction is what puts a percentage on it.</p>
+<h2 id="february-production">4. The February 2025 production configuration</h2>
+<p>"Day 6 (One More Thing)" is the last post of DeepSeek's February 2025 Open Source Week, and unlike the technical report it describes a live online-serving snapshot rather than a training-time deployment plan: 24 hours of DeepSeek-V3/R1 traffic on H800 hardware, dated 2025-02-27 to 2025-02-28<a class="cite" href="#ref-2">2</a>.</p>
+<p>Prefill's parallelism configuration is reported as EP32 for routed experts and DP32 for the MLA/shared-expert path, across 4 nodes, with each GPU handling 9 routed experts and 1 shared expert<a class="cite" href="#ref-2">2</a>. The node count, GPU count, and EP degree match the December report exactly; the "9 routed + 1 shared" figure per GPU also matches the report's "8 native + 1 redundant = 9" arithmetic for prefill almost exactly, differing only in how the ninth expert is labeled (redundant vs. shared). One real change is visible in the numbers themselves: 32-way DP with no tensor-parallel degree stated implies attention now runs with TP=1, replicated across all 32 ranks, rather than the report's TP4+SP combined with DP8 -- the same total GPU count (32), a flatter attention layout. Decode's parallelism is reported as EP144 for routed experts and DP144 for MLA/shared experts, across 18 nodes, with each GPU managing 2 routed experts and 1 shared expert<a class="cite" href="#ref-2">2</a>; by the same arithmetic, 144-way DP against 144 total GPUs implies TP1 there as well, versus the report's TP4+SP+DP80.</p>
+<p>Per-node throughput is stated directly: an H800 node running the production configuration delivers on average about 73.7k tokens/s of input during prefilling, including cache hits, or about 14.8k tokens/s of output during decoding<a class="cite" href="#ref-2">2</a>. Those are stage-specific averages -- a node is either doing prefill work or decode work at a given moment, matching the disaggregated deployment. Dividing by 8 GPUs per node gives a per-GPU figure directly comparable to any single-node deployment: roughly 9.2k input tokens/s per H800 GPU at prefill, and roughly 1.85k output tokens/s per H800 GPU at decode. The prefill number is high because it includes cache-hit tokens, which are cheap to reprocess; the decode number is the one bounded by the memory-access floor described in §2.3.</p>
+<p>Load balancing in production uses three separate balancers rather than one: a prefill load balancer, a decode load balancer, and an expert-parallel load balancer, addressing computational imbalance and dispatch imbalance separately<a class="cite" href="#ref-2">2</a>. The two-microbatch overlap technique from §3 runs continuously in this configuration: two microbatches execute alternately so that the communication cost of one is hidden behind the computation of the other<a class="cite" href="#ref-2">2</a> -- the same mechanism, now described as a standing production behavior rather than a deployment-time design choice.</p>
+<h2 id="ep320-to-ep144">5. EP320 to EP144: reading the change as operational evolution</h2>
+<p>Set the two decode configurations side by side and the surface reading is that DeepSeek contradicted itself: a paper says 40 nodes, a blog two months later says 18. That reading does not survive a close look at what each document is actually claiming. The technical report's §3.4.2 opens with the words "the minimum deployment unit of the decoding stage" -- it is stating a floor, the smallest topology at which the described parallelism plan (one expert per GPU, IBGDA point-to-point, TP4+SP+DP80 attention) is valid, not a claim about how many nodes DeepSeek runs at any given moment<a class="cite" href="#ref-1">1</a>. The Day-6 disclosure makes no reference to a minimum unit at all; it reports what was actually running during a specific, dated 24-hour window of live traffic, not an architecture description<a class="cite" href="#ref-2">2</a>. A floor and a live average are not the same measurement, and there is no logical requirement that they be equal.</p>
+<p>The mechanism difference between the two configurations reinforces that these serve different purposes rather than one replacing the other as a bugfix. EP320 gives every GPU exactly one expert, which is what makes IBGDA's point-to-point path (§2.2) as clean as it is: each GPU either sources or sinks a token for exactly one expert, with no dispatch-side branching. EP144 puts 2 routed experts on every GPU, which halves the deployment's GPU footprint for the same total expert count (288 routed experts across 144 GPUs of 2 each, versus 320 including redundancy) at the cost of some extra dispatch bookkeeping per GPU. That is a genuine engineering trade-off -- fewer, denser GPUs against more, sparser ones -- not an error in either direction.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f4t"><title id="f4t">Expert-to-GPU density, EP320 versus EP144</title>
+<text x="20" y="24" class="d-title d-bold">EP320 (Dec 2024) -- 1 routed expert / GPU</text>
+<text x="20" y="42" class="d-small d-text-light">shown: 8 of 320 GPUs; 64 of 320 also host redundant/shared</text>
+<g>
+<rect x="20" y="55" width="80" height="50" rx="6" class="d-block"/><text x="60" y="82" text-anchor="middle" class="d-text-inv d-mono d-small">1 exp</text>
+<rect x="110" y="55" width="80" height="50" rx="6" class="d-block"/><text x="150" y="82" text-anchor="middle" class="d-text-inv d-mono d-small">1 exp</text>
+<rect x="200" y="55" width="80" height="50" rx="6" class="d-block"/><text x="240" y="82" text-anchor="middle" class="d-text-inv d-mono d-small">1 exp</text>
+<rect x="290" y="55" width="80" height="50" rx="6" class="d-block-accent"/><text x="330" y="76" text-anchor="middle" class="d-text-inv d-mono d-small">1 exp</text><text x="330" y="92" text-anchor="middle" class="d-text-inv d-small">+redund.</text>
+<rect x="380" y="55" width="80" height="50" rx="6" class="d-block"/><text x="420" y="82" text-anchor="middle" class="d-text-inv d-mono d-small">1 exp</text>
+<rect x="470" y="55" width="80" height="50" rx="6" class="d-block"/><text x="510" y="82" text-anchor="middle" class="d-text-inv d-mono d-small">1 exp</text>
+<rect x="560" y="55" width="80" height="50" rx="6" class="d-block-accent"/><text x="600" y="76" text-anchor="middle" class="d-text-inv d-mono d-small">1 exp</text><text x="600" y="92" text-anchor="middle" class="d-text-inv d-small">+shared</text>
+<rect x="650" y="55" width="80" height="50" rx="6" class="d-block"/><text x="690" y="82" text-anchor="middle" class="d-text-inv d-mono d-small">1 exp</text>
+</g>
+<text x="20" y="140" class="d-title d-bold">EP144 (Feb 2025) -- 2 routed + 1 shared / GPU</text>
+<text x="20" y="158" class="d-small d-text-light">shown: 8 of 144 GPUs; every GPU carries the same load (no dedicated redundancy tier)</text>
+<g>
+<rect x="20" y="171" width="80" height="50" rx="6" class="d-block-2"/><text x="60" y="192" text-anchor="middle" class="d-text-inv d-mono d-small">2 exp</text><text x="60" y="207" text-anchor="middle" class="d-text-inv d-small">+shared</text>
+<rect x="110" y="171" width="80" height="50" rx="6" class="d-block-2"/><text x="150" y="192" text-anchor="middle" class="d-text-inv d-mono d-small">2 exp</text><text x="150" y="207" text-anchor="middle" class="d-text-inv d-small">+shared</text>
+<rect x="200" y="171" width="80" height="50" rx="6" class="d-block-2"/><text x="240" y="192" text-anchor="middle" class="d-text-inv d-mono d-small">2 exp</text><text x="240" y="207" text-anchor="middle" class="d-text-inv d-small">+shared</text>
+<rect x="290" y="171" width="80" height="50" rx="6" class="d-block-2"/><text x="330" y="192" text-anchor="middle" class="d-text-inv d-mono d-small">2 exp</text><text x="330" y="207" text-anchor="middle" class="d-text-inv d-small">+shared</text>
+<rect x="380" y="171" width="80" height="50" rx="6" class="d-block-2"/><text x="420" y="192" text-anchor="middle" class="d-text-inv d-mono d-small">2 exp</text><text x="420" y="207" text-anchor="middle" class="d-text-inv d-small">+shared</text>
+<rect x="470" y="171" width="80" height="50" rx="6" class="d-block-2"/><text x="510" y="192" text-anchor="middle" class="d-text-inv d-mono d-small">2 exp</text><text x="510" y="207" text-anchor="middle" class="d-text-inv d-small">+shared</text>
+<rect x="560" y="171" width="80" height="50" rx="6" class="d-block-2"/><text x="600" y="192" text-anchor="middle" class="d-text-inv d-mono d-small">2 exp</text><text x="600" y="207" text-anchor="middle" class="d-text-inv d-small">+shared</text>
+<rect x="650" y="171" width="80" height="50" rx="6" class="d-block-2"/><text x="690" y="192" text-anchor="middle" class="d-text-inv d-mono d-small">2 exp</text><text x="690" y="207" text-anchor="middle" class="d-text-inv d-small">+shared</text>
+</g>
+<text x="20" y="245" class="d-small d-text-light">Orange = GPU also carrying redundant/shared-expert duty in the EP320 plan (64 of 320 total).</text>
+</svg>
+<figcaption><b>Figure 4.</b> EP320 gives every GPU one routed expert and concentrates redundancy on a 64-GPU subset; EP144 doubles routed-expert density on every GPU uniformly. Both are internally consistent load-balancing strategies at different EP granularity<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+<p>The granularity difference has a direct cost-provisioning consequence, using §6's $2/GPU-hour assumption: one EP320 decode unit is 320 GPUs, or $640/hr ($15,360/day) committed the moment that unit is brought online; one EP144 unit is 144 GPUs, or $288/hr ($6,912/day). Scaling decode capacity to aggregate traffic in EP144-sized steps lets the fleet track a demand curve more than twice as finely as scaling it in EP320-sized steps would -- which is the concrete version of the "easier to add and drain incrementally" argument that recurs in the disagreement below.</p>
+<p>Neither document contains retraction language pointing at the other -- no erratum, no "corrected configuration" framing. Read together, they describe an engineering ceiling (§3.4's minimum unit, sized to guarantee the per-expert memory-bound floor is cleared with maximum GPU-per-expert homogeneity) and a production footprint two months later (Day-6's actual average of 226.75 H800 nodes across prefill and decode combined over 24 hours, peaking at 278<a class="cite" href="#ref-2">2</a>) shaped by real traffic and a deliberately denser expert-per-GPU packing. §6 works out what that footprint costs; the formal disagreement over which EP degree is "correct" -- and there is a real one, because both documents make defensible cases -- is taken up at the end of this module.</p>
+<h2 id="economics">6. The economics: $87,072 a day against $562,027 theoretical</h2>
+<p>The Day-6 disclosure is the rare case of a frontier lab publishing its own unit economics. Over the same 24-hour window as §4's throughput numbers, DeepSeek reports a daily operational cost of $87,072 and a theoretical daily revenue of $562,027 had every token been billed at DeepSeek-R1's API rates, for a stated cost-profit margin of 545%<a class="cite" href="#ref-2">2</a>. Both figures are reproducible from primitives the same document discloses.</p>
+<h3 id="cost-derivation">6.1 The cost side</h3>
+<p>The 24-hour window ran at a peak of 278 H800 nodes and an average of 226.75 nodes<a class="cite" href="#ref-2">2</a>, with cost computed at an assumed $2 per GPU-hour<a class="cite" href="#ref-2">2</a>. At 8 GPUs per node, that is:</p>
+$$ \text{cost} = 226.75 \times 8 \times \$2/\text{GPU-hr} \times 24\,\text{h} = \$87{,}072 $$
+<p>which matches the disclosed figure exactly: 226.75 nodes times 8 GPUs per node is 1,814 GPUs on average; at $2 per GPU-hour that is $3,628 per hour, and $3,628 times 24 hours is $87,072. The average-occupancy figure, not either single deployment unit's node count from §2 or §4, is what the cost line is built on: DeepSeek is running many replicas of the prefill and decode deployment units simultaneously, and 226.75 is the fleet-wide time-average across all of them.</p>
+<div class="calc">
+<p class="calc-title">Daily infrastructure cost from average node occupancy</p>
+<div class="calc-row"><label for="k1">Avg H800 nodes (24h)</label><input type="range" id="k1" name="nodes" min="50" max="300" step="0.25" value="226.75"><span></span></div>
+<div class="calc-row"><label for="k2">GPU-hour rate (USD)</label><input type="range" id="k2" name="rate" min="1" max="4" step="0.25" value="2"><span></span></div>
+<div class="calc-out">
+<div>GPUs (8/node)<output data-expr="nodes*8" data-format="int"></output></div>
+<div>Daily cost (USD)<output data-expr="nodes*8*rate*24" data-format="fixed:0"></output></div>
+</div>
+<p class="calc-note">Formula: \( \text{cost} = N_{\text{nodes}} \times 8 \times (\$/\text{GPU-hr}) \times 24\,\text{h} \). Default values reproduce DeepSeek's disclosed $87,072/day exactly<a class="cite" href="#ref-2">2</a>.</p>
+</div>
+<h3 id="revenue-derivation">6.2 The revenue side</h3>
+<p>Over the same window, DeepSeek processed 608 billion input tokens (56.3% served from on-disk KV cache hits) and generated 168 billion output tokens, at an average per-user decode speed of 20-22 tokens/s<a class="cite" href="#ref-2">2</a>. DeepSeek-R1's API pricing, announced 2025-01-20, is $0.14 per million input tokens on a cache hit, $0.55 per million input tokens on a cache miss, and $2.19 per million output tokens<a class="cite" href="#ref-5">5</a>. Applying those rates to the token counts:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Reconstructing DeepSeek's theoretical daily revenue from disclosed token counts<a class="cite" href="#ref-2">2</a> and R1's published API pricing<a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Token class</th><th class="num">Tokens</th><th class="num">Rate (USD / 1M)</th><th class="num">Revenue (USD)</th></tr></thead>
+<tbody>
+<tr><td class="row">Input, cache hit (56.3% of 608B)</td><td class="num">342.3B</td><td class="num">0.14</td><td class="num">47,922</td></tr>
+<tr><td class="row">Input, cache miss (43.7% of 608B)</td><td class="num">265.7B</td><td class="num">0.55</td><td class="num">146,135</td></tr>
+<tr><td class="row">Output</td><td class="num">168.0B</td><td class="num">2.19</td><td class="num">367,920</td></tr>
+<tr><td class="row"><b>Total (reconstructed)</b></td><td class="num"></td><td class="num"></td><td class="num" data-best><b>561,977</b></td></tr>
+<tr><td class="row">DeepSeek's disclosed figure</td><td class="num"></td><td class="num"></td><td class="num">562,027</td></tr>
+</tbody>
+</table>
+<p>The reconstruction lands within $50 of the disclosed $562,027 -- effectively exact, given that 608B, 56.3%, and 168B are themselves rounded inputs. The margin follows directly:</p>
+$$ \text{margin} = \frac{\$562{,}027 - \$87{,}072}{\$87{,}072} \approx 545\% $$
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">Daily cost versus theoretical daily revenue</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<line x1="80" y1="260" x2="700" y2="260" class="d-axis"/>
+<line x1="80" y1="260" x2="80" y2="40" class="d-axis"/>
+<text x="60" y="45" text-anchor="end" class="d-small d-text-light">$600k</text>
+<line x1="80" y1="40" x2="700" y2="40" class="d-grid"/>
+<text x="60" y="150" text-anchor="end" class="d-small d-text-light">$300k</text>
+<line x1="80" y1="150" x2="700" y2="150" class="d-grid"/>
+<rect x="240" y="226" width="120" height="34" class="d-fill-red" rx="4"/>
+<text x="300" y="220" text-anchor="middle" class="d-mono d-bold">$87,072</text>
+<text x="300" y="280" text-anchor="middle" class="d-small d-text-light">Daily cost (226.75 nodes avg, $2/GPU-hr)</text>
+<rect x="440" y="40" width="120" height="220" class="d-fill-green" rx="4"/>
+<text x="500" y="34" text-anchor="middle" class="d-mono d-bold">$562,027</text>
+<text x="500" y="280" text-anchor="middle" class="d-small d-text-light">Theoretical daily revenue (R1 pricing)</text>
+<path d="M380,240 Q410,150 430,60" class="d-arrow d-stroke-amber" fill="none" marker-end="url(#f3-arr)"/>
+<text x="440" y="140" class="d-mono d-small d-bold">+545%</text>
+</svg>
+<figcaption><b>Figure 3.</b> Revenue is theoretical, not realized -- see the caveats below. Data: DeepSeek's own 24-hour disclosure<a class="cite" href="#ref-2">2</a>, reconstructed against R1's published token pricing<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+<h3 id="revenue-caveats">6.3 Why realized revenue is far lower</h3>
+<p>DeepSeek is explicit that $562,027 is a ceiling, not what was actually billed. Three factors pull realized revenue down: DeepSeek-V3's own API pricing is substantially cheaper than R1's, so the fraction of the 608B/168B tokens that were actually V3 (chat, non-reasoning) traffic billed at the lower rate; a large share of usage goes through the free web and app front ends rather than the metered API at all; and nighttime discounts are applied automatically during off-peak hours<a class="cite" href="#ref-2">2</a>. None of those factors change the cost side -- $87,072 is what the infrastructure cost regardless of how the tokens it produced were priced or given away. The $2/GPU-hour figure itself is stated as an assumption for this calculation<a class="cite" href="#ref-2">2</a>, not a quoted vendor rental price -- the disclosure gives no breakdown of depreciation, power, networking, or facilities that would justify treating $2/hr as anything more precise than a round-number stand-in DeepSeek chose so outside readers would have a comparable per-GPU-hour figure to work with.</p>
+<h2 id="sglang-reproduction">7. SGLang's independent reproduction on 96 H100s</h2>
+<p>Neither DeepSeek disclosure is independently verifiable on its own -- both are self-reported, on hardware nobody outside DeepSeek has access to. In May 2025, the SGLang team (LMSYS) published a reproduction of the same wide-EP, PD-disaggregated design on rented hardware: 12 nodes of 8 NVIDIA H100 GPUs each on Atlas Cloud, 96 GPUs total, connected by InfiniBand<a class="cite" href="#ref-4">4</a>. This is the same open-source stack referenced in Module 5 -- DeepEP for all-to-all dispatch/combine, DeepGEMM for grouped GEMMs, and EPLB for expert placement<a class="cite" href="#ref-4">4</a> -- run at a smaller EP degree than either DeepSeek configuration, specifically to see how close a non-DeepSeek team could get to DeepSeek's own published throughput.</p>
+<p>One substitution keeps this from being a fully controlled comparison: SGLang's reproduction runs on H100, not the H800 that both DeepSeek disclosures use. H800 is the export-compliant Hopper variant with reduced NVLink bandwidth relative to H100 (§2), so the two are the same compute die on different interconnects, not identical hardware. The throughput gaps in Table 3 are therefore a comparison of one open-source stack on better-networked GPUs against DeepSeek's own stack on more constrained ones -- which makes the single-digit-percent gap more notable, not less, since SGLang's extra NVLink headroom did not translate into an outright win.</p>
+<p>Prefill was tested at EP32 across 4 nodes -- the same EP degree and node count as both DeepSeek disclosures -- reaching 57,674 / 54,543 / 50,302 tokens/s per node for 1K / 2K / 4K prompt lengths<a class="cite" href="#ref-4">4</a>. Decode was tested at EP72 across 9 nodes, smaller than either DeepSeek decode configuration, reaching 22,282 tokens/s per node at 2K input length, or 17,373 tokens/s per node under a simulated multi-token-prediction (MTP) workload at 4K input<a class="cite" href="#ref-4">4</a>. EPLB in this reproduction managed 288 experts -- 256 routed plus 32 redundant, the same redundant-expert count as DeepSeek's own prefill configuration -- and the SGLang team measured 1.49x and 2.54x speedups from EPLB alone at prefill and decode respectively at this scale<a class="cite" href="#ref-4">4</a>; the placement algorithm itself is Module 5's territory, the multiplier is new data this reproduction adds.</p>
+<p>Two-Batch Overlap (§3's mechanism, independently named and benchmarked) accounted for a measurable share of that throughput: enabling it let prefill run at 16,384 tokens per device rather than 8,192, for a 27-35% throughput increase, and gave decode a 25.5% increase at 256 tokens per device<a class="cite" href="#ref-4">4</a>.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> SGLang's 96-H100 reproduction against DeepSeek's own official profiling data, at matched or closest-available configuration<a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Stage / configuration</th><th class="num">Nodes</th><th class="num">Tok/s per node</th><th class="num">Gap vs. DeepSeek</th></tr></thead>
+<tbody>
+<tr><td class="row">Prefill -- SGLang default EPLB</td><td class="num">4</td><td class="num">50,302</td><td class="num">~20% slower</td></tr>
+<tr><td class="row">Prefill -- SGLang + simulated perfect EPLB</td><td class="num">4</td><td class="num">59,337</td><td class="num" data-best>~5.6%</td></tr>
+<tr><td class="row">Prefill -- DeepSeek official profile</td><td class="num">4</td><td class="num">62,713</td><td class="num">--</td></tr>
+<tr><td class="row">Decode -- SGLang + simulated MTP</td><td class="num">9</td><td class="num">17,373</td><td class="num" data-best>~6.6%</td></tr>
+<tr><td class="row">Decode -- DeepSeek official profile</td><td class="num">16</td><td class="num">18,598</td><td class="num">--</td></tr>
+</tbody>
+</table>
+<p>The DeepSeek decode profile in that last row runs at 16 nodes, not 18 (§4) or 40 (§2) -- a third node count, from DeepSeek's own separately released profiling data, used by the SGLang team as the closest available ground truth. That three different DeepSeek-authored artifacts (the report, the Day-6 blog, and the profiling data) each state a different decode node count is, again, a function of what each artifact is measuring -- a deployment floor, a live average, and a benchmark snapshot -- not a sign that any one of them is wrong.</p>
+<p>The gap percentages in Table 3 are worth deriving explicitly, because "within 5.6%" and "within 6.6%" are easy to misread as generic goodness-of-fit claims rather than specific ratios. At prefill, SGLang's default configuration trails DeepSeek's profile by \( (62{,}713 - 50{,}302) / 62{,}713 \approx 19.8\% \) -- the blog's own "about 20% slower" -- and adding simulated perfect EPLB narrows that to \( (62{,}713 - 59{,}337) / 62{,}713 \approx 5.4\% \), which the blog rounds to 5.6% as its headline prefill figure<a class="cite" href="#ref-4">4</a>. At decode, SGLang's EP72 run under simulated MTP trails DeepSeek's 16-node profile by \( (18{,}598 - 17{,}373) / 18{,}598 \approx 6.6\% \), an exact match to the blog's stated decode figure<a class="cite" href="#ref-4">4</a>. The EPLB and MTP simulations are doing real work in both cases: without them, the gap is roughly four times larger.</p>
+<p>The throughput match translates into a cost figure: at these numbers, SGLang's reproduction computes a cost of $0.20 per million output tokens, about one-fifth of the official DeepSeek Chat API price at the time, and up to 5x higher output throughput than a vanilla tensor-parallel deployment on the same 96 GPUs<a class="cite" href="#ref-4">4</a>. That figure is a different quantity from §6's $87,072/day -- it is a per-token unit cost computed from SGLang's own smaller, rented deployment, not a reconstruction of DeepSeek's fleet-wide number -- but it is the strongest available evidence that DeepSeek's published deployment strategy is reproducible, not merely reported.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>§5 argued that EP320 and EP144 are not in conflict -- one is a stated floor, the other a live average. That resolves the "is this an error" question. It does not resolve a genuinely open systems question underneath it: given a DeepSeek-class MoE model and a target decode QPS, how large should the cross-node decode expert-parallel degree actually be? DeepSeek's own two decode artifacts, plus SGLang's independently-chosen third point (EP72), are the only public data on this question, and they point in different directions.</p>
+<div class="positions">
+<article class="position">
+<h4>Maximize EP for decode</h4>
+<p class="who">The December 2024 technical report's own stated design, EP320 across 40 nodes<a class="cite" href="#ref-1">1</a></p>
+<p>One expert per GPU is the cleanest point in the design space: every GPU either sources or sinks tokens for exactly one expert, which is what lets the all-to-all run as direct point-to-point IBGDA transfers (§2.2) instead of a more complex multi-expert dispatch per GPU. EPLB's own documentation frames this as the natural target for the decoding stage specifically, describing its "global" policy -- replicate experts regardless of group, pack to individual GPUs -- as the one "adopted in decoding stage with a larger expert-parallel size," as distinct from prefill's smaller-EP "hierarchical" policy<a class="cite" href="#ref-6">6</a>. Going wide also buys headroom: more GPUs sharing one global decode batch means each expert accumulates more tokens before the per-expert batch drops into the memory-bound regime described in §2.3, which matters most at low traffic.</p>
+<ul class="pros"><li>Maximum per-GPU homogeneity keeps the IBGDA point-to-point path simple and uniform</li><li>More accumulated tokens per expert at any given traffic level, pushing the memory-bound floor further out</li><li>Matches EPLB's own stated design intent for the decoding stage</li></ul>
+<ul class="cons"><li>320 GPUs is a large, expensive, hard-to-fill fixed granularity to provision in one unit</li><li>Larger blast radius if a node in the unit fails</li><li>Provisions for a ceiling case, not the traffic that is actually arriving most of the time</li></ul>
+</article>
+<article class="position">
+<h4>Right-size EP to observed aggregate load</h4>
+<p class="who">The February 2025 Day-6 production snapshot, EP144 across 18 nodes<a class="cite" href="#ref-2">2</a>, reinforced by SGLang's independent choice of EP72 landing within ~6.6% of DeepSeek's own decode throughput at less than a quarter of the GPU count<a class="cite" href="#ref-4">4</a></p>
+<p>A smaller EP degree with 2 routed experts per GPU roughly halves the GPU footprint needed to host the same routed-expert count, and does so without a dedicated redundancy tier of the kind EP320 needs (§5, Figure 4) -- every GPU carries the same load shape. SGLang's reproduction is direct evidence that a materially smaller EP degree does not cost proportionally more in throughput: EP72 recovered decode throughput within single-digit percent of DeepSeek's own larger-scale profile<a class="cite" href="#ref-4">4</a>, suggesting the memory-bound floor from §2.3 is not nearly as sensitive to EP degree as the maximize-EP argument implies, at least in the traffic regimes both were tested at.</p>
+<ul class="pros"><li>Smaller, more numerous deployment units are easier to add and drain incrementally as aggregate traffic shifts through the day</li><li>No dedicated redundancy tier needed; every GPU is fungible</li><li>SGLang's result suggests the throughput cost of going smaller is modest, not proportional to the EP-degree cut</li></ul>
+<ul class="cons"><li>2 experts per GPU reintroduces some per-GPU dispatch branching that 1-expert-per-GPU avoided</li><li>Leaves less headroom before the memory-bound floor is hit if aggregate traffic spikes well above the observed 226.75-node average</li><li>Neither disclosure reports the actual per-expert batch-size distribution at EP144, so the safety margin is not directly measurable from public data</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Both configurations clear the memory-bound floor from §2.3 at the traffic levels they were each measured under -- that is the only claim either primary source actually supports. Treating EP320 as "the" DeepSeek decode configuration and EP144 as a downgrade, or vice versa, overreads a single number from documents built for different purposes (§5). The more defensible reading is that EP degree is a knob DeepSeek tunes against aggregate decode QPS and GPU-fleet economics, not a fixed architectural constant, and that 144 turned out to be enough once real traffic and a denser 2-expert-per-GPU layout were on the table. What would actually settle the general question -- not just for DeepSeek's specific traffic, but for how EP degree should scale with QPS for any DeepSeek-class MoE model -- is per-expert batch-size telemetry at multiple EP degrees and a fixed traffic level, which none of the three public artifacts (report, blog, SGLang reproduction) provides at matched conditions.</p></div>
+</section>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3 Technical Report</em>. arXiv:2412.19437, 2024-12-26. <a href="https://arxiv.org/pdf/2412.19437">https://arxiv.org/pdf/2412.19437</a>. Accessed 2026-09-17. <span class="ref-use">Used for: §3.4.1/3.4.2 deployment strategy (prefill EP32/4 nodes, decode EP320/40 nodes, redundant experts, IBGDA, two-microbatch overlap, memory-bound decode), §3.5.1 communication-hardware SM allocation.</span></li>
+<li id="ref-2"><span class="ref-type">repo</span>DeepSeek-AI. <em>Day 6 (One More Thing): DeepSeek-V3/R1 Inference System Overview</em>. open-infra-index, #OpenSourceWeek, 2025-02. <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: production parallelism configuration (prefill EP32/DP32, decode EP144/DP144), per-node throughput, 24-hour node occupancy, daily cost/revenue/margin, three-tier load balancing.</span></li>
+<li id="ref-3"><span class="ref-type">blog</span>Markthub, P., Dinan, J., Potluri, S., Howell, S. <em>Improving Network Performance of HPC Systems Using NVIDIA Magnum IO NVSHMEM and GPUDirect Async</em>. NVIDIA Developer Blog, 2022-11-22. <a href="https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async">https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async</a>. Accessed 2026-09-17. <span class="ref-use">Used for: IBGDA mechanism (GPU-issued NIC descriptors, no CPU proxy) and its measured operations/second advantage over proxy-based RDMA at sub-1KiB message sizes.</span></li>
+<li id="ref-4"><span class="ref-type">blog</span>LMSYS Org. <em>Deploying DeepSeek with PD Disaggregation and Large-Scale Expert Parallelism on 96 H100 GPUs</em>. lmsys.org, 2025-05-05. <a href="https://www.lmsys.org/blog/2025-05-05-large-scale-ep/">https://www.lmsys.org/blog/2025-05-05-large-scale-ep/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 96-H100 hardware setup, prefill/decode throughput at EP32/EP72, Two-Batch Overlap gains, EPLB expert count and speedup, comparison to DeepSeek's official profile (5.6%/6.6% gaps), $0.20/1M output-token cost.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>DeepSeek-AI. <em>DeepSeek-R1 Release</em> (API pricing announcement). api-docs.deepseek.com/news, 2025-01-20. <a href="https://api-docs.deepseek.com/news/news250120">https://api-docs.deepseek.com/news/news250120</a>. Accessed 2026-09-17. <span class="ref-use">Used for: R1 API pricing ($0.14/1M cache-hit input, $0.55/1M cache-miss input, $2.19/1M output) underlying the revenue reconstruction in §6.2.</span></li>
+<li id="ref-6"><span class="ref-type">repo</span>DeepSeek-AI. <em>deepseek-ai/EPLB</em> (README). GitHub, main branch. <a href="https://github.com/deepseek-ai/EPLB/blob/main/README.md">https://github.com/deepseek-ai/EPLB/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: EPLB's own framing of the global load-balancing policy as the one adopted for decoding at larger expert-parallel size, cited in "Where experts disagree."</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

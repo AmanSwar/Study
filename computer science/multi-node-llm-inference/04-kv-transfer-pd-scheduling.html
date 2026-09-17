@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KV Transfer and Scheduling Across the Prefill/Decode Boundary · Multi-Node LLM Inference</title>
+<meta name="description" content="The connector abstractions, transfer paths, cross-pool scheduling policies, and failure modes that make prefill/decode disaggregation actually work at runtime, contrasted across vLLM, SGLang, TensorRT-LLM, and NVIDIA Dynamo.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 4</p>
+<h1>KV Transfer and Scheduling Across the Prefill/Decode Boundary</h1>
+<p class="lede">Module 3 made the case for splitting prefill and decode into separate pools. This module is the runtime "how": the generic connector abstraction every disaggregation backend implements, why vLLM and TensorRT-LLM make a decode worker wait for its own transfer to finish while SGLang lets it start admitting the request during that transfer, how a prefill worker gets paired with a decode worker, what happens when a worker joins, drains, or dies mid-transfer, and exactly which of these behaviors are documented defaults versus still-open gaps. After reading, you can trace a request's path from a prefill worker to its first decoded token, step by step, in vLLM, SGLang, TensorRT-LLM, or NVIDIA Dynamo.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>30 min</b> read</span>
+<span class="chip"><b>4</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 3</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f1t"><title id="f1t">Generic request lifecycle across the prefill/decode boundary: router, prefill worker, connector transfer, decode worker</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="400" y="18" text-anchor="middle" class="d-text-light d-small">incoming request</text>
+<path d="M400,24 L400,40" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="320" y="42" width="160" height="46" rx="8" class="d-block"/>
+<text x="400" y="69" text-anchor="middle" class="d-text-inv d-bold">Router / EPP</text>
+<path d="M400,88 L400,104" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="40" y="106" width="200" height="90" rx="8" class="d-block-2"/>
+<text x="140" y="130" text-anchor="middle" class="d-text-inv d-bold">Prefill worker</text>
+<text x="140" y="148" text-anchor="middle" class="d-text-inv d-small">kv producer</text>
+<text x="140" y="168" text-anchor="middle" class="d-text-inv d-small">computes full prompt,</text>
+<text x="140" y="182" text-anchor="middle" class="d-text-inv d-small">emits KV blocks</text>
+
+<path d="M240,151 L340,151" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="290" y="141" text-anchor="middle" class="d-mono d-small">connector</text>
+
+<rect x="340" y="106" width="120" height="90" rx="8" class="d-panel"/>
+<text x="400" y="130" text-anchor="middle" class="d-title d-bold">Transfer</text>
+<text x="400" y="150" text-anchor="middle" class="d-small">LookupBuffer /</text>
+<text x="400" y="166" text-anchor="middle" class="d-small">Pipe / bootstrap /</text>
+<text x="400" y="182" text-anchor="middle" class="d-small">cache-transceiver</text>
+
+<path d="M460,151 L560,151" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="560" y="106" width="200" height="90" rx="8" class="d-block-accent"/>
+<text x="660" y="130" text-anchor="middle" class="d-text-inv d-bold">Decode worker</text>
+<text x="660" y="148" text-anchor="middle" class="d-text-inv d-small">kv consumer</text>
+<text x="660" y="168" text-anchor="middle" class="d-text-inv d-small">admits request,</text>
+<text x="660" y="182" text-anchor="middle" class="d-text-inv d-small">emits tokens</text>
+
+<path d="M660,196 L660,212" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="660" y="230" text-anchor="middle" class="d-text-light d-small">first token</text>
+
+<rect x="20" y="250" width="760" height="55" rx="6" class="d-panel d-dashed"/>
+<text x="40" y="270" class="d-small d-text-light">vLLM: Connector retrieves from kv producer via LookupBuffer.drop_select over a Pipe, decode waits for completion.</text>
+<text x="40" y="288" class="d-small d-text-light">SGLang: bootstrap handshake reserves decode-side slots first; decode admission overlaps the transfer. TensorRT-LLM: cache-transceiver keyed by disagg_request_id.</text>
+</svg>
+<figcaption><b>Figure 1.</b> The three-stage generic pipeline &#8212; prefill compute, KV transfer, decode compute &#8212; that NVIDIA Dynamo's own documentation uses to describe disaggregated serving<a class="cite" href="#ref-4">4</a>, with the three engine-specific transfer mechanisms this module covers overlaid at the bottom<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+
+<h2 id="connector-abstraction">1. The connector abstraction: producer, consumer, and three generic primitives</h2>
+<p>Every disaggregation backend solves the same problem: a prefill worker holds KV cache for a request it will never decode, and a decode worker needs that KV cache before it can emit a token. Strip away engine-specific naming and the shape is always producer/consumer &#8212; the prefill worker is a <b>kv producer</b>, the decode worker is a <b>kv consumer</b> &#8212; connected by something that moves tensors between two GPUs that may be on different nodes. vLLM's documentation names this shape most explicitly and is the cleanest reference vocabulary for the pattern<a class="cite" href="#ref-1">1</a>.</p>
+
+<p>vLLM decomposes the connector into three abstractions<a class="cite" href="#ref-1">1</a>:</p>
+<ul>
+<li><b>Connector</b> &#8212; the top-level interface. It lets a kv consumer retrieve the KV caches of a batch of requests from a kv producer. Everything below is plumbing the Connector composes.</li>
+<li><b>LookupBuffer</b> &#8212; a small key-value-store-like layer with two operations that read like SQL: <code>insert</code> is non-blocking and stores a KV cache tensor keyed by request identity; <code>drop_select</code> is blocking and retrieves a matching tensor while removing it from the buffer, so a tensor is delivered to exactly one consumer and then freed.</li>
+<li><b>Pipe</b> &#8212; a single-direction FIFO for raw tensor transmission, exposing <code>send_tensor</code> and <code>recv_tensor</code>. The Pipe doesn't know about requests or KV semantics; it moves bytes.</li>
+</ul>
+
+<p>A second split that matters operationally: vLLM implements this as two connector types living in two different processes<a class="cite" href="#ref-1">1</a>. A <b>scheduler connector</b> runs inside the scheduler process and decides <i>when</i> a KV transfer should happen &#8212; it schedules the operation against the request's lifecycle. A <b>worker connector</b> runs inside each GPU worker process and actually executes the transfer once scheduled. This separation is why the mechanism composes cleanly with vLLM's existing scheduler loop: the scheduler doesn't touch tensors, and the worker doesn't make admission decisions.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">vLLM's Connector, LookupBuffer, and Pipe abstractions between a kv producer and a kv consumer</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="30" width="180" height="100" rx="8" class="d-block-2"/>
+<text x="110" y="55" text-anchor="middle" class="d-text-inv d-bold">kv producer</text>
+<text x="110" y="73" text-anchor="middle" class="d-text-inv d-small">prefill worker</text>
+<text x="110" y="100" text-anchor="middle" class="d-mono d-small d-text-inv">insert()</text>
+<text x="110" y="116" text-anchor="middle" class="d-text-inv d-small">non-blocking</text>
+
+<path d="M200,80 L260,80" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+<rect x="260" y="20" width="280" height="120" rx="8" class="d-panel"/>
+<text x="400" y="40" text-anchor="middle" class="d-title d-bold">Connector</text>
+<rect x="280" y="52" width="240" height="30" rx="4" class="d-surface"/>
+<text x="400" y="72" text-anchor="middle" class="d-mono d-small">LookupBuffer</text>
+<rect x="280" y="90" width="240" height="30" rx="4" class="d-surface"/>
+<text x="400" y="110" text-anchor="middle" class="d-mono d-small">Pipe: send_tensor / recv_tensor</text>
+
+<path d="M540,80 L600,80" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+<rect x="600" y="30" width="180" height="100" rx="8" class="d-block-accent"/>
+<text x="690" y="55" text-anchor="middle" class="d-text-inv d-bold">kv consumer</text>
+<text x="690" y="73" text-anchor="middle" class="d-text-inv d-small">decode worker</text>
+<text x="690" y="100" text-anchor="middle" class="d-mono d-small d-text-inv">drop_select()</text>
+<text x="690" y="116" text-anchor="middle" class="d-text-inv d-small">blocking</text>
+
+<rect x="60" y="170" width="320" height="46" rx="6" class="d-outline"/>
+<text x="220" y="190" text-anchor="middle" class="d-small">scheduler connector (scheduler process)</text>
+<text x="220" y="206" text-anchor="middle" class="d-small d-text-light">decides when to transfer</text>
+
+<rect x="420" y="170" width="320" height="46" rx="6" class="d-outline"/>
+<text x="580" y="190" text-anchor="middle" class="d-small">worker connector (GPU worker process)</text>
+<text x="580" y="206" text-anchor="middle" class="d-small d-text-light">executes the transfer</text>
+
+<text x="400" y="250" text-anchor="middle" class="d-small d-text-light">Concrete connectors implement this trio against a real transport &#8212; NIXL, Mooncake, LMCache, or CPU offload.</text>
+</svg>
+<figcaption><b>Figure 2.</b> vLLM's Connector / LookupBuffer / Pipe decomposition, and the scheduler-process / worker-process split each concrete connector implements against<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>vLLM ships eight named connectors that implement this trio against different transports and policies, all configured through the same <code>--kv-transfer-config</code> flag<a class="cite" href="#ref-1">1</a>. NIXL and Mooncake are treated purely as connector backends here &#8212; how they move bytes is Module 7's and Module 8's subject; this module cares only about the abstraction each one plugs into.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Named KV connectors in vLLM and what each backs onto<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Connector</th><th>Backs onto</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td class="row">ExampleConnector</td><td>in-repo reference implementation</td><td>minimal, for reading the interface</td></tr>
+<tr><td class="row">LMCacheConnectorV1</td><td>NIXL, underneath LMCache's policy layer</td><td>LMCache handles chunking/reuse, NIXL moves the bytes (Module 8)</td></tr>
+<tr><td class="row">NixlConnector</td><td>NIXL directly, backend list configurable</td><td>fully async send/recv; supports UCX and GDS backends</td></tr>
+<tr><td class="row">MooncakeConnector</td><td>Mooncake's transfer engine</td><td>dedicated connector for Mooncake-based clusters (Module 7)</td></tr>
+<tr><td class="row">MoRIIOConnector</td><td>ROCm I/O path</td><td>ROCm-exclusive; the AMD-side disaggregation connector</td></tr>
+<tr><td class="row">MultiConnector</td><td>an ordered list of other connectors</td><td>orchestrates several connectors together via kwargs list</td></tr>
+<tr><td class="row">OffloadingConnector</td><td>CPU memory</td><td>offloads KV to host RAM, configurable block size/allocation</td></tr>
+<tr><td class="row">FlexKVConnectorV1</td><td>a distributed KV store</td><td>multi-level cache management across tiers</td></tr>
+</tbody>
+</table>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>vLLM's own documentation states the feature plainly: disaggregated prefill "does not improve throughput"<a class="cite" href="#ref-1">1</a>. It is a latency-shaping and interference-isolation tool, not a throughput multiplier &#8212; consistent with Module 3's goodput framing, where the win comes from meeting TTFT/ITL SLOs at a given load, not from raw tokens/second. The docs also flag the whole subsystem as experimental and subject to change<a class="cite" href="#ref-1">1</a>, and note that chunked prefill is the alternative on a single engine, but "in practice it's hard to figure out the correct chunk size value"<a class="cite" href="#ref-1">1</a> &#8212; a tuning cost that disaggregation avoids at the price of the machinery this module describes.</p></aside>
+
+<h2 id="cache-transceiver">2. Request-ID-keyed transfer: TensorRT-LLM's cache-transceiver</h2>
+<p>TensorRT-LLM uses different vocabulary &#8212; <b>context servers</b> for prefill, <b>generation servers</b> for decode &#8212; but the same producer/consumer shape sits underneath. The component responsible for moving the KV cache between them is <code>KvCacheTransceiverV2</code>. Its own documentation describes it as responsible for "efficient transmission and reception of the cache, promptly releasing cache space, and performing cache layout conversions during the exchange process"<a class="cite" href="#ref-2">2</a>. That last clause matters: a context server and a generation server can run different parallelism strategies (different TP/PP degrees, different attention layouts), so the transceiver has to re-tile the KV blocks in flight, not just copy bytes.</p>
+
+<h3 id="cache-transceiver-id">2.1 The disagg_request_id binding mechanism</h3>
+<p>Because context and generation are separate processes with no shared memory, TensorRT-LLM needs a single identifier that both sides agree names the same logical request. That identifier is <code>DisaggregatedParams.disagg_request_id</code>. The documentation is direct about the failure mode this exists to prevent: "the ctx&#8596;gen KV-cache transfer is keyed by it, so a collision (two in-flight requests with the same ID) corrupts the transfer"<a class="cite" href="#ref-2">2</a>. Get the ID scheme wrong and you don't get an error &#8212; you get one request's tokens attending over another request's KV cache.</p>
+
+<p>The ID is a 64-bit snowflake-style value, laid out as<a class="cite" href="#ref-2">2</a>:</p>
+<pre class="code" data-lang="plaintext" data-title="disagg_request_id bit layout" data-nohl><code>[ 0 (1 bit) | timestamp_ms (39 bits) | node_id (8 bits) | process_id (6 bits) | counter (10 bits) ]</code></pre>
+
+<p><code>node_id</code> defaults to a hash of the machine's MAC address but is overridable in the disaggregated config; <code>process_id</code> (0&#8211;63) is set automatically per worker by the launcher via <code>TRTLLM_DISAGG_WORKER_PROCESS_ID</code>, specifically so that "co-located workers never emit the same ID in the same millisecond"<a class="cite" href="#ref-2">2</a>. Global IDs occupy the range \([2^{40}, 2^{63})\) and worker-local IDs occupy \([0, 2^{40})\), which keeps the two ID namespaces from colliding with each other by construction.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 200" role="img" aria-labelledby="f3t"><title id="f3t">Bit-field layout of TensorRT-LLM's 64-bit disagg_request_id</title>
+<rect x="20" y="50" width="20" height="60" rx="2" class="d-outline"/>
+<text x="30" y="130" text-anchor="middle" class="d-mono d-small">1</text>
+<text x="30" y="146" text-anchor="middle" class="d-small d-text-light">reserved</text>
+
+<rect x="40" y="50" width="410" height="60" rx="2" class="d-fill-blue-soft d-stroke-blue"/>
+<text x="245" y="85" text-anchor="middle" class="d-mono">timestamp_ms</text>
+<text x="245" y="130" text-anchor="middle" class="d-mono d-small">39 bits</text>
+<text x="245" y="146" text-anchor="middle" class="d-small d-text-light">&#8776; 17.4 years of range</text>
+
+<rect x="450" y="50" width="90" height="60" rx="2" class="d-fill-cyan-soft d-stroke-cyan"/>
+<text x="495" y="85" text-anchor="middle" class="d-mono">node_id</text>
+<text x="495" y="130" text-anchor="middle" class="d-mono d-small">8 bits</text>
+<text x="495" y="146" text-anchor="middle" class="d-small d-text-light">256 nodes</text>
+
+<rect x="540" y="50" width="70" height="60" rx="2" class="d-fill-orange-soft d-stroke-orange"/>
+<text x="575" y="85" text-anchor="middle" class="d-mono">proc_id</text>
+<text x="575" y="130" text-anchor="middle" class="d-mono d-small">6 bits</text>
+<text x="575" y="146" text-anchor="middle" class="d-small d-text-light">64 procs/node</text>
+
+<rect x="610" y="50" width="110" height="60" rx="2" class="d-fill-green-soft d-stroke-green"/>
+<text x="665" y="85" text-anchor="middle" class="d-mono">counter</text>
+<text x="665" y="130" text-anchor="middle" class="d-mono d-small">10 bits</text>
+<text x="665" y="146" text-anchor="middle" class="d-small d-text-light">1024/ms/proc</text>
+
+<text x="400" y="24" text-anchor="middle" class="d-small d-text-light">64-bit int64, MSB to LSB left to right</text>
+</svg>
+<figcaption><b>Figure 3.</b> Bit-field layout of the <code>disagg_request_id</code> snowflake ID<a class="cite" href="#ref-2">2</a>. See the worked derivation below for what this headroom means in practice.</figcaption>
+</figure>
+
+<details class="more">
+<summary>Worked derivation: ID-space headroom per node</summary>
+<p>The 39-bit millisecond timestamp field gives a wraparound period of</p>
+$$ \frac{2^{39}\ \text{ms}}{1000 \times 3600 \times 24 \times 365.25} \approx 17.42\ \text{years} $$
+<p>which is why the field is a millisecond counter rather than a full Unix epoch in seconds &#8212; it buys multi-decade uniqueness within 39 bits instead of needing 64. Per node, the process and counter fields bound how many distinct requests can be ID'd in a single millisecond: 6 bits of <code>process_id</code> allow \(2^6 = 64\) concurrent worker processes per node, and 10 bits of <code>counter</code> allow \(2^{10} = 1024\) IDs per process per millisecond, for a per-node ceiling of</p>
+$$ 64 \times 1024 \times 1000\ \text{ms/s} = 65{,}536{,}000\ \text{IDs/s per node} $$
+<p>&#8212; several orders of magnitude above any request-admission rate a single node will see, which is the point of a snowflake scheme: pick field widths so collisions are structurally impossible at realistic load rather than statistically unlikely.</p>
+</details>
+
+<h3 id="cache-transceiver-backend">2.2 Backend selection and GB200 caveats</h3>
+<p>The cache-transceiver's default backend is NIXL, and NIXL's own internal transport is selected by the environment variable <code>TRTLLM_NIXL_KVCACHE_BACKEND</code>, with valid values <code>UCX</code> (the default) or <code>LIBFABRIC</code>; an unsupported value logs a warning and falls back to UCX<a class="cite" href="#ref-2">2</a>. The transceiver has no default backend configured at all &#8212; it must be set explicitly in both the context and generation workers' config files, and a missing setting produces the error "Disaggregated serving is not enabled, please check the configuration"<a class="cite" href="#ref-2">2</a>. On GB200-class NVLink domains, a documented failure mode is workers hanging or running slow when different NVLink domains are involved, with the fix being to set <code>UCX_CUDA_IPC_ENABLE_MNNVL: n</code> and adjust <code>UCX_NET_DEVICES</code><a class="cite" href="#ref-2">2</a> &#8212; a reminder that the transport-selection knobs interact with the interconnect topology from Module 1, not just with the disaggregation logic.</p>
+
+<p>One overlap optimization is documented directly: "TensorRT LLM overlaps the KV cache transmission with computation for multiple independent requests"<a class="cite" href="#ref-2">2</a>. Note the scope of that sentence &#8212; it overlaps <i>one request's</i> transfer with <i>another request's</i> compute, at the batch level. It says nothing about a single request's own decode step starting before its own transfer finishes. That distinction is the subject of section 4.</p>
+
+<h2 id="sglang-bootstrap">3. SGLang's bootstrap handshake</h2>
+<p>SGLang frames disaggregation as solving two problems on a unified engine: <b>Prefill Interruption</b>, where incoming prefill batches delay token generation for requests already decoding, and <b>DP Attention Imbalance</b>, where data-parallel workers end up processing mismatched mixes of prefill and decode work<a class="cite" href="#ref-3">3</a>. That framing is worth noticing on its own terms &#8212; it is a different diagnosis from DistServe's and Mooncake's interference argument covered in Module 3, even though both conclude that separate pools help.</p>
+
+<p>The mechanism SGLang uses to hand a request from a prefill worker to a decode worker is a <b>bootstrap handshake</b>, run per request during initialization<a class="cite" href="#ref-3">3</a>:</p>
+
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 220" role="img" aria-label="SGLang bootstrap handshake, five steps from decode-side index allocation to KV cache scatter">
+<g data-step="1">
+<rect x="560" y="30" width="200" height="60" rx="8" class="d-block-accent"/>
+<text x="660" y="55" text-anchor="middle" class="d-text-inv d-bold">Decode worker</text>
+<text x="660" y="73" text-anchor="middle" class="d-text-inv d-small">sends dest. KV indices</text>
+<path d="M560,60 L260,60" class="d-arrow" marker-end="url(#f4-arr)"/>
+</g>
+<g data-step="2">
+<rect x="40" y="30" width="220" height="60" rx="8" class="d-block-2"/>
+<text x="150" y="55" text-anchor="middle" class="d-text-inv d-bold">Prefill worker</text>
+<text x="150" y="73" text-anchor="middle" class="d-text-inv d-small">collects indices during bootstrap</text>
+</g>
+<g data-step="3">
+<rect x="40" y="110" width="220" height="60" rx="8" class="d-block-2"/>
+<text x="150" y="135" text-anchor="middle" class="d-text-inv d-bold">Prefill worker</text>
+<text x="150" y="153" text-anchor="middle" class="d-text-inv d-small">prepares KV slices for those indices</text>
+</g>
+<g data-step="4">
+<path d="M260,140 L560,140" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+<text x="410" y="130" text-anchor="middle" class="d-mono d-small">Mooncake / NIXL</text>
+<rect x="560" y="110" width="200" height="60" rx="8" class="d-block-accent"/>
+<text x="660" y="135" text-anchor="middle" class="d-text-inv d-bold">transfer backend</text>
+<text x="660" y="153" text-anchor="middle" class="d-text-inv d-small">bulk KV transfer</text>
+</g>
+<g data-step="5">
+<rect x="560" y="180" width="200" height="30" rx="6" class="d-panel"/>
+<text x="660" y="200" text-anchor="middle" class="d-small">decode scatters into KV pages</text>
+</g>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+</svg>
+</figure>
+<ol class="steps">
+<li><b>Decode initiates.</b> The decode worker allocates destination KV cache slots for the incoming request and sends those indices to the assigned prefill worker.</li>
+<li><b>Prefill collects.</b> The prefill worker receives and holds the destination indices during the bootstrap phase.</li>
+<li><b>Prefill prepares.</b> Once its forward pass produces the KV blocks, the prefill worker slices out exactly the blocks the decode side asked for.</li>
+<li><b>Backend transfers.</b> The KV slices move over the selected transfer backend (Mooncake or NIXL).</li>
+<li><b>Decode scatters.</b> The decode worker receives the transferred data and writes it into its own KV cache pages at the pre-allocated slots.</li>
+</ol>
+</div>
+
+<p>Each bootstrap session is identified by a <code>room_id</code> together with the decode worker's host and port &#8212; SGLang's equivalent of TensorRT-LLM's <code>disagg_request_id</code>, serving the same collision-avoidance role but carried as connection metadata rather than a single packed integer. A background cleanup task runs on an interval that defaults to 120 seconds, releasing bootstrap-side memory left behind by decode nodes that disconnected without completing the handshake<a class="cite" href="#ref-3">3</a>.</p>
+
+<h3 id="sglang-staging-buffer">3.1 Heterogeneous TP with a GPU staging buffer</h3>
+<p>Prefill and decode often want different tensor-parallel degrees &#8212; prefill is compute-bound and benefits from more TP to spread FLOPs, decode is memory-bandwidth-bound and can run leaner. But different TP sizes mean the KV cache is sharded differently on each side, and a naive per-token slice-by-slice transfer pays a latency tax reassembling those shards. SGLang's fix is a GPU staging buffer: it gathers KV head slices into a contiguous buffer on the prefill side, performs one bulk RDMA transfer, then scatters into the correct KV cache pages on the decode side<a class="cite" href="#ref-3">3</a>. Measured gain is <b>2&#8211;5&#215; throughput improvement</b> over the default per-token slice approach at high concurrency<a class="cite" href="#ref-3">3</a>.</p>
+
+<p>Two scope limits apply. First, staging only activates when prefill and decode use different TP sizes with the Mooncake transfer backend specifically &#8212; when both sides match, staging is automatically bypassed even if the flag is enabled<a class="cite" href="#ref-3">3</a>. Second, the staging buffer targets non-MLA attention (GQA, MHA); MLA models such as DeepSeek-V2/V3 should not enable it<a class="cite" href="#ref-3">3</a>, because MLA's compressed latent KV representation doesn't decompose into the same per-head slices the staging buffer assumes.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Each engine's request-correlation mechanism for binding a prefill phase to its matching decode phase<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Engine</th><th>Mechanism</th><th>Carried as</th></tr></thead>
+<tbody>
+<tr><td class="row">TensorRT-LLM</td><td><code>disagg_request_id</code></td><td>packed 64-bit snowflake int, one field per request</td></tr>
+<tr><td class="row">SGLang</td><td><code>room_id</code> + decode host/port</td><td>bootstrap connection metadata (<code>bootstrap_info</code>)</td></tr>
+<tr><td class="row">vLLM</td><td>block IDs + connection info</td><td><code>kv_transfer_params</code>, passed through engine output</td></tr>
+<tr><td class="row">Dynamo (backend-agnostic)</td><td>whichever of the three above the chosen backend uses</td><td>opaque per-backend metadata (<code>opaque_state</code> for TensorRT-LLM)</td></tr>
+</tbody>
+</table>
+
+<h2 id="sync-vs-overlap">4. Synchronous vs. overlapped transfer</h2>
+<p>This is the design decision that most changes what a request's time-to-first-token looks like, and it's easy to state imprecisely. Two distinct properties are in play, and they don't always move together.</p>
+
+<h3 id="sync-vs-overlap-two-properties">4.1 Two different kinds of "non-blocking"</h3>
+<p>The first property is <b>engine-level non-blocking</b>: does the GPU running the prefill worker sit idle while one request's KV cache streams out, or does it keep serving its batch? NVIDIA Dynamo's documentation states this as a general property of NIXL-based transfer: "the KV transfer is non-blocking, allowing GPU forward passes to continue serving other requests during the transfer"<a class="cite" href="#ref-4">4</a>. TensorRT-LLM's cache-transceiver does the same thing at the batch level &#8212; it "overlaps the KV cache transmission with computation for multiple independent requests"<a class="cite" href="#ref-2">2</a>. Both statements are about the source GPU's utilization across <i>different</i> requests, not about any single request's own critical path.</p>
+
+<p>The second property is <b>request-level synchronicity</b>: for one specific request, does its decode phase wait until its own KV transfer has fully landed, or can the decode worker start doing useful work on that request before the transfer completes? This is where the three engines diverge, and Dynamo's documentation states the divergence directly by comparing what each backend does<a class="cite" href="#ref-4">4</a>:</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Backend-specific transfer metadata and request-level execution model, per NVIDIA Dynamo's own comparison<a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Backend</th><th>Transfer metadata</th><th>Execution model</th></tr></thead>
+<tbody>
+<tr><td class="row">SGLang</td><td><code>bootstrap_info</code> (host, port, room_id)</td><td>asynchronous &#8212; prefill runs as a background task; decode phase begins immediately while transfer proceeds in parallel</td></tr>
+<tr><td class="row">vLLM</td><td><code>kv_transfer_params</code> (block IDs, connection info)</td><td>synchronous &#8212; decode waits for prefill to complete before proceeding</td></tr>
+<tr><td class="row">TensorRT-LLM</td><td><code>opaque_state</code> (serialized internal metadata)</td><td>synchronous &#8212; decode waits for prefill to complete before proceeding</td></tr>
+</tbody>
+</table>
+
+<p>SGLang's overlap is only possible because of the bootstrap handshake from section 3: the decode worker has already reserved destination KV slots and registered a <code>room_id</code> before the transfer starts, so its scheduler can admit the request into decode-side bookkeeping without waiting for bytes to arrive &#8212; the actual generation of the first token still needs the KV cache to be present, but the scheduling and slot-reservation overhead that would otherwise sit serially in front of it is pulled forward. vLLM's synchronous default reflects the blocking semantics of <code>LookupBuffer.drop_select</code> from section 1: the consumer side calls a blocking retrieval and only proceeds once it returns. TensorRT-LLM's cache-transceiver is synchronous per request for the same reason &#8212; the generation server needs a complete, layout-converted KV cache before it can run attention correctly &#8212; while still keeping the GPU busy on other requests in the interim via the batch-level overlap from 4.1.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f5t"><title id="f5t">Timeline comparing SGLang's overlapped decode admission against vLLM/TensorRT-LLM's synchronous wait-for-completion transfer</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<text x="20" y="30" class="d-title d-bold">SGLang (asynchronous)</text>
+<line x1="20" y1="60" x2="760" y2="60" class="d-axis"/>
+<rect x="20" y="46" width="140" height="28" rx="4" class="d-block-2"/>
+<text x="90" y="65" text-anchor="middle" class="d-text-inv d-small">bootstrap handshake</text>
+<rect x="160" y="46" width="260" height="28" rx="4" class="d-fill-orange-soft d-stroke-orange"/>
+<text x="290" y="65" text-anchor="middle" class="d-small">KV transfer (background)</text>
+<rect x="220" y="46" width="200" height="28" rx="4" class="d-block-accent" opacity="0.85"/>
+<text x="320" y="65" text-anchor="middle" class="d-text-inv d-small">decode admitted, scheduling begins</text>
+<path d="M420,74 L420,90" class="d-arrow" marker-end="url(#f5-arr)"/>
+<text x="420" y="104" text-anchor="middle" class="d-small d-text-light">first token</text>
+
+<text x="20" y="150" class="d-title d-bold">vLLM / TensorRT-LLM (synchronous)</text>
+<line x1="20" y1="180" x2="760" y2="180" class="d-axis"/>
+<rect x="20" y="166" width="140" height="28" rx="4" class="d-block-2"/>
+<text x="90" y="185" text-anchor="middle" class="d-text-inv d-small">handoff (ID/params)</text>
+<rect x="160" y="166" width="260" height="28" rx="4" class="d-fill-orange-soft d-stroke-orange"/>
+<text x="290" y="185" text-anchor="middle" class="d-small">KV transfer (drop_select / transceiver, blocking)</text>
+<rect x="420" y="166" width="100" height="28" rx="4" class="d-block-accent"/>
+<text x="470" y="185" text-anchor="middle" class="d-text-inv d-small">decode admitted</text>
+<path d="M520,194 L520,210" class="d-arrow" marker-end="url(#f5-arr)"/>
+<text x="520" y="224" text-anchor="middle" class="d-small d-text-light">first token</text>
+
+<text x="290" y="244" text-anchor="middle" class="d-mono d-small d-text-light">decode admission starts ~100px earlier on the async path, relative to transfer duration</text>
+</svg>
+<figcaption><b>Figure 4.</b> SGLang's decode admission overlaps the KV transfer window; vLLM and TensorRT-LLM gate decode admission on transfer completion<a class="cite" href="#ref-4">4</a>. Bar widths are illustrative of the ordering documented in Table 3, not measured durations &#8212; no controlled cross-engine timing benchmark is available in the sources for this module.</figcaption>
+</figure>
+
+<h2 id="cross-pool-scheduling">5. Scheduling across two pools: pairing prefill and decode workers</h2>
+<p>Disaggregation turns one scheduling decision into two: which prefill worker gets this request, and &#8212; once prefill is done &#8212; which decode worker receives its KV cache. Module 2 covered the first decision in depth (prefix-cache-aware scoring, load/SLO signals, the filter-score-select pipeline); it applies to prefill-pool placement unchanged. What's new here is the second decision, made after prefill completes, and each engine wires it differently.</p>
+
+<h3 id="cross-pool-dynamo">5.1 Dynamo's PrefillRouter</h3>
+<p>Dynamo names this component the <b>PrefillRouter</b>. It selects a decode worker using "KV-aware routing (based on cache overlap scores and load) or simple load balancing"<a class="cite" href="#ref-4">4</a> &#8212; the same two-signal family Module 2 described for prefill-pool routing, reapplied to the decode side. Once a decode worker is chosen, the router "injects the prefill result into the decode request, then routes to the decode worker"<a class="cite" href="#ref-4">4</a>: the prefill output (KV transfer metadata, generated tokens so far) is attached to the request object before it's handed off, rather than the decode worker having to separately discover where its input came from.</p>
+
+<h3 id="cross-pool-sglang">5.2 SGLang's router</h3>
+<p>SGLang's standalone Rust load balancer, <code>sglang-router</code>, exposes disaggregation-aware routing through a dedicated launch mode: <code>sglang_router.launch_router --pd-disaggregation --prefill http://IP:PORT --decode http://IP:PORT</code>, with pool membership declared explicitly per URL and a configurable <code>health-check-interval-secs</code> for liveness checking<a class="cite" href="#ref-3">3</a>. The router receives the client request, dispatches the prefill portion to a prefill instance, and routes the decode continuation to a decode instance<a class="cite" href="#ref-3">3</a>. The documentation is explicit about a related statelessness constraint: prefill and decode run in separate serving processes whose "process-local Responses stores cannot provide coherent shared state"<a class="cite" href="#ref-3">3</a> &#8212; the router itself does not maintain conversation history across the split, so a client relying on server-side session state has to send explicit context rather than assume continuity.</p>
+
+<h3 id="cross-pool-trtllm">5.3 TensorRT-LLM's disaggregated orchestrator</h3>
+<p>TensorRT-LLM's orchestration layer receives client requests and dispatches them to the appropriate context and generation servers over the OpenAI-compatible REST API, marking a dispatched request as "context-only" (skip the generation phase) when it goes to a context server and "generation-only" (skip the context phase) when it goes to a generation server<a class="cite" href="#ref-2">2</a>. The handoff metadata is called <code>ctx_params</code>: it moves from the context instance to the generation instance and is "used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks"<a class="cite" href="#ref-2">2</a> &#8212; so, unlike Dynamo's inject-then-route pattern, the generation server pulls the KV cache itself once it has the context instance's address, rather than the orchestrator pushing the payload. At the fleet level, coordinator/worker processes bind the same port so that "the kernel load-balances incoming connections across them by 4-tuple hash"<a class="cite" href="#ref-2">2</a> &#8212; a detail about how multiple coordinator or worker replicas share inbound connections, not about which specific context server pairs with which generation server for a given request.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 4.</b> How each engine decides which decode/generation worker receives a completed prefill<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Engine</th><th>Who decides</th><th>Selection signal</th><th>Handoff direction</th></tr></thead>
+<tbody>
+<tr><td class="row">Dynamo</td><td>PrefillRouter</td><td>KV-cache overlap score + load, or plain load balancing</td><td>router injects result, pushes to decode worker</td></tr>
+<tr><td class="row">SGLang</td><td>sglang-router</td><td>declared pool membership + health checks</td><td>router dispatches prefill, then routes continuation to decode</td></tr>
+<tr><td class="row">TensorRT-LLM</td><td>disaggregated orchestrator</td><td>REST dispatch to registered ctx/gen servers</td><td>orchestrator hands <code>ctx_params</code>; generation server pulls KV from context server</td></tr>
+</tbody>
+</table>
+
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>What the fetched documentation does <i>not</i> specify: SGLang's router documentation describes pool membership and health checking but not a cache-overlap-aware scoring function for the prefill&#8594;decode pairing step specifically (its prefix-cache scoring, per Module 2, governs which prefill worker gets a request, not which decode worker receives the transfer). TensorRT-LLM's 4-tuple hash detail governs connection load-balancing across coordinator/worker replicas, not per-request context-to-generation affinity. Where a source is silent on a mechanism, this module says so rather than inferring one.</p></aside>
+
+<h3 id="cross-pool-admission">5.4 Admission signals feeding the pairing decision</h3>
+<p>Pairing is only half the problem; the router also needs to know a decode worker has room before committing a request to it. The three engines expose that signal at different granularities. SGLang controls decode-side admission with a static, per-worker ceiling: the documented multi-node DeepSeek deployment sets <code>--max-running-requests 128</code> on the decode cluster<a class="cite" href="#ref-3">3</a>, a hard cap the router's pool/health logic operates within rather than a continuously updated score. Dynamo ties admission to the same <code>RuntimeConfig</code> that a worker publishes on joining the pool (section 6): it includes KV capacity, and the PrefillRouter's load-based selection criterion draws on load alongside cache-overlap scores<a class="cite" href="#ref-4">4</a> &#8212; the documentation connects the two without spelling out the exact scoring formula that combines a capacity figure with a load figure into one selection decision. For vLLM and TensorRT-LLM, once a pairing is made, admission of the transferred request into the decode worker's running batch falls back to each engine's own single-node continuous-batching admission logic &#8212; the same mechanism Aman already knows from single-node serving, just fed by a connector instead of a locally-computed KV cache.</p>
+
+<h2 id="xpyd-reconfiguration">6. xPyD runtime reconfiguration</h2>
+<p>A production disaggregated deployment runs some number \(x\) of prefill workers and \(y\) of decode workers &#8212; shorthand for this is "xPyD." Fixed pool sizes are a planning assumption, not an operational reality: load shifts, hardware fails, and capacity needs to move between the two pools without a full redeploy. Dynamo documents this capability as runtime-reconfigurable xPyD, meaning workers can be added and removed while the system is serving traffic<a class="cite" href="#ref-4">4</a>.</p>
+
+<p>The two paths are asymmetric<a class="cite" href="#ref-4">4</a>:</p>
+<ul>
+<li><b>Add:</b> a new worker registers with the discovery service and publishes its <code>RuntimeConfig</code>, which includes its KV capacity. The router "automatically discovers new workers via the discovery service and incorporates them into routing decisions"<a class="cite" href="#ref-4">4</a> &#8212; no explicit router restart or reconfiguration step is described; discovery is push-based from the worker side and pull-based from the router side.</li>
+<li><b>Remove:</b> a worker being taken out of the pool first drains its active requests, then deregisters from discovery<a class="cite" href="#ref-4">4</a>. Draining means in-flight requests are allowed to finish on that worker rather than being killed; only after they complete does the worker stop advertising itself and disappear from the router's view.</li>
+</ul>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f6t"><title id="f6t">State diagram for adding and removing a worker at runtime in Dynamo's xPyD model</title>
+<defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<text x="200" y="24" text-anchor="middle" class="d-title d-bold">Add path</text>
+<rect x="60" y="40" width="280" height="46" rx="20" class="d-outline"/>
+<text x="200" y="68" text-anchor="middle" class="d-small">worker starts</text>
+<path d="M200,86 L200,110" class="d-arrow" marker-end="url(#f6-arr)"/>
+<rect x="60" y="112" width="280" height="46" rx="20" class="d-block-2"/>
+<text x="200" y="140" text-anchor="middle" class="d-text-inv d-small">register + publish RuntimeConfig (incl. KV capacity)</text>
+<path d="M200,158 L200,182" class="d-arrow" marker-end="url(#f6-arr)"/>
+<rect x="60" y="184" width="280" height="46" rx="20" class="d-block-accent"/>
+<text x="200" y="212" text-anchor="middle" class="d-text-inv d-small">router discovers, includes in routing</text>
+
+<text x="600" y="24" text-anchor="middle" class="d-title d-bold">Remove path</text>
+<rect x="460" y="40" width="280" height="46" rx="20" class="d-outline"/>
+<text x="600" y="68" text-anchor="middle" class="d-small">removal requested</text>
+<path d="M600,86 L600,110" class="d-arrow" marker-end="url(#f6-arr)"/>
+<rect x="460" y="112" width="280" height="46" rx="20" class="d-block-2"/>
+<text x="600" y="140" text-anchor="middle" class="d-text-inv d-small">drain active requests to completion</text>
+<path d="M600,158 L600,182" class="d-arrow" marker-end="url(#f6-arr)"/>
+<rect x="460" y="184" width="280" height="46" rx="20" class="d-block-accent"/>
+<text x="600" y="212" text-anchor="middle" class="d-text-inv d-small">deregister from discovery, worker gone</text>
+
+<line x1="400" y1="20" x2="400" y2="240" class="d-grid"/>
+</svg>
+<figcaption><b>Figure 5.</b> Worker add versus worker remove in Dynamo's runtime-reconfigurable xPyD model<a class="cite" href="#ref-4">4</a>. The two paths are not mirror images &#8212; add is push-then-discover, remove is drain-then-deregister.</figcaption>
+</figure>
+
+<p>TensorRT-LLM's own documentation draws a sharp line under the equivalent capability on its side: dynamic node joining and leaving "is being built on top of" the existing cache-transceiver mechanism<a class="cite" href="#ref-2">2</a> &#8212; explicitly in progress, not generally available. This is not a disagreement about how the mechanism should work; it's a maturity gap between two projects documenting the same category of capability at different points in its development. Dynamo's docs describe xPyD as something that already functions; TensorRT-LLM's docs describe the equivalent as future work layered on infrastructure (the cache-transceiver and <code>disagg_request_id</code> scheme from section 2) that already exists for the static case. Treat "runtime reconfigurable pool sizing" as a capability whose availability you need to check per engine and per release, not as a property of disaggregation in general.</p>
+
+<h2 id="failure-detection">7. Failure detection: heartbeats, bootstrap timeouts, and what's actually specified</h2>
+<p>A disaggregated request has a partner dependency that a colocated engine never has: the decode side is waiting on a specific remote prefill worker, and that worker can die, hang, or lose network reachability mid-transfer. How each engine detects and responds to that is documented to very different depths.</p>
+
+<h3 id="failure-sglang">7.1 SGLang: the most fully specified defaults</h3>
+<p>SGLang publishes concrete numeric defaults for every timeout in the bootstrap path<a class="cite" href="#ref-3">3</a>:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 5.</b> SGLang's disaggregation failure-detection defaults<a class="cite" href="#ref-3">3</a>.</caption>
+<thead><tr><th>Setting</th><th class="num">Default</th><th>Protects against</th></tr></thead>
+<tbody>
+<tr><td class="row"><code>SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL</code></td><td class="num">5.0 s</td><td>decode-side polling of prefill worker liveness</td></tr>
+<tr><td class="row"><code>SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE</code></td><td class="num">2 consecutive</td><td>false positives from a single dropped heartbeat</td></tr>
+<tr><td class="row"><code>SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT</code></td><td class="num">300 s</td><td>prefill-side: handshake that never completes</td></tr>
+<tr><td class="row"><code>SGLANG_DISAGGREGATION_WAITING_TIMEOUT</code></td><td class="num">300 s</td><td>decode-side: transfer that never arrives</td></tr>
+</tbody>
+</table>
+
+<p>With the defaults, a decode worker treats a prefill server as offline after two missed heartbeats at 5-second spacing &#8212; roughly 10 seconds of undetected failure in the worst case before the health signal flips. Both the bootstrap and waiting timeouts default to 300 seconds and can be relaxed; the documentation gives <code>export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600</code> as an example for slower networks or larger clusters<a class="cite" href="#ref-3">3</a>. On the cleanup side, the 120-second bootstrap-entry cleanup interval from section 3 is explicitly about releasing prefill-side memory left behind when "a running decode node loses connection"<a class="cite" href="#ref-3">3</a> &#8212; note this documents the decode-dies-first direction; the sources for this module do not spell out the symmetric case of a request-level response when the <i>prefill</i> side dies mid-transfer for a request already past the bootstrap step, beyond the heartbeat eventually marking that prefill server offline for future routing decisions.</p>
+
+<h3 id="failure-trtllm">7.2 TensorRT-LLM: startup-time coordinator health, not mid-transfer partner death</h3>
+<p>TensorRT-LLM documents a different failure surface: a fleet worker's relationship to its own coordinator, not one worker's relationship to its transfer partner. "A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's <code>/cluster_info</code> with bounded retry (up to <code>--server_start_timeout</code> seconds) and exits with an error"<a class="cite" href="#ref-2">2</a>. This guards against a worker starting up into a cluster whose coordinator is down or unreachable &#8212; a bring-up-time check, not a running-request check. Separately, the documentation notes an NVLink-domain hang failure mode on GB200-class hardware (section 2.2) and an HTTP connection-pool issue resolved by raising <code>server_keep_alive_timeout</code> when clients hold large idle connection pools<a class="cite" href="#ref-2">2</a>. None of this is the "context server dies while a generation server is mid-pull of its KV cache" case; the sources for this module do not document that scenario for TensorRT-LLM.</p>
+
+<h3 id="failure-dynamo">7.3 Dynamo: documented at the worker-lifecycle level only</h3>
+<p>Dynamo's disaggregated-serving documentation covers worker registration, draining, and deregistration (section 6) but does not specify heartbeat intervals, discovery-service polling periods, or a request-level response to a partner dying mid-transfer<a class="cite" href="#ref-4">4</a>. This is worth stating plainly rather than papering over: as of this writing, failure handling for the KV-transfer boundary specifically is the least-documented part of the three engines' disaggregation implementations, and Dynamo's own docs are the thinnest of the three on this exact point.</p>
+
+<table class="tbl tbl-dense">
+<caption><b>Table 6.</b> What each engine's own documentation specifies about disaggregation failure handling, and what it does not<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Engine</th><th>Detects</th><th>Default</th><th>Not documented (per these sources)</th></tr></thead>
+<tbody>
+<tr><td class="row">SGLang</td><td>prefill liveness via decode-side heartbeat; unfinished bootstrap; unfinished transfer</td><td>5.0 s interval, 2 failures, 300 s bootstrap/waiting timeout</td><td>exact per-request outcome (retry vs. fail) once prefill is marked offline mid-request</td></tr>
+<tr><td class="row">TensorRT-LLM</td><td>worker-to-coordinator reachability at startup; NVLink-domain hangs; idle HTTP pools</td><td><code>--server_start_timeout</code> bounded retry</td><td>context-server death mid-transfer for an in-flight request</td></tr>
+<tr><td class="row">Dynamo</td><td>worker presence via discovery-service registration/deregistration</td><td>not specified</td><td>heartbeat interval; timeout values; mid-transfer partner-death response</td></tr>
+</tbody>
+</table>
+
+<p>The one resilience property that does carry across all three, stated most explicitly by Dynamo, is engine-level non-blocking transfer from section 4.1: whatever happens to one request's transfer, it does not stall the source GPU's other in-flight work<a class="cite" href="#ref-4">4</a>. That protects throughput for everyone else on the same worker even when a specific transfer is struggling; it does not, by itself, tell you what happens to the struggling request.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The three engines don't disagree about whether disaggregation should exist &#8212; Module 3 already made that case. They disagree, in their implementation choices if not in explicit prose, about whether the transfer window should be on or off a request's critical path. That's a real design trade-off with measurable consequences, not a documentation gap, so it earns the same treatment as a sourced controversy.</p>
+<div class="positions">
+<article class="position">
+<h4>Overlap-first: let decode admission proceed during transfer</h4>
+<p class="who">SGLang's bootstrap-handshake design<a class="cite" href="#ref-3">3</a>, described comparatively in NVIDIA Dynamo's backend documentation<a class="cite" href="#ref-4">4</a></p>
+<p>Reserve the decode-side KV slots and register the request before the transfer even starts, so the decode worker's scheduling and admission machinery runs in parallel with the byte movement instead of after it. This is what makes the heterogeneous-TP GPU staging buffer's 2&#8211;5&#215; throughput gain reachable at all (section 3.1) &#8212; it requires prefill and decode to already be decoupled at the point the transfer begins.</p>
+<ul class="pros">
+<li>Shrinks the portion of TTFT that is serially exposed to full transfer latency.</li>
+<li>Makes staging-buffer-style optimizations reachable, since they need early decoupling between the two sides.</li>
+<li>Documented, tunable failure detection: explicit heartbeat interval, failure-count threshold, and two separate 300 s timeouts (Table 5).</li>
+</ul>
+<ul class="cons">
+<li>More moving parts to operate correctly: bootstrap room IDs, a background cleanup task, heartbeat tuning.</li>
+<li>The staging-buffer path that benefits most from this design is explicitly incompatible with MLA models.</li>
+<li>The sources reviewed do not specify the exact per-request outcome when a partner dies after bootstrap but before transfer completion (section 7.1).</li>
+</ul>
+</article>
+<article class="position">
+<h4>Synchronous-first: gate decode admission on transfer completion</h4>
+<p class="who">vLLM's default connector behavior via <code>LookupBuffer.drop_select</code><a class="cite" href="#ref-1">1</a>; TensorRT-LLM's cache-transceiver<a class="cite" href="#ref-2">2</a>; both confirmed as the synchronous case in Dynamo's own backend comparison<a class="cite" href="#ref-4">4</a></p>
+<p>Don't let the decode worker touch a request until its KV cache has fully, correctly landed. TensorRT-LLM still keeps the source GPU busy by overlapping one request's transfer with a different request's compute (section 2.2), and vLLM's blocking <code>drop_select</code> call means a tensor is handed to exactly one consumer with no possibility of a partial or stale read.</p>
+<ul class="pros">
+<li>Simpler correctness argument: no window where the decode worker could attend over an incomplete KV cache.</li>
+<li>TensorRT-LLM's batch-level overlap recovers some of the GPU-utilization cost without touching per-request ordering.</li>
+<li>Fewer distinct failure states to reason about, since there is no "admitted but not yet transferred" state to define behavior for.</li>
+</ul>
+<ul class="cons">
+<li>The full transfer duration sits serially in front of the first decode step for every request, with no documented mitigation at the per-request level.</li>
+<li>vLLM's own documentation concedes the whole disaggregated-prefill path "does not improve throughput" and remains labeled experimental<a class="cite" href="#ref-1">1</a>.</li>
+<li>TensorRT-LLM's equivalent of xPyD &#8212; dynamic node joining/leaving &#8212; is explicitly still being built, not GA (section 6), suggesting the synchronous implementation is also the less operationally mature one on that specific axis.</li>
+</ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>No source reviewed for this module publishes a controlled, head-to-head TTFT_P90 comparison between a synchronous connector (vLLM's NixlConnector or TensorRT-LLM's cache-transceiver) and SGLang's overlapped bootstrap path on identical hardware, model, and ISL:OSL distribution &#8212; that is the experiment that would actually settle which design wins by how much, and it does not appear to exist publicly as of 2026-09-17. Absent that number, the trade is structural rather than empirical: overlap buys latency at the cost of a wider failure-mode surface to operate (more timeouts, more state, more things that can be misconfigured), while synchronous transfer buys operational and correctness simplicity at the cost of paying the full transfer time on every request's critical path. For a deployment where Module 3's TTFT_P90 SLO is the binding constraint, the overlap design is worth its added complexity. For a first disaggregated deployment, or one where the transfer subsystem itself is still labeled experimental (as vLLM's is), starting with the synchronous default and only adopting the overlapped path once the operational failure modes are well understood is the more defensible sequencing &#8212; which is also, in effect, what each project's own maturity signals already suggest.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>All four primary sources for this module are live, versioned documentation rather than papers, which means the specific numbers in this module &#8212; timeout defaults, flag names, whether a capability is GA &#8212; are the most likely of anything in this course to drift within a year. Three trends to watch specifically: first, TensorRT-LLM's explicit "in progress" label on dynamic node joining/leaving (section 6) is a stated near-term roadmap item, built on infrastructure (the cache-transceiver and <code>disagg_request_id</code> scheme) that already exists for the static case &#8212; the gap with Dynamo's already-documented xPyD is likely to narrow, not persist. Second, failure handling for the mid-transfer partner-death case is the thinnest-documented mechanism across all three engines (section 7) &#8212; as disaggregation moves from early production deployments toward being the default topology for large models, expect this to get filled in with explicit retry/failover semantics rather than left to heartbeat-driven routing decisions alone. Third, the connector list itself is not fixed: vLLM's eight named connectors (Table 1) and SGLang's two transfer backends (Mooncake, NIXL) are the current state of two actively developed projects, and Modules 7 and 8 treat the transfer-engine layer underneath them in more depth, including the version churn that layer is going through.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>vLLM contributors. <em>Disaggregated Prefilling</em>. vLLM Documentation, docs.vllm.ai/en/latest/features/disagg_prefill/, package v0.29.0 (2026-09-09). <a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">https://docs.vllm.ai/en/latest/features/disagg_prefill/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Connector/LookupBuffer/Pipe abstraction, scheduler-vs-worker connector split, the eight named connectors and their backends, the "does not improve throughput" and experimental-status caveats.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>NVIDIA / TensorRT-LLM contributors. <em>Disaggregated Serving</em> (disagg-serving.md). TensorRT-LLM documentation, main branch. <a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md">https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: KvCacheTransceiverV2 mechanism, disagg_request_id bit layout and binding rationale, NIXL/UCX/LIBFABRIC backend selection, GB200 NVLink-domain caveat, coordinator fail-fast behavior, dynamic node joining/leaving in-progress status.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>SGLang contributors. <em>PD Disaggregation</em>. SGLang Documentation, docs.sglang.io/advanced_features/pd_disaggregation.html. <a href="https://docs.sglang.io/advanced_features/pd_disaggregation.html">https://docs.sglang.io/advanced_features/pd_disaggregation.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: bootstrap handshake steps, room_id/host/port correlation, cleanup interval, heartbeat and timeout defaults, Mooncake/NIXL backend selection, heterogeneous-TP staging buffer mechanism and scope limits, sglang-router launch flags and stateless-design note, multi-node DeepSeek deployment flags.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>NVIDIA. <em>Disaggregated Serving</em> (NVIDIA Dynamo Documentation). docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving. <a href="https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving">https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the generic three-stage pipeline framing, NIXL non-blocking VRAM-to-VRAM transfer, the backend-specific transfer-metadata/execution-model comparison table, PrefillRouter selection criteria, xPyD worker add/remove mechanism.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

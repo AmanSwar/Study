@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LMCache and NIXL: The Reusable KV Layer and the Transfer-Library Primitive · Multi-Node LLM Inference: From One Node to N</title>
+<meta name="description" content="LMCache's engine-agnostic KV-cache offload and reuse mechanism, NIXL's three transfer abstractions and backend list, and how both contrast against Mooncake's Transfer Engine.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 8</p>
+  <h1>LMCache and NIXL: The Reusable KV Layer and the Transfer-Library Primitive</h1>
+  <p class="lede">LMCache turns a serving engine's KV cache from private, per-replica scratch space into a pluggable, storage-backed resource: chunk it, evict it under GPU memory pressure, and reload it on a prefix hit, independent of which engine or which storage tier sits underneath. NIXL solves a narrower problem one layer down — a uniform point-to-point transfer call that works identically whether the destination is another GPU's HBM, a peer's CPU DRAM, or a file on NVMe — and three independently built engines (Dynamo, TensorRT-LLM, SGLang) now share it as a default or alternate KV-transfer backend. This module covers LMCache's offload mechanism and backend list, NIXL's three abstractions and version history, and contrasts both against Mooncake's Transfer Engine from Module 7, so you can say precisely which layer you are touching when you set a connector flag.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>25 min</b> read</span>
+    <span class="chip"><b>11</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 4</b></span>
+    <span class="chip">Prerequisite: <b>Module 7</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 390" role="img" aria-labelledby="f1t"><title id="f1t">Layered stack: serving engines on top, LMCache as an optional engine-agnostic policy layer, three movers underneath, physical fabric at the bottom</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="20" y="20" width="760" height="55" rx="8" class="d-block"/>
+    <text x="400" y="42" text-anchor="middle" class="d-text-inv d-bold">Serving engines</text>
+    <text x="400" y="62" text-anchor="middle" class="d-text-inv d-small">vLLM &#183; SGLang &#183; TensorRT-LLM &#183; Dynamo</text>
+
+    <path d="M400,75 L400,138" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="405" y="100" class="d-mono d-small">e.g. LMCacheConnectorV1</text>
+
+    <path d="M120,75 Q34,158 120,238" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <text x="10" y="160" class="d-text-light d-small">direct</text>
+    <text x="10" y="172" class="d-text-light d-small">(bypasses</text>
+    <text x="10" y="184" class="d-text-light d-small">LMCache)</text>
+
+    <rect x="60" y="140" width="680" height="55" rx="8" class="d-hl"/>
+    <text x="400" y="162" text-anchor="middle" class="d-bold">LMCache</text>
+    <text x="400" y="180" text-anchor="middle" class="d-small">engine-agnostic reuse / offload policy layer</text>
+
+    <path d="M135,195 L135,238" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M400,195 L400,238" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M650,195 L650,238" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="20" y="240" width="230" height="60" rx="8" class="d-block-2"/>
+    <text x="135" y="264" text-anchor="middle" class="d-text-inv d-bold">NIXL</text>
+    <text x="135" y="282" text-anchor="middle" class="d-text-inv d-small">generic, UCX / GDS</text>
+
+    <rect x="285" y="240" width="230" height="60" rx="8" class="d-block-2"/>
+    <text x="400" y="264" text-anchor="middle" class="d-text-inv d-bold">Mooncake Transfer Engine</text>
+    <text x="400" y="282" text-anchor="middle" class="d-text-inv d-small">bundled with Mooncake Store</text>
+
+    <rect x="550" y="240" width="230" height="60" rx="8" class="d-block-2"/>
+    <text x="665" y="264" text-anchor="middle" class="d-text-inv d-bold">LMCache-native</text>
+    <text x="665" y="282" text-anchor="middle" class="d-text-inv d-small">CPU RAM &#183; disk &#183; Redis &#183; S3</text>
+
+    <path d="M135,300 L135,336" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M400,300 L400,336" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M665,300 L665,336" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="20" y="338" width="760" height="38" rx="8" class="d-panel"/>
+    <text x="400" y="362" text-anchor="middle" class="d-mono d-small">NVLink &#183; InfiniBand / RoCE &#183; GPUDirect RDMA &#183; NVMe-oF &#183; local disk (Module 1)</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> LMCache is an optional policy layer some engines route through (vLLM's <code>LMCacheConnectorV1</code>, Dynamo's LMCache integration); other paths (vLLM's <code>NixlConnector</code>, SGLang's and TensorRT-LLM's own backend selection, detailed in &#167;2.3) reach NIXL or Mooncake's Transfer Engine directly. LMCache itself can dispatch to NIXL, Mooncake, or its own simpler backends (&#167;1.2). Table 2 gives the full per-project mapping. Data: LMCache's backend list<a class="cite" href="#ref-1">1</a> and NIXL's abstractions/backend list<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+<h2 id="lmcache-reuse-layer">1. LMCache: turning KV cache into reusable state</h2>
+<p>Every project covered so far in this course keeps its KV cache as private, in-process GPU memory: once a request finishes and its blocks are evicted, that computation is gone unless another request happens to land on a replica that still holds a matching prefix in HBM (Module 2's prefix-cache routing) or unless Mooncake's cluster-wide pool still has it (Module 7). LMCache adds a layer underneath the engine that gives KV cache a lifecycle independent of any single request or GPU: it moves cold chunks out of GPU memory before eviction destroys them, and reloads them on a later prefix hit instead of letting the engine recompute<a class="cite" href="#ref-1">1</a>. The project's own framing is explicit about this reversal: LMCache is "a KV cache management layer for LLM inference. It turns KV cache from a temporary state into reusable AI-native knowledge"<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="lmcache-mechanism">1.1 Mechanism: memory pressure, chunking, transparent retrieval</h3>
+<p>The trigger is GPU memory pressure. As new requests need KV-cache space, LMCache moves data out of the engine's own paged GPU allocator into a configured backend, then transparently returns it when a later request's prompt shares a prefix with an offloaded chunk — the quickstart doc states plainly that "LMCache will automatically handle storing and managing KV cache in CPU memory" once GPU memory is insufficient<a class="cite" href="#ref-3">3</a>.</p>
+<p>Movement happens at LMCache's own chunk granularity, not at whatever block size the underlying engine's paged KV allocator uses internally: the default chunk size is 256 tokens<a class="cite" href="#ref-3">3</a>. This is a separate, independently-configured boundary from Mooncake's 512-token content-hash block covered in Module 7<a class="cite" href="#ref-5">5</a> — LMCache re-chunks at its own size regardless of what physical block granularity the engine or a different cluster-wide cache happens to use.</p>
+<p>The economic logic underneath the whole mechanism is the one Module 3 already established for prefill generally: regenerating a previously-computed prefix's KV state costs a full compute-bound forward pass over every token in that prefix, while reading the same state back from a slower tier costs only the bytes moved. LMCache applies that trade one layer down from Module 3's prefill/decode pool split — inside a single engine instance, below the level any pool-level scheduling decision operates at — exchanging capacity on a CPU, disk, or network tier for avoided recompute, chunk by chunk, whenever a prefix happens to still be resident somewhere off the GPU. The trade only pays when a chunk is actually reused; a chunk offloaded and never touched again is pure overhead with no offsetting benefit, which is why the backend and capacity choice in Table 1 is a real tuning decision for a given workload's prefix-reuse rate, not a free upgrade to apply uniformly.</p>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Every layer in a disaggregated KV pipeline negotiates reuse in tokens, not in another layer's physical block size. LMCache's default chunk is 256 tokens<a class="cite" href="#ref-3">3</a>; Mooncake's content-hash block is 512 tokens<a class="cite" href="#ref-5">5</a>; the serving engine's own paged KV allocator has yet a third, independent block size. None of these need to match for the layers to compose correctly — each one only needs a consistent chunk boundary against itself.</p></aside>
+
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f2t"><title id="f2t">LMCache's offload decision path: GPU memory pressure triggers chunking, chunks are written to a configured backend, and a later prefix hit reloads instead of recomputing</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="40" y="90" width="160" height="60" rx="8" class="d-block"/>
+<text x="120" y="115" text-anchor="middle" class="d-text-inv d-bold">GPU HBM</text>
+<text x="120" y="133" text-anchor="middle" class="d-text-inv d-small">KV cache</text>
+
+<g data-step="1">
+<rect x="40" y="80" width="160" height="8" class="d-fill-amber"/>
+<text x="120" y="70" text-anchor="middle" class="d-small d-text-light">memory pressure</text>
+</g>
+
+<g data-step="2">
+<path d="M200,120 L258,120" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="260" y="90" width="140" height="60" rx="8" class="d-hl"/>
+<text x="330" y="115" text-anchor="middle" class="d-bold">Chunk</text>
+<text x="330" y="133" text-anchor="middle" class="d-small">256 tok default</text>
+</g>
+
+<g data-step="3">
+<path d="M320,150 L110,188" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M330,150 L305,188" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M340,150 L500,188" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M350,150 L692,188" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+<rect x="20" y="190" width="180" height="50" rx="8" class="d-block-2"/>
+<text x="110" y="211" text-anchor="middle" class="d-text-inv d-small d-bold">CPU RAM</text>
+<text x="110" y="227" text-anchor="middle" class="d-text-inv d-small">/ local disk</text>
+
+<rect x="215" y="190" width="180" height="50" rx="8" class="d-block-2"/>
+<text x="305" y="211" text-anchor="middle" class="d-text-inv d-small d-bold">Redis/Valkey</text>
+<text x="305" y="227" text-anchor="middle" class="d-text-inv d-small">/ S3</text>
+
+<rect x="410" y="190" width="180" height="50" rx="8" class="d-block-2"/>
+<text x="500" y="211" text-anchor="middle" class="d-text-inv d-small d-bold">Mooncake</text>
+<text x="500" y="227" text-anchor="middle" class="d-text-inv d-small">/ InfiniStore</text>
+
+<rect x="605" y="190" width="175" height="50" rx="8" class="d-block-2"/>
+<text x="692" y="211" text-anchor="middle" class="d-text-inv d-small d-bold">NIXL</text>
+<text x="692" y="227" text-anchor="middle" class="d-text-inv d-small">/ GDS</text>
+</g>
+
+<g data-step="4">
+<path d="M110,188 L110,158 L124,158 L124,152" class="d-arrow-active d-dashed" marker-end="url(#f2-arr)"/>
+<text x="10" y="163" class="d-mono d-small">cache hit:</text>
+<text x="10" y="175" class="d-mono d-small">reload, skip recompute</text>
+</g>
+</svg>
+</figure>
+<ol class="steps">
+<li><b>Memory pressure.</b> As new requests need KV-cache space, the engine's own paged GPU allocator runs low, and LMCache steps in<a class="cite" href="#ref-3">3</a>.</li>
+<li><b>Chunk boundary.</b> LMCache carves the cold KV data into its own 256-token chunks, a boundary independent of whatever block size the engine's own paged allocator uses internally<a class="cite" href="#ref-3">3</a>.</li>
+<li><b>Backend selection.</b> Each chunk is written to whichever of LMCache's eight configured backends is active for this deployment (Table 1)<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>Reuse on a later hit.</b> A later request whose prompt shares that prefix triggers a reload from the backend instead of a recompute on the GPU<a class="cite" href="#ref-3">3</a>.</li>
+</ol>
+</div>
+<h3 id="lmcache-backends">1.2 Pluggable backends</h3>
+<p>LMCache does not implement one fixed storage tier; it is a plugin surface. Between the quickstart doc's backend list — CPU memory, local file system, Mooncake Storage, InfiniStore, Redis, ValKey<a class="cite" href="#ref-3">3</a> — and the project README's broader list — CPU RAM, local disk (SSD), Redis/Valkey, Mooncake, InfiniStore, S3-compatible object storage, NIXL, and GDS<a class="cite" href="#ref-1">1</a> — the union is eight named backends spanning three very different reachability classes: in-process host memory, local persistent storage, and network-attached storage or transport libraries.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> LMCache's pluggable offload/reuse backends. Data: LMCache quickstart doc and project README<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Backend</th><th>Reachability</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td class="row">CPU RAM</td><td>in-process, no network hop</td><td>the default in LMCache's own quickstart example<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Local disk (SSD)</td><td>local filesystem</td><td>survives process restart, still local to the host<a class="cite" href="#ref-1">1</a></td></tr>
+<tr><td class="row">Redis / Valkey</td><td>network, in-memory KV store</td><td>shared across processes/hosts, not just one engine instance<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Mooncake (Storage)</td><td>network, Mooncake's own store</td><td>composes with Module 7's KVCache-centric architecture<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-5">5</a></td></tr>
+<tr><td class="row">InfiniStore</td><td>network, dedicated KV storage</td><td>listed alongside Mooncake as a remote storage option<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">S3-compatible object storage</td><td>network, object store</td><td>largest-capacity tier in the list, listed only in the README<a class="cite" href="#ref-1">1</a></td></tr>
+<tr><td class="row">NIXL</td><td>transport library, not a store itself</td><td>LMCache dispatches through NIXL's own backend interface (&#167;2) rather than opening its own wire protocol<a class="cite" href="#ref-1">1</a></td></tr>
+<tr><td class="row">GDS</td><td>GPUDirect Storage transport</td><td>the same GPU-to-storage path NIXL itself exposes as a backend<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a></td></tr>
+</tbody>
+</table>
+
+<p>Reading the eight rows as three concentric reachability tiers, rather than eight independent choices, clarifies the design space more than the raw list does. CPU RAM and local disk are host-local: no network round trip, but capacity bounded by whatever one host provides, and invisible to any other replica<a class="cite" href="#ref-1">1</a>. Redis/Valkey, Mooncake, InfiniStore, and S3 are network-attached: reachable from any replica in the cluster, at the cost of a network hop per chunk, and — for Mooncake specifically — already integrated with the cluster-wide content-addressed pool Module 7 describes<a class="cite" href="#ref-3">3</a>. NIXL and GDS are neither a store nor a tier; they are the transport two of the other backends (Mooncake, and implicitly any GDS-reachable filesystem) can themselves be reached through, which is why they appear in the same list without being a competing capacity option.</p>
+
+<p>Which tier is worth configuring depends on what the deployment is actually optimizing for, not on which backend is individually fastest. A single replica serving traffic with no cross-instance sharing gets most of the achievable benefit from CPU RAM alone: no network hop, and it captures the common case of a user revisiting a similar prompt within that one process's lifetime. A fleet of replicas behind a shared router (Module 2) benefits more from a network-attached tier such as Redis/Valkey or Mooncake, because a chunk offloaded by one replica becomes reachable by whichever other replica the router happens to send the next matching request to, rather than staying trapped behind whichever process first evicted it. A deployment where the KV cache must survive a process restart, a rolling upgrade, or a crash needs a tier that outlives the engine process entirely, which rules out CPU RAM — freed the moment the process exits — and points at local disk, S3, or a dedicated store instead.</p>
+
+<p>The last two rows matter for &#167;3: two of LMCache's eight "backends" are not storage systems at all, they are transport libraries — meaning LMCache's own plugin list already includes NIXL as one option among several, not a competitor to it.</p>
+
+<h3 id="lmcache-vllm-integration">1.3 vLLM integration and a worked example</h3>
+<p>vLLM enables LMCache through the same <code>--kv-transfer-config</code> flag Module 4 introduced for connectors generally, setting <code>kv_connector</code> to <code>LMCacheConnectorV1</code> and <code>kv_role</code> to <code>kv_both</code><a class="cite" href="#ref-3">3</a>. Module 4 introduced the general shape underneath every connector: a <i>kv producer</i> and a <i>kv consumer</i>, with a Connector retrieving KV caches between them, a LookupBuffer exposing <code>insert</code> and <code>drop_select</code> calls, and a Pipe as the single-direction FIFO that actually carries tensors<a class="cite" href="#ref-4">4</a>. LMCache's <code>kv_role=kv_both</code> setting collapses that producer/consumer split onto one instance: within a single vLLM process, LMCache is simultaneously the producer that inserts evicted chunks into its backend and the consumer that later retrieves them, rather than the producer and consumer being two separate instances the way they are for prefill/decode disaggregation in Module 4. vLLM's own reference production deployment treats LMCache as a first-class, documented capability rather than a third-party add-on: the production-stack repository's tutorial set includes "How to Enable KV Cache Offloading with LMCache" as a named tutorial<a class="cite" href="#ref-6">6</a>.</p>
+<p>The quickstart doc's own worked configuration gives a concrete sizing example: a CPU memory limit of 5.0 GB, a stated workload ratio of about 1.5 GB per 10,000 tokens, and an observed roughly 7.43x speedup on second-run inference with CPU offloading enabled<a class="cite" href="#ref-3">3</a>. Combined with the 256-token default chunk size, that ratio turns into a concrete cache budget:</p>
+$$ \text{tokens cacheable} = \frac{5.0\ \text{GB}}{1.5\ \text{GB} \,/\, 10{,}000\ \text{tok}} = \frac{5.0}{1.5}\times 10{,}000 \approx 33{,}300\ \text{tokens} $$
+<p>At 256 tokens per chunk, that is roughly \(33{,}300 / 256 \approx 130\) resident chunks before this particular 5.0 GB CPU tier itself fills up and starts evicting. This ratio is an example tied to the specific model and precision used in LMCache's own quickstart, not a universal constant — the arithmetic pattern (memory budget divided by bytes-per-token, divided again by chunk size) is what transfers to a different model, not the 1.5 GB figure itself.</p>
+
+<div class="calc">
+<p class="calc-title">LMCache CPU-tier cache budget</p>
+<div class="calc-row"><label for="c1">CPU memory budget (GB)</label><input type="range" id="c1" name="mem" min="1" max="64" step="1" value="5"></div>
+<div class="calc-row"><label for="c2">Workload ratio (GB per 10,000 tok)</label><input type="range" id="c2" name="ratio" min="0.5" max="4" step="0.1" value="1.5"></div>
+<div class="calc-row"><label for="c3">Chunk size (tokens)</label><input type="range" id="c3" name="chunk" min="64" max="1024" step="64" value="256"></div>
+<div class="calc-out">
+<div>Tokens cacheable<output data-expr="(mem/ratio)*10000" data-format="int"></output></div>
+<div>Resident chunks<output data-expr="floor((mem/ratio)*10000/chunk)" data-format="int"></output></div>
+</div>
+<p class="calc-note">Formula: \( \text{tokens} = (\text{mem} / \text{ratio}) \times 10{,}000 \), \( \text{chunks} = \lfloor \text{tokens} / \text{chunk} \rfloor \). Defaults reproduce LMCache's own quickstart example (5.0 GB budget, 1.5 GB per 10,000 tokens, 256-token chunk)<a class="cite" href="#ref-3">3</a>. The ratio itself is specific to the model and precision in that example, not a general constant &#8212; move the slider to see how the token budget scales once you substitute a different model's KV-cache-bytes-per-token figure.</p>
+</div>
+
+<p>Whether the roughly 7.43x second-run speedup generalizes depends entirely on how much of that second run was cache-hit rather than cache-miss traffic and on the specific model and hardware in the quickstart's own test<a class="cite" href="#ref-3">3</a>; treat it as evidence the mechanism works, not as a deployment-independent multiplier.</p>
+
+<h3 id="lmcache-reframing">1.4 Integration timeline</h3>
+<p>LMCache's adoption into the two largest orchestration projects in this course happened within about two months of each other in the second half of 2025: the README records that LMCache "extends its turbo-boost to multimodal models in vLLM V1" as of a July 2025 update, and that "NVIDIA Dynamo integrates LMCache, accelerating LLM inference" as of September 2025<a class="cite" href="#ref-1">1</a>. Module 9 covers exactly where LMCache sits inside Dynamo's own KV Block Manager (KVBM); here the point is narrower — by late 2025, LMCache had gone from a vLLM-specific offload connector to an offload/reuse layer plugged into the two most widely deployed orchestration stacks in this ecosystem, without changing its own mechanism or backend list. That LMCache could be integrated into two architecturally different orchestration stacks within roughly two months of each other is itself indirect evidence for the design choice in &#167;1.2: because LMCache's interface to a host engine is a connector plus a pluggable backend store, not a fork of that engine's own KV-cache internals, adding a new consumer is a matter of implementing one connector against LMCache's existing API rather than modifying LMCache itself.</p>
+<h2 id="nixl-transfer-primitive">2. NIXL: the point-to-point transfer primitive</h2>
+<p>Module 1 named NIXL's three abstractions in passing, while building the physical bandwidth/latency ladder underneath every transport this course refers to<a class="cite" href="#ref-2">2</a>. This section gives NIXL's architecture in full: what each abstraction does, which backends actually work today versus which are still in development, why three independently built serving engines route their KV transfer through it, and what its release history says about how settled the library is.</p>
+
+<h3 id="nixl-abstractions">2.1 Three abstractions</h3>
+<p>NIXL (NVIDIA Inference Xfer Library) states its own design goal directly: it is "targeted for accelerating point to point communications in AI inference frameworks such as NVIDIA Dynamo, while providing an abstraction over various types of memory (e.g., CPU and GPU) and storage (e.g., file, block and object store) through a modular plug-in architecture"<a class="cite" href="#ref-2">2</a>. That goal decomposes into three named abstractions<a class="cite" href="#ref-2">2</a>:</p>
+<ul>
+<li><b>Memory Sections</b> — unifies memory and storage types (GPU HBM, CPU DRAM, files, block devices, object stores) behind one buffer-list primitive, so a transfer call does not need a different code path depending on what kind of address it is reading from or writing to.</li>
+<li><b>Transfer Backend Interface</b> — abstracts the different wire-level transport backends (UCX, GDS, and whatever else is registered) and selects the one that can actually move bytes between the memory/storage types named in a given transfer.</li>
+<li><b>Metadata Handler</b> — manages the data needed to establish communication between two NIXL agents: discovery, capability exchange, and cached addressing information, so repeated transfers between the same pair of agents do not re-negotiate from scratch.</li>
+</ul>
+
+<p>NIXL's name states its scope precisely: an inference <i>transfer</i> library, not a general communication library. Module 1 already drew the distinction its design leans on — UCX serves both point-to-point transfers and the ring/tree collective patterns NCCL and RCCL use for all-reduce, and those two traffic shapes have historically been optimized by different code paths even when they share the same transport layer underneath. NIXL targets only the point-to-point side of that split<a class="cite" href="#ref-2">2</a>: a KV-cache handoff from one prefill worker's Memory Section to one decode worker's, a single chunk written to one storage backend, a weight push from one rank to another (Module 9's ModelExpress). It has no notion of a reduction operation, a broadcast tree, or a collective's rank topology — every transfer in NIXL's model is addressed agent-to-agent, which is exactly the shape a KV-cache handoff needs and an all-reduce does not.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 280" role="img" aria-labelledby="f2nt"><title id="f2nt">Two NIXL agents, each exposing Memory Sections, Transfer Backend Interface, and Metadata Handler; a control-plane exchange and a data-plane transfer cross between them</title>
+<defs><marker id="f2n-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="30" y="30" width="300" height="220" rx="10" class="d-panel"/>
+<text x="180" y="52" text-anchor="middle" class="d-title">NIXL Agent &#8212; source</text>
+
+<rect x="50" y="66" width="260" height="46" rx="6" class="d-block"/>
+<text x="180" y="86" text-anchor="middle" class="d-text-inv d-bold">Memory Sections</text>
+<text x="180" y="102" text-anchor="middle" class="d-text-inv d-small">unify mem + storage</text>
+
+<rect x="50" y="122" width="260" height="46" rx="6" class="d-block-2"/>
+<text x="180" y="142" text-anchor="middle" class="d-text-inv d-bold">Transfer Backend I/F</text>
+<text x="180" y="158" text-anchor="middle" class="d-text-inv d-small">select backend</text>
+
+<rect x="50" y="178" width="260" height="46" rx="6" class="d-block-accent"/>
+<text x="180" y="198" text-anchor="middle" class="d-text-inv d-bold">Metadata Handler</text>
+<text x="180" y="214" text-anchor="middle" class="d-text-inv d-small">agent discovery</text>
+
+<rect x="470" y="30" width="300" height="220" rx="10" class="d-panel"/>
+<text x="620" y="52" text-anchor="middle" class="d-title">NIXL Agent &#8212; target</text>
+
+<rect x="490" y="66" width="260" height="46" rx="6" class="d-block"/>
+<text x="620" y="86" text-anchor="middle" class="d-text-inv d-bold">Memory Sections</text>
+<text x="620" y="102" text-anchor="middle" class="d-text-inv d-small">unify mem + storage</text>
+
+<rect x="490" y="122" width="260" height="46" rx="6" class="d-block-2"/>
+<text x="620" y="142" text-anchor="middle" class="d-text-inv d-bold">Transfer Backend I/F</text>
+<text x="620" y="158" text-anchor="middle" class="d-text-inv d-small">select backend</text>
+
+<rect x="490" y="178" width="260" height="46" rx="6" class="d-block-accent"/>
+<text x="620" y="198" text-anchor="middle" class="d-text-inv d-bold">Metadata Handler</text>
+<text x="620" y="214" text-anchor="middle" class="d-text-inv d-small">agent discovery</text>
+
+<path d="M310,145 L490,145" class="d-arrow-active" marker-end="url(#f2n-arr)"/>
+<text x="400" y="138" text-anchor="middle" class="d-mono d-small">data plane: UCX / GDS</text>
+
+<path d="M310,201 L490,201" class="d-arrow d-dashed" marker-end="url(#f2n-arr)"/>
+<text x="400" y="240" text-anchor="middle" class="d-mono d-small">control plane: discovery + addressing</text>
+</svg>
+<figcaption><b>Figure 2.</b> NIXL's three abstractions on each side of a transfer: Memory Sections describe what is being read or written locally, the Transfer Backend Interface picks the wire protocol, and paired Metadata Handlers negotiate the connection between agents before bytes move. Data: NIXL architecture doc<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<h3 id="nixl-backends">2.2 Backends: two actively supported, more in development</h3>
+<p>Of the backends the Transfer Backend Interface can select, only two are labelled actively supported as of this writing: UCX and NVIDIA Magnum IO GPUDirect Storage (GDS); other filesystem, block, and object-storage backends are explicitly listed as in development<a class="cite" href="#ref-2">2</a>. Through those two backends, NIXL reaches the same physical transport protocols Module 1 built the bandwidth ladder from — RoCE, InfiniBand, GPUDirect RDMA, NVMe-oF, TCP, and NVLink<a class="cite" href="#ref-2">2</a> — as a uniform call regardless of which one answers on the wire. This is a narrower backend list than Mooncake's own Transfer Engine already ships (&#167;3), which matters directly for how mature each option is to depend on today.</p>
+<p>GDS is NVIDIA's GPUDirect Storage product, named explicitly in NIXL's own docs as "NVIDIA Magnum IO GPUDirect Storage"<a class="cite" href="#ref-2">2</a> — the same GPUDirect product family whose GPU-to-GPU member, GPUDirect RDMA, Module 1 covered as the mechanism that removes the two host-side copies from a cross-node transfer. GDS extends that branding to GPU-to-storage transfers instead of GPU-to-GPU ones: a NIXL transfer that names a file or block device as one endpoint can reach it through GDS as a registered backend rather than being folded into a generic "disk" option the way LMCache's own local-disk backend is (Table 1). That it merits its own named backend, distinct from the storage types Memory Sections otherwise unify generically, is itself a signal that the file/block/object backends still listed as "in development"<a class="cite" href="#ref-2">2</a> are not simply thinner wrappers around GDS — each storage type is its own integration effort.</p>
+
+<h3 id="nixl-shared-substrate">2.3 NIXL as shared substrate across three engines</h3>
+<p>NIXL's stated design goal — one library other inference frameworks depend on rather than each reimplementing point-to-point transfer — is not just aspirational; three independently built serving engines route KV transfer through it as of 2026-09-17:</p>
+<ul>
+<li><b>Dynamo</b> uses it as the default KV-transfer path: "Dynamo leverages NIXL to transfer KV cache directly from the VRAM of the prefill engine to the VRAM of the decode engine. The KV transfer is non-blocking, allowing GPU forward passes to continue serving other requests during the transfer"<a class="cite" href="#ref-7">7</a>.</li>
+<li><b>TensorRT-LLM</b>'s cache-transceiver (<code>KvCacheTransceiverV2</code>) defaults to NIXL as its backend; NIXL's own internal transport is then selected by the environment variable <code>TRTLLM_NIXL_KVCACHE_BACKEND</code>, valid values <code>UCX</code> (the default) or <code>LIBFABRIC</code>, with an unsupported value logging a warning and falling back to UCX<a class="cite" href="#ref-8">8</a> — a detail Module 4 already covered from the connector side; here it is the same fact from NIXL's side of the interface.</li>
+<li><b>SGLang</b> ships NIXL as one of exactly two transfer backends, alongside Mooncake: installed via <code>pip install nixl</code>, using UCX by default with LIBFABRIC available through the <code>SGLANG_DISAGGREGATION_NIXL_BACKEND</code> environment variable<a class="cite" href="#ref-9">9</a>. Unlike Dynamo and TensorRT-LLM, SGLang does not default to NIXL — it exposes both NIXL and Mooncake as configuration choices, discussed further in &#167;3.</li>
+</ul>
+<p>Three different projects, three different levels of commitment to NIXL — default-only (Dynamo), default-with-fallback (TensorRT-LLM), and equal-choice (SGLang) — but all three depend on the same three abstractions from &#167;2.1 rather than each writing their own. Because these are three separately maintained codebases pointing at the same upstream library, a fix like the v1.4.1 use-after-free closure discussed next (&#167;2.4) benefits all three at once as each project bumps its vendored NIXL version — the alternative, three independent reimplementations of point-to-point transfer, would have needed the same class of bug found and fixed three separate times, on three separate schedules.</p>
+
+<h3 id="nixl-version-churn">2.4 Version churn as evidence of a young library</h3>
+<p>NIXL's release history over roughly one month (through v1.4.1, dated 2026-09-01) is dense with both bug fixes and internal format changes<a class="cite" href="#ref-10">10</a>:</p>
+<ol class="timeline">
+<li><time>v1.3.2</time><b>Cross-node EFA hang fixed</b><p>A cross-node AWS EFA transfer hang introduced in v1.3.1 was fixed through a per-rail flush strategy<a class="cite" href="#ref-10">10</a>.</p></li>
+<li><time>v1.4.0</time><b>Stride descriptors + tracing</b><p>Introduced stride (compressed) descriptors, cutting descriptor-list memory from roughly 44 MB to roughly 7 KB, and added a <code>nixl::trace</code> tracing framework with an NVTX backend for Nsight Systems integration<a class="cite" href="#ref-10">10</a>.</p></li>
+<li><time>v1.4.1</time><b>Use-after-free closed</b><p>Closed a use-after-free window in the transfer-request path and restored the <code>num_experts</code> parameter for CUDA-graph reuse across rank changes<a class="cite" href="#ref-10">10</a>.</p></li>
+</ol>
+<p>The stride-descriptor change alone is worth pausing on: shrinking a per-transfer descriptor structure from roughly 44 MB to roughly 7 KB is a reduction of approximately \(44{,}000{,}000 / 7{,}000 \approx 6{,}300\times\) — the kind of change that only makes sense if the previous representation was carrying far more redundant metadata than the transfer itself needed, which is the sort of inefficiency a library still finds and fixes in its first couple of years, not one still present after a decade of production hardening. The <code>num_experts</code> fix in the same release is worth flagging for Module 5's audience specifically: it means a CUDA graph capturing a wide-EP dispatch/combine pattern can be reused safely across a rank-count change without recapturing<a class="cite" href="#ref-10">10</a> — exactly the situation EPLB's periodic redundant-expert rebalancing creates. Separately, that same v1.4.0 release added the <code>nixl::trace</code> tracing framework with an NVTX backend for Nsight Systems integration<a class="cite" href="#ref-10">10</a>; no equivalent tracing integration for Mooncake's Transfer Engine appears in any source reviewed for this module, which is itself a data point on relative operational tooling maturity, not just on backend count.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>A use-after-free bug in the transfer-request path was only closed in v1.4.1, dated 2026-09-01<a class="cite" href="#ref-10">10</a> — one business day before this module's access date. Pin NIXL to a specific tested tag in any production deployment rather than tracking latest, and re-test after every upgrade; the same caution applies to any project (TensorRT-LLM, Dynamo, SGLang) that vendors a specific NIXL version inside its own container images.</p></aside>
+<h2 id="contrasting-transport-designs">3. Three transport designs, one job</h2>
+<p>By this point three different movers have appeared across this module and Module 7: NIXL (&#167;2), Mooncake's Transfer Engine, and LMCache's own eight-backend plugin list (&#167;1.2), which itself can dispatch through either of the other two. All three solve the same underlying problem — move KV-cache bytes from one place to another fast — at three different levels of generality, and the field has not converged on one.</p>
+<p>Mooncake's Transfer Engine, covered in full in Module 7, already ships a broader raw transport list than NIXL exposes today: the repository names TCP, RDMA, AWS EFA, NVMe-oF, NVLink, HIP, Barex, CXL, and Ascend-family transports as supported<a class="cite" href="#ref-11">11</a>. It ships bundled as one component of the Mooncake project, alongside Mooncake Store (the distributed KV-cache storage engine) and Mooncake EP & Process Group (fault-tolerant execution for large-scale MoE)<a class="cite" href="#ref-11">11</a>, and it is adopted directly as a named backend by vLLM, SGLang, and, since June 2025, LMDeploy<a class="cite" href="#ref-11">11</a>.</p>
+<p>NIXL takes the opposite starting point: a generic abstraction over memory <i>and</i> storage first, with only two backends — UCX and GDS — actively supported today and the rest explicitly labelled in development<a class="cite" href="#ref-2">2</a>. What it trades for that narrower backend list is independence from any one storage system's data model: three separately built engines (Dynamo, TensorRT-LLM, SGLang) depend on it as a default or alternate KV-transfer backend (&#167;2.3) without any of them needing to adopt Mooncake's KVCache/Store abstractions to do so.</p>
+<p>LMCache's own backends are not really a third transport design at all. For a single-host deployment, LMCache moves bytes through its own CPU RAM, local-disk, Redis/Valkey, or S3 backends without depending on either NIXL or Mooncake<a class="cite" href="#ref-1">1</a>. For a higher-performance or cross-node deployment, it dispatches the same offload/reuse decision through NIXL or through Mooncake Storage as two of its eight backend options (&#167;1.2)<a class="cite" href="#ref-1">1</a>. LMCache is a policy layer that composes with either of the other two rather than competing with them for the same job.</p>
+
+<h3 id="contrasting-worked-scenario">3.1 Two concrete choices</h3>
+<p>Put concretely, using two deployments this course already sets up: a team standing up wide expert-parallel decoding (Module 5) across GB200 NVL72 racks on TensorRT-LLM inherits NIXL as the cache-transceiver's default with zero extra configuration<a class="cite" href="#ref-8">8</a> — swapping in Mooncake's Transfer Engine instead would mean replacing a working default to gain a transport list none of this module's sources show that deployment needing beyond what NIXL's UCX backend already reaches. A team that has already built cross-node prefix caching on Mooncake's KVCache-centric Store (Module 7) and is now adding SGLang to the same cluster gets an actual choice, not a default to accept or override: SGLang's own docs list both Mooncake and NIXL as configuration options<a class="cite" href="#ref-9">9</a>, and picking Mooncake keeps the KV-transfer path on the same data model already running in production, at the cost of not gaining NIXL's broader multi-consumer surface for anything the cluster might add beyond that one engine.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 2.</b> NIXL vs. Mooncake's Transfer Engine vs. LMCache's own backends: scope, coupling, and adoption. Data: NIXL architecture and releases<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-10">10</a>, Mooncake repository<a class="cite" href="#ref-11">11</a>, LMCache repository and quickstart<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-6">6</a>, engine docs<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-9">9</a>.</caption>
+<thead><tr><th>Dimension</th><th>NIXL</th><th>Mooncake Transfer Engine</th><th>LMCache's own backends</th></tr></thead>
+<tbody>
+<tr><td class="row">Scope</td><td>generic memory + storage abstraction<a class="cite" href="#ref-2">2</a></td><td>bundled with Mooncake's KVCache-centric Store<a class="cite" href="#ref-11">11</a></td><td>reuse/offload policy layer, not a transport itself<a class="cite" href="#ref-1">1</a></td></tr>
+<tr><td class="row">Actively-supported backends</td><td>UCX, GDS; others in development<a class="cite" href="#ref-2">2</a></td><td>TCP, RDMA, EFA, NVMe-oF, NVLink, HIP, Barex, CXL, Ascend<a class="cite" href="#ref-11">11</a></td><td>CPU RAM, disk, Redis/Valkey, S3 &#8212; plus NIXL, GDS, Mooncake as pass-through options<a class="cite" href="#ref-1">1</a></td></tr>
+<tr><td class="row">Coupling</td><td>independent library, no owning storage system<a class="cite" href="#ref-2">2</a></td><td>coupled to Mooncake's own KVCache data model<a class="cite" href="#ref-11">11</a></td><td>engine-agnostic by design; not coupled to one store<a class="cite" href="#ref-1">1</a></td></tr>
+<tr><td class="row">Adopted as KV-transfer backend by</td><td>Dynamo (default)<a class="cite" href="#ref-7">7</a>, TensorRT-LLM (default)<a class="cite" href="#ref-8">8</a>, SGLang (alternate)<a class="cite" href="#ref-9">9</a></td><td>vLLM, SGLang, LMDeploy<a class="cite" href="#ref-11">11</a></td><td>vLLM (<code>LMCacheConnectorV1</code>), Dynamo since Sep 2025<a class="cite" href="#ref-1">1</a></td></tr>
+<tr><td class="row">Recent maturity signal</td><td>v1.3.2 &#8594; v1.4.1 in about one month, active bug fixes<a class="cite" href="#ref-10">10</a></td><td>USENIX FAST 2025 Best Paper; production since Kimi's launch (Module 7)</td><td>production tutorial in vLLM's own reference stack<a class="cite" href="#ref-6">6</a></td></tr>
+</tbody>
+</table>
+<p>Reading the "Adopted as KV-transfer backend by" row across both columns is the closest thing to a convergence signal this module has: NIXL is the default for every project NVIDIA either controls or ships an official backend for (Dynamo, TensorRT-LLM), while Mooncake's Transfer Engine is additionally available wherever a team already runs Mooncake's cross-node KVCache store and wants a mover that already speaks its data model (SGLang, LMDeploy, and vLLM's own <code>MooncakeConnector</code> sitting alongside its <code>NixlConnector</code> per Module 4). vLLM and SGLang appear on both sides of the table for the same reason: both shipped connector support for NIXL and for Mooncake, and let the deployer pick, rather than the project itself picking one.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Table 2 already lays out the factual differences; the open question is which design point is actually correct for a KV-transfer layer — bundle the mover with a specific KVCache system the way Mooncake does, or keep it generic and let independent projects adopt it the way NIXL does. Neither side has published a controlled benchmark against the other, so this is a disagreement about architecture philosophy backed by adoption evidence on each side, not about measured numbers.</p>
+<div class="positions">
+<article class="position">
+<h4>Purpose-built and bundled wins for the common case</h4>
+<p class="who">Implicit in Mooncake's own design and its direct adoption by three serving engines<a class="cite" href="#ref-11">11</a>, cross-referenced against Module 7</p>
+<p>Mooncake ships its Transfer Engine already supporting nine named transports — TCP, RDMA, AWS EFA, NVMe-oF, NVLink, HIP, Barex, CXL, Ascend-family<a class="cite" href="#ref-11">11</a> — bundled with a KVCache-centric Store that already knows how to hash, place, and evict the specific data being moved. A team that has already adopted Mooncake's architecture for cross-node prefix caching (Module 7) gets the transfer mechanism for free, tuned to the same data model, with no separate abstraction layer to learn or debug. The implicit argument is that a KV-transfer layer's main job is moving one specific kind of data — paged KV blocks belonging to a content-addressed cache — well, and that optimizing for that one job beats optimizing for generality across jobs the deployment may never actually have.</p>
+<ul class="pros"><li>One component to deploy and operate instead of two</li><li>Transports already cover AMD (HIP), Huawei Ascend, and CXL — a wider hardware surface than NIXL's current two active backends</li><li>Production-hardened since Kimi's launch and a FAST 2025 Best Paper<a class="cite" href="#ref-11">11</a></li></ul>
+<ul class="cons"><li>Coupled to Mooncake's own KVCache/Store data model; moving something that is not Mooncake KVCache means stepping outside its scope</li><li>Adopting it for transfer alone still means adopting a specific project's abstractions, not a neutral one</li></ul>
+</article>
+<article class="position">
+<h4>A generic, pluggable abstraction is the correct layer</h4>
+<p class="who">NIXL's own stated design goal<a class="cite" href="#ref-2">2</a>, and its adoption as default or alternate backend by Dynamo<a class="cite" href="#ref-7">7</a>, TensorRT-LLM<a class="cite" href="#ref-8">8</a>, and SGLang<a class="cite" href="#ref-9">9</a></p>
+<p>NIXL was built explicitly to sit underneath multiple independent frameworks rather than one project's own store, unifying memory <i>and</i> storage behind Memory Sections and letting the Transfer Backend Interface pick UCX or GDS underneath<a class="cite" href="#ref-2">2</a>. Three separately engineered serving stacks now depend on the same abstraction, which means bug fixes and backend improvements amortize across all three instead of being re-solved per project. The implicit argument is the opposite bet from Mooncake's: that a cluster's transfer needs rarely stay confined to one data model forever — KV transfer today, weight streaming or storage tiering tomorrow, possibly across engines from different vendors — and that paying the cost of a thinner backend list now is worth not having to re-architect the transport layer when the second use case shows up.</p>
+<ul class="pros"><li>No coupling to any one KVCache data model — usable for KV transfer, weight streaming (Module 9's ModelExpress), or storage tiering alike</li><li>Three independent, competing serving engines already default or alternate to it, evidence the abstraction is doing its job across different codebases</li></ul>
+<ul class="cons"><li>Only two backends (UCX, GDS) are actively supported today, narrower than Mooncake's already-working transport list<a class="cite" href="#ref-2">2</a></li><li>Version churn — a use-after-free fix as recent as v1.4.1 (2026-09-01)<a class="cite" href="#ref-10">10</a> — signals the abstraction itself is still settling</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>SGLang's own decision to ship both backends behind a configuration flag rather than pick one<a class="cite" href="#ref-9">9</a> is the most honest signal available: as of 2026-09-17, no source reviewed for this module publishes a controlled, head-to-head benchmark moving identical KV blocks over identical hardware through both the NIXL-UCX path and the Mooncake Transfer Engine path, so neither position is settled by evidence rather than by which project you already run. The practical decision collapses to what else is already in the cluster: if Mooncake's KVCache-centric Store (Module 7) is already deployed for cross-node prefix caching, its Transfer Engine is the lower-friction choice because the data model is already shared. If the requirement is one transport layer serving multiple, unrelated consumers — KV transfer today, weight streaming or storage tiering tomorrow, across engines that do not share a KVCache abstraction — NIXL's genericity is the better bet, which is exactly why the NVIDIA-controlled projects in this ecosystem (Dynamo, TensorRT-LLM) standardize on it by default. What would settle the argument is the missing benchmark: identical hardware, identical KV payload, both transfer paths, measured throughput and tail latency.</p></div>
+</section>
+<h2 id="what-is-changing">What is changing</h2>
+<p>Three things in this module are most likely to be stale within a year. First, NIXL's backend surface: the architecture doc already names filesystem, block, and object-storage backends as "in development" alongside the two actively supported today<a class="cite" href="#ref-2">2</a> — expect that list to grow, which would narrow the transport-list gap with Mooncake's Transfer Engine that &#167;3 documents as of this writing. Second, LMCache's integration into Dynamo is under one year old as of this module's access date (September 2025)<a class="cite" href="#ref-1">1</a>; Module 9 covers where it lands inside Dynamo's KV Block Manager, and that boundary is still being drawn. Third, the release cadence itself — three NIXL versions in roughly a month, each with functional bug fixes rather than only cosmetic changes<a class="cite" href="#ref-10">10</a> — means any specific version number or environment-variable default cited in this module should be re-checked against the live docs before being relied on in a deployment, not assumed to still hold. Fourth, and least likely to resolve quickly: the NIXL-versus-Mooncake choice &#167;3 and the disagreement above document as unsettled is unsettled precisely because the deciding benchmark does not exist yet. Nothing in either project's own release notes suggests that benchmark is planned; expect this to remain a judgment call based on what a team already runs, not a data-driven decision, for the foreseeable future.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">repo</span>LMCache contributors. <em>LMCache/LMCache</em> (README). Main branch, 2026. <a href="https://github.com/LMCache/LMCache">https://github.com/LMCache/LMCache</a>. Accessed 2026-09-17. <span class="ref-use">Used for: "AI-native knowledge" framing, full storage-backend list (CPU RAM, disk, Redis/Valkey, Mooncake, InfiniStore, S3, NIXL, GDS), vLLM V1 multimodal and Dynamo integration dates.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>NVIDIA (ai-dynamo). <em>NIXL Architecture</em> (nixl.md, main branch docs). 2026. <a href="https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md">https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NIXL's design goal, the three abstractions (Memory Sections, Transfer Backend Interface, Metadata Handler), actively-supported backends (UCX, GDS) vs. in-development, transport protocol list.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>LMCache contributors. <em>Example: Offload KV cache to CPU</em> (LMCache Documentation). docs.lmcache.ai, 2026. <a href="https://docs.lmcache.ai/getting_started/quickstart/offload_kv_cache.html">https://docs.lmcache.ai/getting_started/quickstart/offload_kv_cache.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: offload trigger mechanism, 256-token default chunk size, quickstart backend list, vLLM KVTransferConfig example, 5.0 GB / 1.5-GB-per-10k-tokens sizing example, ~7.43x second-run speedup.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>vLLM contributors. <em>Disaggregated Prefilling</em> (vLLM Documentation). docs.vllm.ai/en/latest/features/disagg_prefill. <a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">https://docs.vllm.ai/en/latest/features/disagg_prefill/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the general Connector / kv producer / kv consumer / LookupBuffer (insert, drop_select) / Pipe abstraction that LMCache's kv_role=kv_both setting collapses onto one instance.</span></li>
+<li id="ref-5"><span class="ref-type">paper</span>Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., Xu, X. <em>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</em>. arXiv:2407.00079v4, USENIX FAST 2025 Best Paper. <a href="https://arxiv.org/pdf/2407.00079">https://arxiv.org/pdf/2407.00079</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 512-token content-hash block size, cross-referenced against LMCache's own 256-token chunk.</span></li>
+<li id="ref-6"><span class="ref-type">repo</span>vLLM Project contributors. <em>vllm-project/production-stack</em> (README). Released 2026-01-22. <a href="https://github.com/vllm-project/production-stack">https://github.com/vllm-project/production-stack</a>. Accessed 2026-09-17. <span class="ref-use">Used for: LMCache offload tutorial listed as a named, first-class tutorial in vLLM's own reference production stack.</span></li>
+<li id="ref-7"><span class="ref-type">official</span>NVIDIA. <em>Disaggregated Serving</em> (NVIDIA Dynamo Documentation). docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving. <a href="https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving">https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NIXL as Dynamo's default KV-transfer path, non-blocking VRAM-to-VRAM transfer.</span></li>
+<li id="ref-8"><span class="ref-type">official</span>NVIDIA / TensorRT-LLM contributors. <em>Disaggregated Serving</em> (disagg-serving.md). TensorRT-LLM documentation, main branch. <a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md">https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: KvCacheTransceiverV2 defaulting to NIXL, TRTLLM_NIXL_KVCACHE_BACKEND (UCX default / LIBFABRIC) selection and fallback behavior.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>SGLang contributors. <em>PD Disaggregation</em>. SGLang Documentation, docs.sglang.io/advanced_features/pd_disaggregation.html. <a href="https://docs.sglang.io/advanced_features/pd_disaggregation.html">https://docs.sglang.io/advanced_features/pd_disaggregation.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NIXL as one of SGLang's two transfer backends (alongside Mooncake), pip install nixl, UCX default / LIBFABRIC via SGLANG_DISAGGREGATION_NIXL_BACKEND.</span></li>
+<li id="ref-10"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/nixl Releases</em>. v1.4.1, 2026-09-01. <a href="https://github.com/ai-dynamo/nixl/releases">https://github.com/ai-dynamo/nixl/releases</a>. Accessed 2026-09-17. <span class="ref-use">Used for: v1.3.2 EFA per-rail flush fix, v1.4.0 stride descriptors (~44 MB &#8594; ~7 KB) and nixl::trace/NVTX integration, v1.4.1 use-after-free fix and num_experts CUDA-graph fix.</span></li>
+<li id="ref-11"><span class="ref-type">repo</span>Moonshot AI / MADSys contributors. <em>kvcache-ai/Mooncake</em> (README). Main branch, updates through August 2026. <a href="https://github.com/kvcache-ai/Mooncake/blob/main/README.md">https://github.com/kvcache-ai/Mooncake/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Transfer Engine's supported transport list (TCP, RDMA, EFA, NVMe-oF, NVLink, HIP, Barex, CXL, Ascend), bundling with Mooncake Store and Mooncake EP/Process Group, vLLM/SGLang/LMDeploy adoption.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

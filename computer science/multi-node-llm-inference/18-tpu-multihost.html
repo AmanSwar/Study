@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TPU Multi-Host Serving: ICI, Pathways, and JetStream · Multi-Node LLM Inference</title>
+<meta name="description" content="ICI mesh/torus topology as TPU's structural alternative to NVLink/NVSwitch and InfiniBand, Pathways' single-controller orchestration as the analog to Dynamo/llm-d, and what has no equivalent yet -- wide-EP all-to-all dispatch and a mature multi-host PD stack.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N &#183; Module 18</p>
+<h1>TPU Multi-Host Serving: ICI, Pathways, and JetStream</h1>
+<p class="lede">Everything in Modules 1&#8211;16 assumed NVLink/NVSwitch inside a node, InfiniBand or RoCE between nodes, and an orchestrator (Dynamo, llm-d) coordinating independently-running vLLM/SGLang/TensorRT-LLM engines. TPU multi-host serving keeps the same questions &#8212; how far can one low-latency domain reach, how do you scale past it, what serves the request &#8212; but answers them with a different topology (ICI mesh/torus, not a switched fabric), a different orchestration model (Pathways' single controller, not an external scheduler over autonomous engines), and a serving-engine lineage (JetStream, now folding into vLLM's <code>tpu-inference</code>) that is still consolidating as of this writing. After this module you can map every mechanism in this course onto its TPU-side equivalent, structural substitute, or documented absence.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>35 min</b> read</span>
+<span class="chip"><b>13</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 1</b>, <b>Module 4</b>, <b>Module 14</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f1t"><title id="f1t">TPU ICI 2D torus mesh (each chip wired to its four grid neighbors, wrapping at the edges) next to an 8-GPU NVSwitch fabric where every GPU reaches every other GPU in one hop</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="200" y="24" text-anchor="middle" class="d-bold d-small">TPU v6e: ICI, 2D torus</text>
+<line x1="70" y1="70" x2="70" y2="250" class="d-outline"/>
+<line x1="130" y1="70" x2="130" y2="250" class="d-outline"/>
+<line x1="190" y1="70" x2="190" y2="250" class="d-outline"/>
+<line x1="250" y1="70" x2="250" y2="250" class="d-outline"/>
+<line x1="50" y1="90" x2="270" y2="90" class="d-outline"/>
+<line x1="50" y1="150" x2="270" y2="150" class="d-outline"/>
+<line x1="50" y1="210" x2="270" y2="210" class="d-outline"/>
+<line x1="50" y1="270" x2="270" y2="270" class="d-outline"/>
+<g class="d-mono d-small">
+<rect x="57" y="77" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="117" y="77" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="177" y="77" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="237" y="77" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="57" y="137" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="117" y="137" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="177" y="137" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="237" y="137" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="57" y="197" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="117" y="197" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="177" y="197" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="237" y="197" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="57" y="257" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="117" y="257" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="177" y="257" width="26" height="26" rx="4" class="d-block-2"/>
+<rect x="237" y="257" width="26" height="26" rx="4" class="d-block-2"/>
+</g>
+<path d="M70,77 C 20,35 320,35 250,77" class="d-outline d-dashed" fill="none"/>
+<path d="M70,283 C 20,325 320,325 250,283" class="d-outline d-dashed" fill="none"/>
+<text x="20" y="175" text-anchor="middle" class="d-text-light d-small" transform="rotate(-90 20 175)">wraps (torus)</text>
+<text x="160" y="292" text-anchor="middle" class="d-mono d-small">800 GB/s per ICI link, 4 neighbors/chip</text>
+<text x="160" y="308" text-anchor="middle" class="d-text-light d-small">corner-to-corner: multiple ICI hops, not one</text>
+<text x="330" y="170" text-anchor="middle" class="d-text-light" style="font-size:22px">vs</text>
+<text x="600" y="24" text-anchor="middle" class="d-bold d-small">8&#215;H100: NVSwitch, full bisection</text>
+<rect x="510" y="130" width="180" height="60" rx="8" class="d-panel d-outline"/>
+<text x="600" y="155" text-anchor="middle" class="d-bold d-small">NVSwitch fabric</text>
+<text x="600" y="172" text-anchor="middle" class="d-text-light d-small">one hop to any of 7 peers</text>
+<g class="d-mono d-small">
+<rect x="440" y="70" width="70" height="34" rx="6" class="d-block"/><text x="475" y="91" text-anchor="middle" class="d-text-inv">GPU0</text>
+<rect x="530" y="60" width="70" height="34" rx="6" class="d-block"/><text x="565" y="81" text-anchor="middle" class="d-text-inv">GPU1</text>
+<rect x="620" y="70" width="70" height="34" rx="6" class="d-block"/><text x="655" y="91" text-anchor="middle" class="d-text-inv">GPU2</text>
+<rect x="700" y="90" width="70" height="34" rx="6" class="d-block"/><text x="735" y="111" text-anchor="middle" class="d-text-inv">GPU3</text>
+<rect x="440" y="250" width="70" height="34" rx="6" class="d-block"/><text x="475" y="271" text-anchor="middle" class="d-text-inv">GPU4</text>
+<rect x="530" y="260" width="70" height="34" rx="6" class="d-block"/><text x="565" y="281" text-anchor="middle" class="d-text-inv">GPU5</text>
+<rect x="620" y="250" width="70" height="34" rx="6" class="d-block"/><text x="655" y="271" text-anchor="middle" class="d-text-inv">GPU6</text>
+<rect x="700" y="230" width="70" height="34" rx="6" class="d-block"/><text x="735" y="251" text-anchor="middle" class="d-text-inv">GPU7</text>
+</g>
+<path d="M490,95 L515,140" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M575,94 L560,130" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M650,100 L610,140" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M710,105 L665,150" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M490,255 L515,190" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M575,258 L560,190" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M650,252 L610,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M710,235 L665,175" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="600" y="300" text-anchor="middle" class="d-mono d-small">900 GB/s per GPU (NVLink4), any pair, 1 hop</text>
+</svg>
+<figcaption><b>Figure 1.</b> Structural contrast, not just a naming difference. TPU v6e wires each chip to its four grid neighbors over ICI at 800 GB/s bidirectional per link in a 2D torus that wraps at the pod edges<a class="cite" href="#ref-1">1</a> &#8212; a chip two rows and two columns away is multiple ICI hops, not one. An 8-GPU NVSwitch node gives full bisection bandwidth: every GPU reaches every other GPU in a single hop at the same 900 GB/s NVLink4 rate<a class="cite" href="#ref-2">2</a>, the baseline from Module 1 &#167;1. TPU7x (Ironwood) uses a 3D torus within 64-chip cubes, joined to other cubes by an Optical Circuit Switch (OCS) &#8212; a third topology again, covered in &#167;1.2<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<h2 id="tpu-pod-ici">1. TPU pod anatomy and ICI: a mesh, not a switch</h2>
+<p>Module 1 built the NVLink/NVSwitch baseline on one premise: every GPU in an 8-GPU node reaches every other GPU at the same per-GPU rate, in one hop, because the NVSwitch fabric gives full bisection bandwidth<a class="cite" href="#ref-2">2</a>. Google's TPU Inter-Chip Interconnect (ICI) does not give you that premise. It gives every chip a fixed number of direct wires to its nearest neighbors in a grid, and lets you reach a farther chip only by routing across several of those links. The rest of this module is downstream of that one structural fact, so it is worth pinning down precisely, generation by generation.</p>
+
+<h3 id="tpu-v6e-ici">1.1 TPU v6e (Trillium): 256-chip pod, 2D torus</h3>
+<p>A TPU v6e Pod contains 256 chips, each carrying 800 GB/s of bidirectional ICI bandwidth, 32 GB of HBM at 1,638 GB/s, and a peak of 918 TFLOPs bf16 (1,836 TOPs Int8) per chip; the pod-level BF16 peak is 234.9 PFLOPs<a class="cite" href="#ref-1">1</a>. The interconnect topology is a 2D torus<a class="cite" href="#ref-1">1</a>: each chip connects to its four nearest neighbors &#8212; north, south, east, west &#8212; and those links wrap around at the pod's edges, so the last chip in a row connects directly back to the first. That wraparound is what makes it a torus rather than a plain mesh: it removes the edge chips that would otherwise have fewer neighbors and halves the worst-case hop count between any two chips, since you can now go around the short way in either direction<a class="cite" href="#ref-3">3</a>.</p>
+
+<h3 id="tpu7x-ici">1.2 TPU7x (Ironwood): 9,216-chip pod, 3D torus inside 64-chip cubes, OCS between cubes</h3>
+<p>TPU7x (Ironwood), Google's most recent generation, scales the same idea two dimensions further and one level higher. Each chip carries 192 GB of HBM at approximately 7.37 TB/s, 2,307 TFLOPs BF16 (4,614 TFLOPs FP8) of peak compute, two TensorCores and four SparseCores, and 1,200 GB/s of bidirectional ICI bandwidth<a class="cite" href="#ref-4">4</a>. Chips are wired into a 3D torus (topology strings of the form <code>AxBxC</code>, with dimensions that must be multiples of four once a slice exceeds 64 chips), and a pod scales up to 9,216 chips<a class="cite" href="#ref-4">4</a> &#8212; comparable in chip count to the earlier v5p generation<a class="cite" href="#ref-4">4</a>.</p>
+<p>The mechanism that gets from a single 3D-torus cube to a 9,216-chip pod is where TPU7x genuinely departs from anything on the GPU side. Chips inside one 64-chip (4&#215;4&#215;4) cube are wired directly over ICI in the 3D torus; multiple cubes are then joined by an Optical Circuit Switch (OCS) network, described by Google as "a dynamic, reconfigurable optical network"<a class="cite" href="#ref-5">5</a>. The official architecture reference calls out the OCS's role for fault tolerance specifically: "ICI resiliency" lets connections be "routed around OCS and optical ICI faults"<a class="cite" href="#ref-3">3</a> &#8212; the optical layer can be reconfigured in the field to route around a failed link or a failed cube, something a fixed-topology electrical switch (NVSwitch) or a statically-cabled fat-tree (InfiniBand) does not do at the same layer. Module 1's NVLink/NVSwitch and InfiniBand/RoCE treatment has no OCS-equivalent component; ConnectX-7's adaptive routing sprays one flow's packets across several paths within a fixed physical topology (Module 1 &#167;2.1) &#8212; a related but distinct idea, since it is packet-level path diversity, not a physically reconfigurable optical fabric.</p>
+
+<h3 id="ici-vs-switched">1.3 Why a torus is a different kind of thing than a switched fabric</h3>
+<p>Put the two facts about Module 1's fabrics and this module's fabric side by side. NVSwitch and InfiniBand are both, structurally, switched networks: a packet goes from source to a switch (or a small number of switch tiers) to destination, and the switch's job is to give every pair of endpoints roughly the same latency and bandwidth regardless of physical position &#8212; that is the definition of full bisection bandwidth, and it is why Module 1 could say "any two of the eight GPUs" without qualification. ICI is a direct point-to-point mesh: there is no switch chip in the middle, only wires between physically adjacent chips, and the "distance" between two chips is a real, position-dependent hop count across the torus. Reaching a chip that is two hops away costs more latency and consumes ICI bandwidth on two links instead of one; reaching the diagonally opposite corner of a large torus can cost several hops. Google's own architecture documentation frames the ICI-connected set of chips within one pod as a "slice"<a class="cite" href="#ref-3">3</a> precisely because a chip's position inside that mesh is a first-class fact about the deployment, not an implementation detail hidden behind a switch.</p>
+<p>This is the single fact that should recalibrate any instinct carried over from the NVLink/NVSwitch mental model: "how many chips can I put in one interconnect domain" is not the same question on a torus as on a switched fabric, because the cost of a communication pattern on a torus depends on <em>where in the mesh</em> the participating chips sit, not just on whether they share a domain. All-reduce and all-to-all algorithms tuned for a torus (ring or hypercube-style schedules that follow the physical adjacency) look different from the switch-agnostic collectives Module 1 and Module 5 describe for NVLink domains &#8212; a distinction this module flags without re-deriving, since the collective-algorithm level is not covered by the sources examined for this module.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> TPU v6e and TPU7x pod specs against GB200 NVL72's NVLink domain, the largest single-fabric GPU unit in this course (Module 1 &#167;5)<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-6">6</a>.</caption>
+<thead><tr><th>Platform</th><th class="num">Chips/GPUs per unit</th><th>Topology</th><th class="num">Per-chip interconnect BW</th><th class="num">Per-chip/GPU HBM</th></tr></thead>
+<tbody>
+<tr><td class="row">TPU v6e (Trillium)</td><td class="num">256 / pod</td><td>2D torus</td><td class="num">800 GB/s (ICI)</td><td class="num">32 GB @ 1,638 GB/s</td></tr>
+<tr><td class="row">TPU7x (Ironwood)</td><td class="num" data-best>9,216 / pod</td><td>3D torus + OCS between cubes</td><td class="num" data-best>1,200 GB/s (ICI)</td><td class="num" data-best>192 GB @ &#8776;7.37 TB/s</td></tr>
+<tr><td class="row">GB200 NVL72</td><td class="num">72 / rack</td><td>NVSwitch, full bisection</td><td class="num">1.8 TB/s (NVLink5)</td><td class="num">&#8776;186 GB @ &#8776;8 TB/s</td></tr>
+</tbody>
+</table>
+<p class="small muted">GB200 NVL72 row derived from its published rack aggregates &#8212; 130 TB/s NVLink bandwidth and 13.4 TB of HBM3e at 576 TB/s across 72 GPUs<a class="cite" href="#ref-6">6</a> &#8212; divided by 72 to put it on the same per-chip basis as the TPU rows; NVIDIA does not publish these as per-GPU figures directly, but the arithmetic matches the per-GPU NVLink5 rate from Module 1 &#167;1.2 exactly (130 TB/s &#247; 72 &#8776; 1.8 TB/s).</p>
+
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>TPU7x's chip is a dual-chiplet design: two chiplets, each with 96 GB of HBM, presented to software as one 192 GB device<a class="cite" href="#ref-4">4</a>. The 1,200 GB/s ICI figure and the 192 GB / &#8776;7.37 TB/s HBM figure are both per whole chip, not per chiplet.</p></aside>
+
+<h2 id="inference-slice">2. The inference-optimized slice: v6e-8 as the "8-GPU node," and where the analogy breaks</h2>
+<p>Google's own terminology gives you a direct on-ramp from the GPU vocabulary: a TPU Pod is "a contiguous set of TPUs grouped together over a specialized network," and a slice is "a collection of chips all located inside the same TPU Pod connected by high-speed inter-chip interconnects"<a class="cite" href="#ref-3">3</a>. A slice is the unit you actually allocate and serve on &#8212; the direct analog of "one 8-GPU node" from Module 1, and the unit every later section of this module (Pathways deployments, disaggregation, checkpoint loading) is scoped to.</p>
+
+<h3 id="v6e-8-slice">2.1 The 8-chip inference slice</h3>
+<p>Google calls out an 8-chip configuration specifically for serving: "slices with 8 chips (v6e-8) attached to a single VM are optimized for inference, allowing all 8 chips to be used in a single serving workload"<a class="cite" href="#ref-1">1</a>. That is deliberately the same chip count as an HGX 8-GPU node, and the parallel is not an accident of phrasing &#8212; both are the smallest unit that lets a serving engine treat the whole local interconnect domain as one addressable pool for tensor/expert-parallel sharding. Inside a v6e-8 slice, any two chips are within the 2D torus's 8-chip footprint, so the hop-count penalty from &#167;1.3 stays small; that is why Google marks this particular shape, not an arbitrary 8-chip subset, as the inference-optimized one.</p>
+
+<h3 id="multihost-slices">2.2 Scaling past one slice: 1&#215;1 to 16&#215;16</h3>
+<p>Multi-host configurations scale from a 1&#215;1 topology up to 16&#215;16 &#8212; the full 256-chip v6e pod &#8212; spread across as many as 64 VMs<a class="cite" href="#ref-1">1</a>. Each larger topology is still one ICI-connected slice by the &#167;2 definition; what changes is how many separate host VMs' worth of chips participate, and therefore how many physical hosts a single-controller runtime (&#167;3) has to coordinate to treat the slice as one serving unit.</p>
+
+<h3 id="where-analogy-breaks">2.3 Where the 8-GPU-node analogy breaks: chip-to-host ratio</h3>
+<p>The place the parallel stops holding cleanly is the chip-to-host ratio, and it is not the same across TPU generations either. A v6e-8 inference slice puts all 8 chips behind a single VM<a class="cite" href="#ref-1">1</a> &#8212; matching HGX's 8-GPUs-per-host ratio exactly. TPU7x does not: "each host is connected to four chips"<a class="cite" href="#ref-3">3</a>, so a TPU7x VM is a 4-chip unit, and a <code>2x2x1</code> topology (4 chips) is explicitly the single-host case, with <code>2x2x2</code> and larger being multi-host<a class="cite" href="#ref-3">3</a>. A 4-chip TPU7x VM ships with 224 vCPUs and 960 GB of host RAM<a class="cite" href="#ref-4">4</a> &#8212; a much larger host-CPU/host-RAM allowance per accelerator than a typical 8-GPU HGX host, reflecting a design point where the host is doing comparatively more work (input pipeline, SparseCore-adjacent preprocessing) per accelerator chip than a GPU host typically does.</p>
+<p>The practical consequence: on TPU7x, "one node" in the GPU sense (one physical host, one PCIe/NIC domain) is a 4-chip unit, not an 8-chip one, and reaching the other 4 chips of even the smallest useful inference topology already means crossing a host boundary &#8212; still within ICI, since ICI links the chips directly rather than routing through host networking, but crossing a boundary that matters for anything host-scoped (process placement, host-local memory, VM lifecycle). This is exactly the kind of substitution the rest of this course has trained you to look for: same word ("node"), different physical referent, and the difference is load-bearing the moment you reason about failure domains or checkpoint-loading parallelism (&#167;7).</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Do not carry over "8-GPU node = 1 NVSwitch domain = 1 failure/replication unit" as a fixed constant. On TPU, the slice (the ICI domain) and the host (the VM/chip-count-per-host boundary) are two different things that happen to coincide for v6e-8 and do not coincide for TPU7x. Check both numbers for whichever generation you are actually deploying on<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a>.</p></aside>
+
+<h2 id="pathways-orchestration">3. Pathways: single-controller orchestration as the TPU answer to Dynamo/llm-d</h2>
+<p>Module 9 and Module 10 covered two different answers to "who decides which worker serves this request and manages this worker's lifecycle": Dynamo's Router/Planner/KVBM/Grove component set, and llm-d's Endpoint-Picker-based layered scheduler, both external to, and coordinating, independently-running vLLM/SGLang/TensorRT-LLM engine processes. Pathways is Google's answer to the same question, and it takes a structurally different position: instead of an external orchestrator issuing requests to autonomous per-GPU engine processes, Pathways puts a single controller in charge of the whole distributed computation and lets that controller schedule work across every chip in the deployment as one program.</p>
+
+<h3 id="single-controller-model">3.1 Single-controller vs. multi-controller (SPMD)</h3>
+<p>The distinction has a name in the systems literature: Pathways "makes use of a novel asynchronous distributed dataflow design that lets the control plane execute in parallel despite dependencies in the data plane, and with careful engineering, allows Pathways to adopt a single-controller model that makes it easier to express complex new parallelism patterns"<a class="cite" href="#ref-7">7</a>. Contrast this with the SPMD (single-program, multiple-data) style that the vLLM/SGLang/TensorRT-LLM stack in Modules 9&#8211;13 uses: each GPU process runs the same program independently, and coordination between them happens through explicit collective calls (all-reduce, all-to-all) that every rank must call in the same order &#8212; a multi-controller model, in the paper's terms, where there is no single point that sees the whole computation. Pathways' single controller can instead express computations that are heterogeneous across parts of the cluster &#8212; different pipeline stages, different parallelism strategies on different islands of chips &#8212; because one program, running on the controller, is deciding what every chip does, rather than each chip's process deciding for itself from an SPMD script<a class="cite" href="#ref-7">7</a>.</p>
+<p>The paper reports concrete evidence this design does not sacrifice throughput to get that flexibility: Pathways achieves near-100% accelerator utilization for SPMD-style computations across 2,048 TPUs, and delivers throughput comparable to the SPMD case even for a Transformer model pipelined across 16 stages, or sharded across two separate islands of accelerators connected only by a data-center network<a class="cite" href="#ref-7">7</a>. That last case &#8212; two islands joined over a DCN, not a shared low-latency fabric &#8212; is the direct academic ancestor of the disaggregated-slice configuration in &#167;5.</p>
+
+<h3 id="pathways-on-cloud">3.2 Pathways on Cloud: the four containers you actually deploy</h3>
+<p>The production system built on this idea, Pathways on Cloud, ships as four containers wired together by a Kubernetes LeaderWorkerSet (LWS) &#8212; the same primitive Module 14 covers as the multi-host replication unit for sharded GPU serving. Google's own multi-host inference guide names them explicitly<a class="cite" href="#ref-8">8</a>:</p>
+<ul>
+<li><strong>pathways-proxy</strong> &#8212; listens on port 38681 and forwards requests to the resource manager at the LWS leader's address.</li>
+<li><strong>pathways-rm</strong> (resource manager) &#8212; runs with <code>--node_type=resource_manager</code> on port 38677, and manages TPU topology and instance configuration via an <code>--instance_count</code> parameter and an <code>--instance_type=tpuv6e:TOPOLOGY</code> parameter.</li>
+<li><strong>jax-tpu</strong> &#8212; the actual model-inference engine, running MaxText or JetStream underneath, exposing health checks on port 8000.</li>
+<li><strong>jetstream-http</strong> &#8212; the HTTP server, also on port 8000, that provides the client-facing inference API.</li>
+</ul>
+<p>These are deployed as an LWS group whose <code>size</code> matches the topology &#8212; for example, <code>size: 5</code> (one leader plus four workers) for a v6e-16 slice laid out as a <code>4x4</code> topology, with a <code>leaderworkerset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool</code> annotation binding the group to one physical node pool<a class="cite" href="#ref-8">8</a>. The leader hosts the resource manager and proxy; workers connect back to the leader's resource-manager address, and the resource manager tracks every participating slice through its <code>instance_count</code>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Pathways on Cloud: jetstream-http serves client requests by calling the jax-tpu engine, while pathways-proxy and pathways-rm form a separate control plane that provisions and tracks the jax-tpu LeaderWorkerSet group's topology</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="475" y="18" text-anchor="middle" class="d-text-light d-small">data plane (per-request)</text>
+<rect x="20" y="30" width="120" height="54" rx="8" class="d-block-accent"/>
+<text x="80" y="52" text-anchor="middle" class="d-text-inv d-bold">Client</text>
+<text x="80" y="68" text-anchor="middle" class="d-text-inv d-small">request</text>
+<path d="M140,57 L180,57" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="180" y="30" width="180" height="54" rx="8" class="d-block"/>
+<text x="270" y="52" text-anchor="middle" class="d-text-inv d-bold">jetstream-http</text>
+<text x="270" y="68" text-anchor="middle" class="d-text-inv d-small">:8000 HTTP API</text>
+<path d="M360,57 L400,57" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="400" y="10" width="380" height="130" rx="8" class="d-outline d-dashed"/>
+<text x="590" y="26" text-anchor="middle" class="d-small d-text-light">LeaderWorkerSet: jax-tpu (MaxText / JetStream engine)</text>
+<rect x="420" y="45" width="160" height="60" rx="6" class="d-block-2"/>
+<text x="500" y="68" text-anchor="middle" class="d-text-inv d-small">jax-tpu leader</text>
+<text x="500" y="84" text-anchor="middle" class="d-text-inv d-small">host 0, :8000 health</text>
+<rect x="600" y="45" width="160" height="60" rx="6" class="d-block-2"/>
+<text x="680" y="68" text-anchor="middle" class="d-text-inv d-small">jax-tpu worker(s)</text>
+<text x="680" y="84" text-anchor="middle" class="d-text-inv d-small">host 1..N</text>
+<path d="M580,75 L600,75" class="d-arrow" marker-end="url(#f2-arr)"/>
+<text x="590" y="118" text-anchor="middle" class="d-mono d-small">ICI (intra-slice)</text>
+<text x="475" y="175" text-anchor="middle" class="d-text-light d-small">control plane (topology / provisioning)</text>
+<rect x="60" y="195" width="190" height="54" rx="8" class="d-surface"/>
+<text x="155" y="217" text-anchor="middle" class="d-bold d-small">pathways-proxy</text>
+<text x="155" y="233" text-anchor="middle" class="d-small d-text-light">:38681</text>
+<path d="M250,222 L300,222" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="300" y="195" width="230" height="54" rx="8" class="d-surface"/>
+<text x="415" y="217" text-anchor="middle" class="d-bold d-small">pathways-rm</text>
+<text x="415" y="233" text-anchor="middle" class="d-small d-text-light">:38677, --node_type=resource_manager</text>
+<path d="M415,195 L500,140" class="d-arrow d-dashed" marker-end="url(#f2-arr)"/>
+<text x="500" y="175" text-anchor="middle" class="d-small d-text-light">manages instance_count / topology</text>
+</svg>
+<figcaption><b>Figure 2.</b> Pathways on Cloud's four named containers, deployed as one LeaderWorkerSet group: <code>jetstream-http</code> serves the request-facing API and calls the <code>jax-tpu</code> engine over ICI within the slice, while <code>pathways-proxy</code> and <code>pathways-rm</code> form the control plane that provisions and tracks the group's topology<a class="cite" href="#ref-8">8</a>.</figcaption>
+</figure>
+
+<h3 id="pathways-vs-dynamo-llmd">3.3 What is shared with Dynamo/llm-d, and what is not</h3>
+<p>The Kubernetes primitive is literally shared: Pathways on Cloud deploys over LeaderWorkerSet<a class="cite" href="#ref-8">8</a>, the same API Module 14 covers as the substrate llm-d and vLLM's own multi-host guides assume for gang-scheduling a sharded replica across physical hosts. That is a genuine 1:1 port &#8212; the Kubernetes-level "how do I deploy N hosts as one addressable replication unit" problem has the same answer on both stacks.</p>
+<p>Above that layer, the models diverge. Dynamo's Planner and llm-d's Endpoint Picker both sit outside the inference engine process and make decisions &#8212; which replica gets a request, when to scale a pool &#8212; by observing metrics that engines expose (Module 9 &#167;3, Module 10 &#167;3), while the engines themselves remain ordinary SPMD processes unaware of the orchestrator's existence beyond the metrics endpoint. Grove, Dynamo's Kubernetes operator, does topology-aware gang scheduling as a control-plane concern layered on top of independently-running engine pods. Pathways instead puts scheduling <em>inside</em> the single-controller runtime that the engine itself is built on: <code>jax-tpu</code> is not an autonomous SPMD process that happens to expose metrics to an external scheduler, it is a worker in a Pathways-coordinated dataflow graph whose placement and gang-scheduling the resource manager already owns as part of running the program at all<a class="cite" href="#ref-7">7</a>. There is no Pathways-side analog to Dynamo's Router doing KV-cache-aware request-to-replica scoring (Module 9 &#167;2) or llm-d's prefix-cache scorer (Module 2, Module 10) documented in the sources examined here &#8212; Pathways' multi-host inference documentation describes topology and lifecycle management, not cross-replica KV-aware routing, and no source surveyed for this module describes such a component.</p>
+
+<h2 id="jetstream-tpu-inference">4. JetStream, and its 2026 consolidation into <code>tpu-inference</code></h2>
+<p>This module's manifest scope names JetStream as TPU's serving engine, parallel to Module 11&#8211;13's vLLM/SGLang/TensorRT-LLM. That framing is accurate for most of JetStream's life, and the mechanism is worth understanding on its own terms &#8212; but as of this writing the project has just been folded into a different, vLLM-owned repository, and the currency of that change matters enough to state plainly rather than gloss over.</p>
+
+<h3 id="what-jetstream-was">4.1 What JetStream is</h3>
+<p>JetStream describes itself as "a throughput and memory optimized engine for LLM inference on XLA devices, starting with TPUs (and GPUs in future)"<a class="cite" href="#ref-9">9</a>. Structurally it ships as an orchestrator around a pluggable "engine" interface with two reference implementations: a JAX engine, backed by Google's MaxText training/inference framework, and a PyTorch engine, backed by a separate <code>jetstream-pytorch</code> project<a class="cite" href="#ref-9">9</a>. The JAX/MaxText path is the one Google's own documentation and blog posts use for concrete numbers, and its server is launched as <code>MaxText.maxengine_server</code>, configured with MaxText's own sharding flags &#8212; <code>ici_fsdp_parallelism</code>, <code>ici_tensor_parallelism</code>, <code>ici_autoregressive_parallelism</code> &#8212; that map a model's parallelism strategy onto ICI-connected chip axes, plus <code>max_prefill_predict_length</code> and <code>per_device_batch_size</code> for the serving-specific prefill/decode shape<a class="cite" href="#ref-9">9</a>. That JAX engine is what Pathways' <code>jax-tpu</code> container (&#167;3.2) runs underneath its HTTP surface. Concretely, a single-host launch binds parallelism directly onto ICI axes as explicit flags rather than as a separate topology descriptor:</p>
+
+<pre class="code" data-lang="bash" data-title="JetStream MaxText engine launch, single v6e-8 slice"><code>python3 -m MaxText.maxengine_server \
+  MaxText/configs/base.yml \
+  tokenizer_path=${TOKENIZER_PATH} \
+  load_parameters_path=${LOAD_PARAMETERS_PATH} \
+  model_name=${MODEL_NAME} \
+  max_prefill_predict_length=1024 \
+  max_target_length=2048 \
+  ici_fsdp_parallelism=1 \
+  ici_tensor_parallelism=-1 \
+  ici_autoregressive_parallelism=1 \
+  per_device_batch_size=11 \
+  scan_layers=false \
+  weight_dtype=bfloat16</code></pre>
+<p class="small muted">The three <code>ici_*</code> flags partition the slice's chips along FSDP, tensor-parallel, and autoregressive (decode-batch) axes; <code>-1</code> tells MaxText to infer that axis's size from the others and the slice's total chip count<a class="cite" href="#ref-9">9</a>. There is no separate "which chips are in my ICI domain" configuration step &#8212; the flags assume the whole slice is one addressable pool, consistent with &#167;1.3.</p>
+
+<h3 id="jetstream-pathways-integration">4.2 April 2025: Pathways integration, multi-host and disaggregated numbers</h3>
+<p>Pathways was integrated into JetStream for the first time in April 2025, and Google's own numbers from that release are the concrete evidence for why multi-host and disaggregated serving matter operationally, not just architecturally. On the multi-host side, Llama 3.1 405B &#8212; a model that does not fit on a single host at any reasonable precision &#8212; reached 1,703 tokens/s on Trillium (v6e) via Pathways-enabled multi-host inference, a figure Google reports as 3&#215; more inference per dollar than TPU v5e<a class="cite" href="#ref-10">10</a>. On the disaggregated side, the same release reports, for Llama2-70B on Trillium, a 7&#215; improvement in time-to-first-token and roughly 3&#215; improvement in time-per-output-token from splitting prefill and decode into independently-scaled stages versus a monolithic engine<a class="cite" href="#ref-10">10</a>. These are Google's own headline numbers, model- and generation-specific, in the same vendor-reported category as the Dynamo and llm-d claims in Modules 9&#8211;10 &#8212; read them the same way, as an existence proof of the technique's direction rather than a portable constant.</p>
+<p>The same April 2025 update is also where vLLM support on TPU first appears in Google's own materials, explicitly framed as "an alternative to JetStream," giving customers "choice"<a class="cite" href="#ref-10">10</a> rather than a replacement. That framing did not last unchanged.</p>
+
+<h3 id="jetstream-archival">4.3 February 2026: JetStream's archival and the move to <code>tpu-inference</code></h3>
+<p>As of this writing, the <code>AI-Hypercomputer/JetStream</code> repository carries an explicit archival notice: "In an effort to streamline TPU inference efforts in open source, we have migrated core functionality in JetStream to the new <code>tpu-inference</code> repository. For this reason, we will be archiving JetStream on February 1st 2026"<a class="cite" href="#ref-9">9</a>. The successor, <code>vllm-project/tpu-inference</code>, describes itself plainly: "vLLM TPU is now powered by <code>tpu-inference</code>, an expressive and powerful new hardware plugin unifying JAX and PyTorch under a single lowering path within the vLLM project"<a class="cite" href="#ref-12">12</a>. Concretely, <code>tpu-inference</code> lowers every model &#8212; including PyTorch model code, via a PyTorch-to-JAX bridge called Torchax &#8212; through one JAX&#8594;XLA compilation path, rather than maintaining a separate PyTorch/XLA path; the vLLM project reports this change alone produced roughly 20% higher throughput than the earlier direct PyTorch/XLA route, because it lets PyTorch models reuse JAX's compiler primitives<a class="cite" href="#ref-11">11</a>, and 3.6&#215; (Llama 3.1-8B on v6e-1) to 2.1&#215; (Llama 3.1-70B on v6e-8) throughput over the original, February-2025-era TPU prototype<a class="cite" href="#ref-11">11</a>.</p>
+<p>The practical reading for a deployment decision today: "JetStream" as a name still appears in Google's own multi-host-inference documentation, describing what the <code>jax-tpu</code> container runs (&#167;3.2, &#167;4.1) &#8212; but the open-source repository that used to be the reference implementation is archived, and its functionality now lives inside vLLM's TPU backend. <code>tpu-inference</code> lists v7x, v5e, and v6e as its recommended generations and v3/v4/v5p as experimental<a class="cite" href="#ref-12">12</a>. This is a live consolidation, not a settled state; treat any specific feature-support claim in &#167;5&#8211;6 as dated to the snapshot cited, not as a permanent fact.</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat &#8212; currency</span><p>This module's as-of date is 2026-09-17. JetStream's GitHub archival took effect February 1, 2026<a class="cite" href="#ref-9">9</a>, roughly seven months before this module was written. The feature-support numbers in &#167;5.3 and &#167;6.2 are drawn from a live, auto-updated support-matrix dashboard in the <code>tpu-inference</code> README, snapshotted "Last Updated: 2026-08-27"<a class="cite" href="#ref-12">12</a> &#8212; expect these specific pass/fail statuses to keep changing.</p></aside>
+
+<h2 id="tpu-disaggregation">5. Disaggregated serving on TPU: a DCN cliff, not an ICI one</h2>
+<p>Module 3 established why prefill and decode interfere when colocated on one engine, and Module 4 covered the connector abstraction GPU serving stacks use to move KV cache between separate prefill and decode pools. The interference argument &#8212; compute-bound prefill work stalling memory-bandwidth-bound decode steps &#8212; is a property of the workload, not of NVLink or ICI, so there is no reason it would not apply on TPU as well. What is worth working through carefully is <em>how</em> the split is implemented once ICI is the intra-slice fabric, because the natural assumption &#8212; "ICI is already one fast mesh, so disaggregation must mean something different here" &#8212; turns out to be only half right.</p>
+
+<h3 id="aggregated-vs-disaggregated">5.1 Aggregated one-slice vs. disaggregated two-slice deployment</h3>
+<p>Google's Pathways multi-host inference guide gives two concrete example topologies. The aggregated case is a single v6e-16 slice with a unified LeaderWorkerSet group running both prefill and decode on the same engine, the same chips, the same ICI domain<a class="cite" href="#ref-8">8</a>. The disaggregated case does not subdivide that one slice internally &#8212; it uses <em>two separate</em> v6e-8 slices, one for prefill and one for decode, configured via a Kubernetes <code>subGroupPolicy</code> with <code>subGroupSize: 2</code> and an inference-server mode named <code>ExperimentalMaxtextDisaggregatedServer_8</code><a class="cite" href="#ref-8">8</a> &#8212; the "Experimental" prefix in that config name is Google's own, not an editorial addition. The same documentation defines the two stages precisely: "prefill: this stage processes the input prompt and generates an intermediate representation (like a key-value cache). It's often compute intensive. Decode: this stage generates the output tokens, one by one, using the prefill representation. It is typically memory-bandwidth bound"<a class="cite" href="#ref-8">8</a> &#8212; the identical interference framing Module 3 built from DistServe and Splitwise, restated in Google's own words for the TPU case.</p>
+<p>Because each v6e-8 slice is its own ICI domain (&#167;1.3), the two slices in the disaggregated configuration do not share an ICI mesh with each other. The KV cache produced by the prefill slice has to leave that slice's ICI domain entirely and reach the decode slice over the external network connecting the two VM groups &#8212; the data-center network (DCN), not ICI.</p>
+
+<h3 id="dcn-cliff">5.2 Quantifying the DCN cliff</h3>
+<p>This is where the "ICI dissolves the interconnect-cliff argument" intuition breaks down, and it is worth doing the arithmetic explicitly rather than asserting it. TPU7x's own spec sheet gives both numbers on the same per-chip basis: 1,200 GB/s of bidirectional ICI bandwidth, and 100 Gb/s of DCN bandwidth, per chip<a class="cite" href="#ref-4">4</a>.</p>
+<p>Converting to matching units: 100 Gb/s &#247; 8 bits/byte = 12.5 GB/s. The ratio of ICI to DCN bandwidth per chip is then</p>
+$$ \frac{1{,}200\ \text{GB/s}}{12.5\ \text{GB/s}} = 96\times $$
+<p>Ninety-six times is a bigger proportional cliff than Module 1's NVLink-to-InfiniBand drop (18&#8211;36&#215;, Module 1 &#167;2.3, per-GPU/per-chip single-rail comparison). The GPU-side story and the TPU-side story turn out to have the same shape &#8212; a large per-chip bandwidth drop the instant traffic leaves the local interconnect domain &#8212; with different constants and a different name for the fabric on the far side of the cliff (DCN, not InfiniBand/RoCE). Disaggregation on TPU therefore pays the same kind of transport tax GPU disaggregation does; it is not free just because the intra-slice fabric happens to be a mesh instead of a switch.</p>
+
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>"ICI is one big low-latency domain" is true <em>within</em> a slice and false <em>across</em> slices. Splitting prefill and decode into separate slices (rather than separate chip subsets of one slice) is precisely what re-introduces a bandwidth cliff for the KV-cache transfer &#8212; the same structural move, and the same trade-off, that Module 3 and Module 4 describe for crossing an NVLink domain boundary on GPU.</p></aside>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f3t"><title id="f3t">Aggregated single v6e-16 slice sharing one ICI domain for prefill and decode, versus two disaggregated v6e-8 slices each with its own ICI domain, connected only by the slower data-center network</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="190" y="20" text-anchor="middle" class="d-bold d-small">Aggregated: one v6e-16 slice</text>
+<rect x="30" y="35" width="320" height="180" rx="8" class="d-panel"/>
+<text x="190" y="55" text-anchor="middle" class="d-small d-text-light">prefill + decode, one ICI domain</text>
+<g class="d-fill-blue">
+<rect x="55" y="70" width="24" height="24" rx="3"/><rect x="90" y="70" width="24" height="24" rx="3"/><rect x="125" y="70" width="24" height="24" rx="3"/><rect x="160" y="70" width="24" height="24" rx="3"/>
+<rect x="55" y="105" width="24" height="24" rx="3"/><rect x="90" y="105" width="24" height="24" rx="3"/><rect x="125" y="105" width="24" height="24" rx="3"/><rect x="160" y="105" width="24" height="24" rx="3"/>
+<rect x="55" y="140" width="24" height="24" rx="3"/><rect x="90" y="140" width="24" height="24" rx="3"/><rect x="125" y="140" width="24" height="24" rx="3"/><rect x="160" y="140" width="24" height="24" rx="3"/>
+<rect x="55" y="175" width="24" height="24" rx="3"/><rect x="90" y="175" width="24" height="24" rx="3"/><rect x="125" y="175" width="24" height="24" rx="3"/><rect x="160" y="175" width="24" height="24" rx="3"/>
+</g>
+<text x="270" y="150" text-anchor="middle" class="d-small">16 chips,</text>
+<text x="270" y="168" text-anchor="middle" class="d-small">shared ICI</text>
+<text x="190" y="235" text-anchor="middle" class="d-mono d-small">800 GB/s ICI, both stages</text>
+
+<text x="610" y="20" text-anchor="middle" class="d-bold d-small">Disaggregated: two v6e-8 slices</text>
+<rect x="420" y="35" width="150" height="150" rx="8" class="d-panel"/>
+<text x="495" y="52" text-anchor="middle" class="d-small d-text-light">prefill (v6e-8)</text>
+<g class="d-fill-blue">
+<rect x="440" y="65" width="22" height="22" rx="3"/><rect x="472" y="65" width="22" height="22" rx="3"/><rect x="504" y="65" width="22" height="22" rx="3"/><rect x="536" y="65" width="22" height="22" rx="3"/>
+<rect x="440" y="97" width="22" height="22" rx="3"/><rect x="472" y="97" width="22" height="22" rx="3"/><rect x="504" y="97" width="22" height="22" rx="3"/><rect x="536" y="97" width="22" height="22" rx="3"/>
+</g>
+<text x="495" y="150" text-anchor="middle" class="d-mono d-small">own ICI</text>
+<rect x="630" y="35" width="150" height="150" rx="8" class="d-panel"/>
+<text x="705" y="52" text-anchor="middle" class="d-small d-text-light">decode (v6e-8)</text>
+<g class="d-fill-cyan">
+<rect x="650" y="65" width="22" height="22" rx="3"/><rect x="682" y="65" width="22" height="22" rx="3"/><rect x="714" y="65" width="22" height="22" rx="3"/><rect x="746" y="65" width="22" height="22" rx="3"/>
+<rect x="650" y="97" width="22" height="22" rx="3"/><rect x="682" y="97" width="22" height="22" rx="3"/><rect x="714" y="97" width="22" height="22" rx="3"/><rect x="746" y="97" width="22" height="22" rx="3"/>
+</g>
+<text x="705" y="150" text-anchor="middle" class="d-mono d-small">own ICI</text>
+<path d="M572,110 L628,110" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+<text x="600" y="100" text-anchor="middle" class="d-mono d-small">KV cache</text>
+<text x="600" y="230" text-anchor="middle" class="d-mono d-small">DCN, &#8776;12.5 GB/s/chip</text>
+<text x="600" y="248" text-anchor="middle" class="d-text-light d-small">(&#8776;96&#215; slower than ICI, &#167;5.2)</text>
+</svg>
+<figcaption><b>Figure 3.</b> The aggregated example uses one v6e-16 slice with prefill and decode unified on one ICI domain; the disaggregated example uses two separate v6e-8 slices, each keeping its own ICI domain, with KV cache crossing the data-center network (DCN) between them<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h3 id="tpu-inference-pd-status">5.3 Where the open-source stack stands: DCN-based P/D disaggregation</h3>
+<p>The vLLM TPU blog, current as of October 2025, listed single-host prefill/decode disaggregation as experimental and multi-host dynamic disaggregation as a "What's Next" roadmap item, not yet shipped<a class="cite" href="#ref-11">11</a>. The live <code>tpu-inference</code> support-matrix snapshot cited here (2026-08-27) shows movement since: "DCN-based P/D disaggregation" is listed as Passing across both the Flax and Torchax backends<a class="cite" href="#ref-12">12</a> &#8212; the feature's own name confirms the &#167;5.2 mechanism, that the transfer path is explicitly over DCN rather than ICI. Read this alongside a second row in the same table: a separately-tracked "multi-host" feature flag is listed as Untested across all backends<a class="cite" href="#ref-12">12</a> in that same snapshot. The honest reading is that DCN-based KV transfer between slices is validated, while the broader "multi-host" capability flag in the same matrix has not been independently re-verified as of that date &#8212; two different claims that should not be collapsed into one "multi-host PD works" headline.</p>
+
+<h3 id="cross-ref-module34">5.4 Cross-reference: same why, different transport</h3>
+<p>Nothing about the &#167;5.1 motivation differs from Module 3's argument: separate the compute-bound and memory-bandwidth-bound phases so neither stalls the other, and size each pool independently. What differs is entirely at the mechanism level Module 4 covers for GPU: instead of a connector plugging into a running engine process to pull KV blocks peer-to-peer (vLLM's <code>NixlConnector</code>/<code>MooncakeConnector</code> pattern, Module 4 &#167;2), the TPU path as documented here separates prefill and decode at the level of entire Pathways slices, coordinated by the same single-controller/LeaderWorkerSet machinery from &#167;3, with the transfer itself crossing DCN. No source examined for this module describes a TPU-side connector abstraction analogous to vLLM's pluggable <code>Connector</code>/<code>LookupBuffer</code>/<code>Pipe</code> interface (Module 4, Module 11) that lets a single running engine process attach to multiple named backends; the granularity of disaggregation documented here is the slice, not the connector.</p>
+
+<h2 id="ep-on-tpu">6. Expert parallelism on TPU: the sharding primitive exists, the DeepEP analog does not</h2>
+<p>Module 5 and Module 6 covered wide expert parallelism on GPU in detail: DeepEP's two kernel modes, EPLB's redundant-expert placement, and DeepSeek's own EP320/EP144 production configurations, all built on a specialized all-to-all dispatch/combine kernel library tuned to NVLink-plus-RDMA. The natural question for this module is whether TPU has an equivalent. The honest answer from the sources examined here is: partially, and not yet at the same layer.</p>
+
+<h3 id="sparsecore-not-moe">6.1 SparseCores are not a MoE-dispatch engine</h3>
+<p>TPU chips carry a component with a name that invites the wrong guess. SparseCores sound like they might be TPU's dedicated mixture-of-experts hardware, and TPU7x has four of them per chip, v6e has two<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-1">1</a>. Google's own architecture documentation is explicit about what they actually do: "SparseCores are dataflow processors that accelerate models using sparse operations. A primary use case is accelerating recommendation models, which rely heavily on embeddings"<a class="cite" href="#ref-3">3</a>. They are purpose-built for the irregular-memory-access pattern of large embedding-table lookups &#8212; the recommendation-system workload class &#8212; not for routing tokens to experts and running an all-to-all dispatch/combine across chips the way DeepEP does for DeepSeek-class MoE inference. No source examined for this module describes SparseCores being used for LLM MoE expert routing.</p>
+
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Do not read "TPU has dedicated sparse-compute hardware" as "TPU has a hardware MoE-dispatch engine." SparseCores accelerate embedding-table gathers for recommendation-style sparsity<a class="cite" href="#ref-3">3</a>; DeepEP-style expert dispatch is a communication-pattern problem (all-to-all token routing across chips, Module 5 &#167;1), not an embedding-lookup problem, and the sources here document no TPU hardware or kernel library purpose-built for it.</p></aside>
+
+<h3 id="ep-support-matrix">6.2 What the open-source stack actually ships: EP as a generic parallelism dimension</h3>
+<p><code>tpu-inference</code>'s own parallelism-technique support matrix (snapshot 2026-08-27) lists Expert Parallelism (EP) alongside pipeline, data, and tensor parallelism as a supported sharding dimension: Passing at single-host for both the Flax and Torchax backends, Untested at multi-host for both<a class="cite" href="#ref-12">12</a>. The same README's quantization-support tables list "Fused MoE" and "gmm" (grouped matrix multiply, the standard MoE-batched-matmul primitive) kernels as Untested across every listed weight/activation precision combination in the same snapshot<a class="cite" href="#ref-12">12</a>. Taken together: MoE models can be sharded across chips using EP as a parallelism strategy within a single host today, but there is no documented, validated all-to-all dispatch/combine kernel library at DeepSeek/DeepEP scale &#8212; cross-node, redundant-expert-aware, load-balanced &#8212; in the sources surveyed for this module. EPLB's redundant-expert placement algorithm and its hierarchical-vs-global policy split (Module 5 &#167;3&#8211;4) have no documented TPU-side counterpart here.</p>
+
+<h3 id="sgl-jax-bridge">6.3 SGL-JAX and SGL-torchtpu: a bridge, not a native mechanism</h3>
+<p>The clearest evidence that wide-EP-on-TPU is still being built, rather than already shipped, is where it appears: as a forthcoming feature of a GPU-ecosystem project being ported onto TPU, not as a Google-native capability. SGLang already runs on current TPU generations via SGL-JAX, with support for Gemma, Qwen, DeepSeek, GLM, Mimo, Kimi, Ling, MiniMax, and Grok, plus the Wan and Flux diffusion models<a class="cite" href="#ref-13">13</a>. RadixArk's announced follow-on, SGL-torchtpu, is a PyTorch-native TPU backend with eager execution and MPMD (multiple-program multiple-data) support, and its feature list explicitly includes "parallelism (data, tensor, expert, context, and pipeline)"<a class="cite" href="#ref-13">13</a> &#8212; expert parallelism named as a roadmap item for a bridge project, not as a description of an existing Google-native TPU mechanism.</p>
+
+<h3 id="ep-absence-summary">6.4 Summary: no DeepEP analog, cross-referenced</h3>
+<p>Put plainly, against Module 5 and Module 6's terms: TPU has EP as a sharding dimension<a class="cite" href="#ref-12">12</a>, and TPU has SGLang's own wide-EP machinery arriving via SGL-JAX/SGL-torchtpu as those ports mature<a class="cite" href="#ref-13">13</a> &#8212; which will, once landed, presumably carry DeepEP-equivalent all-to-all kernels onto TPU through SGLang's own code paths rather than a TPU-native equivalent. What TPU does not have, in any source examined for this module, is a native, Google-published, DeepEP-equivalent all-to-all dispatch/combine kernel library, an EPLB-equivalent redundant-expert placement algorithm, or a published DeepSeek-scale (EP144/EP320-class) production deployment on TPU. This is a documented absence as of 2026-09-17, not a permanent architectural one &#8212; the same "still consolidating" caveat from &#167;4.3 applies.</p>
+
+<h2 id="operational-realities">7. Operational realities the GPU-stack modules don't surface</h2>
+<p>Two facts from Google's own Pathways documentation don't map onto anything Modules 1&#8211;16 needed to cover explicitly, because they are specific to how Pathways-on-Cloud is currently packaged and accessed rather than to any GPU-vs-TPU hardware difference.</p>
+
+<h3 id="checkpoint-restore">7.1 Checkpoint restoration time as a first-class number</h3>
+<p>Google's multi-host inference walkthrough reports concrete checkpoint-restoration times for its two worked examples: approximately 7 minutes to restore a Llama 3.1 405B (int8) checkpoint onto a v6e-16 slice, and approximately 2 minutes for a Llama 2 70B (int8) checkpoint onto two v6e-8 slices<a class="cite" href="#ref-8">8</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f4t"><title id="f4t">Bar chart comparing checkpoint restoration time in minutes for Llama 3.1 405B on a v6e-16 slice versus Llama 2 70B on two v6e-8 slices</title>
+<line x1="80" y1="40" x2="80" y2="220" class="d-axis"/>
+<line x1="80" y1="220" x2="700" y2="220" class="d-axis"/>
+<text x="40" y="45" text-anchor="middle" class="d-small d-text-light">min</text>
+<line x1="75" y1="66" x2="700" y2="66" class="d-grid"/><text x="65" y="70" text-anchor="end" class="d-mono d-small">7</text>
+<line x1="75" y1="132" x2="700" y2="132" class="d-grid"/><text x="65" y="136" text-anchor="end" class="d-mono d-small">4</text>
+<line x1="75" y1="198" x2="700" y2="198" class="d-grid"/><text x="65" y="202" text-anchor="end" class="d-mono d-small">1</text>
+<rect x="240" y="66" width="140" height="154" class="d-fill-orange"/>
+<text x="310" y="56" text-anchor="middle" class="d-mono d-small">&#8776;7 min</text>
+<text x="310" y="240" text-anchor="middle" class="d-small">Llama 3.1-405B, v6e-16</text>
+<rect x="470" y="176" width="140" height="44" class="d-fill-blue"/>
+<text x="540" y="166" text-anchor="middle" class="d-mono d-small">&#8776;2 min</text>
+<text x="540" y="240" text-anchor="middle" class="d-small">Llama 2-70B, two v6e-8</text>
+</svg>
+<figcaption><b>Figure 4.</b> Checkpoint restoration time scales with model size and slice count, not just model size: the 405B-parameter model on a 16-chip slice takes roughly 3.5&#215; longer to restore than the 70B model on two 8-chip slices, in Google's own worked examples<a class="cite" href="#ref-8">8</a>.</figcaption>
+</figure>
+
+<p>No comparable published number appears in Modules 1&#8211;16 for GPU-side checkpoint loading, because none of those modules' sources reported one &#8212; but the mechanism it stands in for is not new: it is the same weight-loading step Module 9 covers under ModelExpress (Dynamo's GPU-to-GPU weight streaming over NIXL/NVLink). What is distinctive here is that Google states the number directly, as a planning input, rather than leaving it implicit. For fleet operations &#8212; the rolling-upgrade and drain-before-remove patterns Module 14 &#167;7 covers for GPU pods &#8212; a multi-minute checkpoint-restore step per slice is a real constraint on how fast you can cycle a slice through an upgrade, and it scales with both model size and the number of hosts a restore has to fan out across.</p>
+
+<h3 id="access-model">7.2 Access model: not yet fully self-serve</h3>
+<p>Pathways on Cloud is explicitly not a fully self-serve GA product as of this writing: "to get access to Pathways, you need to contact your Google Cloud Account representative"<a class="cite" href="#ref-8">8</a>. This is a meaningful contrast with the rest of this course's stack, none of which gates access behind an account-representative conversation: vLLM, SGLang, TensorRT-LLM, Dynamo, and llm-d are all installable directly from their public repositories on any cluster with the right accelerators, and <code>tpu-inference</code> itself is a public, pip-installable, actively-developed open-source project with a public issue tracker and a live support matrix<a class="cite" href="#ref-12">12</a>. The practical decision this creates &#8212; Pathways' access-gated, Google-operated path versus the self-serve <code>tpu-inference</code>/SGL-JAX path &#8212; is substantial enough to be one of the two positions in the next section.</p>
+
+<h2 id="what-ports">8. Mapping the course onto TPU: what ports, what substitutes, what's absent</h2>
+<p>Collecting &#167;1&#8211;7 and the cross-references to Modules 1&#8211;16 into one table, the same exercise Module 17 runs for AMD's Instinct platform.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 2.</b> Course mechanism (Modules 1&#8211;16) mapped to its TPU-side status, per the sources examined in this module.</caption>
+<thead><tr><th>GPU-stack mechanism</th><th>TPU-side status</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td class="row">NVLink/NVSwitch (Mod. 1)</td><td>Structural substitute</td><td>ICI mesh/torus + OCS between cubes; direct point-to-point, not switched (&#167;1)</td></tr>
+<tr><td class="row">InfiniBand/RoCE (Mod. 1)</td><td>Structural substitute</td><td>Data-center network (DCN); a comparable or larger per-chip bandwidth cliff (&#167;5.2)</td></tr>
+<tr><td class="row">Dynamo / llm-d orchestration (Mod. 9&#8211;10)</td><td>Structural substitute</td><td>Pathways: single-controller dataflow graph, not an external scheduler over autonomous engines (&#167;3)</td></tr>
+<tr><td class="row">LeaderWorkerSet (Mod. 14)</td><td data-best>1:1 port</td><td>Pathways on Cloud deploys over the same LWS API (&#167;3.2)</td></tr>
+<tr><td class="row">vLLM / SGLang / TensorRT-LLM (Mod. 11&#8211;13)</td><td>Partial port, consolidating</td><td>JetStream (legacy) folding into vLLM's <code>tpu-inference</code>; SGLang via SGL-JAX/SGL-torchtpu (&#167;4, &#167;6.3)</td></tr>
+<tr><td class="row">PD disaggregation / KV connectors (Mod. 3&#8211;4)</td><td>Structural substitute</td><td>Whole-slice separation over DCN, not a per-process connector plugin; same interference motivation (&#167;5)</td></tr>
+<tr><td class="row">Wide-EP, DeepEP all-to-all, EPLB (Mod. 5&#8211;6)</td><td data-worst>No documented equivalent</td><td>EP exists as a sharding dimension only; no native all-to-all kernel library or redundant-expert placement found (&#167;6)</td></tr>
+<tr><td class="row">KV-cache-aware / prefix-cache routing (Mod. 2)</td><td>Not evidenced</td><td>No TPU-side component analogous to Dynamo's Router or llm-d's prefix-cache scorer documented in sources examined (&#167;3.3)</td></tr>
+</tbody>
+</table>
+<p class="small muted">"Not evidenced" and "no documented equivalent" describe the sources surveyed for this module, not a claim that no such component exists anywhere at Google &#8212; see &#167;4.3 and the disagreement below on how much weight to put on documentation gaps for a fast-moving, partly access-gated stack.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The disagreement on TPU serving is less "which mechanism is better" than "which of two paths onto TPU should you bet a production deployment on" &#8212; Google's own Pathways-plus-JetStream-lineage stack, or the open-source vLLM/SGLang ports that carry this course's GPU-native tooling onto TPU. The two paths are not mutually exclusive today, and neither position disputes the hardware facts in &#167;1&#8211;2; they disagree about which software layer to depend on.</p>
+<div class="positions">
+<article class="position">
+<h4>Bet on Google's own Pathways/JetStream-lineage stack</h4>
+<p class="who">Google's own positioning, most directly in its inference-updates blog<a class="cite" href="#ref-10">10</a></p>
+<p>Google describes JetStream as "based on the same inference stack used to serve Gemini models"<a class="cite" href="#ref-10">10</a> &#8212; a direct claim that this is the production-hardened path, co-designed with the hardware (Ironwood's own architecture blog frames prefill/decode optimization as a chip-design decision<a class="cite" href="#ref-5">5</a>) and operated at Google's own scale before anyone outside Google touches it. Pathways' single-controller model is also the one substantiated by a peer-reviewed systems paper with concrete utilization numbers<a class="cite" href="#ref-7">7</a>, not just a vendor blog claim.</p>
+<ul class="pros"><li>Co-designed with the chip; Google has operated it at Gemini scale before external release<a class="cite" href="#ref-10">10</a></li><li>Single-controller model has a published, peer-reviewed performance case (near-100% utilization at 2,048 TPUs)<a class="cite" href="#ref-7">7</a></li></ul>
+<ul class="cons"><li>Access-gated: requires contacting a Google Cloud account representative, not self-serve<a class="cite" href="#ref-8">8</a></li><li>Does not carry this course's GPU-side tooling (KV connectors, EPP-style routers) onto TPU; you adopt a different deployment model, not a port of the one you already know</li></ul>
+</article>
+<article class="position">
+<h4>Bet on the open vLLM/<code>tpu-inference</code> and SGLang/SGL-JAX ports</h4>
+<p class="who">The vLLM project's own framing of <code>tpu-inference</code><a class="cite" href="#ref-12">12</a> and SGLang/RadixArk's TPU announcement<a class="cite" href="#ref-13">13</a></p>
+<p><code>tpu-inference</code> is public, pip-installable, and explicitly designed to "retain vLLM standardization: keep the same user experience, telemetry, and interface"<a class="cite" href="#ref-12">12</a> across GPU and TPU &#8212; meaning the router, connector, and observability concepts from Modules 2, 4, and 11 carry over largely unchanged, even though the underlying kernels and parallelism plumbing are TPU-specific. SGLang's SGL-JAX bridge makes the same bet from the other open-source engine<a class="cite" href="#ref-13">13</a>. Neither requires an account-representative conversation to try.</p>
+<ul class="pros"><li>Self-serve, public, actively developed with a live support matrix<a class="cite" href="#ref-12">12</a></li><li>Preserves the operational knowledge (routing, connectors, observability) this course already built for the GPU stack</li></ul>
+<ul class="cons"><li>Multi-host P/D and multi-host EP are marked Untested in the same live matrix as of 2026-08-27<a class="cite" href="#ref-12">12</a> &#8212; less production mileage than Google's internal stack claims</li><li>No published DeepSeek-scale wide-EP reproduction on TPU exists yet in the sources surveyed, unlike the GPU-side SGLang reproduction Module 6 covers</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>For a team already inside Google Cloud's enterprise relationship and running Gemini-adjacent workloads, Google's own Pathways stack is the lower-risk default &#8212; it is what Google itself reports running in production, and the access gate is a business-process cost, not a technical one. For a team that already operates the vLLM/SGLang stack this course spends fourteen modules on and wants one operational model across GPU and TPU fleets, <code>tpu-inference</code> and SGL-JAX are the more coherent bet, at the cost of adopting features (multi-host EP, at minimum) that are demonstrably less mature by the projects' own support matrices<a class="cite" href="#ref-12">12</a>. What would settle it: a published, reproducible, DeepSeek-or-larger-class wide-EP benchmark on TPU from either path, analogous to the GPU-side SGLang reproduction in Module 6 &#8212; none exists in the sources surveyed for this module as of 2026-09-17.</p>
+</div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Three things in this module are likely to be stale within a year, in order of how fast they are moving. Fastest: the <code>tpu-inference</code> feature-support matrix cited in &#167;5.3 and &#167;6.2 is a live, auto-updated dashboard, not a fixed release note<a class="cite" href="#ref-12">12</a> &#8212; the specific Passing/Untested statuses quoted here are a snapshot dated 2026-08-27 and should be re-checked directly before any deployment decision. Next fastest: the JetStream-to-<code>tpu-inference</code> consolidation itself (&#167;4.3) is seven months old as of this writing and the ecosystem has not finished settling &#8212; whether Pathways' own <code>jax-tpu</code> engine eventually runs on <code>tpu-inference</code> internals, stays on MaxText/JetStream permanently, or the two remain parallel paths is not resolved in any source examined here. Slowest but still worth tracking: Pathways' access-gated model (&#167;7.2) is a business-process fact about Google Cloud's current rollout, not a technical constraint, and vendors routinely move such gates to self-serve GA as a product matures.</p>
+<p>Module 1 opened this course by asking what changes, physically and logically, the instant a second node appears. On TPU the answer has the same shape and different constants: within one ICI-connected slice, the chip-to-chip question barely changes from the single-node case &#8212; a torus instead of a switch, but still one low-latency domain you can treat as one addressable pool. The change shows up at two boundaries instead of one: the host boundary within a slice (&#167;2.3, where TPU7x's 4-chips-per-host ratio means "node" stops meaning what it means on an 8-GPU HGX host), and the slice boundary itself, where ICI's 800&#8211;1,200 GB/s gives way to a data-center network running two orders of magnitude slower (&#167;5.2). Sixteen modules on NVLink, InfiniBand, and RoCE turn out to have taught the right question &#8212; where is the low-latency domain's edge, and what happens when a request crosses it &#8212; even where every specific fabric, orchestrator, and serving engine on this hardware has a different name.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>Google. <em>TPU v6e</em> (Google Cloud Documentation). 2026. <a href="https://docs.cloud.google.com/tpu/docs/v6e">https://docs.cloud.google.com/tpu/docs/v6e</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 256-chip pod, 800 GB/s bidirectional ICI/chip, 32 GB HBM @ 1,638 GB/s, 918 TFLOPs bf16/chip, 234.9 PFLOPs pod peak, 2D torus, the 8-chip inference-optimized v6e-8 slice, and multi-host scaling to 16&#215;16 across up to 64 VMs.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>NVIDIA. <em>H100 GPU</em> (product page). 2026. <a href="https://www.nvidia.com/en-us/data-center/h100/">https://www.nvidia.com/en-us/data-center/h100/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NVLink4 900 GB/s per-GPU bandwidth, the Figure 1 and Module 1 baseline for full-bisection NVSwitch comparison.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>Google. <em>TPU architecture</em> (system-architecture-tpu-vm, Google Cloud Documentation). 2026. <a href="https://docs.cloud.google.com/tpu/docs/system-architecture-tpu-vm">https://docs.cloud.google.com/tpu/docs/system-architecture-tpu-vm</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Pod/slice definitions, torus wraparound framing, SparseCore counts and purpose (embeddings, not MoE dispatch), ICI resiliency/OCS fault routing, 3D topology notation (<code>AxBxC</code>, multiples of four), TPU7x's 4-chips-per-host ratio.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>Google. <em>TPU7x</em> (Google Cloud Documentation). 2026. <a href="https://docs.cloud.google.com/tpu/docs/tpu7x">https://docs.cloud.google.com/tpu/docs/tpu7x</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 9,216-chip pod, 3D torus, 192 GB HBM @ &#8776;7.37 TB/s/chip, 2,307/4,614 TFLOPs BF16/FP8, 1,200 GB/s ICI/chip, 100 Gbps DCN/chip, dual-chiplet design, 4-chip VM (224 vCPUs/960 GB RAM), two TensorCores/four SparseCores per chip.</span></li>
+<li id="ref-5"><span class="ref-type">blog</span>Google Cloud. <em>Inside the Ironwood TPU codesigned AI stack</em>. Google Cloud Blog, 2026. <a href="https://cloud.google.com/blog/products/compute/inside-the-ironwood-tpu-codesigned-ai-stack">https://cloud.google.com/blog/products/compute/inside-the-ironwood-tpu-codesigned-ai-stack</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 3D torus within 64-chip cubes joined by Optical Circuit Switch (OCS) as "a dynamic, reconfigurable optical network," and the compute-intensive-prefill/memory-bandwidth-intensive-decode framing.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>NVIDIA. <em>GB200 NVL72</em> (product page). 2026. <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">https://www.nvidia.com/en-us/data-center/gb200-nvl72/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 130 TB/s rack-wide NVLink bandwidth and 13.4 TB HBM3e @ 576 TB/s across 72 GPUs, for the Table 1 per-chip comparison.</span></li>
+<li id="ref-7"><span class="ref-type">paper</span>Barham, P., Chowdhery, A., Dean, J., Ghemawat, S., Hand, S., Hurt, D., Isard, M., Lim, H., Pang, R., Roy, S., Saeta, B., Schuh, P., Sepassi, R., El Shafey, L., Thekkath, C. A., Wu, Y. <em>Pathways: Asynchronous Distributed Dataflow for ML</em>. MLSys 2022 / arXiv:2203.12533, 2022. <a href="https://arxiv.org/abs/2203.12533">https://arxiv.org/abs/2203.12533</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the single-controller model definition versus SPMD/multi-controller systems, gang-scheduling across accelerator islands, and the near-100% utilization at 2,048 TPUs / 16-stage-pipeline-over-two-islands performance result.</span></li>
+<li id="ref-8"><span class="ref-type">official</span>Google. <em>Perform multihost inference using Pathways</em> (AI Hypercomputer Documentation). 2026. <a href="https://docs.cloud.google.com/ai-hypercomputer/docs/workloads/pathways-on-cloud/multihost-inference">https://docs.cloud.google.com/ai-hypercomputer/docs/workloads/pathways-on-cloud/multihost-inference</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the four named containers (pathways-proxy, pathways-rm, jax-tpu, jetstream-http) and their ports, LeaderWorkerSet deployment shape, the aggregated (single v6e-16 slice) vs. disaggregated (two v6e-8 slices, <code>subGroupPolicy</code>, <code>ExperimentalMaxtextDisaggregatedServer_8</code>) examples, the prefill/decode definitions, checkpoint-restoration timings (&#8776;7 min Llama 3.1-405B, &#8776;2 min Llama 2-70B), and the account-representative access requirement.</span></li>
+<li id="ref-9"><span class="ref-type">repo</span>Google (AI-Hypercomputer). <em>JetStream</em> (README, main branch). 2026. <a href="https://github.com/AI-Hypercomputer/JetStream/blob/main/README.md">https://github.com/AI-Hypercomputer/JetStream/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: JetStream's self-description as a throughput/memory-optimized XLA inference engine, its JAX/MaxText and PyTorch reference engine implementations, the MaxText engine's ICI-mapped sharding flags (<code>ici_fsdp_parallelism</code>, <code>ici_tensor_parallelism</code>, <code>ici_autoregressive_parallelism</code>) and <code>maxengine_server</code> launch command (docs/online-inference-with-maxtext-engine.md, same repository), and the archival notice (repository archived February 1, 2026, functionality migrated to <code>tpu-inference</code>).</span></li>
+<li id="ref-10"><span class="ref-type">blog</span>Google Cloud. <em>AI Hypercomputer inference updates for Google Cloud TPU and GPU</em>. Google Cloud Blog, 2025. <a href="https://cloud.google.com/blog/products/compute/ai-hypercomputer-inference-updates-for-google-cloud-tpu-and-gpu">https://cloud.google.com/blog/products/compute/ai-hypercomputer-inference-updates-for-google-cloud-tpu-and-gpu</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the April 2025 Pathways-in-JetStream integration; multi-host Llama 3.1 405B at 1,703 tok/s / 3&#215; inference-per-dollar vs. v5e; disaggregated-serving Llama2-70B (7&#215; TTFT, &#8776;3&#215; TPOT) gains; the "same inference stack used to serve Gemini models" claim; and vLLM-on-TPU's initial framing as an alternative to JetStream.</span></li>
+<li id="ref-11"><span class="ref-type">blog</span>vLLM Team. <em>vLLM TPU: A New Unified Backend Supporting PyTorch and JAX on TPU</em>. vLLM Blog, 2025-10-16. <a href="https://blog.vllm.ai/2025/10/16/vllm-tpu.html">https://blog.vllm.ai/2025/10/16/vllm-tpu.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Torchax PyTorch-to-JAX bridge and single JAX&#8594;XLA lowering path, the &#8776;20% throughput gain over direct PyTorch/XLA, the 3.6&#215;/2.1&#215; gains over the February-2025 prototype, and the single-host-experimental/multihost-roadmap status of P/D disaggregation as of that date.</span></li>
+<li id="ref-12"><span class="ref-type">repo</span>vLLM Project. <em>tpu-inference</em> (README, incl. live feature-support matrices). 2026. <a href="https://github.com/vllm-project/tpu-inference">https://github.com/vllm-project/tpu-inference</a>. Accessed 2026-09-17 (support-matrix snapshot dated 2026-08-27 in-repo). <span class="ref-use">Used for: the "unifying JAX and PyTorch under a single lowering path" and "retain vLLM standardization" self-description; recommended (v7x/v5e/v6e) vs. experimental (v3/v4/v5p) TPU generations; the Core Features table's "DCN-based P/D disaggregation" (Passing) and "multi-host" (Untested) rows; the Parallelism Techniques table's EP row (single-host Passing, multi-host Untested); and the Fused-MoE/gmm quantization rows (Untested).</span></li>
+<li id="ref-13"><span class="ref-type">blog</span>LMSYS Org / RadixArk. <em>RadixArk Joins Forces with Google to Bring Full SGLang Features to TPUs</em>. LMSYS Blog, 2026-07-30. <a href="https://www.lmsys.org/blog/2026-07-30-sglang-google-tpu/">https://www.lmsys.org/blog/2026-07-30-sglang-google-tpu/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: SGL-JAX's current TPU model support (Gemma, Qwen, DeepSeek, GLM, Mimo, Kimi, Ling, MiniMax, Grok, Wan, Flux), and the planned SGL-torchtpu backend's roadmap including expert parallelism, Radix Cache, HiCache, quantization, and speculative decoding.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

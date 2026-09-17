@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AMD MI300X/MI355X Multi-Node Serving: RCCL, InfiniBand/RoCE, and vLLM-ROCm · Multi-Node LLM Inference</title>
+<meta name="description" content="What transfers from the NVIDIA-centric multi-node inference stack to AMD's Instinct platform and what does not: RCCL's IB/RoCE setup, MI300X/MI355X's interconnect numbers, MoRI as ROCm's DeepEP equivalent, and vLLM-ROCm's DP+EP results.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference · Module 17</p>
+<h1>AMD MI300X/MI355X Multi-Node Serving: RCCL, InfiniBand/RoCE, and vLLM-ROCm</h1>
+<p class="lede">Modules 1&#8211;15 built a mental model of multi-node serving entirely on NVIDIA parts: NVLink, NCCL, DeepEP, NIXL, Dynamo, TensorRT-LLM. This module runs the same questions against AMD's Instinct platform &#8212; MI300X and MI355X &#8212; and is explicit about which pieces are a drop-in substitution, which are a real but younger reimplementation, and which have no AMD-side answer in the sources available as of this writing. After reading, you can take any mechanism from Modules 1&#8211;15 and say what happens to it on ROCm.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>35 min</b> read</span>
+<span class="chip"><b>15</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Modules 1, 4, 5</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">AMD bandwidth ladder: Infinity Fabric inside an 8-GPU MI300X node vs. RoCEv2 between nodes, log scale GB/s</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<line x1="230" y1="20" x2="230" y2="300" class="d-axis"/>
+<text x="185" y="30" text-anchor="end" class="d-text-light d-small">intra-node (Infinity Fabric)</text>
+<rect x="235" y="55" width="448" height="36" rx="6" class="d-block-2"/>
+<text x="185" y="78" text-anchor="end" class="d-small">4th-gen IF, MI300X (per GPU)</text>
+<text x="690" y="78" class="d-mono d-small d-bold">896 GB/s</text>
+<rect x="235" y="101" width="470" height="36" rx="6" class="d-block-2"/>
+<text x="185" y="124" text-anchor="end" class="d-small">5th-gen IF, MI355X (per chip)</text>
+<text x="712" y="124" class="d-mono d-small d-bold">538 GB/s&#215;7 mesh</text>
+<line x1="230" y1="150" x2="230" y2="300" class="d-dashed d-outline"/>
+<text x="185" y="163" text-anchor="end" class="d-text-light d-small">inter-node (RoCEv2)</text>
+<rect x="235" y="180" width="150" height="34" rx="6" class="d-block-accent"/>
+<text x="392" y="202" class="d-mono d-small d-bold">50 GB/s / port</text>
+<text x="185" y="202" text-anchor="end" class="d-small">Pollara 400GbE NIC (1 rail)</text>
+<rect x="235" y="222" width="240" height="34" rx="6" class="d-block-accent"/>
+<text x="482" y="244" class="d-mono d-small d-bold">400 GB/s aggregate</text>
+<text x="185" y="244" text-anchor="end" class="d-small">8-NIC node, all rails</text>
+<rect x="235" y="264" width="60" height="34" rx="6" class="d-block-accent"/>
+<text x="302" y="286" class="d-mono d-small d-bold">90 GB/s (analog)</text>
+<text x="185" y="286" text-anchor="end" class="d-small">single flow, all-to-all class</text>
+<line x1="230" y1="300" x2="760" y2="300" class="d-axis"/>
+<text x="490" y="325" text-anchor="middle" class="d-text-light d-small">bandwidth per link or aggregate, log scale</text>
+</svg>
+<figcaption><b>Figure 1.</b> Same cliff shape as Module 1's NVLink&#8594;InfiniBand ladder, different labels: Infinity Fabric holds 896 GB/s per GPU inside an 8-GPU MI300X node (a direct mesh of seven 128 GB/s bidirectional links, not a switched fabric)<a class="cite" href="#ref-1">1</a>, and the moment a request crosses to another node the transport becomes RoCEv2 over a 400 Gb/s (50 GB/s) NIC per rail &#8212; &#167;3 gives the exact NIC and aggregate node figures<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="same-problem-different-fabric">1. Same problem, a different fabric</h2>
+<p>Everything Modules 1&#8211;15 established about <em>why</em> multi-node serving is hard &#8212; the bandwidth cliff at the node boundary, the goodput case for prefill/decode disaggregation, the all-to-all shape of cross-node MoE, KV cache as a tiered cluster resource &#8212; is hardware-agnostic. None of that gets re-derived here. What changes on AMD's Instinct platform is the layer directly underneath those ideas: the physical interconnect, the collective-communication library, the wide-expert-parallel dispatch kernel, and the maturity of the serving-engine integration that wires them together. This module works through each of those four layers in turn, then closes with a single table mapping every named NVIDIA-stack mechanism from Modules 1&#8211;15 to its AMD-side equivalent, partial equivalent, or gap.</p>
+<p>The comparison is grounded in two AMD accelerators: MI300X, shipping since December 2023 and the subject of AMD's own Hot Chips 2024 architecture talk<a class="cite" href="#ref-1">1</a>, and MI355X, the next generation whose specs in this module come from a third-party aggregation source rather than an AMD-hosted product page &#8212; flagged explicitly in &#167;2.4 because it matters for how much confidence to put in those specific numbers.</p>
+
+<h2 id="mi300x-mi355x-architecture">2. MI300X and MI355X: memory-first architecture</h2>
+<p>AMD's pitch for Instinct in LLM inference has always been memory capacity first, interconnect second &#8212; the opposite emphasis from NVIDIA's NVLink-centric story in Module 1. MI300X packs 153 billion transistors across a multi-die module built on TSMC 5nm/6nm FinFET, organized as eight XCD (accelerator complex die) compute chiplets plus four IOD (I/O die) memory controllers, all connected through an Infinity Fabric Advanced Package interposer<a class="cite" href="#ref-1">1</a>. The number that drives everything downstream in this course &#8212; how many GPUs an EP or TP group needs before it crosses a node boundary &#8212; is memory capacity: 192 GB of HBM3 per GPU, versus 80 GB on an H100 SXM<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</p>
+
+<h3 id="mi300x-die">2.1 The chip: 304 compute units, 5.2&#8211;5.3 TB/s HBM bandwidth</h3>
+<p>Each MI300X exposes 304 Compute Units and 1,216 Matrix Cores to software, backed by 192 GB of HBM3 across eight memory stacks<a class="cite" href="#ref-1">1</a>. AMD's own Hot Chips slide states the per-GPU HBM bandwidth as 5.2 TB/s<a class="cite" href="#ref-1">1</a>; AMD's OEM-partner data sheet (reproduced verbatim in Lenovo's ThinkSystem product guide for the same part) states it as 5.3 TB/s<a class="cite" href="#ref-3">3</a>. That 0.1 TB/s gap is small enough to be rounding, but it is not arbitrary: multiply each figure by eight GPUs and only one of them reproduces AMD's own published 8-GPU platform aggregate.</p>
+
+<details class="more">
+<summary>Worked check: which per-GPU number is consistent with AMD's own platform aggregate?</summary>
+<p>AMD states the 8-GPU MI300X platform aggregate HBM bandwidth as 42.4 TB/s<a class="cite" href="#ref-1">1</a>. Dividing that by 8:</p>
+$$ 42.4\ \text{TB/s} \div 8 = 5.30\ \text{TB/s per GPU} $$
+<p>That matches the 5.3 TB/s figure from the OEM data sheet exactly, not the 5.2 TB/s figure from the architecture talk. Going the other direction, 5.2 TB/s &#215; 8 = 41.6 TB/s, about 1.9% below the published platform aggregate. The practical takeaway: use the platform-level number (42.4 TB/s) for capacity planning, since it is the one AMD's own materials are internally consistent about; treat the single-GPU 5.2 TB/s figure as a rounded headline number, not the one to multiply.</p>
+</details>
+
+<h3 id="mi300x-8gpu-platform">2.2 The 8-GPU platform: a direct mesh, not a switched fabric</h3>
+<p>Module 1 &#167;1 established that H100/B200 GPUs inside an 8-GPU node reach any other GPU at the full per-GPU NVLink rate because NVSwitch chips provide a switched, full-bisection fabric. AMD's 8-GPU MI300X platform (the "UBB", universal baseboard) takes a structurally different approach: there is no switch chip. Each of the eight MI300X OAM modules has seven point-to-point bidirectional Infinity Fabric links running at 128 GB/s each, wired so that every GPU connects directly to every other GPU &#8212; a fully-connected mesh<a class="cite" href="#ref-1">1</a>. Seven links at 128 GB/s per link gives the per-GPU aggregate bandwidth figure quoted throughout AMD's materials:</p>
+$$ 7 \times 128\ \text{GB/s} = 896\ \text{GB/s per GPU} $$
+<p>This is a direct, unswitched topology: a GPU-to-GPU hop never traverses a third chip the way it might on a switched fabric, but it also means the mesh does not scale past eight GPUs without adding a network hop &#8212; there is no AMD analog to NVL72's 72-GPU single-domain switch fabric (Module 1 &#167;5) in the sources for this module. Beyond eight GPUs, AMD's own deployment guidance is to leave the mesh (Infinity Fabric "XGMI island") and use pipeline parallelism or cross-node RDMA instead of trying to extend TP<a class="cite" href="#ref-4">4</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 380" role="img" aria-labelledby="f2t"><title id="f2t">8-GPU MI300X platform: direct point-to-point mesh, seven 128 GB/s bidirectional links per GPU, no switch chip</title>
+<g>
+<circle cx="240" cy="80" r="34" class="d-block-2"/><text x="240" y="85" text-anchor="middle" class="d-text-inv d-small d-bold">GPU0</text>
+<circle cx="440" cy="60" r="34" class="d-block-2"/><text x="440" y="65" text-anchor="middle" class="d-text-inv d-small d-bold">GPU1</text>
+<circle cx="600" cy="110" r="34" class="d-block-2"/><text x="600" y="115" text-anchor="middle" class="d-text-inv d-small d-bold">GPU2</text>
+<circle cx="640" cy="260" r="34" class="d-block-2"/><text x="640" y="265" text-anchor="middle" class="d-text-inv d-small d-bold">GPU3</text>
+<circle cx="520" cy="330" r="34" class="d-block-2"/><text x="520" y="335" text-anchor="middle" class="d-text-inv d-small d-bold">GPU4</text>
+<circle cx="330" cy="335" r="34" class="d-block-2"/><text x="330" y="340" text-anchor="middle" class="d-text-inv d-small d-bold">GPU5</text>
+<circle cx="180" cy="260" r="34" class="d-block-2"/><text x="180" y="265" text-anchor="middle" class="d-text-inv d-small d-bold">GPU6</text>
+<circle cx="140" cy="170" r="34" class="d-block-2"/><text x="140" y="175" text-anchor="middle" class="d-text-inv d-small d-bold">GPU7</text>
+<g class="d-outline d-dim" style="stroke-width:1">
+<line x1="240" y1="80" x2="440" y2="60"/><line x1="240" y1="80" x2="600" y2="110"/><line x1="240" y1="80" x2="640" y2="260"/><line x1="240" y1="80" x2="520" y2="330"/><line x1="240" y1="80" x2="330" y2="335"/><line x1="240" y1="80" x2="180" y2="260"/><line x1="240" y1="80" x2="140" y2="170"/>
+<line x1="440" y1="60" x2="600" y2="110"/><line x1="440" y1="60" x2="640" y2="260"/><line x1="440" y1="60" x2="520" y2="330"/><line x1="440" y1="60" x2="330" y2="335"/><line x1="440" y1="60" x2="180" y2="260"/><line x1="440" y1="60" x2="140" y2="170"/>
+<line x1="600" y1="110" x2="640" y2="260"/><line x1="600" y1="110" x2="520" y2="330"/><line x1="600" y1="110" x2="330" y2="335"/><line x1="600" y1="110" x2="180" y2="260"/><line x1="600" y1="110" x2="140" y2="170"/>
+<line x1="640" y1="260" x2="520" y2="330"/><line x1="640" y1="260" x2="330" y2="335"/><line x1="640" y1="260" x2="180" y2="260"/><line x1="640" y1="260" x2="140" y2="170"/>
+<line x1="520" y1="330" x2="330" y2="335"/><line x1="520" y1="330" x2="180" y2="260"/><line x1="520" y1="330" x2="140" y2="170"/>
+<line x1="330" y1="335" x2="180" y2="260"/><line x1="330" y1="335" x2="140" y2="170"/>
+<line x1="180" y1="260" x2="140" y2="170"/>
+</g>
+</g>
+<text x="400" y="20" text-anchor="middle" class="d-title">8&#215; MI300X OAM, direct Infinity Fabric mesh</text>
+<text x="400" y="365" text-anchor="middle" class="d-mono d-small">7 bidirectional links &#215; 128 GB/s = 896 GB/s per GPU, no switch chip</text>
+</svg>
+<figcaption><b>Figure 2.</b> Every MI300X on the 8-GPU UBB baseboard connects directly to every other MI300X &#8212; a fully-connected mesh of point-to-point Infinity Fabric links, not a switched fabric routed through NVSwitch-class silicon. Data: AMD Hot Chips 2024<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="mi300x-vs-h100">2.3 8-GPU MI300X platform vs. 8-GPU H100 HGX</h3>
+<p>Putting the mesh's per-GPU bandwidth together with each GPU's 192 GB of HBM3 gives the platform-level comparison AMD leads with: an 8-GPU MI300X platform against an 8-GPU H100 HGX.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f3t"><title id="f3t">8-GPU MI300X platform vs 8-GPU H100 HGX: aggregate HBM capacity and bandwidth, bar chart</title>
+<line x1="70" y1="20" x2="70" y2="220" class="d-axis"/>
+<line x1="70" y1="220" x2="740" y2="220" class="d-axis"/>
+<text x="30" y="225" class="d-small d-text-light">0</text>
+<text x="30" y="130" class="d-small d-text-light">0.75 TB</text>
+<text x="30" y="30" class="d-small d-text-light">1.5 TB</text>
+<line x1="65" y1="125" x2="740" y2="125" class="d-grid"/>
+<rect x="150" y="192" width="90" height="28" class="d-fill-blue"/><text x="195" y="240" text-anchor="middle" class="d-small">H100 HGX</text><text x="195" y="182" text-anchor="middle" class="d-mono d-small">640 GB</text>
+<rect x="290" y="20" width="90" height="200" class="d-fill-orange"/><text x="335" y="240" text-anchor="middle" class="d-small">MI300X plat.</text><text x="335" y="10" text-anchor="middle" class="d-mono d-small">1.5 TB</text>
+<rect x="480" y="153" width="90" height="67" class="d-fill-blue"/><text x="525" y="240" text-anchor="middle" class="d-small">H100 HGX</text><text x="525" y="143" text-anchor="middle" class="d-mono d-small">25.6 TB/s</text>
+<rect x="620" y="76" width="90" height="144" class="d-fill-orange"/><text x="665" y="240" text-anchor="middle" class="d-small">MI300X plat.</text><text x="665" y="66" text-anchor="middle" class="d-mono d-small">42.4 TB/s</text>
+<text x="265" y="265" text-anchor="middle" class="d-text-light d-small">HBM capacity, 8-GPU node</text>
+<text x="595" y="265" text-anchor="middle" class="d-text-light d-small">HBM bandwidth, 8-GPU node</text>
+<text x="400" y="300" text-anchor="middle" class="d-title">1.5&#215; capacity, 1.66&#215; bandwidth &#8594; ~680B vs. ~290B params inference-fit</text>
+</svg>
+<figcaption><b>Figure 3.</b> AMD's own comparison of an 8-GPU MI300X platform against an 8-GPU H100 HGX: 1.5 TB HBM3 at 42.4 TB/s aggregate vs. 640 GB HBM3 at 25.6 TB/s, translating into AMD's claimed ~680B-parameter single-node inference fit versus ~290B for H100 HGX<a class="cite" href="#ref-1">1</a>. This is AMD's own framing of NVIDIA hardware, not an independently reproduced benchmark &#8212; NVIDIA's own H100 SXM page states 80 GB at 3.35 TB/s per GPU (8&#215;3.35&#8201;=&#8201;26.8 TB/s)<a class="cite" href="#ref-2">2</a>, a few percent above AMD's 25.6 TB/s figure, most likely reflecting a different H100 SKU or a different rounding convention between the two vendors' marketing materials &#8212; a reminder to always re-derive the platform number from a single vendor's own per-GPU spec rather than mixing sources.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Per-GPU spec comparison across the four accelerators referenced in this course. MI355X figures are analysis-tier (&#167;2.4); all others are vendor-published.<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-6">6</a></caption>
+<thead><tr><th>Part</th><th class="num">HBM (GB)</th><th class="num">HBM BW (TB/s)</th><th>Intra-node fabric</th><th class="num">Fabric BW/GPU</th><th class="num">TDP (W)</th></tr></thead>
+<tbody>
+<tr><td class="row">H100 SXM</td><td class="num">80</td><td class="num">3.35</td><td>NVLink 4 (NVSwitch)</td><td class="num">900 GB/s</td><td class="num">700</td></tr>
+<tr><td class="row">B200 SXM (DGX/HGX)</td><td class="num" data-best>180</td><td class="num" data-best>8.0</td><td>NVLink 5 (NVSwitch)</td><td class="num" data-best>1.8 TB/s</td><td class="num">&#8212;<sup>&#8224;</sup></td></tr>
+<tr><td class="row">MI300X</td><td class="num">192</td><td class="num">5.3</td><td>Infinity Fabric (direct mesh)</td><td class="num">896 GB/s</td><td class="num">750</td></tr>
+<tr><td class="row">MI355X <span class="badge badge-amber">analysis</span></td><td class="num" data-best>288</td><td class="num" data-best>8.0</td><td>Infinity Fabric (direct mesh)</td><td class="num">538 GB/s</td><td class="num" data-worst>1,400</td></tr>
+</tbody>
+</table>
+<p class="small muted"><sup>&#8224;</sup> NVIDIA's DGX B200 datasheet states ~14.3 kW for the full 8-GPU + dual-Xeon system rather than a standalone per-GPU TDP<a class="cite" href="#ref-5">5</a>; third-party listings commonly cite up to 1,000 W per B200 SXM, but that figure is not confirmed against an NVIDIA-hosted document in this module's research pass and is omitted from the table rather than stated as fact.</p>
+
+<h3 id="mi355x-generation">2.4 MI355X: the generational jump, at analysis-tier confidence</h3>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>AMD's own MI355X product pages (amd.com/en/products/accelerators/instinct/mi350/mi355x) timed out on every fetch attempt while researching this module, consistent with the same failure noted in this course's source map. The numbers in this section come from a SemiAnalysis/InferenceX chip-database aggregation page<a class="cite" href="#ref-6">6</a>, cross-checked for internal consistency against AMD's own Hot Chips talk for the prior generation<a class="cite" href="#ref-1">1</a>, but they are analysis-tier, not vendor-primary. Treat every number in this subsection as provisional until confirmed against an AMD-hosted data sheet.</p></aside>
+<p>With that caveat stated: MI355X moves to 288 GB of HBM3e per GPU at 8 TB/s &#8212; 1.5&#215; the capacity and 1.5&#215; the bandwidth of MI300X &#8212; and a 5th-generation Infinity Fabric link running at 538 GB/s per chip<a class="cite" href="#ref-6">6</a>. If the same seven-link fully-connected topology holds (the source does not explicitly confirm the link count, only the aggregate), an 8-chip node reaches roughly 4.3 TB/s aggregate per-node fabric bandwidth (538 GB/s &#215; 8 chips)<a class="cite" href="#ref-6">6</a>. Peak compute at low precision is large: 10,066 dense TFLOP/s at FP4 and 5,033 TFLOP/s at FP8<a class="cite" href="#ref-6">6</a>. The cost of that density is power: 1,400 W TDP per chip, roughly 2.09 kW all-in once board overhead is included<a class="cite" href="#ref-6">6</a> &#8212; double MI300X's 750 W<a class="cite" href="#ref-3">3</a> and twice H100's 700 W<a class="cite" href="#ref-2">2</a>. For multi-node scale-out specifically, MI355X standardizes on RoCEv2 Ethernet via a Pollara 400GbE NIC<a class="cite" href="#ref-6">6</a> &#8212; the same choice MI300X-generation platforms make, covered next.</p>
+
+<h2 id="rocev2-pollara">3. Multi-node fabric: RoCEv2 via Pollara, not InfiniBand-first</h2>
+<p>Module 1 treated InfiniBand and RoCE as two options NVIDIA supports side by side, with IB the default for the highest-end fabrics (Quantum-X800) and RoCE as the Ethernet-based alternative (Spectrum-X800). AMD's own multi-node documentation flips that default: the standard scale-out fabric for both MI300X and MI355X platforms is RoCEv2 Ethernet, carried over AMD's own Pollara 400GbE NIC<a class="cite" href="#ref-6">6</a>. A concrete deployment example makes the shape of this concrete: AMD's own ROCm engineering blog describing a GLM-5.1-FP8 wide-expert-parallel deployment across up to 64 MI300X GPUs (&#167;5.2) specifies eight GPU-local backend NICs per node, all carrying RDMA traffic over a RoCEv2 fabric<a class="cite" href="#ref-7">7</a> &#8212; one dedicated 400 Gb/s RoCE NIC per GPU, the same rail-optimized shape Module 1 described for NVIDIA nodes.</p>
+<p>That symmetry lets the arithmetic from Module 1 &#167;2 transfer over unchanged. A single RoCEv2 rail at 400 Gb/s is 50 GB/s (400 &#247; 8, converting bits to bytes)<a class="cite" href="#ref-6">6</a>, identical to a single ConnectX-7 NDR InfiniBand rail. Summed across the standard 8-NIC-per-node configuration:</p>
+$$ 8 \times 50\ \text{GB/s} = 400\ \text{GB/s aggregate node bandwidth (all 8 rails, all-to-all traffic pattern)} $$
+<p>This is the exact figure Module 1 &#167;2 derived for an H100-generation node with 8&#215;400 Gb/s NDR NICs. The convergence is not a coincidence: both vendors standardized on the same physical-layer generation (400 Gb/s Ethernet-class ports, whether badged InfiniBand or RoCEv2) at roughly the same point in time, and both use the same rail-per-GPU topology to reach it. The practical consequence for a wide-EP dispatch/combine kernel (&#167;5) or a cross-node KV transfer (Module 4/7's connectors) is that the achievable aggregate bandwidth budget is the same whether the cluster is CUDA or ROCm &#8212; the difference is entirely in which library issues the RDMA verbs calls underneath, not in what the wire delivers.</p>
+<p>RoCEv2 is a Layer-3-routable extension of the original RDMA-over-Converged-Ethernet specification, letting RDMA traffic cross IP routers the way plain InfiniBand traffic normally cannot without a gateway<a class="cite" href="#ref-6">6</a>. That routability is precisely why AMD's own multi-node setup guidance (&#167;4) treats RoCE configuration as requiring more explicit operator effort than InfiniBand: IB has a well-defined subnet manager and RDMA activates automatically once the fabric is up, whereas RoCE's use of ordinary Ethernet switches means the RDMA verbs layer has to be told, by hand, which GID (Global Identifier, RoCE's IP-routable address analog) and which physical NIC to use.</p>
+
+<h2 id="rccl">4. RCCL: what transfers unchanged from NCCL, what does not</h2>
+<p>Every collective call this course has attributed to NCCL &#8212; the all-reduce inside a TP group, the all-gather feeding a decode step, the point-to-point send/recv underneath a KV-cache handoff &#8212; has a direct AMD-side counterpart: RCCL, the ROCm Collective Communication Library. RCCL is the single strongest "transfers unchanged" case in this whole module, and it is worth being precise about exactly why.</p>
+
+<h3 id="rccl-api-compat">4.1 API-compatible by construction</h3>
+<p>RCCL is built to expose the same public API as NCCL: its header files (<code>src/nccl.h.in</code> and <code>include/rccl/rccl.h</code>) are generated to be a drop-in replacement, so code written against <code>ncclAllReduce</code>, <code>ncclSend</code>/<code>ncclRecv</code>, or any other NCCL entry point compiles and runs against RCCL without source changes<a class="cite" href="#ref-8">8</a>. This is why PyTorch's distributed backend, vLLM's tensor/pipeline/data-parallel plumbing, and DeepSpeed all work on ROCm with no code fork specific to the collective layer &#8212; they call NCCL's API, and RCCL answers it. RCCL implements the same collective set: all-reduce, all-gather, reduce, broadcast, reduce-scatter, gather, scatter, and all-to-all, plus point-to-point send/recv, using the same ring and tree algorithm families NCCL uses<a class="cite" href="#ref-8">8</a>. Transport support mirrors NCCL's shape too: RCCL optimizes for PCIe, xGMI (the technical name for the Infinity Fabric GPU-to-GPU link introduced in &#167;2.2 &#8212; "Infinity Fabric" is the marketing name, "xGMI" is what shows up in driver and library documentation), InfiniBand Verbs, and TCP/IP sockets<a class="cite" href="#ref-8">8</a>.</p>
+<p>A second dimension of the same compatibility: most of the environment variables that control NCCL's behavior work identically under the <code>NCCL_</code> prefix in RCCL, not a separate <code>RCCL_</code>-prefixed set. <code>NCCL_SOCKET_IFNAME</code>, <code>NCCL_IB_HCA</code>, <code>NCCL_IB_GID_INDEX</code>, and <code>NCCL_MIN_NCHANNELS</code> all mean exactly what they mean under NCCL &#8212; there is no ROCm-specific renaming to learn for the variables this course already covered in Module 1<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-4">4</a>. RCCL layers a small number of genuinely new, <code>RCCL_</code>-prefixed variables on top for AMD-specific tuning (&#167;4.3); it does not replace the NCCL-inherited ones.</p>
+
+<h3 id="rccl-multinode-setup">4.2 Multi-node setup: more manual steps than InfiniBand's auto-activation</h3>
+<p>Where RCCL diverges from a pure "same as NCCL" story is operational, not architectural: bringing up a multi-node RCCL job requires more explicit host-level setup than an equivalent NCCL/InfiniBand deployment, because AMD's documented reference path assumes RoCE (&#167;3) rather than InfiniBand. AMD's own multi-node setup guide lists the required RDMA/networking package set for Ubuntu &#8212; <code>iproute2</code>, <code>librdmacm-dev</code>, <code>rdmacm-utils</code>, <code>infiniband-diags</code>, <code>ibverbs-utils</code>, <code>perftest</code>, plus the full <code>rdma-core</code>/<code>libibverbs</code> family &#8212; before any RCCL launch is attempted<a class="cite" href="#ref-9">9</a>. Three launch-level environment variables set the distributed topology: <code>MASTER_ADDR</code> (rendezvous host), <code>NNODES</code> (node count), and <code>NODE_RANK</code> (this node's rank, 0 for the master)<a class="cite" href="#ref-9">9</a> &#8212; the same three variables any <code>torchrun</code>-launched multi-node PyTorch job already uses, unchanged by ROCm.</p>
+<p>Below that launch layer, two RCCL-consumed variables select the physical fabric: <code>NCCL_SOCKET_IFNAME</code> picks the network interface for out-of-band coordination traffic (AMD's docs show both a manual example and an auto-detection one-liner built from <code>rdma link show</code>), and <code>NCCL_IB_HCA</code> lists which RDMA devices RCCL should actually move bytes over &#8212; <code>rdma0..rdma7</code> for Broadcom NICs, <code>mlx5_0..mlx5_9</code> for Mellanox NICs, again with an auto-detection one-liner built from <code>ibv_devices</code><a class="cite" href="#ref-9">9</a>. The RoCE-specific step that has no InfiniBand analog is <code>NCCL_IB_GID_INDEX=3</code>: on RoCE, a GPU's network identity is one of several possible GIDs (RoCE's IP-routable, IB-derived addressing scheme) assigned to a NIC, and index 3 is the one AMD's guide specifies for its RoCE deployments<a class="cite" href="#ref-9">9</a>. AMD's documentation is explicit about the consequence of getting the RoCE path wrong: "for InfiniBand-equipped nodes, RCCL activates RDMA automatically," but for Broadcom RoCE NICs specifically, "it is crucial to install the exact same version of the RoCE library... that is installed on your host system" inside every container or environment the job runs in<a class="cite" href="#ref-9">9</a> &#8212; a version-matching requirement that has no counterpart in an InfiniBand deployment, where the fabric's subnet manager handles device discovery without per-host library version pinning.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">RCCL multi-node launch: three layers of environment variables, from job topology down to the RoCE-specific GID index</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="30" y="20" width="230" height="70" rx="8" class="d-block"/>
+<text x="145" y="45" text-anchor="middle" class="d-text-inv d-bold d-small">Launch topology</text>
+<text x="145" y="65" text-anchor="middle" class="d-mono d-text-inv d-small">MASTER_ADDR</text>
+<text x="145" y="80" text-anchor="middle" class="d-mono d-text-inv d-small">NNODES &#183; NODE_RANK</text>
+<path d="M260,55 L300,55" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="300" y="20" width="230" height="70" rx="8" class="d-block-2"/>
+<text x="415" y="45" text-anchor="middle" class="d-text-inv d-bold d-small">Interface selection</text>
+<text x="415" y="65" text-anchor="middle" class="d-mono d-text-inv d-small">NCCL_SOCKET_IFNAME</text>
+<text x="415" y="80" text-anchor="middle" class="d-mono d-text-inv d-small">NCCL_IB_HCA</text>
+<path d="M530,55 L570,55" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="570" y="20" width="200" height="70" rx="8" class="d-block-accent"/>
+<text x="670" y="45" text-anchor="middle" class="d-text-inv d-bold d-small">RoCE only</text>
+<text x="670" y="65" text-anchor="middle" class="d-mono d-text-inv d-small">NCCL_IB_GID_INDEX=3</text>
+<text x="670" y="80" text-anchor="middle" class="d-text-inv d-small">+ exact library-version match</text>
+<line x1="145" y1="90" x2="145" y2="130" class="d-dashed d-outline"/>
+<text x="145" y="150" text-anchor="middle" class="d-small">unchanged from any PyTorch</text>
+<text x="145" y="165" text-anchor="middle" class="d-small">multi-node launch</text>
+<line x1="415" y1="90" x2="415" y2="130" class="d-dashed d-outline"/>
+<text x="415" y="150" text-anchor="middle" class="d-small">NCCL_-prefixed, identical</text>
+<text x="415" y="165" text-anchor="middle" class="d-small">semantics to NVIDIA/IB</text>
+<line x1="670" y1="90" x2="670" y2="130" class="d-dashed d-outline"/>
+<text x="670" y="150" text-anchor="middle" class="d-small">RCCL/RoCE-specific:</text>
+<text x="670" y="165" text-anchor="middle" class="d-small">no InfiniBand analog</text>
+<rect x="130" y="200" width="540" height="70" rx="8" class="d-panel"/>
+<text x="400" y="225" text-anchor="middle" class="d-small d-bold">RCCL-specific additions (&#167;4.3)</text>
+<text x="400" y="248" text-anchor="middle" class="d-mono d-small">RCCL_NET_GDR_LEVEL=2 &#183; RCCL_DEBUG=INFO &#183; NCCL_MIN_NCHANNELS=112</text>
+<text x="400" y="263" text-anchor="middle" class="d-text-light d-small">tuning knobs layered on top, not a replacement for the NCCL-prefixed set above</text>
+</svg>
+<figcaption><b>Figure 4.</b> RCCL's multi-node launch sequence: job topology and interface-selection variables keep their NCCL semantics unchanged; the RoCE-specific GID index and library-version-matching requirement are the one step with no InfiniBand counterpart. Data: AMD ROCm multi-node setup docs<a class="cite" href="#ref-9">9</a>.</figcaption>
+</figure>
+
+<h3 id="rccl-specific">4.3 RCCL-specific additions</h3>
+<p>Layered on top of the inherited NCCL surface, AMD's own vLLM-on-ROCm performance guidance names a handful of genuinely RCCL-specific knobs: <code>RCCL_NET_GDR_LEVEL=2</code> to enable GPUDirect-RDMA-class direct NIC-to-GPU transfers (paired with a note to verify NIC support, illustrated in AMD's own docs against a ConnectX-6+ card &#8212; a reminder that many ROCm clusters still run on Mellanox/NVIDIA-branded NICs rather than AMD's own Pollara parts), <code>RCCL_DEBUG=INFO</code> for initialization and rendezvous logging, and <code>NCCL_MIN_NCHANNELS=112</code> to raise the default channel count (32&#8211;64) for tensor- and pipeline-parallel multi-GPU workloads specifically, not single-GPU inference<a class="cite" href="#ref-4">4</a>. AMD's multi-node checklist also flags two Kubernetes/container-level requirements this course's earlier modules did not need to name for NVIDIA: run with <code>--distributed-executor-backend ray</code> (vLLM's default executor for multi-node ROCm jobs, managing HIP-visible ranks and RCCL communicator creation) and ensure a shared <code>/dev/shm</code> across ranks &#8212; sized via Docker's <code>--shm-size</code> or a Kubernetes <code>emptyDir</code> &#8212; because RCCL's rendezvous protocol needs it<a class="cite" href="#ref-4">4</a>.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>AMD's own placement guidance for TP is conservative: stay within a single XGMI island (&#8804;8 GPUs, the mesh in Figure 2) using tensor parallelism only, and switch to pipeline parallelism &#8212; not an extended TP group &#8212; the moment a deployment needs to scale beyond eight GPUs or cross a node boundary<a class="cite" href="#ref-4">4</a>. That is a direct consequence of &#167;2.2: there is no AMD analog to NVL72's 72-GPU single-fabric domain, so TP degree above 8 always means paying the RoCEv2 cliff from &#167;3 on every all-reduce, which AMD's own guidance treats as a configuration to avoid rather than a supported scaling path.</p></aside>
+
+<h2 id="mori">5. MoRI: the ROCm answer to DeepEP</h2>
+<p>Module 5 built wide expert parallelism entirely around DeepEP &#8212; NVLink-domain-to-RDMA-domain dispatch/combine kernels, FP8 dispatch with BF16 combine, EP8 NVLink bandwidth of 726/740 GB/s falling to 81&#8211;90 GB/s once dispatch crosses into the RDMA domain. The question the manifest for this module poses directly: is there a ROCm-side equivalent, or does cross-node MoE on AMD hardware have no dedicated kernel library at all? There is an equivalent, and it is young: MoRI, AMD's Modular RDMA Interface<a class="cite" href="#ref-10">10</a>.</p>
+
+<h3 id="mori-components">5.1 What MoRI is</h3>
+<p>MoRI describes itself as a bottom-up, modular, composable framework for RDMA-and-GPU communication &#8212; explicitly positioned the way MLIR positions itself for compilers: a set of reusable building blocks rather than one monolithic library<a class="cite" href="#ref-10">10</a>. It splits into named sub-components, two of which map directly onto mechanisms this course has already named for the CUDA stack:</p>
+<ul>
+<li><strong>MoRI-EP</strong> &#8212; dispatch and combine kernels for MoE all-to-all traffic, with both intra-node and inter-node (latency-optimized) variants<a class="cite" href="#ref-10">10</a>. This is the direct structural analog to DeepEP's normal and low-latency kernel modes from Module 5.</li>
+<li><strong>MoRI-IO</strong> &#8212; point-to-point KV-cache transfer with GPU-Direct-RDMA-class low overhead<a class="cite" href="#ref-10">10</a>. This is what backs vLLM's <code>MoRIIOConnector</code>, already named in Module 4/11's connector table as "the ROCm-only disaggregation connector" without further detail &#8212; MoRI-IO is that detail.</li>
+<li><strong>MoRI-SHMEM</strong> &#8212; symmetric-memory APIs for GPU-initiated communication, integrated with Triton kernels via a MoRI-IR layer<a class="cite" href="#ref-10">10</a>, roughly analogous in purpose to NVSHMEM on the CUDA side.</li>
+<li><strong>MoRI-CCL</strong> &#8212; a lightweight collective-communication layer for latency-sensitive, customized scenarios, distinct from RCCL's general-purpose collective set<a class="cite" href="#ref-10">10</a>.</li>
+</ul>
+<p>MoRI's dispatch/combine kernels support quantized traffic the same way DeepEP does, and the reported effect is similar in kind: AMD's own MI355X distributed-inference write-up reports FP4-dispatch-plus-FP8-combine cutting per-token dispatch/combine payload from 28,672 bytes (BF16 baseline) to 11,200 bytes, a 2.56&#215; bandwidth reduction, with FP8-blockwise combine latency around 770 &#181;s against 907 &#181;s for unquantized BF16<a class="cite" href="#ref-11">11</a>. MoRI-EP and MoRI-IO are integrated into both SGLang and vLLM as of 2026, giving both major open-source engines a ROCm-native path for wide-EP dispatch and PD KV transfer that does not route through RCCL's general collective API<a class="cite" href="#ref-10">10</a><a class="cite" href="#ref-11">11</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f5t"><title id="f5t">Where MoRI sits relative to RCCL and the serving engines, compared to DeepEP/NIXL/RCCL on the CUDA side</title>
+<rect x="30" y="30" width="330" height="190" rx="10" class="d-outline d-dashed"/>
+<text x="195" y="20" text-anchor="middle" class="d-small d-bold">ROCm stack</text>
+<rect x="55" y="50" width="280" height="40" rx="6" class="d-block"/><text x="195" y="75" text-anchor="middle" class="d-text-inv d-small d-bold">vLLM-ROCm / SGLang</text>
+<rect x="55" y="105" width="130" height="40" rx="6" class="d-block-2"/><text x="120" y="130" text-anchor="middle" class="d-text-inv d-small d-bold">MoRI-EP</text>
+<rect x="205" y="105" width="130" height="40" rx="6" class="d-block-2"/><text x="270" y="130" text-anchor="middle" class="d-text-inv d-small d-bold">MoRI-IO</text>
+<rect x="55" y="160" width="280" height="40" rx="6" class="d-block-muted"/><text x="195" y="185" text-anchor="middle" class="d-text-inv d-small">RCCL &#183; RoCEv2 / xGMI</text>
+<rect x="440" y="30" width="330" height="190" rx="10" class="d-outline d-dashed"/>
+<text x="605" y="20" text-anchor="middle" class="d-small d-bold">CUDA stack (Modules 1&#8211;15)</text>
+<rect x="465" y="50" width="280" height="40" rx="6" class="d-block"/><text x="605" y="75" text-anchor="middle" class="d-text-inv d-small d-bold">vLLM / SGLang / TensorRT-LLM</text>
+<rect x="465" y="105" width="130" height="40" rx="6" class="d-block-2"/><text x="530" y="130" text-anchor="middle" class="d-text-inv d-small d-bold">DeepEP</text>
+<rect x="615" y="105" width="130" height="40" rx="6" class="d-block-2"/><text x="680" y="130" text-anchor="middle" class="d-text-inv d-small d-bold">NIXL</text>
+<rect x="465" y="160" width="280" height="40" rx="6" class="d-block-muted"/><text x="605" y="185" text-anchor="middle" class="d-text-inv d-small">NCCL &#183; IB/RoCE / NVLink</text>
+</svg>
+<figcaption><b>Figure 5.</b> MoRI-EP occupies DeepEP's position (wide-EP dispatch/combine) and MoRI-IO occupies NIXL's position (point-to-point KV/PD transfer) in the ROCm stack, both sitting above RCCL rather than replacing it &#8212; structurally the same layering Module 1 &#167;4 described for NIXL sitting above UCX/NCCL. Data: ROCm/mori repository<a class="cite" href="#ref-10">10</a>.</figcaption>
+</figure>
+
+<h3 id="mori-glm-example">5.2 A worked multi-node deployment: GLM-5.1-FP8 on up to 64 MI300X GPUs</h3>
+<p>AMD's own ROCm engineering blog documents a concrete multi-node wide-EP deployment that plays the same role for this module that Module 6 plays for DeepEP: a real, numbers-grounded production-shaped reference. The model is GLM-5.1-FP8 &#8212; 78 transformer layers (3 dense, 75 MoE), 256 routed experts with top-8 routing, Multi-head Latent Attention plus DeepSeek Sparse Attention, FP8 block-128 quantization<a class="cite" href="#ref-7">7</a>. The deployment scales prefill/decode-disaggregated wide-EP topologies from 2 nodes up to 8:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> GLM-5.1-FP8 xPyD topologies on MI300X, MoRI-EP/MoRI-IO over RoCEv2. Data: AMD ROCm Blogs<a class="cite" href="#ref-7">7</a>.</caption>
+<thead><tr><th>Topology</th><th class="num">Nodes</th><th class="num">GPUs</th><th>EP degree</th></tr></thead>
+<tbody>
+<tr><td class="row">1P/1D</td><td class="num">2</td><td class="num">16</td><td>EP8</td></tr>
+<tr><td class="row">2P/2D</td><td class="num">4</td><td class="num">32</td><td>EP16</td></tr>
+<tr><td class="row">2P/4D</td><td class="num">6</td><td class="num">48</td><td>EP16 (prefill) / EP32 (decode)</td></tr>
+<tr><td class="row">4P/4D</td><td class="num" data-best>8</td><td class="num" data-best>64</td><td>EP32 (both)</td></tr>
+</tbody>
+</table>
+<p>Peak measured throughput was 16,525 tokens/s on the 2P/4D topology at 28k input tokens and concurrency 256<a class="cite" href="#ref-7">7</a>. The blog's most instructive negative result is arguably more useful than the peak number: a single-instance (non-disaggregated) decode configuration collapsed to 1,405 tokens/s under the same 28k-context, 256-concurrency load &#8212; 11.8&#215; slower than the multi-instance topologies &#8212; because KV cache capacity exhausted on one instance<a class="cite" href="#ref-7">7</a>. That is Module 3's disaggregation argument reproduced independently on ROCm hardware with MoRI as the transport, not RCCL alone: the deployment used a from-source vLLM build in "WideEP WRITE-mode," meaning this was a genuinely current, in-flight integration rather than a long-stable reference path<a class="cite" href="#ref-7">7</a>.</p>
+
+<h3 id="mori-maturity">5.3 A maturity gap worth stating plainly</h3>
+<p>MoRI's public integration into SGLang is dated to v0.5.10+, running on ROCm 7.2, published May 2026<a class="cite" href="#ref-11">11</a>; the GLM-5.1 wide-EP blog is dated August 2026<a class="cite" href="#ref-7">7</a>. DeepEP, by contrast, has been in production use since DeepSeek's own December 2024 technical report (Module 6), independently reproduced by SGLang on 96 H100 GPUs (Module 6), and used across this course's entire Part 5 survey of open-source engines. Neither age nor a shorter public track record makes MoRI wrong &#8212; the GLM-5.1 numbers above are real, measured, multi-node results &#8212; but a library six months into public integration and one two years into multi-organization production validation are not the same claim of maturity &#8212; the "Where experts disagree" section below returns to this point directly.</p>
+
+<h2 id="vllm-rocm">6. vLLM-ROCm: the support-matrix view</h2>
+<p>vLLM itself is not forked for ROCm &#8212; it is the same project Modules 4, 5, and 11 already covered, with ROCm as one more backend selected by the kernels and environment variables it loads. What differs on AMD hardware is which attention/MoE kernel implementation gets selected, and which of vLLM's named multi-node connectors (Module 4/11's table) actually has a ROCm-side transport underneath it.</p>
+
+<h3 id="aiter">6.1 AITER: the kernel layer under attention and MoE</h3>
+<p>AMD's AI Tensor Engine for ROCm (AITER) supplies fused, ROCm-optimized kernels for GEMM, RMSNorm, MoE, and attention, switched on with a single master flag, <code>VLLM_ROCM_USE_AITER=1</code><a class="cite" href="#ref-4">4</a>. Underneath that flag, vLLM-ROCm selects among seven named attention backends depending on model architecture:</p>
+<table class="tbl tbl-dense">
+<caption><b>Table 3.</b> vLLM-ROCm attention backends and their target model classes. Data: AMD ROCm vLLM V1 performance optimization docs<a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Backend</th><th>Target models</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td class="row">ROCM_AITER_FA</td><td>MHA (Llama, Mistral, Qwen)</td><td>recommended default for MHA</td></tr>
+<tr><td class="row">ROCM_AITER_MLA</td><td>MLA (DeepSeek-V3/R1, Kimi-K2.5)</td><td>default selection for MLA</td></tr>
+<tr><td class="row">ROCM_AITER_MLA_SPARSE</td><td>DSA sparse-attention (DeepSeek-V3.2, GLM-5)</td><td>sparse-attention variant</td></tr>
+<tr><td class="row">ROCM_AITER_UNIFIED_ATTN</td><td>gpt-oss models</td><td>&#8212;</td></tr>
+<tr><td class="row">ROCM_ATTN</td><td>MHA fallback</td><td>Radeon / AITER-unavailable fallback</td></tr>
+<tr><td class="row">TRITON_MLA</td><td>MLA fallback</td><td>when AITER MLA unavailable</td></tr>
+<tr><td class="row">TRITON_ATTN</td><td>general fallback</td><td>&#8212;</td></tr>
+</tbody>
+</table>
+<p>The measured gains from switching a MHA model onto <code>ROCM_AITER_FA</code> are large: 2.7&#8211;4.4&#215; tokens-per-second over the <code>ROCM_ATTN</code> legacy fallback, plus a further 15&#8211;20% decode improvement at high concurrency (&#8805;32 concurrent requests) when <code>VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1</code> reorders the KV cache layout for better memory access<a class="cite" href="#ref-4">4</a>. For MLA models, <code>ROCM_AITER_MLA</code> delivers 1.2&#8211;1.5&#215; over the <code>TRITON_MLA</code> fallback<a class="cite" href="#ref-4">4</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f6t"><title id="f6t">AITER attention backend speedup ranges vs. legacy ROCm fallback backends</title>
+<line x1="70" y1="20" x2="70" y2="210" class="d-axis"/>
+<line x1="70" y1="210" x2="740" y2="210" class="d-axis"/>
+<text x="30" y="215" class="d-small d-text-light">1&#215;</text>
+<text x="30" y="120" class="d-small d-text-light">2.5&#215;</text>
+<text x="30" y="30" class="d-small d-text-light">4.5&#215;</text>
+<line x1="65" y1="120" x2="740" y2="120" class="d-grid"/>
+<rect x="140" y="35" width="110" height="175" class="d-fill-orange"/>
+<text x="195" y="25" text-anchor="middle" class="d-mono d-small">2.7&#8211;4.4&#215;</text>
+<text x="195" y="230" text-anchor="middle" class="d-small">ROCM_AITER_FA</text>
+<text x="195" y="245" text-anchor="middle" class="d-text-light d-small">vs. ROCM_ATTN (MHA)</text>
+<rect x="340" y="145" width="110" height="65" class="d-fill-blue"/>
+<text x="395" y="135" text-anchor="middle" class="d-mono d-small">1.2&#8211;1.5&#215;</text>
+<text x="395" y="230" text-anchor="middle" class="d-small">ROCM_AITER_MLA</text>
+<text x="395" y="245" text-anchor="middle" class="d-text-light d-small">vs. TRITON_MLA (MLA)</text>
+<rect x="540" y="176" width="110" height="34" class="d-fill-cyan"/>
+<text x="595" y="166" text-anchor="middle" class="d-mono d-small">+15&#8211;20%</text>
+<text x="595" y="230" text-anchor="middle" class="d-small">shuffled KV layout</text>
+<text x="595" y="245" text-anchor="middle" class="d-text-light d-small">high concurrency decode</text>
+</svg>
+<figcaption><b>Figure 6.</b> Measured AITER speedups over vLLM-ROCm's legacy attention backends. Data: AMD ROCm vLLM V1 performance optimization docs<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h3 id="dp-ep-rocm">6.2 DP+EP on ROCm</h3>
+<p>The DP+EP arithmetic Module 5 and Module 11 established for CUDA &#8212; <code>EP_SIZE = TP_SIZE &#215; DP_SIZE</code>, attention replicated across DP ranks at TP=1, MoE sharded across the full EP group &#8212; is unchanged on vLLM-ROCm; it is the same vLLM code path. What AMD's own guidance adds is a concurrency-dependent crossover between two configurations. At high concurrency (&#8805;512 concurrent requests), DP+EP outperforms plain TP by 16&#8211;47%, because DP partitions the KV cache across GPUs for MLA models instead of duplicating it the way TP does<a class="cite" href="#ref-4">4</a>. At low concurrency (&#8804;128 requests), the recommendation flips: TP+EP delivers 40&#8211;86% higher throughput than DP+EP, with the crossover sitting around 256&#8211;512 concurrent requests<a class="cite" href="#ref-4">4</a>. AMD's documented DeepSeek-R1 result at the high-concurrency end of that range is 7,114 tokens/s at 1,024 concurrent requests on an 8-GPU DP=8+EP configuration<a class="cite" href="#ref-4">4</a>. One further caveat AMD states explicitly: for ultra-sparse MoE models with under 1% expert activation (their example is Llama-4-Maverick-class architectures), expert parallelism should be skipped entirely &#8212; the all-to-all overhead EP adds exceeds the benefit, making EP 7&#8211;12% <em>slower</em> than TP alone for that model class<a class="cite" href="#ref-4">4</a>.</p>
+
+<h3 id="connectors-rocm">6.3 The connector list, and the one confirmed gap</h3>
+<p>Module 4 and Module 11 already listed <code>MoRIIOConnector</code> among vLLM's named disaggregation connectors as "the ROCm-side path," without detail on what backs it<a class="cite" href="#ref-12">12</a>; &#167;5.1 supplied that detail &#8212; it is MoRI-IO. The remaining seven connectors in vLLM's list (<code>LMCacheConnectorV1</code>, <code>NixlConnector</code>, <code>MooncakeConnector</code>, <code>MultiConnector</code>, <code>OffloadingConnector</code>, <code>FlexKVConnectorV1</code>, <code>PyNcclConnector</code>) are, in principle, vendor-agnostic Python code paths that call into whatever collective or transfer library is installed underneath &#8212; but two of them warrant a specific caveat rather than a blanket "transfers unchanged."</p>
+<p><code>NixlConnector</code> depends on NIXL, and NIXL's own architecture documentation states its actively-supported backends as UCX and NVIDIA Magnum IO GPUDirect Storage (GDS)<a class="cite" href="#ref-13">13</a>. UCX itself is vendor-neutral and does support ROCm transports, but GDS is an NVIDIA-specific storage-tiering technology with no stated ROCm equivalent in NIXL's own documentation<a class="cite" href="#ref-13">13</a>. None of this module's sources confirm <code>NixlConnector</code> as a validated, supported path on ROCm clusters &#8212; which is presumably exactly why <code>MoRIIOConnector</code> exists as a separate, ROCm-specific connector rather than everyone simply using <code>NixlConnector</code> everywhere. <code>MooncakeConnector</code> is more clearly portable: SGLang's own PD-disaggregation documentation lists Mooncake's transfer engine as one of two selectable backends (alongside NIXL) with per-GPU InfiniBand device mapping as its only stated hardware assumption, not a CUDA-specific one<a class="cite" href="#ref-14">14</a>, and Mooncake's transfer engine (Module 7) is built on generic RDMA verbs rather than a CUDA-only API.</p>
+
+<h2 id="economics">7. Economics: tokens per provisioned megawatt</h2>
+<p>Module 15's capacity-planning framework and Module 3's disaggregation-payoff disagreement both converge on the same metric being the one that actually matters for fleet sizing: not raw throughput, but throughput normalized by the power a data center actually has to provision. InferenceMAX, the same SemiAnalysis benchmark suite Module 3 and Module 15 used for the NVIDIA-side TCO crossover, publishes exactly this comparison across MI300X and MI355X on GPT-OSS 120B (MXFP4 weights) at a fixed 90 tokens/s/user interactivity target<a class="cite" href="#ref-15">15</a>:</p>
+<div class="kpis">
+<div class="kpi kpi-orange"><b>750,000 tok/s/MW</b><span>MI300X, 90 tok/s/user interactivity<a class="cite" href="#ref-15">15</a></span></div>
+<div class="kpi kpi-cyan"><b>2,550,000 tok/s/MW</b><span>MI355X, same interactivity target<a class="cite" href="#ref-15">15</a></span></div>
+</div>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f7t"><title id="f7t">InferenceMAX: MI300X vs MI355X tokens/s per provisioned MW at 90 tok/s/user interactivity, GPT-OSS 120B MXFP4</title>
+<line x1="80" y1="20" x2="80" y2="210" class="d-axis"/>
+<line x1="80" y1="210" x2="740" y2="210" class="d-axis"/>
+<text x="40" y="215" class="d-small d-text-light">0</text>
+<text x="20" y="120" class="d-small d-text-light">1.3M</text>
+<text x="20" y="30" class="d-small d-text-light">2.6M</text>
+<line x1="75" y1="120" x2="740" y2="120" class="d-grid"/>
+<rect x="230" y="150" width="130" height="60" class="d-fill-blue"/>
+<text x="295" y="140" text-anchor="middle" class="d-mono d-small">750,000</text>
+<text x="295" y="230" text-anchor="middle" class="d-small">MI300X</text>
+<rect x="480" y="30" width="130" height="180" class="d-fill-orange"/>
+<text x="545" y="20" text-anchor="middle" class="d-mono d-small">2,550,000</text>
+<text x="545" y="230" text-anchor="middle" class="d-small">MI355X</text>
+<text x="400" y="255" text-anchor="middle" class="d-title">3.4&#215; tokens/s per provisioned MW, same interactivity target</text>
+</svg>
+<figcaption><b>Figure 7.</b> MI355X's generational jump is far larger in tokens/s-per-provisioned-MW than in raw HBM bandwidth (1.5&#215;, &#167;2.4) &#8212; the FP4 compute density and Infinity Fabric bandwidth both contribute, and 1,400 W TDP per chip (&#167;2.4) is already priced into the MW denominator. Data: SemiAnalysis InferenceMAX v1<a class="cite" href="#ref-15">15</a>.</figcaption>
+</figure>
+
+<p>Two things are worth being precise about here. First, memory capacity (&#167;2.3's "fewer nodes fit a given MoE model" argument) and tokens-per-MW are not the same claim: MI355X's capacity/bandwidth advantage over MI300X is a modest 1.5&#215; (&#167;2.4), but its economic advantage at fixed interactivity is 3.4&#215; &#8212; most of that gap comes from compute density and power efficiency at the newer process/architecture generation, not from having more HBM to hold a bigger model on fewer GPUs. Second, InferenceMAX's own broader finding from Module 3 and Module 15 &#8212; that a disaggregation TCO advantage is conditional on the interactivity target, not unconditional &#8212; is stated by the same source as depending, on the NVIDIA side, on "implementing disaggregated prefill and wide expert parallelism over Spectrum-X as well as InfiniBand"<a class="cite" href="#ref-15">15</a>. Nothing in this module's sources publishes an equivalent AMD-side disaggregated-prefill TCO crossover point at varying interactivity targets; the 750k/2.55M tok/s/MW figures above are single-point comparisons at one interactivity level, not a full crossover curve of the kind Module 3 &#167;7 derived for GB200 NVL72 vs. B200.</p>
+
+<h2 id="what-ports-what-doesnt">8. What ports 1:1, what's a substitution, what's a gap</h2>
+<p>Collecting every mechanism this module and Modules 1&#8211;15 have named into one table: the middle column is the honest answer to "does this transfer," not a marketing claim in either direction.</p>
+<table class="tbl tbl-dense">
+<caption><b>Table 4.</b> NVIDIA-stack mechanism (Modules 1&#8211;15) mapped to its AMD/ROCm-side equivalent, partial equivalent, or gap.</caption>
+<thead><tr><th>NVIDIA-stack mechanism</th><th>AMD/ROCm equivalent</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td class="row">NVLink/NVSwitch (Module 1)</td><td>Infinity Fabric, direct 8-GPU mesh (&#167;2.2)</td><td><span class="badge badge-blue">substitution</span> comparable per-GPU BW, different topology (switched vs. direct)</td></tr>
+<tr><td class="row">NVL72 72-GPU NVLink domain (Module 1 &#167;5)</td><td>none in these sources</td><td><span class="badge badge-red">gap</span> no &gt;8-GPU single-fabric domain named for ROCm</td></tr>
+<tr><td class="row">InfiniBand NDR/XDR (Module 1)</td><td>RoCEv2 via Pollara 400GbE (&#167;3)</td><td><span class="badge badge-blue">substitution</span> identical per-rail and aggregate arithmetic (&#167;3)</td></tr>
+<tr><td class="row">GPUDirect RDMA (Module 1)</td><td>RDMA + <code>RCCL_NET_GDR_LEVEL=2</code> (&#167;4.3)</td><td><span class="badge badge-green">transfers</span> same mechanism, different flag namespace</td></tr>
+<tr><td class="row">UCX (Module 1)</td><td>UCX, unchanged</td><td><span class="badge badge-green">transfers</span> vendor-neutral library, no ROCm fork</td></tr>
+<tr><td class="row">NCCL (throughout)</td><td>RCCL (&#167;4)</td><td><span class="badge badge-green">transfers</span> API-compatible drop-in, shared <code>NCCL_*</code> env vars</td></tr>
+<tr><td class="row">DeepEP wide-EP dispatch/combine (Module 5)</td><td>MoRI-EP (&#167;5.1)</td><td><span class="badge badge-blue">substitution</span> same problem shape, different library, ~2 years younger</td></tr>
+<tr><td class="row">NIXL (Modules 1, 8)</td><td>MoRI-IO (&#167;5.1) for KV/PD transfer; NIXL's own GDS backend has no confirmed ROCm path</td><td><span class="badge badge-amber">partial</span> see &#8220;Where experts disagree&#8221; below</td></tr>
+<tr><td class="row">vLLM DP+EP CLI arithmetic (Modules 5, 11)</td><td>identical, same codebase (&#167;6.2)</td><td><span class="badge badge-green">transfers</span></td></tr>
+<tr><td class="row">vLLM KV connectors (Modules 4, 11)</td><td>7 of 9 vendor-agnostic + <code>MoRIIOConnector</code> ROCm-specific (&#167;6.3)</td><td><span class="badge badge-green">transfers</span>, with one named addition</td></tr>
+<tr><td class="row">Mooncake transfer engine (Module 7)</td><td>unchanged &#8212; generic RDMA verbs, no CUDA-only dependency</td><td><span class="badge badge-green">transfers</span></td></tr>
+<tr><td class="row">SGLang PD/router, wide-EP recipe (Module 12)</td><td>same codebase; MoRI as ROCm transfer backend (&#167;5.2 worked example)</td><td><span class="badge badge-green">transfers</span></td></tr>
+<tr><td class="row">NVIDIA Dynamo (Module 9)</td><td>none in these sources</td><td><span class="badge badge-red">gap</span></td></tr>
+<tr><td class="row">TensorRT-LLM / Triton (Module 13)</td><td>none &#8212; CUDA-only by design</td><td><span class="badge badge-red">gap</span> use vLLM-ROCm/SGLang-ROCm instead</td></tr>
+<tr><td class="row">llm-d / Gateway API Inference Extension (Module 10), Kubernetes orchestration (Module 14)</td><td>inference-engine-agnostic; operates above the GPU backend</td><td><span class="badge badge-green">transfers</span> not verified against ROCm specifically in these sources, but architecturally backend-independent</td></tr>
+</tbody>
+</table>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The material in this module supports two genuinely different readings of the same evidence, depending on which layer of the stack you weight most heavily. Both readings are grounded in real, cited numbers &#8212; they disagree about which numbers determine "production readiness."</p>
+<div class="positions">
+<article class="position">
+<h4>The gap is closing fast, and the fundamentals are already equivalent</h4>
+<p class="who">Supported by AMD's own ROCm documentation, the LMSYS/AMD MoRI announcement, and AMD's GLM-5.1 wide-EP engineering blog<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-7">7</a></p>
+<p>RCCL is not an approximation of NCCL's API, it is the same API by construction, with the same NCCL-prefixed environment variables carrying over unchanged (&#167;4.1). MoRI-EP occupies exactly DeepEP's position in the stack and reports comparable quantization-driven bandwidth reductions (&#167;5.1). AITER's measured speedups (2.7&#8211;4.4&#215; over legacy attention, &#167;6.1) and DP+EP's measured 16&#8211;47% gain (&#167;6.2) are not projected numbers, they are benchmarked ones. The GLM-5.1 deployment (&#167;5.2) is an actual 64-GPU, 8-node, prefill/decode-disaggregated wide-EP deployment that ran and produced a throughput number &#8212; not a roadmap slide.</p>
+<ul class="pros"><li>Every number cited is a measured result, not a projection</li><li>The collective-communication layer (the hardest thing to get right) is essentially solved via API compatibility</li><li>A real multi-node wide-EP deployment exists and its failure mode (single-instance decode collapse) matches this course's own disaggregation argument</li></ul>
+<ul class="cons"><li>All of the strongest evidence (MoRI, GLM-5.1 deployment) is AMD's or AMD-partner's own published material, not independently reproduced the way SGLang's DeepSeek reproduction (Module 6) independently validated DeepSeek's own numbers</li><li>"Comparable to DeepEP" is asserted by analogy of position in the stack, not by a head-to-head benchmark against DeepEP on the same workload</li></ul>
+</article>
+<article class="position">
+<h4>The orchestration and transfer-substrate layer has a real, named gap</h4>
+<p class="who">Grounded in what these sources do <em>not</em> show: no ROCm-side equivalent to NVIDIA Dynamo (Module 9) or TensorRT-LLM/Triton (Module 13) appears anywhere in this module's research, and NIXL's own architecture documentation names GDS &#8212; an NVIDIA Magnum IO technology &#8212; as one of only two actively-supported backends<a class="cite" href="#ref-13">13</a></p>
+<p>Modules 8&#8211;13 spent five modules on the fleet-orchestration and transfer-substrate layer that actually determines whether a multi-node deployment is operable at scale: SLA-driven autoscaling (Dynamo's Planner), a standardized Kubernetes Endpoint Picker protocol (llm-d/Gateway API Inference Extension), and a shared point-to-point transfer library (NIXL) that TensorRT-LLM, Dynamo, and SGLang all build on. This module found direct ROCm-side substitutes for the collective-communication and wide-EP-kernel layers, but not for the SLA-driven planning layer specifically &#8212; nothing in these sources describes an AMD-side Planner-equivalent that ingests a TTFT/ITL SLO and derives pool sizing the way Dynamo's does (Module 9). Separately, MoRI's public integration track record (ROCm 7.2, SGLang v0.5.10+, dated 2026, &#167;5.3) is measured in months, against DeepEP's roughly two years of multi-organization production validation (Module 6).</p>
+<ul class="pros"><li>Grounded in a documented absence, not speculation: these specific components genuinely do not appear in the sourced material</li><li>Distinguishes the layer that is solved (collectives, kernels) from the layer that determines actual fleet operability (SLA planning, cross-engine orchestration)</li></ul>
+<ul class="cons"><li>Absence of evidence in this module's source set is not proof of absence in the field &#8212; a ROCm-side SLA planner or a NIXL ROCm backend may exist and simply not have surfaced in this research pass</li><li>Risks overweighting orchestration-layer parity when the collective/kernel layer (&#167;4, &#167;5) is arguably the harder engineering problem and is the one AMD has clearly solved</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Both positions are correct about different layers, and the practical read for a deployment decision is to separate them rather than average them into one "ROCm is/isn't ready" verdict. For the compute-and-collective layer &#8212; RCCL, Infinity Fabric, AITER, MoRI-EP &#8212; the evidence supports treating ROCm as a genuine substitution, not a lesser option: the numbers in &#167;4&#8211;6 are measured, and the GLM-5.1 deployment (&#167;5.2) proves the pieces compose end to end at real multi-node scale. For the fleet-orchestration layer &#8212; SLA-driven autoscaling, a shared cross-engine transfer substrate with GDS-class storage tiering, the kind of five-module survey Part 5 gave the NVIDIA stack &#8212; this module found no equivalent to name, which is either a genuine gap or a research-pass limitation; only a dedicated search focused specifically on ROCm orchestration tooling (outside this module's scope) would settle which. Until that search happens, the honest operational stance is: build the serving path on vLLM-ROCm or SGLang-ROCm with MoRI (both proven at multi-node scale), and expect to build SLA-driven fleet orchestration yourself rather than finding an off-the-shelf Dynamo-class layer for it.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>MoRI's SGLang integration reached v0.5.10+ on ROCm 7.2 in May 2026 and the GLM-5.1 wide-EP deployment blog followed in August 2026<a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-7">7</a> &#8212; both recent enough that a search six months from this module's as-of date is likely to find a materially larger set of validated MoRI-based multi-node deployments, and possibly vLLM's own upstream WideEP mode (currently "WRITE-mode," &#167;5.2) reaching a stable, non-from-source release. MI355X's specs are the most likely numbers in this module to firm up: AMD's own product pages were unreachable during this research pass (&#167;2.4), and a retry against an AMD-hosted PDF brief would either confirm or correct the analysis-tier figures used here. AMD's ROCm release cadence itself (7.2 already superseding earlier 7.x versions cited in this module's sources) means any <code>VLLM_ROCM_*</code> environment variable or AITER backend name in &#167;6 should be re-checked against the ROCm version actually deployed, not assumed stable across releases.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">talk</span>Smith, A., Alla, V. <em>AMD Instinct MI300X Generative AI Accelerator and Platform Architecture</em>. Hot Chips 2024, August 2024. <a href="https://hc2024.hotchips.org/assets/program/conference/day1/23_HC2024.AMD.MI300X.ASmith(MI300X).v1.Final.20240817.pdf">https://hc2024.hotchips.org/assets/program/conference/day1/23_HC2024.AMD.MI300X.ASmith(MI300X).v1.Final.20240817.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: MI300X die/package specs (153B transistors, 8 XCD, 304 CUs, 192GB HBM3 @ 5.2TB/s), 8-GPU platform direct mesh topology (7&#215;128 GB/s links, slide 13), platform-aggregate 1.5 TB @ 42.4 TB/s vs. H100 HGX's 640 GB @ 25.6 TB/s (slide 6).</span></li>
+<li id="ref-2"><span class="ref-type">official</span>NVIDIA. <em>H100 GPU</em> (product page). 2026. <a href="https://www.nvidia.com/en-us/data-center/h100/">https://www.nvidia.com/en-us/data-center/h100/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: H100 SXM 80 GB HBM3 @ 3.35 TB/s, NVLink4 900 GB/s per GPU, 700 W TDP.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>Lenovo. <em>ThinkSystem AMD MI300X 192GB 750W 8-GPU Board</em> (product guide, reproducing AMD's published MI300X specifications). <a href="https://lenovopress.lenovo.com/lp1943-thinksystem-amd-mi300x-192gb-750w-8-gpu-board">https://lenovopress.lenovo.com/lp1943-thinksystem-amd-mi300x-192gb-750w-8-gpu-board</a>. Accessed 2026-09-17. <span class="ref-use">Used for: MI300X 750 W maximum TBP, 5.3 TB/s HBM bandwidth, 128 GB/s per-link/896 GB/s aggregate Infinity Fabric confirmation.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>AMD. <em>vLLM V1 performance optimization</em>. ROCm Documentation, rocm.docs.amd.com. <a href="https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/vllm-optimization.html">https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/vllm-optimization.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: AITER attention-backend list and measured speedups, DP+EP vs. TP+EP crossover and throughput figures, DeepSeek-R1 7,114 TPS result, RCCL_NET_GDR_LEVEL/RCCL_DEBUG/NCCL_MIN_NCHANNELS, XGMI-island TP placement guidance, multi-node checklist.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>NVIDIA. <em>NVIDIA DGX B200</em> (datasheet). 2025. <a href="https://www.aspsys.com/wp-content/uploads/2025/05/nvidia-dgx-b200-datasheet.pdf">https://www.aspsys.com/wp-content/uploads/2025/05/nvidia-dgx-b200-datasheet.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: DGX B200 1,440 GB total GPU memory (180 GB/GPU), 64 TB/s aggregate HBM3e bandwidth (8 TB/s/GPU), 14.4 TB/s aggregate NVLink bandwidth (1.8 TB/s/GPU), ~14.3 kW system power.</span></li>
+<li id="ref-6"><span class="ref-type">analysis</span>SemiAnalysis / InferenceX. <em>AMD Instinct MI355X &#8212; Specs, Pricing &amp; AI Inference Benchmarks</em>. 2026. <a href="https://inferencex.semianalysis.com/chips/mi355x">https://inferencex.semianalysis.com/chips/mi355x</a>. Accessed 2026-09-17. <span class="ref-use">Used for: MI355X 288 GB HBM3e @ 8 TB/s, 538 GB/s/chip 5th-gen Infinity Fabric, 1,400 W TDP/chip, RoCEv2 via Pollara 400GbE NIC. Analysis-tier: AMD's own MI355X product pages timed out on every fetch attempt in this module's research.</span></li>
+<li id="ref-7"><span class="ref-type">blog</span>AMD ROCm Blogs. <em>DI Series: Scaling GLM-5.1-FP8 to 64 MI300X GPUs</em>. August 2026. <a href="https://rocm.blogs.amd.com/software-tools-optimization/di-glm-wideep/README.html">https://rocm.blogs.amd.com/software-tools-optimization/di-glm-wideep/README.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: xPyD topology table (1P/1D through 4P/4D, 2&#8211;8 nodes), 16,525 tok/s peak throughput, single-instance decode collapse to 1,405 tok/s, 8 GPU-local RoCEv2 NICs/node, MoRI-EP/MoRI-IO usage, from-source vLLM WideEP write-mode.</span></li>
+<li id="ref-8"><span class="ref-type">repo</span>ROCm. <em>rccl</em> (README.md, develop branch). 2026. <a href="https://github.com/ROCm/rccl/blob/develop/README.md">https://github.com/ROCm/rccl/blob/develop/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: RCCL's NCCL-API-compatible header generation, supported collective set, transport support (PCIe, xGMI, InfiniBand Verbs, TCP/IP).</span></li>
+<li id="ref-9"><span class="ref-type">official</span>AMD. <em>Multi-node setup for AI workloads</em>. ROCm Documentation, rocm.docs.amd.com. <a href="https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/system-setup/multi-node-setup.html">https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/system-setup/multi-node-setup.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: required RDMA/networking packages, MASTER_ADDR/NNODES/NODE_RANK launch variables, NCCL_SOCKET_IFNAME/NCCL_IB_HCA interface selection, NCCL_IB_GID_INDEX=3 for RoCE, InfiniBand auto-activation vs. RoCE library-version-matching requirement.</span></li>
+<li id="ref-10"><span class="ref-type">repo</span>ROCm. <em>mori</em> (Modular RDMA Interface, README). 2026. <a href="https://github.com/ROCm/mori">https://github.com/ROCm/mori</a>. Accessed 2026-09-17. <span class="ref-use">Used for: MoRI's component breakdown (MoRI-EP, MoRI-IO, MoRI-SHMEM, MoRI-CCL), supported GPUs/NICs, SGLang/vLLM integration status.</span></li>
+<li id="ref-11"><span class="ref-type">blog</span>LMSYS Org. <em>Win on TCO: How AMD Instinct MI355X Achieves Cost-Competitive Distributed Inference Through SGLang with MoRI</em>. May 28, 2026. <a href="https://www.lmsys.org/blog/2026-05-28-mori/">https://www.lmsys.org/blog/2026-05-28-mori/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: FP4-dispatch/FP8-combine bandwidth reduction (28,672&#8594;11,200 bytes/token, 2.56&#215;), combine latency figures, ROCm 7.2/SGLang v0.5.10+ version details, measured cost/throughput numbers.</span></li>
+<li id="ref-12"><span class="ref-type">official</span>vLLM contributors. <em>Disaggregated Prefilling</em>. vLLM Documentation, docs.vllm.ai/en/latest/features/disagg_prefill/. <a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">https://docs.vllm.ai/en/latest/features/disagg_prefill/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the named connector list, cross-referencing MoRIIOConnector's position among the other eight connectors.</span></li>
+<li id="ref-13"><span class="ref-type">official</span>NVIDIA (ai-dynamo). <em>NIXL Architecture</em> (nixl.md, main branch docs). 2026. <a href="https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md">https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NIXL's actively-supported backends (UCX, NVIDIA Magnum IO GPUDirect Storage), the basis for the NixlConnector ROCm-gap discussion.</span></li>
+<li id="ref-14"><span class="ref-type">official</span>SGLang / RadixArk. <em>PD Disaggregation</em>. SGLang Documentation, docs.sglang.io. <a href="https://docs.sglang.io/advanced_features/pd_disaggregation.html">https://docs.sglang.io/advanced_features/pd_disaggregation.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Mooncake transfer engine as a vendor-generic RDMA-based PD backend with per-GPU InfiniBand device mapping.</span></li>
+<li id="ref-15"><span class="ref-type">analysis</span>SemiAnalysis. <em>InferenceMAX: Open Source Inference Benchmarking</em>. InferenceMAX v1, 2026. <a href="https://newsletter.semianalysis.com/p/inferencemax-open-source-inference">https://newsletter.semianalysis.com/p/inferencemax-open-source-inference</a>. Accessed 2026-09-17. <span class="ref-use">Used for: MI300X (750,000 tok/s/MW) vs. MI355X (2,550,000 tok/s/MW) at 90 tok/s/user interactivity on GPT-OSS 120B MXFP4; Spectrum-X/InfiniBand disaggregation framing.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

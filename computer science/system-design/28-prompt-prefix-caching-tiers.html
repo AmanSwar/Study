@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Platform Prompt/Prefix Caching: Tiers, TTLs, and Billing Implications · System Design</title>
+<meta name="description" content="Anthropic's explicit-breakpoint cache lookup vs. OpenAI's automatic longest-prefix match, the write-premium/read-discount arithmetic that decides when caching pays for itself, the TTL trap that a long streamed response creates, and the fork over whether cached tokens count against a rate limit.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 28</p>
+  <h1>Platform Prompt/Prefix Caching: Tiers, TTLs, and Billing Implications</h1>
+  <p class="lede">A GPU-side inference engine reuses a shared KV-cache prefix for free, whenever it happens to see one twice. A platform turns that opportunistic reuse into a metered, priced, time-boxed product: a write you pay a premium for, a read you get a discount on, a clock that runs out, and — on one of the two major APIs but not the other — a rate limit the read doesn't count against. This module is about that product, not the cache itself.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>4</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 2</b>, <b>Module 22</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 430" role="img" aria-labelledby="f1t"><title id="f1t">Same six-block request evaluated by an explicit-breakpoint hash-walk-backward lookup and by an automatic longest-to-shortest prefix match</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f1-arr-hit" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+    </defs>
+    <text x="20" y="26" class="d-title">Explicit breakpoint, walk backward (Anthropic)</text>
+    <rect x="20" y="40" width="90" height="46" rx="6" class="d-block-muted"/><text x="65" y="67" text-anchor="middle" class="d-text-inv d-small">tools</text>
+    <rect x="115" y="40" width="90" height="46" rx="6" class="d-block-muted"/><text x="160" y="67" text-anchor="middle" class="d-text-inv d-small">system</text>
+    <rect x="210" y="40" width="90" height="46" rx="6" class="d-hl"/><text x="255" y="60" text-anchor="middle" class="d-small">msg 1</text><text x="255" y="74" text-anchor="middle" class="d-mono d-small">bp1</text>
+    <rect x="305" y="40" width="90" height="46" rx="6" class="d-block-muted"/><text x="350" y="67" text-anchor="middle" class="d-text-inv d-small">msg 2</text>
+    <rect x="400" y="40" width="90" height="46" rx="6" class="d-block-muted"/><text x="445" y="67" text-anchor="middle" class="d-text-inv d-small">msg 3</text>
+    <rect x="495" y="40" width="90" height="46" rx="6" class="d-hl"/><text x="540" y="60" text-anchor="middle" class="d-small">msg 4</text><text x="540" y="74" text-anchor="middle" class="d-mono d-small">bp2</text>
+    <path d="M540,95 L540,115 L255,115 L255,95" class="d-arrow" marker-end="url(#f1-arr-hit)"/>
+    <text x="397" y="112" text-anchor="middle" class="d-mono d-small">hash-walk back up to 20 blocks</text>
+    <rect x="600" y="40" width="180" height="46" rx="6" class="d-panel"/>
+    <text x="690" y="58" text-anchor="middle" class="d-small">bp1 hash: written turn 1</text>
+    <text x="690" y="75" text-anchor="middle" class="d-small">bp2: hit at bp1, extend</text>
+
+    <text x="20" y="150" class="d-title">Automatic, longest-to-shortest match (OpenAI)</text>
+    <rect x="20" y="164" width="90" height="46" rx="6" class="d-block-muted"/><text x="65" y="191" text-anchor="middle" class="d-text-inv d-small">tools</text>
+    <rect x="115" y="164" width="90" height="46" rx="6" class="d-block-muted"/><text x="160" y="191" text-anchor="middle" class="d-text-inv d-small">system</text>
+    <rect x="210" y="164" width="90" height="46" rx="6" class="d-block-muted"/><text x="255" y="191" text-anchor="middle" class="d-text-inv d-small">msg 1</text>
+    <rect x="305" y="164" width="90" height="46" rx="6" class="d-block-muted"/><text x="350" y="191" text-anchor="middle" class="d-text-inv d-small">msg 2</text>
+    <rect x="400" y="164" width="90" height="46" rx="6" class="d-block-muted"/><text x="445" y="191" text-anchor="middle" class="d-text-inv d-small">msg 3</text>
+    <rect x="495" y="164" width="90" height="46" rx="6" class="d-hl"/><text x="540" y="191" text-anchor="middle" class="d-small">msg 4</text>
+    <path d="M540,210 L540,225 L20,225 L20,210" class="d-arrow-active" marker-end="url(#f1-arr-hit)"/>
+    <text x="280" y="222" text-anchor="middle" class="d-mono d-small">no marker needed &mdash; try longest prefix first, shrink on miss</text>
+    <rect x="600" y="164" width="180" height="46" rx="6" class="d-panel"/>
+    <text x="690" y="182" text-anchor="middle" class="d-small">machine-local cache</text>
+    <text x="690" y="199" text-anchor="middle" class="d-small">no hash lookback window</text>
+
+    <rect x="20" y="250" width="760" height="170" rx="8" class="d-surface"/>
+    <text x="400" y="275" text-anchor="middle" class="d-title">What actually differs</text>
+    <text x="40" y="300" class="d-small d-text-light">Anthropic:</text>
+    <text x="140" y="300" class="d-small">write happens only at a marked block; a read can only find a prefix</text>
+    <text x="140" y="316" class="d-small">a prior request explicitly wrote, up to 20 blocks back<a class="cite" href="#ref-1">1</a>.</text>
+    <text x="40" y="342" class="d-small d-text-light">OpenAI:</text>
+    <text x="140" y="342" class="d-small">every request is a potential write; a read checks the longest prefix</text>
+    <text x="140" y="358" class="d-small">first and shortens until it finds a match already resident on the</text>
+    <text x="140" y="374" class="d-small">serving machine it landed on &mdash; no client-side marker at all<a class="cite" href="#ref-2">2</a>.</text>
+    <text x="40" y="400" class="d-small d-text-light">Same billing shape:</text>
+    <text x="200" y="400" class="d-small">both meter the result as a write (premium) or a read (discount) &mdash; §3.</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The same growing six-block conversation, evaluated by Anthropic's explicit-breakpoint hash lookup<a class="cite" href="#ref-1">1</a> and by OpenAI's automatic longest-to-shortest prefix match<a class="cite" href="#ref-2">2</a>. The lookup mechanism differs; the resulting write/read billing event does not (§3).</figcaption>
+</figure>
+
+<h2 id="platform-cache-vs-kv-cache">1. Why this is a platform mechanism, not a KV-cache mechanism</h2>
+<p>The GPU-side mechanism is one you already have: when two requests share an identical token prefix, an inference engine can skip recomputing that prefix's key/value tensors and reuse the ones already sitting in the paged KV cache from an earlier request or an earlier turn in the same conversation. That reuse is opportunistic, free of charge to nobody in particular, and governed entirely by eviction policy and memory pressure inside the serving cluster. Nothing about it involves a customer, a price, or a clock. It is the substrate this module builds on top of, and this module does not re-derive it.</p>
+<p>What Anthropic and OpenAI expose to a paying customer is a different thing wearing the same name. Both platforms let a client mark part of a prompt as reusable, and both platforms then do three things no GPU-side cache does on its own: they <b>charge a premium</b> the first time that prefix is processed (a "cache write"), they <b>charge a discount</b> every subsequent time it is found (a "cache read"), and they attach a <b>time-to-live</b> after which the entry is gone and the next request pays full write price again<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>. That is a billing-bearing product wrapped around a memory-management mechanism, and the product's rules — not the underlying KV-cache eviction policy — are what a platform engineer has to design against and what a customer has to reason about when deciding whether to mark a block cacheable at all.</p>
+<p>Module 2 already covers the general vocabulary this specializes: cache-aside placement, TTL-based versus event-based invalidation, and the stampede problem of many readers racing a cold cache. Every one of those ideas reappears here in a form specific to LLM platforms — TTL expiry that a slow streamed response can itself cause (§4), a stampede variant where concurrent requests all miss because none of them has finished writing yet (§5) — and this module treats the general mechanism as background, cited by number, rather than re-explained. What Module 2's treatment could not anticipate, because no classical cache works this way, is that the miss/hit outcome here is also a metered event with its own price and its own interaction with a customer's rate limit (§6) — Module 22's territory, which this module specializes rather than restates.</p>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>Everywhere this module says "cache," it means the platform-level, billed, TTL-bounded prefix cache a client opts into via an API parameter — never the GPU-resident KV cache the serving engine manages on its own. The two are related (the platform's cache write is, mechanically, a hint that keeps a prefix's KV tensors alive past the point they would otherwise be evicted) but the platform layer's contract with the customer is the subject here.</p></aside>
+
+<h2 id="two-lookup-philosophies">2. Two lookup philosophies: explicit breakpoints vs. automatic prefix match</h2>
+<p>Both platforms cache the same kind of thing — a prefix of tokens shared across requests — and both platforms turn a hit into a discounted read and a miss into a premium-priced write. Where they diverge completely is in how a request tells the cache what to look for, and that divergence has direct, practical consequences for how you author a prompt.</p>
+
+<h3 id="anthropic-explicit-breakpoints">2.1 Anthropic: explicit breakpoints, walk backward on a hash</h3>
+<p>Anthropic's mechanism has three parts, stated as three "core principles" in its own documentation. First, a cache write happens only where a client places a marker: "marking a block with <code>cache_control</code> writes exactly one cache entry: a hash of the prefix ending at that block. The system does not write entries at earlier positions"<a class="cite" href="#ref-1">1</a>. Nothing is cached implicitly; if you never mark a breakpoint, nothing gets written, no matter how repetitive the prompt is. Second, a cache read does not search for "content that happens to be identical" in the abstract — it searches for a prior write. On every request, the system computes the prefix hash at the client's breakpoint, and "if none exists, it walks backward one block at a time, checking whether the prefix hash at each earlier position matches something already in the cache. It is looking for prior writes, not stable content"<a class="cite" href="#ref-1">1</a>. Third, that backward walk is bounded: "the system checks at most 20 positions per breakpoint, counting the breakpoint itself as position 1. If no matching entry is found in that window, checking stops"<a class="cite" href="#ref-1">1</a>. A single request may declare up to four such breakpoints, and the prefix they build on is assembled in a fixed order — tools, then system, then messages — so that "changes at each level invalidate that level and all subsequent levels"<a class="cite" href="#ref-1">1</a>: edit the system prompt and every message-level cache entry built on top of it is worthless on the next request, even though the messages themselves did not change.</p>
+<p>The 20-block lookback window has a sharp practical failure mode in a long-running agent loop. Anthropic's own example walks through it directly: a ten-block first turn writes an entry at block 10; a fifteen-block second turn's breakpoint at block 15 walks back, finds the turn-1 entry at block 10 within the window, and extends it; but by a thirty-five-block third turn, checking positions 35 down to 16 no longer reaches the turn-2 entry sitting at block 15 — it is one position outside the window — so the request pays full price with no hit at all<a class="cite" href="#ref-1">1</a>. The stated fix is to plant a second, earlier breakpoint deliberately, closer to where the conversation was when it last wrote a cache entry, so that a fast-growing tool-calling loop does not silently walk itself out of its own cache. (Anthropic also folds a run of consecutive <code>tool_use</code> or <code>tool_result</code> blocks into a single position for the purposes of this count, so a turn with many parallel tool calls does not by itself push the window out<a class="cite" href="#ref-1">1</a> — but the twenty-position ceiling is otherwise unforgiving.)</p>
+
+<h3 id="openai-automatic-prefix-match">2.2 OpenAI: automatic, longest-to-shortest, machine-local</h3>
+<p>OpenAI's mechanism removes the marker entirely. There is no equivalent of <code>cache_control</code>; every request is automatically a candidate cache write, and every request is automatically checked against the cache on the way in. The lookup itself is a longest-to-shortest search: the system "walks through only the cache lookup boundaries in the incoming request, from longest prefix to shortest, looking for an available matching prefix already cached on the machine"<a class="cite" href="#ref-2">2</a>. On current models (GPT-5.6 and later) those lookup boundaries are "the first 2 and latest 50 explicit breakpoints" plus a set of implicit breakpoints and up to twenty earlier eligible message endings<sup>a</sup>; on earlier models the only boundaries are implicit ones spaced at model-dependent intervals from the hidden system message<a class="cite" href="#ref-2">2</a>. Either way, reuse requires the entire rendered prefix up to that boundary to match exactly — "if content or a relevant setting changes before a breakpoint, the prefix after that change cannot match the existing cache entry"<a class="cite" href="#ref-2">2</a>, which is the same invalidation-cascade idea Anthropic states explicitly, arrived at without any client-visible breakpoint concept at all.</p>
+<p>The word "machine" in that quote is doing real work and is easy to miss on a first read. OpenAI's cache is not a logical, request-routing-independent store; it is resident on whichever physical serving machine happened to handle the write, and a read only succeeds if the read request is routed back to that same machine: "cached states live on individual machines, where traffic above 15 requests per minute can lead to overflow routing. A request can reuse a cached prefix only if it reaches a machine holding a matching entry"<a class="cite" href="#ref-2">2</a>. Routing is driven by current machine load, by a hash of the initial tokens following the hidden system content, and optionally by a client-supplied <code>prompt_cache_key</code> that is described as important for pinning cache affinity on older models and optional on GPT-5.6 and later<a class="cite" href="#ref-2">2</a>. This is a genuinely different failure surface from Anthropic's 20-block lookback: a request can have an identical, well-formed prefix and still miss purely because load-based routing sent it to a machine that never saw the write. OpenAI states this plainly — "maintaining a session doesn't guarantee a cache hit"<a class="cite" href="#ref-2">2</a> — and separately notes caches are isolated per organization and cannot cross a regional processing boundary<a class="cite" href="#ref-2">2</a>.</p>
+<p class="small muted"><sup>a</sup> This routing/lookup-boundary detail is genuinely version-specific (stated for GPT-5.6+ vs. earlier models) and is the kind of number likely to move within a year; treat the mechanism (longest-to-shortest, machine-resident) as the durable fact and the exact boundary counts as a snapshot.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Cache-lookup mechanics, Anthropic vs. OpenAI, as each platform's own documentation states them<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Property</th><th>Anthropic (Claude API)</th><th>OpenAI (API)</th></tr></thead>
+<tbody>
+<tr><td class="row">Client marker required</td><td>Yes &mdash; <code>cache_control</code> on a block</td><td>No &mdash; fully automatic</td></tr>
+<tr><td class="row">Lookup direction</td><td>Backward from breakpoint, hash of prior writes</td><td>Longest-to-shortest prefix match</td></tr>
+<tr><td class="row">Lookback / lookup scope</td><td>20 positions per breakpoint</td><td>First 2 + latest 50 explicit breakpoints, plus implicit boundaries (GPT-5.6+)</td></tr>
+<tr><td class="row">Max explicit breakpoints</td><td>4 per request</td><td>N/A (no client-declared breakpoints)</td></tr>
+<tr><td class="row">Prefix build order</td><td>tools &rarr; system &rarr; messages</td><td>Rendered-prefix order; no declared hierarchy</td></tr>
+<tr><td class="row">Cache locality</td><td>Not documented as machine-pinned</td><td>Machine-local; routed by load, token hash, optional <code>prompt_cache_key</code></td></tr>
+<tr><td class="row">Session/affinity guarantee</td><td>Not applicable (hash-based, not routing-based)</td><td>None &mdash; "a session doesn't guarantee a cache hit"</td></tr>
+</tbody>
+</table>
+<p>The practical upshot for how you write a client is opposite in each direction. Against Anthropic, you decide explicitly where the reusable boundary is and you must keep at least one breakpoint within 20 blocks of the last write in a fast-growing conversation. Against OpenAI, you do nothing to mark the boundary, but you may need to supply a stable <code>prompt_cache_key</code> and accept that even a byte-identical prefix can miss on pure bad luck in load-based routing. Neither is strictly simpler; they trade an explicit-but-bounded failure mode for an implicit-but-routing-dependent one.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>An explicit breakpoint is a cost-control knob as much as a lookup mechanism: because a write only happens where you place <code>cache_control</code>, you decide exactly which prefix boundary is worth paying the 1.25&times;/2&times; premium for, and a request with no breakpoint at all never pays it. An automatic cache has no equivalent dial — every eligible request is a candidate write whether or not the caller expects the cost, which is simpler to integrate but removes the one lever Anthropic's design gives a cost-conscious client: the choice not to cache a particular prefix at all.</p></aside>
+
+<h2 id="pricing-arithmetic">3. Pricing arithmetic: write premiums, read discounts, and the break-even hit rate</h2>
+<p>Both platforms price a cache event as a multiple of the ordinary, uncached input-token rate. Anthropic's standard multipliers are a 1.25&times; premium for a 5-minute cache write, a 2&times; premium for a 1-hour cache write, and a 0.1&times; discount for a cache read, with an exception on two current models (Claude Fable 5.1 and Claude Mythos 5.1) where the read discount is 0.025&times; instead<a class="cite" href="#ref-1">1</a>. OpenAI's current-generation (GPT-5.6 and later) multipliers are the same 1.25&times; write premium and 0.1&times; read discount; on earlier OpenAI models there was no separate write premium at all — caching was free to attempt, and the discounted cached-input rate was baked into each model's own published price rather than expressed as a multiplier<a class="cite" href="#ref-2">2</a>. That earlier-generation asymmetry is worth noticing on its own: OpenAI's move to charging a write premium on GPT-5.6+ is a convergence toward Anthropic's pricing shape, not a coincidence of two platforms landing on the same numbers independently.</p>
+
+<table class="tbl tbl-dense">
+<caption><b>Table 2.</b> Anthropic list pricing at four points on the model range, in US$ per million tokens (MTok), showing the write premium and read discount applied to each model's own base input rate<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Model</th><th class="num">Base input</th><th class="num">5m write (1.25&times;)</th><th class="num">1h write (2&times;)</th><th class="num">Cache read</th><th class="num">Output</th></tr></thead>
+<tbody>
+<tr><td class="row">Claude Haiku 4.5</td><td class="num">1.00</td><td class="num">1.25</td><td class="num">2.00</td><td class="num">0.10</td><td class="num">5.00</td></tr>
+<tr><td class="row">Claude Sonnet 5</td><td class="num">2.00</td><td class="num">2.50</td><td class="num">4.00</td><td class="num">0.20</td><td class="num">10.00</td></tr>
+<tr><td class="row">Claude Opus 5</td><td class="num">5.00</td><td class="num">6.25</td><td class="num">10.00</td><td class="num">0.50</td><td class="num">25.00</td></tr>
+<tr><td class="row">Claude Fable 5.1</td><td class="num">10.00</td><td class="num">12.50</td><td class="num">20.00</td><td class="num" data-best>0.25</td><td class="num">50.00</td></tr>
+</tbody>
+</table>
+<p>The last row is the exception: Fable 5.1's read price is 0.025&times; its own $10 base rate, i.e. $0.25/MTok, versus the $1.00/MTok a 0.1&times; discount would give at that base price — a cache hit on that model is proportionally cheaper than a cache hit anywhere else in the table.</p>
+
+<h3 id="break-even-derivation">3.1 When does paying the write premium pay for itself?</h3>
+<p>Write a cache write's multiplier as \(w\) and a cache read's multiplier as \(r\), both relative to the ordinary base input price for an \(L\)-token prefix (so a single uncached request against that prefix costs \(1\) unit, i.e. \(L\) tokens at the base rate). Consider the simplest case: one write followed by \(N\) reads, no misses in between. Caching costs \(w + Nr\) in total, against \(N+1\) units if every one of those \(N+1\) requests had instead paid the uncached rate. Caching is worthwhile once</p>
+$$w + Nr \le N+1 \quad\Longrightarrow\quad N \ge \frac{w-1}{1-r}.$$
+<p>For Anthropic's and current OpenAI's 5-minute-equivalent tier (\(w=1.25\), \(r=0.1\)): \(N^\ast = 0.25/0.9 \approx 0.28\). Because \(N\) must be a whole number of requests, this means the very first re-read of the prefix already crosses even: at \(N=1\), caching costs \(1.25+0.10=1.35\) units against \(2\) units uncached. A prefix you expect to reuse even once is worth marking cacheable under either platform's base tier.</p>
+<p>That simple case assumes every request after the first is a hit — no TTL expiry, no concurrent cold miss, no routing miss. §4 and §5 show why that assumption breaks in practice, so the more useful version of this derivation treats the fraction of requests that hit, not the count of reads after one clean write. Let \(h\in[0,1]\) be the steady-state hit rate: the fraction of all requests against a given prefix that find it already cached, with the remaining \(1-h\) fraction each paying the write price (because each one is, from the cache's point of view, indistinguishable from a first write — TTL expired, routed to the wrong machine, or the lookback window missed). The expected cost per request, in the same units, is</p>
+$$\text{cost}(h) = (1-h)\,w + h\,r = w - h(w-r).$$
+<p>This is linear in \(h\): a straight line from \(\text{cost}(0)=w\) down to \(\text{cost}(1)=r\). Caching beats not caching at all exactly when \(\text{cost}(h) \le 1\), which solves to a break-even hit rate</p>
+$$h^\ast = \frac{w-1}{w-r}.$$
+<p>Plugging in the numbers: for the 5-minute Anthropic tier and current-generation OpenAI (\(w=1.25\), \(r=0.1\)), \(h^\ast = 0.25/1.15 \approx 21.7\%\). For Anthropic's 1-hour tier (\(w=2\), \(r=0.1\)), \(h^\ast = 1/1.9 \approx 52.6\%\) — more than double the hit rate needed to break even, because the 1-hour write premium is itself more than double the 5-minute one. For the two Anthropic models with the deeper 0.025&times; read discount, \(h^\ast = 0.25/1.225 \approx 20.4\%\), barely different from the 21.7% baseline — the write premium \(w\), not the read discount \(r\), is what dominates the break-even point, because the write premium sets the height of the line at \(h=0\) while the read discount only pulls down where the line ends at \(h=1\).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f2t"><title id="f2t">Expected relative cost per request as a function of cache hit rate, for the 5-minute and 1-hour Anthropic cache tiers</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="70" y1="30" x2="70" y2="300" class="d-axis"/>
+    <line x1="70" y1="300" x2="740" y2="300" class="d-axis"/>
+    <text x="45" y="59" class="d-text-light d-small">2.0</text>
+    <text x="45" y="181" class="d-text-light d-small">1.0</text>
+    <text x="45" y="304" class="d-text-light d-small">0</text>
+    <text x="20" y="170" class="d-text-light d-small" transform="rotate(-90,20,170)">relative cost per request</text>
+    <text x="400" y="335" text-anchor="middle" class="d-text-light d-small">cache hit rate h</text>
+    <text x="70" y="318" class="d-mono d-small">0%</text>
+    <text x="405" y="318" text-anchor="middle" class="d-mono d-small">50%</text>
+    <text x="735" y="318" text-anchor="end" class="d-mono d-small">100%</text>
+    <line x1="70" y1="55" x2="740" y2="55" class="d-grid"/>
+    <!-- no-cache reference: cost=1 always, y=177 given cost-to-y mapping y=300-cost*122.73 over a 0-2.2 cost range -->
+    <line x1="70" y1="177" x2="740" y2="177" class="d-dashed d-outline"/>
+    <text x="590" y="169" class="d-mono d-small">no-cache cost = 1</text>
+    <!-- 5-minute tier: w=1.25 -> y=300-1.25*122.73=147; r=0.1 -> y=300-0.1*122.73=288 -->
+    <path d="M70,147 L740,288" class="d-line d-stroke-blue"/>
+    <circle cx="215" cy="177" r="5" class="d-fill-blue"/>
+    <text x="225" y="200" class="d-mono d-small">h*=21.7%</text>
+    <text x="100" y="138" class="d-small d-text-light">5-min tier (w=1.25, r=0.1)</text>
+    <!-- 1-hour tier: w=2.0 -> y=300-2.0*122.73=55; r=0.1 -> y=288 -->
+    <path d="M70,55 L740,288" class="d-line d-stroke-orange"/>
+    <circle cx="422" cy="177" r="5" class="d-fill-orange"/>
+    <text x="432" y="200" class="d-mono d-small">h*=52.6%</text>
+    <text x="100" y="46" class="d-small d-text-light">1-hour tier (w=2, r=0.1)</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Expected cost per request relative to never caching (dashed line at 1.0), as a function of steady-state cache hit rate \(h\), for Anthropic's 5-minute tier (\(w=1.25\)) and 1-hour tier (\(w=2\)), both at a 0.1&times; read discount. Caching only pays off once the curve drops below the dashed line: 21.7% hit rate for the 5-minute tier, 52.6% for the 1-hour tier. Multipliers per Anthropic's published pricing<a class="cite" href="#ref-1">1</a>; the line and crossing points are this module's derivation from those multipliers.</figcaption>
+</figure>
+
+<div class="calc">
+  <p class="calc-title">Break-even hit rate for a write premium / read discount pair</p>
+  <div class="calc-row"><label for="c1">Write multiplier w</label><input type="range" id="c1" name="w" min="1" max="3" step="0.05" value="1.25"></div>
+  <div class="calc-row"><label for="c2">Read multiplier r</label><input type="range" id="c2" name="r" min="0.01" max="0.5" step="0.005" value="0.1"></div>
+  <div class="calc-out">
+    <div>Break-even hit rate h*<output data-expr="(w-1)/(w-r)" data-format="pct"></output></div>
+    <div>Cost at h=0 (all misses)<output data-expr="w" data-format="fixed:2"></output></div>
+    <div>Cost at h=1 (all hits)<output data-expr="r" data-format="fixed:2"></output></div>
+  </div>
+  <p class="calc-note">Formula derived above: \( h^\ast = (w-1)/(w-r) \). Try Anthropic's 1-hour tier (w=2, r=0.1) against its 5-minute tier (w=1.25, r=0.1) to see how much a longer, more expensive write raises the hit rate you need before it is worth it.</p>
+</div>
+
+<h2 id="ttl-trap">4. The TTL trap: cache lifetime is wall-clock from request start, not idle time</h2>
+<p>The break-even arithmetic in §3 assumed a hit rate you control by deciding to reuse a prefix. In practice the hit rate is also bounded by a clock, and the clock's exact starting point is where the trap sits. Anthropic's documentation is explicit about it: "the lifetime is measured from the start of the request that writes or reads the cache entry, not from the end of its response. Time spent generating a response counts against the lifetime: if a response takes 4 minutes to stream, a follow-up request that reuses the same cached prefix must start within about 1 minute of that response completing"<a class="cite" href="#ref-1">1</a>. The default lifetime is 5 minutes<a class="cite" href="#ref-1">1</a>, and none of those 5 minutes are reserved for the client's think time after the response finishes — the model's own token-generation time is drawn from the same budget.</p>
+<p>This matters specifically because it is not the failure mode an engineer would guess from the name "5-minute cache." The naive mental model is "the entry survives for 5 minutes of idle time after the response is done," which would make almost any interactive follow-up safe. The actual rule is "the entry survives for 5 minutes from the moment the request that created it was sent," which means a slow generation directly eats into the window available for the next turn to land inside it. A reasoning-heavy response, a long tool-calling turn, or simply a large <code>max_tokens</code> budget on a verbose answer can each single-handedly consume most of the cache's usable lifetime before the user has even started typing the next message.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f3t"><title id="f3t">A 4-minute streamed response consumes most of a 5-minute cache lifetime, leaving about 1 minute for a follow-up request to hit</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="40" y1="150" x2="760" y2="150" class="d-axis"/>
+    <text x="40" y="175" class="d-mono d-small">t=0</text>
+    <text x="616" y="175" class="d-mono d-small">t=4min</text>
+    <text x="760" y="175" text-anchor="end" class="d-mono d-small">t=5min</text>
+    <!-- cache lifetime bracket -->
+    <rect x="40" y="60" width="720" height="30" rx="4" class="d-panel"/>
+    <text x="400" y="80" text-anchor="middle" class="d-small d-text-light">5-minute cache lifetime, counted from t=0 (request start)</text>
+    <!-- generation bar 0 to 4 min -->
+    <rect x="40" y="110" width="576" height="34" rx="4" class="d-block"/>
+    <text x="328" y="132" text-anchor="middle" class="d-text-inv d-bold">response streaming (4 min)</text>
+    <!-- remaining window 4 to 5 min -->
+    <rect x="616" y="110" width="144" height="34" rx="4" class="d-hl"/>
+    <text x="688" y="132" text-anchor="middle" class="d-bold">~1 min left</text>
+    <!-- follow-up request arrows: one landing inside window, one outside -->
+    <path d="M660,180 L660,148" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+    <text x="660" y="200" text-anchor="middle" class="d-small">follow-up at t=4:30</text>
+    <text x="660" y="216" text-anchor="middle" class="d-small d-bold">inside window &rarr; hit</text>
+    <path d="M780,180 L780,148" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <text x="780" y="200" text-anchor="end" class="d-small">follow-up at t=5:30</text>
+    <text x="780" y="216" text-anchor="end" class="d-small">past t=5min &rarr; miss, re-write at 1.25x</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Anthropic's default 5-minute cache lifetime counts from the start of the write request, not from the end of the response<a class="cite" href="#ref-1">1</a>. A response that streams for 4 minutes leaves only about 1 minute of window for a follow-up to reuse the cache; a follow-up that arrives after the 5-minute mark misses entirely and pays the write premium again.</figcaption>
+</figure>
+
+<p>OpenAI's default retention is structured differently rather than just numerically differently, and the difference is worth naming precisely because it changes which workloads are exposed to this trap. On GPT-5.6 and later, an entry "remains eligible for reuse for 30 minutes after its most recent write or reuse"<a class="cite" href="#ref-2">2</a> — a sliding window that resets on every hit, not a fixed clock from the original write. On earlier OpenAI models, retention depends on a configured policy: the default in-memory mode keeps an entry active for "around 5 to 10 minutes of inactivity, up to one hour," and an explicit 24-hour mode "typically keeps entries available for around 30 minutes and can retain them for up to 24 hours"<a class="cite" href="#ref-2">2</a>. Both of those are phrased around <i>inactivity</i>, which is the idle-time model a client would naively assume applies everywhere — it happens to be closer to correct for OpenAI's current defaults than for Anthropic's, though OpenAI's own documentation does not state explicitly whether response-generation time is excluded from that inactivity clock the way it is explicitly included in Anthropic's.</p>
+<p>The operational consequence is direct: a workload built around Anthropic's default 5-minute tier and a long, reasoning-heavy or tool-calling turn should budget for the response time eating the window, either by moving to the 1-hour tier (at the 2&times; write premium and the correspondingly higher 52.6% break-even hit rate derived in §3.1) or by structuring the conversation so a fast, short exchange re-touches the cache before the 5 minutes elapse. Neither platform's documentation describes a way to extend a live entry's TTL without sending another request against it — there is no "keep-alive" call, only reuse itself.</p>
+<p>This trap is sharpest exactly where Module 27's agent harnesses live: a multi-step tool-calling loop that pauses on a sandboxed code execution, waits on an approval gate, or simply runs a long reasoning turn before its next tool call can easily burn most of a 5-minute window on generation and wait time alone, long before the harness re-invokes the model with the same accumulated system prompt and tool list as its cache prefix. A harness that tracks its own elapsed wall-clock time since the last cache write — not just since the last response finished — is the only way to know, before sending the next call, whether it is about to land inside Figure 3's shrinking window or outside it.</p>
+
+<h2 id="operational-edges">5. Operational edges: minimum length, cold concurrent misses, invalidation cascade, no manual clear</h2>
+<p>Four smaller mechanisms decide whether the arithmetic in §3 actually applies to a given request at all, and each one is a place where a client that assumes caching "just works" silently pays full price without an error to warn it.</p>
+<h3 id="minimum-cacheable-length">5.1 Minimum cacheable length</h3>
+<p>Both platforms refuse to cache a prefix below a minimum token count, and both do so silently rather than by raising an error. Anthropic's threshold varies by model, from 512 tokens on some current models up to 4,096 tokens on others<a class="cite" href="#ref-1">1</a>; "shorter prompts cannot be cached, even if marked with <code>cache_control</code>," and the only way to detect that this happened is to check the response's usage fields — "if both <code>cache_creation_input_tokens</code> and <code>cache_read_input_tokens</code> are 0, caching did not occur"<a class="cite" href="#ref-1">1</a>. OpenAI's current-generation threshold is a flat 1,024 visible input tokens; earlier models varied the effective minimum with request settings such as tools, images, output schemas, reasoning effort, and verbosity, and in both generations "tokens in the OpenAI-provided hidden system content do not count toward this minimum"<a class="cite" href="#ref-2">2</a>. A short, templated system prompt reused across thousands of small requests — exactly the shape that looks most cacheable to a developer — is precisely the case most likely to fall under either threshold and get billed as if caching had never been requested.</p>
+<table class="tbl tbl-dense">
+<caption><b>Table 4.</b> Anthropic's minimum cacheable prompt length by model — the token count below which a <code>cache_control</code> marker is silently ignored<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Model</th><th class="num">Minimum tokens</th></tr></thead>
+<tbody>
+<tr><td class="row">Claude Opus 5 / Fable 5.1 / Mythos 5.1 / Fable 5 / Mythos 5</td><td class="num" data-best>512</td></tr>
+<tr><td class="row">Claude Opus 4.8 / Sonnet 5 / Sonnet 4.6 / Sonnet 4.5</td><td class="num">1,024</td></tr>
+<tr><td class="row">Claude Mythos Preview / Opus 4.7</td><td class="num">2,048</td></tr>
+<tr><td class="row">Claude Opus 4.6 / Opus 4.5 / Haiku 4.5</td><td class="num" data-worst>4,096</td></tr>
+</tbody>
+</table>
+<p>The 8&times; spread between the smallest and largest threshold in Table 4 is not a rounding artifact — it means the same short, cacheable-looking system prompt can be a live cache entry on one model and a permanent no-op on another, purely as a function of which model the request targets, with no error returned either way.</p>
+<h3 id="concurrent-cold-miss">5.2 Concurrent cold misses</h3>
+<p>Module 2 covers the classical thundering-herd problem: many readers hitting an expired key at once, each independently regenerating the same value. The prompt-cache version is narrower but just as costly. Anthropic states it directly: "a cache entry only becomes available after the first response begins. If you need cache hits for parallel requests, wait for the first response before sending subsequent requests"<a class="cite" href="#ref-1">1</a>. Fire five requests against the same new prefix at once, and all five see an empty cache — every one of them writes, none of them reads, and the write premium is paid five times over instead of once. OpenAI's machine-affinity model (§2.2) produces a related but distinct failure: even after a first write exists, a burst of concurrent traffic against the same prefix — "traffic above 15 requests per minute can lead to overflow routing"<a class="cite" href="#ref-2">2</a> — can scatter later requests onto machines that never received the write, so a request that would have hit at low concurrency misses purely because of routing load. Both failures point to the same operational rule: burst concurrency against a freshly-cacheable prefix is the one traffic shape prompt caching handles worst on either platform.</p>
+<h3 id="invalidation-cascade">5.3 The invalidation cascade</h3>
+<p>Anthropic builds a request's cache prefix in a fixed order — tools, then system, then messages — and states plainly that "changes at each level invalidate that level and all subsequent levels"<a class="cite" href="#ref-1">1</a>. Add one tool to a tool list and every cache entry keyed on any system-prompt or message-level breakpoint built after it goes stale on the next request, even though the system prompt and messages themselves are byte-identical to before. OpenAI's automatic matching produces the same outcome from the opposite direction, without a named hierarchy: because reuse "requires the entire rendered prefix to match" up to a boundary, "if content or a relevant setting changes before a breakpoint, the prefix after that change cannot match the existing cache entry"<a class="cite" href="#ref-2">2</a>. A configuration change that looks purely additive — one more tool, one more few-shot example inserted near the top of a system prompt — is the change most likely to be made carelessly and most likely to silently invalidate an entire cache tier that a workload was depending on.</p>
+<h3 id="no-manual-clear">5.4 No manual clear, on either platform</h3>
+<p>This is the one place the two platforms agree rather than fork. Anthropic's documentation describes no API method to invalidate a cache entry on demand — the only lifecycle events are a write, a read, and TTL expiry. OpenAI states the absence explicitly: "manual cache clearing is not currently available. Cache entries expire according to the model's cache lifetime and retention settings"<a class="cite" href="#ref-2">2</a>. There is no operational lever equivalent to a CDN's purge API (Module 1) or an application cache's explicit <code>DEL</code> (Module 2) for either platform's prompt cache. If a cached prefix turns out to be wrong — a stale system prompt containing an error, a tool definition that needs to change immediately for a security reason — the only mitigation available is to change the prefix's content (which forces a new hash or a broken prefix match, i.e. a guaranteed miss on the next request) and wait out the TTL on the old entry, which then simply expires unread.</p>
+
+<h2 id="rate-limit-fork">6. The rate-limit fork: do cached tokens count against your throughput ceiling?</h2>
+<p>Module 22 covers rate limiting as a general platform mechanism: Anthropic's continuously-replenishing token bucket against three dimensions (RPM, ITPM, OTPM)<a class="cite" href="#ref-3">3</a> versus OpenAI's independent per-minute/per-day counters across six dimensions (RPM, RPD, TPM, TPD, IPM, and audio minutes per minute)<a class="cite" href="#ref-4">4</a>. What that comparison sets up but does not resolve is what happens to a cache <i>hit</i> specifically — and here the two platforms make opposite decisions with a large practical effect on any workload built around heavy prefix reuse.</p>
+<p>Anthropic excludes cache reads from the input-token count that its ITPM limit measures: "for most models, only uncached input tokens (<code>input_tokens</code> + <code>cache_creation_input_tokens</code>) count toward your ITPM rate limits"<a class="cite" href="#ref-3">3</a> — the read tokens, <code>cache_read_input_tokens</code>, do not count at all. Anthropic states the resulting effect directly with a worked example: "with a 2,000,000 ITPM limit and an 80% cache hit rate, you could effectively process 10,000,000 total input tokens per minute"<a class="cite" href="#ref-3">3</a>. The arithmetic behind that number is exactly the hit-rate framing from §3: if 80% of your input tokens are cache reads and only the remaining 20% count against the 2,000,000-token ceiling, then \(0.2 \times \text{total} = 2{,}000{,}000\) gives a total throughput of 10,000,000 tokens/minute — five times the nominal limit, purely as a consequence of how much of that traffic is a cache hit. Anthropic's 1-hour cache tier documentation frames this as a deliberate use case rather than an incidental side effect: one of its stated reasons to choose the 1-hour tier over the 5-minute default is "to improve your rate limit utilization, because cache hits are not deducted against your rate limit."<a class="cite" href="#ref-1">1</a></p>
+<p>OpenAI makes the opposite choice. Its prompt-caching documentation states plainly: "cached input tokens still count toward tokens-per-minute limits. Prompt caching does not change how rate limits are calculated."<a class="cite" href="#ref-2">2</a> A request that is 100% cache hit, billed at 0.1&times; the base price, occupies exactly the same slice of the TPM ceiling as an equivalent request that missed entirely and was billed at full price. The discount is real; the throughput headroom is not.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Effective input throughput at a nominal 2,000,000-token-per-minute limit, at three cache hit rates, under each platform's counting rule<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Hit rate</th><th class="num">Anthropic effective tokens/min (cache reads excluded)</th><th class="num">OpenAI effective tokens/min (cache reads counted)</th></tr></thead>
+<tbody>
+<tr><td class="row">0%</td><td class="num">2,000,000</td><td class="num">2,000,000</td></tr>
+<tr><td class="row">50%</td><td class="num">4,000,000</td><td class="num" data-worst>2,000,000</td></tr>
+<tr><td class="row">80%</td><td class="num" data-best>10,000,000</td><td class="num" data-worst>2,000,000</td></tr>
+</tbody>
+</table>
+<p>Table 3's Anthropic column is computed the same way as the documentation's own example: at hit rate \(h\), only the \((1-h)\) uncached fraction counts against the limit, so effective throughput is \(\text{limit}/(1-h)\) — 2,000,000/0.5 = 4,000,000 at 50%, 2,000,000/0.2 = 10,000,000 at 80%. OpenAI's column is flat at the nominal limit at every hit rate, by design.</p>
+<p>The dollar consequence stacks with, rather than replaces, the throughput consequence. Take Claude Sonnet 5 at the prices in Table 2 ($2.00/MTok base input, $0.20/MTok cache read) against a fixed 2,000,000 ITPM ceiling and an 80% steady-state hit rate. On Anthropic, that workload's $-cost per token is already down to \(0.2\times\$2.00 + 0.8\times\$0.20 = \$0.56\)/MTok blended — a 72% price cut relative to the $2.00 uncached rate — and its effective throughput ceiling is simultaneously five times wider, at 10,000,000 tokens/minute, from §3.1's \(h^\ast=21.7\%\) break-even and Table 3's exclusion rule both pointing the same direction. On OpenAI, the identical 80%-hit-rate workload gets the same blended per-token discount but stays capped at whatever its nominal TPM limit already was: the price drops, the ceiling does not move. A capacity plan built by reading only the price list and ignoring which platform's rate-limit rule applies will be off by roughly the hit rate's own multiplier on Anthropic and exactly right, for the wrong reason, on OpenAI.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f4t"><title id="f4t">Same 2,000,000-token-per-minute limit; Anthropic's effective ceiling stretches with cache hit rate, OpenAI's stays flat</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="20" y="26" class="d-title">Anthropic: cache reads excluded from ITPM</text>
+    <line x1="70" y1="110" x2="740" y2="110" class="d-axis"/>
+    <rect x="70" y="70" width="134" height="30" rx="4" class="d-block"/><text x="137" y="90" text-anchor="middle" class="d-text-inv d-small">0% hit: 2M</text>
+    <rect x="70" y="35" width="268" height="30" rx="4" class="d-block-2"/><text x="204" y="55" text-anchor="middle" class="d-text-inv d-small">50% hit: 4M effective</text>
+    <rect x="70" y="0" width="670" height="30" rx="4" class="d-block-accent"/><text x="405" y="20" text-anchor="middle" class="d-text-inv d-small">80% hit: 10M effective</text>
+    <text x="400" y="130" text-anchor="middle" class="d-small d-text-light">effective input tokens/min rises as hit rate rises</text>
+
+    <text x="20" y="175" class="d-title">OpenAI: cached tokens counted toward TPM</text>
+    <line x1="70" y1="260" x2="740" y2="260" class="d-axis"/>
+    <rect x="70" y="220" width="134" height="30" rx="4" class="d-block"/><text x="137" y="240" text-anchor="middle" class="d-text-inv d-small">0% hit: 2M</text>
+    <rect x="70" y="220" width="134" height="30" rx="0" class="d-outline d-dashed"/>
+    <rect x="220" y="220" width="134" height="30" rx="4" class="d-block-muted"/><text x="287" y="240" text-anchor="middle" class="d-text-inv d-small">50% hit: 2M</text>
+    <rect x="370" y="220" width="134" height="30" rx="4" class="d-block-muted"/><text x="437" y="240" text-anchor="middle" class="d-text-inv d-small">80% hit: 2M</text>
+    <text x="400" y="285" text-anchor="middle" class="d-small d-text-light">effective ceiling flat at 2M regardless of hit rate</text>
+    <text x="620" y="240" class="d-small d-text-light">discount still applies to $,</text>
+    <text x="620" y="256" class="d-small d-text-light">just not to the token count</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> The same nominal 2,000,000-token-per-minute limit under Anthropic's exclusion rule<a class="cite" href="#ref-3">3</a> and OpenAI's inclusion rule<a class="cite" href="#ref-2">2</a>. A heavy-cache-reuse workload gets a rising effective throughput ceiling on one platform and no throughput benefit at all on the other, even though both discount the price of a cache-read token to 0.1&times; base.</figcaption>
+</figure>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The two platforms this module has compared throughout do not just implement prompt caching differently — they have made an opposite, stated design decision about what a cache hit is <i>for</i>, and that decision shows up nowhere more concretely than in whether a cached token counts against a customer's rate limit. Neither company frames this as a debate; each states its own rule as a fact about its own product. Read side by side, the two rules are nonetheless a genuine disagreement about what a rate limit is supposed to protect.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Exclude cache reads from the throughput limit</h4>
+    <p class="who">Anthropic's ITPM design and its explicit 1-hour-cache rate-limit-utilization guidance<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-1">1</a></p>
+    <p>A cache hit skips the expensive part of serving a prefill — recomputing key/value tensors for tokens the engine has already seen — so metering it identically to a token that forced a full prefill charges the customer for capacity the request never actually consumed a second time. Anthropic states the 1-hour cache tier is worth its higher write premium specifically <i>because</i> "cache hits are not deducted against your rate limit," and its rate-limit documentation gives a concrete payoff: an 80% hit rate against a 2,000,000 ITPM cap yields roughly 10,000,000 effective input tokens per minute.</p>
+    <ul class="pros"><li>Rewards efficient client design: a customer that restructures its prompts to maximize reuse gets a proportionally higher effective throughput ceiling without renegotiating a contract.</li><li>Ties the limit to the resource it plausibly exists to ration (prefill compute) rather than to a token count that no longer reflects new compute once it is a hit.</li></ul>
+    <ul class="cons"><li>Makes capacity planning harder for the provider: a customer's effective consumption is now a function of a hit rate that can swing — a burst of first-time users, a config change that breaks the invalidation cascade (§5.3), a wave of TTL expiries (§4) — turning a stable-looking 2,000,000-token customer into a much larger one the moment their hit rate drops.</li><li>The limit stops bounding a single stable physical quantity; it bounds uncached tokens only, which is not the number a capacity planner can read off a dashboard without also tracking hit rate.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Count every token, cached or not</h4>
+    <p class="who">OpenAI's TPM design, stated without exception across model generations<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-4">4</a></p>
+    <p>A cached read still occupies a slot in the serving path — it still has to be looked up, still holds a place in whatever KV-cache memory keeps it resident, and still contributes to the aggregate request the rate limit is shaping the arrival rate of. OpenAI's own language is unconditional: "prompt caching does not change how rate limits are calculated." One counting rule, applied uniformly regardless of how the tokens in a request were priced, is simpler to state, simpler to audit, and does not require a customer to model their own hit rate to know what their effective ceiling is at any moment.</p>
+    <ul class="pros"><li>A single, predictable ceiling: a 2,000,000 TPM customer is always a 2,000,000 TPM customer, independent of how cache-friendly their workload happens to be on a given day.</li><li>Simpler enforcement and a simpler mental model — no separate accounting path for cache-read tokens, no dependency on a hit rate the provider has to compute per customer per window to enforce the limit correctly.</li></ul>
+    <ul class="cons"><li>A customer running a heavily-cached agentic loop — repeatedly reusing a long system prompt and tool list across hundreds of turns, exactly the workload prompt caching is marketed at — gets the price discount but none of the throughput benefit, and can hit the same wall a completely uncached workload would.</li><li>If the limit's real purpose is to bound the provider's prefill compute exposure, counting hits toward it is over-conservative: it caps the customer below what the underlying resource can actually support once most of their traffic is hits.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Which rule is "right" depends on what physical resource a given rate limit is actually rationing, and that is exactly the fact neither platform's documentation discloses. If the binding constraint behind a customer's limit is prefill FLOPs — the compute a cache hit genuinely avoids — Anthropic's exclusion is the more accurate model, and it should become the more common design as serving engines increasingly separate prefill and decode capacity into distinct pools (the GPU-backend-handoff territory of Module 25): a limit on prefill-consuming tokens should track prefill-consuming tokens, and a cache hit is not one. If the binding constraint is instead something a cache hit does not relieve at all — resident KV-cache memory footprint held across the TTL, attention-serving slots occupied per request regardless of prefill cost, or simply a provider's deliberate cap on aggregate exposure to a customer's traffic independent of mechanism — OpenAI's uniform count is the more honest rule, because exempting reads would then be giving away headroom against a resource the reads still consume. Absent a published account from either provider of what specifically saturates first during a capacity incident — prefill compute (favors exclusion) or KV-cache-resident memory pressure (favors uniform counting) — this is not resolvable from outside either company, and a platform engineer's practical takeaway is narrower: know which platform you are integrating against before you build a heavy-cache-reuse workload's capacity plan around an assumed throughput ceiling, because the same hit rate produces a very different effective limit on each.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">official</span>Anthropic. <em>Prompt caching (Claude API)</em>. Live documentation. <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">https://platform.claude.com/docs/en/build-with-claude/prompt-caching</a>. Accessed 2026-09-17. <span class="ref-use">Used for: cache_control breakpoint/hash-walk-backward mechanism and 20-position lookback window, tools&rarr;system&rarr;messages ordering and invalidation cascade, 5-minute/1-hour write and read pricing multipliers (1.25x/2x/0.1x, 0.025x on Fable/Mythos 5.1), per-model minimum cacheable length table, TTL-measured-from-request-start and the streaming-time-counts-against-lifetime rule, concurrent-request cold-cache-miss behavior, and absence of manual cache clearing.</span></li>
+  <li id="ref-2"><span class="ref-type">official</span>OpenAI. <em>Prompt caching (OpenAI API)</em>. Live documentation. <a href="https://developers.openai.com/api/docs/guides/prompt-caching">https://developers.openai.com/api/docs/guides/prompt-caching</a>. Accessed 2026-09-17. <span class="ref-use">Used for: automatic longest-to-shortest prefix lookup and cache lookup boundaries, machine-local cache affinity and prompt_cache_key/overflow-routing behavior, GPT-5.6+ vs. earlier-model TTL modes (30-minute sliding window vs. in_memory/24h retention), write/read pricing multipliers, minimum cacheable length, absence of manual cache clearing, and cached-token counting toward TPM.</span></li>
+  <li id="ref-3"><span class="ref-type">official</span>Anthropic. <em>Rate limits (Claude API)</em>. Live documentation. <a href="https://platform.claude.com/docs/en/api/rate-limits">https://platform.claude.com/docs/en/api/rate-limits</a>. Accessed 2026-09-17. <span class="ref-use">Used for: token-bucket rate-limiting mechanism, the RPM/ITPM/OTPM dimension set, exclusion of cache_read_input_tokens from ITPM, and the worked 2,000,000-ITPM/80%-hit-rate/10,000,000-effective-tokens example.</span></li>
+  <li id="ref-4"><span class="ref-type">official</span>OpenAI. <em>Rate limits (OpenAI API)</em>. Live documentation. <a href="https://developers.openai.com/api/docs/guides/rate-limits">https://developers.openai.com/api/docs/guides/rate-limits</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the six independent rate-limit dimensions (RPM, RPD, TPM, TPD, IPM, audio minutes per minute) establishing TPM as the single relevant dimension for the cached-token counting contrast in §6.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-d: The Inference Scheduler, Endpoint Picker, and Kubernetes Gateway API Inference Extension · Multi-Node LLM Inference</title>
+<meta name="description" content="How llm-d wires Module 2's KV-cache-aware scheduler into real Kubernetes plumbing: the InferencePool CRD, the Endpoint Picker as a concrete Envoy ext-proc backend, the Gateway API Inference Extension standard, and a plain assessment of whether any of this is production-grade today.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 10</p>
+<h1>llm-d: The Inference Scheduler, Endpoint Picker, and Kubernetes Gateway API Inference Extension</h1>
+<p class="lede">Module 2 already worked out how a router decides which replica gets a request &#8212; approximate and precise KV-cache scoring, the filter-score-select pipeline, the plugin architecture. This module covers what is genuinely new once that decision has to run as real Kubernetes infrastructure: the <code>InferencePool</code> custom resource every EPP-based router is built against, the exact Envoy external-processing wire protocol that carries the picked endpoint back to the data plane, and llm-d's specific position as the project that now hosts the Gateway API Inference Extension's own reference Endpoint Picker implementation. After reading, you can read an <code>InferencePool</code> manifest, trace a request through the ext-proc gRPC stream, and state precisely how mature this stack is as of today.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>35 min</b> read</span>
+<span class="chip"><b>14</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 2</b>, <b>Module 9</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 400" role="img" aria-labelledby="f1t"><title id="f1t">The full request path from a Kubernetes HTTPRoute through an InferencePool to the Endpoint Picker over Envoy's ext-proc protocol, and back down to a chosen pod</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="120" y="24" text-anchor="middle" class="d-small d-bold">Client</text>
+<rect x="60" y="34" width="120" height="44" rx="8" class="d-block-muted"/>
+<text x="120" y="60" text-anchor="middle" class="d-text-inv d-small">HTTP request</text>
+<path d="M120,78 L120,102" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="40" y="104" width="160" height="50" rx="8" class="d-panel"/>
+<text x="120" y="124" text-anchor="middle" class="d-small d-bold">HTTPRoute</text>
+<text x="120" y="142" text-anchor="middle" class="d-small d-text-light">backendRef</text>
+<path d="M200,129 L240,129" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="240" y="104" width="200" height="50" rx="8" class="d-block-2"/>
+<text x="340" y="124" text-anchor="middle" class="d-text-inv d-small d-bold">InferencePool</text>
+<text x="340" y="142" text-anchor="middle" class="d-text-inv d-small">selector, targetPorts</text>
+<path d="M440,129 L480,129" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="480" y="104" width="180" height="50" rx="8" class="d-panel"/>
+<text x="570" y="124" text-anchor="middle" class="d-small d-bold">Envoy gateway</text>
+<text x="570" y="142" text-anchor="middle" class="d-small d-text-light">ext-proc filter</text>
+<path d="M570,154 L570,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="640" y="172" text-anchor="middle" class="d-mono d-small">gRPC stream</text>
+<rect x="380" y="182" width="380" height="130" rx="10" class="d-surface"/>
+<text x="570" y="202" text-anchor="middle" class="d-title d-bold">Endpoint Picker (EPP)</text>
+<text x="570" y="218" text-anchor="middle" class="d-small d-text-light">endpointPickerRef target</text>
+<rect x="400" y="228" width="340" height="70" rx="6" class="d-block"/>
+<text x="570" y="248" text-anchor="middle" class="d-text-inv d-small d-bold">llm-d scheduler (Module 2)</text>
+<text x="570" y="264" text-anchor="middle" class="d-text-inv d-small">filter &#8594; score &#8594; select</text>
+<text x="570" y="280" text-anchor="middle" class="d-text-inv d-small">prefix/session/load scorers</text>
+<path d="M480,182 Q380,150 380,129" class="d-dashed d-outline" fill="none"/>
+<path d="M400,297 L200,340" class="d-arrow" marker-end="url(#f1-arr)" fill="none"/>
+<text x="270" y="330" text-anchor="middle" class="d-mono d-small">x-gateway-destination-endpoint</text>
+<path d="M570,312 L570,340" class="d-dashed d-outline"/>
+<rect x="40" y="342" width="720" height="50" rx="8" class="d-panel"/>
+<text x="90" y="362" text-anchor="middle" class="d-small">Pod A</text>
+<rect x="60" y="368" width="60" height="16" rx="3" class="d-outline"/>
+<text x="250" y="362" text-anchor="middle" class="d-small d-bold">Pod B (picked)</text>
+<rect x="220" y="368" width="60" height="16" rx="3" class="d-fill-orange"/>
+<text x="410" y="362" text-anchor="middle" class="d-small">Pod C</text>
+<rect x="380" y="368" width="60" height="16" rx="3" class="d-outline"/>
+<text x="570" y="362" text-anchor="middle" class="d-small">Pod D</text>
+<rect x="540" y="368" width="60" height="16" rx="3" class="d-outline"/>
+<text x="700" y="357" text-anchor="middle" class="d-small d-text-light">InferencePool</text>
+<text x="700" y="373" text-anchor="middle" class="d-small d-text-light">member pods</text>
+<path d="M570,180 Q660,250 260,368" class="d-arrow-active" marker-end="url(#f1-arr)" fill="none" style="stroke-width:1.5"/>
+</svg>
+<figcaption><b>Figure 1.</b> The pieces this module adds around Module 2's scheduler: an <code>HTTPRoute</code> sends traffic to an <code>InferencePool</code>, the pool's <code>endpointPickerRef</code> points the gateway's ext-proc filter at the Endpoint Picker, the EPP runs Module 2's filter-score-select pipeline internally, and returns its pick as a header the gateway reads before forwarding the request to the winning pod. CRD fields per the Gateway API Inference Extension's InferencePool spec<a class="cite" href="#ref-5">5</a>; ext-proc wiring per the Endpoint Picker Protocol<a class="cite" href="#ref-8">8</a>.</figcaption>
+</figure>
+
+<h2 id="llmd-in-the-stack">1. llm-d in the open-source stack: five well-lit paths and governance</h2>
+<h3 id="what-llmd-is">1.1 What llm-d is, and what it is not</h3>
+<p>llm-d describes itself as a Kubernetes-native distributed inference stack, and its own repository organizes its capabilities into five themes it calls "well-lit paths": Intelligent Routing (prefix-cache and load-aware balancing &#8212; Module 2's subject), Advanced KV-Cache Management (tiered offloading to CPU and disk &#8212; Module 7/8's subject), Serving Large Models (prefill/decode disaggregation and wide expert-parallelism &#8212; Modules 3&#8211;6's subject), Operational Excellence (flow control and SLO-aware autoscaling), and Batch Processing (OpenAI-compatible batch APIs)<a class="cite" href="#ref-2">2</a>. llm-d is not itself an inference engine; it runs vLLM and SGLang as its supported engines and adds the routing, caching, and orchestration machinery around them<a class="cite" href="#ref-2">2</a> &#8212; the same "orchestration layer above engines" framing Module 9 introduced for Dynamo, applied to a different set of Kubernetes-native building blocks. The project's own tagline describes it as targeting "any accelerator," and its site lists GPUs, TPUs, XPUs, CPUs, and NPUs as hardware it runs across<a class="cite" href="#ref-15">15</a> &#8212; a broader hardware ambition than Dynamo's GPU-and-NVIDIA-fabric-centric framing (Module 9), though this course's own sourcing for llm-d's mechanism (Module 2 and this module) is entirely GPU-based, and the non-GPU claim is not one this course can independently verify from a fetched benchmark.</p>
+<p>The first four of those themes are already covered from the mechanism side by earlier modules in this course. What none of those modules covered is how the routing decision from Module 2 becomes a real object a Kubernetes cluster operator deploys, upgrades, and debugs. That is this module's entire scope: the CRD, the wire protocol, and the project's own maturity.</p>
+<h3 id="governance">1.2 Founding organizations and CNCF Sandbox status</h3>
+<p>llm-d was founded in May 2025 by Red Hat, Google Cloud, IBM Research, CoreWeave, and NVIDIA<a class="cite" href="#ref-2">2</a>. It was accepted into the Cloud Native Computing Foundation as a Sandbox project on March 12, 2026, with the acceptance publicly announced on March 24, 2026 at KubeCon Europe<a class="cite" href="#ref-4">4</a>. Industry contributors named alongside the founders include AMD, Cisco, Hugging Face, Intel, Lambda, and Mistral AI, with academic participation from UC Berkeley and the University of Chicago<a class="cite" href="#ref-4">4</a>. Section 8 comes back to exactly what "Sandbox" means for whether any of this is safe to run in production.</p>
+<p>The project moves fast by version number: the earliest tagged GitHub release is v0.2.0 (July 2025), and the most recent as of this module's access date is v0.9.0, released August 17, 2026<a class="cite" href="#ref-3">3</a> &#8212; nine minor releases in about thirteen months. The v0.9.0 release notes describe themselves as "hardened for scale," listing router high availability, enhanced autoscaling, end-to-end observability, and expanded hardware support among the changes<a class="cite" href="#ref-12">12</a>.</p>
+<h3 id="llmd-vs-dynamo-brief">1.3 A different Kubernetes-native bet than Dynamo</h3>
+<p>Module 9 covered Dynamo as a vertically integrated orchestration layer with its own named components &#8212; a Router, a Planner, a KV Block Manager &#8212; and its own backend list (vLLM, SGLang, TensorRT-LLM)<a class="cite" href="#ref-13">13</a>. llm-d takes a structurally different position: rather than shipping a self-contained router, it builds its scheduler as an implementation of a Kubernetes-standard API contract (sections 2&#8211;4 of this module), so that the same scheduling logic can, in principle, run behind any Envoy-based gateway that speaks that contract, not only behind llm-d's own frontend. Both projects solve overlapping problems &#8212; KV-cache-aware routing, SLO-driven scaling, disaggregated serving orchestration &#8212; from different starting assumptions about where the API boundary should sit. Section 6 returns to this contrast once the standard itself has been introduced.</p>
+
+<h2 id="gaie-standard">2. The Gateway API Inference Extension: the standard llm-d builds on</h2>
+<h3 id="what-gaie-is">2.1 What GAIE standardizes</h3>
+<p>The Kubernetes Gateway API Inference Extension (GAIE) is an official Kubernetes SIG project whose stated purpose is to optimize self-hosting generative models on Kubernetes by extending any Gateway API implementation that also supports Envoy's external-processing protocol into an "inference gateway" &#8212; one capable of routing on model-serving-specific signals instead of only HTTP-level load balancing<a class="cite" href="#ref-1">1</a>. It ships two things: an API type, <code>InferencePool</code> (section 3), and a wire contract, the Endpoint Picker Protocol (section 4), that any conformant EPP must speak. Module 2 already introduced the EPP as "a data-plane component that communicates via the Envoy external processing protocol, and acts as the Router"<a class="cite" href="#ref-1">1</a> and covered the three-layer architecture GAIE's own proposal describes &#8212; a Routing Layer, a Flow Controller, and a Scheduling Layer<a class="cite" href="#ref-9">9</a> &#8212; as the API-level description of exactly the same computation llm-d's scheduler implements concretely. Neither of those points is repeated here.</p>
+<p>What matters for this module is that GAIE is explicitly a standard, not an implementation: gateway vendors (Envoy Gateway, kgateway, GKE Gateway, and others) implement the InferencePool and ext-proc side of the contract, and separate projects implement the EPP side. llm-d is one EPP implementation of that contract &#8212; section 5 covers exactly how central a one. GAIE's named goals go beyond the KV-cache-aware routing Module 2 covers: the project also states routing client model names to use-case-specific LoRA adapters as a goal, alongside the request-scheduling algorithm being KV-cache- and request-cost-aware<a class="cite" href="#ref-1">1</a>. The LoRA-routing goal is the piece that connects directly to section 3.3's multi-pool pattern &#8212; routing by model name to a specific pool is the same mechanism whether "model name" selects a different base model or a different LoRA adapter served from the same base weights.</p>
+<h3 id="gaie-version-history">2.2 Version history: from GA to the current release</h3>
+<p><code>InferencePool</code> graduated to a stable, GA API version, <code>v1</code>, at project release v1.0.0, published September 9, 2025<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-5">5</a>. Since then the project has shipped monthly-to-quarterly releases: v1.3.0 (January 21, 2026), v1.4.0 (March 20, 2026, adding gRPC support via the <code>appProtocol</code> field), v1.5.0 (April 19, 2026, the release that made <code>endpointPickerRef</code> optional &#8212; section 3.2), and v1.6.1, the most recent tag as of this module's access date, published September 11, 2026<a class="cite" href="#ref-6">6</a>. That cadence &#8212; six days short of a year from a GA v1.0.0 to a v1.6.1 &#8212; is the same evidence Module 8 already used for NIXL: a young standard, moving in production-relevant ways (field defaults changing, not just patch fixes), whose exact field list is worth re-checking against the live spec rather than memorizing from any one snapshot.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 220" role="img" aria-labelledby="f5t"><title id="f5t">Version timeline of the Gateway API Inference Extension standard alongside llm-d's own release history</title>
+<line x1="60" y1="60" x2="760" y2="60" class="d-axis"/>
+<text x="60" y="44" class="d-small d-bold">GAIE (the standard)</text>
+<circle cx="140" cy="60" r="5" class="d-fill-blue"/><text x="140" y="82" text-anchor="middle" class="d-mono d-small">v1.0.0</text><text x="140" y="98" text-anchor="middle" class="d-small d-text-light">2025-09-09</text><text x="140" y="30" text-anchor="middle" class="d-small">GA</text>
+<circle cx="420" cy="60" r="5" class="d-fill-orange"/><text x="420" y="82" text-anchor="middle" class="d-mono d-small">v1.5.0</text><text x="420" y="98" text-anchor="middle" class="d-small d-text-light">2026-04-19</text><text x="420" y="30" text-anchor="middle" class="d-small">endpointPickerRef optional</text>
+<circle cx="720" cy="60" r="5" class="d-fill-blue"/><text x="720" y="82" text-anchor="middle" class="d-mono d-small">v1.6.1</text><text x="720" y="98" text-anchor="middle" class="d-small d-text-light">2026-09-11</text><text x="720" y="30" text-anchor="middle" class="d-small">latest</text>
+<line x1="60" y1="160" x2="760" y2="160" class="d-axis"/>
+<text x="60" y="144" class="d-small d-bold">llm-d</text>
+<circle cx="140" cy="160" r="5" class="d-fill-cyan"/><text x="140" y="182" text-anchor="middle" class="d-mono d-small">v0.2.0</text><text x="140" y="198" text-anchor="middle" class="d-small d-text-light">2025-07-29</text>
+<circle cx="460" cy="160" r="5" class="d-fill-amber"/><text x="460" y="182" text-anchor="middle" class="d-mono d-small">CNCF Sandbox</text><text x="460" y="198" text-anchor="middle" class="d-small d-text-light">2026-03-12</text>
+<circle cx="720" cy="160" r="5" class="d-fill-cyan"/><text x="720" y="182" text-anchor="middle" class="d-mono d-small">v0.9.0</text><text x="720" y="198" text-anchor="middle" class="d-small d-text-light">2026-08-17</text>
+<line x1="140" y1="60" x2="140" y2="160" class="d-dashed d-outline"/>
+</svg>
+<figcaption><b>Figure 5.</b> Both the standard and its principal implementation are less than a year past their respective 1.0/Sandbox milestones, moving on a monthly-to-quarterly cadence. GAIE dates from the project's own GitHub release history<a class="cite" href="#ref-6">6</a>; llm-d dates from its GitHub release history<a class="cite" href="#ref-3">3</a> and CNCF's acceptance announcement<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h2 id="inferencepool-crd">3. The InferencePool CRD</h2>
+<h3 id="crd-fields">3.1 The full field list</h3>
+<p><code>InferencePool</code> is a namespaced custom resource. Its spec has two required fields and two optional ones, and the optional <code>endpointPickerRef</code> field is itself a small object with its own defaults worth knowing precisely, because one of them (<code>failureMode</code>) decides what happens to every request in flight if the EPP process dies.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> <code>InferencePoolSpec</code> and its <code>endpointPickerRef</code> sub-object, field by field<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-14">14</a>.</caption>
+<thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Default</th></tr></thead>
+<tbody>
+<tr><td class="row">selector</td><td>label selector</td><td class="d-mono" data-best>yes</td><td>&#8212;</td></tr>
+<tr><td class="row">targetPorts</td><td>port array</td><td class="d-mono" data-best>yes</td><td>&#8212;</td></tr>
+<tr><td class="row">appProtocol</td><td>protocol string</td><td>no</td><td class="d-mono">http</td></tr>
+<tr><td class="row">endpointPickerRef</td><td>object reference</td><td>no <small>(required before v1.5.0)</small></td><td>&#8212;</td></tr>
+<tr><td class="row">&#8618; endpointPickerRef.group</td><td>API group</td><td>no</td><td>&#8212;</td></tr>
+<tr><td class="row">&#8618; endpointPickerRef.kind</td><td>object kind</td><td>no</td><td class="d-mono">Service</td></tr>
+<tr><td class="row">&#8618; endpointPickerRef.name</td><td>object name</td><td class="d-mono" data-best>yes</td><td>&#8212;</td></tr>
+<tr><td class="row">&#8618; endpointPickerRef.port</td><td>port</td><td>no</td><td>&#8212;</td></tr>
+<tr><td class="row">&#8618; endpointPickerRef.failureMode</td><td>enum</td><td>no</td><td class="d-mono" data-worst>FailClose</td></tr>
+</tbody>
+</table>
+<p><code>selector</code> is a label selector whose labels must exactly match the labels applied to the model-server pods in the pool<a class="cite" href="#ref-5">5</a> &#8212; this is what turns the CRD from a passive record into a live group membership: any pod matching the selector is a candidate for the EPP to pick, and pods leave the pool the instant their labels stop matching, independent of any explicit deregistration step. <code>targetPorts</code> names the port numbers on those pods the gateway should actually route to<a class="cite" href="#ref-5">5</a>. <code>appProtocol</code>, added at GAIE v1.4.0, lets a pool declare it speaks gRPC rather than plain HTTP<a class="cite" href="#ref-6">6</a>, which matters once a deployment puts a gRPC-based model server behind the same InferencePool contract.</p>
+<h3 id="epp-ref-and-failure-mode">3.2 endpointPickerRef and the fail-open/fail-close choice</h3>
+<p><code>endpointPickerRef</code> is the field that ties an InferencePool to an actual EPP: by default it targets a Kubernetes <code>Service</code> object, named explicitly, on an explicit port<a class="cite" href="#ref-14">14</a>. Until GAIE v1.5.0 this field was required &#8212; every InferencePool had to name an EPP. Since v1.5.0 it is optional, "to allow usages of InferencePool without user-managed Endpoint Picker deployments"<a class="cite" href="#ref-5">5</a>, meaning a gateway can fall back to ordinary load balancing across the pool's pods when no EPP is configured, rather than treating the absence of an EPP as a configuration error.</p>
+<p>When an EPP <i>is</i> configured, <code>failureMode</code> decides what the gateway does if that EPP stops responding. The default, <code>FailClose</code>, drops the request outright<a class="cite" href="#ref-14">14</a> &#8212; the safer default for a scheduler whose whole job is enforcing correctness properties (decode-stage filtering, SLO-aware admission) that a blind fallback pick could violate. The alternative, <code>FailOpen</code>, has the gateway forward the request to a pod of its own choosing when the EPP fails<a class="cite" href="#ref-14">14</a> &#8212; trading routing quality for availability. Neither GAIE's spec page nor llm-d's own documentation states a recommended choice; it is a genuine per-deployment trade-off between "never serve a request the scheduler didn't approve" and "never let a scheduler outage become a full outage."</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>The default matters because it is easy to get by doing nothing: a manifest that omits <code>failureMode</code> entirely gets <code>FailClose</code> silently<a class="cite" href="#ref-14">14</a>, which is the right choice for a pool serving requests where a misrouted decode-stage request would violate a correctness property (Module 2, section 6.1's <code>decode-filter</code>), but turns any EPP rollout, crash, or scale-to-zero window into a full outage for that pool rather than a degraded one. A pool an operator is comfortable degrading gracefully under &#8212; batch or best-effort traffic, for instance &#8212; is where setting <code>FailOpen</code> explicitly is worth the routing-quality cost of an occasional unscored pick.</p></aside>
+<pre class="code" data-lang="yaml" data-title="InferencePool manifest, all fields shown" data-hl="9-13"><code>apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: vllm-qwen3-32b
+spec:
+  selector:
+    matchLabels:
+      app: vllm-qwen3-32b
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    name: vllm-qwen3-32b-epp
+    port:
+      number: 9002
+    failureMode: FailOpen
+</code></pre>
+<p class="small muted">Manifest per the InferencePool API reference<a class="cite" href="#ref-5">5</a>; this example sets <code>failureMode</code> explicitly to <code>FailOpen</code>, overriding the <code>FailClose</code> default.</p>
+<h3 id="httproute-wiring">3.3 HTTPRoute: one route, many pools</h3>
+<p>An <code>HTTPRoute</code> &#8212; the standard Gateway API object that maps a hostname and path to a backend &#8212; can list an InferencePool as a <code>backendRef</code>, and a single HTTPRoute may reference multiple InferencePools<a class="cite" href="#ref-5">5</a>. That is the mechanism behind multi-model and multi-tenant serving: one route (say, a public OpenAI-compatible endpoint) can fan out by model name or weighted split to several pools, each pool backed by its own EPP, its own selector, and its own model-server fleet. Module 14 covers this pattern operationally; the point to take from this section is purely structural &#8212; <code>InferencePool</code> occupies the same API slot a plain Kubernetes <code>Service</code> would occupy as an HTTPRoute's backend, except that instead of round-robin or session-affinity load balancing at the kube-proxy layer, the pool's <code>endpointPickerRef</code> substitutes a model-aware decision at the gateway layer.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f2t"><title id="f2t">One HTTPRoute referencing two InferencePools as backendRefs, each pool with its own selector, targetPorts, and endpointPickerRef</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="20" width="200" height="60" rx="8" class="d-block"/>
+<text x="120" y="44" text-anchor="middle" class="d-text-inv d-small d-bold">HTTPRoute</text>
+<text x="120" y="62" text-anchor="middle" class="d-text-inv d-small">backendRefs: [A, B]</text>
+<path d="M220,50 Q300,50 300,90" class="d-arrow" marker-end="url(#f2-arr)" fill="none"/>
+<path d="M220,50 Q300,50 300,190" class="d-arrow" marker-end="url(#f2-arr)" fill="none"/>
+<rect x="300" y="92" width="220" height="70" rx="8" class="d-block-2"/>
+<text x="410" y="114" text-anchor="middle" class="d-text-inv d-small d-bold">InferencePool A</text>
+<text x="410" y="130" text-anchor="middle" class="d-text-inv d-small">selector: app=model-a</text>
+<text x="410" y="146" text-anchor="middle" class="d-text-inv d-small">endpointPickerRef: epp-a</text>
+<rect x="300" y="182" width="220" height="70" rx="8" class="d-block-2"/>
+<text x="410" y="204" text-anchor="middle" class="d-text-inv d-small d-bold">InferencePool B</text>
+<text x="410" y="220" text-anchor="middle" class="d-text-inv d-small">selector: app=model-b</text>
+<text x="410" y="236" text-anchor="middle" class="d-text-inv d-small">endpointPickerRef: epp-b</text>
+<path d="M520,127 L570,127" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="570" y="102" width="200" height="50" rx="8" class="d-panel"/>
+<text x="670" y="122" text-anchor="middle" class="d-small">EPP A + pods</text>
+<text x="670" y="140" text-anchor="middle" class="d-small d-text-light">model A fleet</text>
+<path d="M520,217 L570,217" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="570" y="192" width="200" height="50" rx="8" class="d-panel"/>
+<text x="670" y="212" text-anchor="middle" class="d-small">EPP B + pods</text>
+<text x="670" y="230" text-anchor="middle" class="d-small d-text-light">model B fleet</text>
+</svg>
+<figcaption><b>Figure 2.</b> One <code>HTTPRoute</code> fans out to two independently scheduled <code>InferencePool</code>s, each with its own selector, target ports, and EPP &#8212; the structural basis for multi-model serving behind one endpoint. Per the InferencePool spec's HTTPRoute relationship<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<h2 id="wiring-epp-envoy">4. Wiring the EPP into Envoy: the ext-proc protocol</h2>
+<h3 id="ext-proc-stream">4.1 A bidirectional gRPC stream, not a REST callback</h3>
+<p>Module 2's Figure 4 drew the EPP's role in a request's path at the level of "the gateway calls the EPP, the EPP replies." The actual mechanism is Envoy's external-processing (<code>ext_proc</code>) HTTP filter: Envoy opens a bidirectional gRPC stream to an external service, sends it <code>ProcessingRequest</code> messages, and expects <code>ProcessingResponse</code> messages back<a class="cite" href="#ref-7">7</a>. The filter can be configured to send any combination of request headers, request body, request trailers, response headers, and response trailers as separate messages on the same stream<a class="cite" href="#ref-7">7</a> &#8212; for a routing decision, only the request-headers phase (and, when a scorer needs prompt content for hashing per Module 2 section 3, the request body) needs to reach the EPP; the EPP does not need to see response data at all, since its job is finished once the gateway has a destination.</p>
+<p>GAIE's EPP architecture proposal is explicit that this boundary is fixed, not extensible: "the Ext-Proc Server protocol is very well defined & specific, deviation could cause the EPP to become unusable or unstable"<a class="cite" href="#ref-9">9</a>. The request is buffered by the Ext-Proc Server component and handed to the Routing Layer<a class="cite" href="#ref-9">9</a> &#8212; the three layers Module 2 already covered (Routing Layer, Flow Controller, Scheduling Layer) are everything downstream of that fixed protocol boundary; the wire format itself is not a place llm-d, or any other EPP implementation, gets to innovate.</p>
+<h3 id="destination-endpoint-header">4.2 How the EPP hands back its pick</h3>
+<p>The EPP communicates its selected pod to Envoy two ways at once, and both must agree: an HTTP header, <code>x-gateway-destination-endpoint</code>, set to the pod's address in <code>ip:port</code> form (or a comma-separated list of several addresses), and the same value duplicated in the ext-proc response's <code>dynamic_metadata</code> field, nested under a namespace key that defaults to <code>envoy.lb</code><a class="cite" href="#ref-8">8</a>. Concretely, the metadata entry looks like <code>{"envoy.lb": {"x-gateway-destination-endpoint": "10.0.4.12:8000"}}</code>. Envoy's load-balancing layer reads that metadata to override its normal endpoint selection and send the request straight to the named pod, bypassing whatever load-balancing policy would otherwise apply to the pool. This is the concrete mechanism behind the dashed arrow in Module 2's Figure 4 ("select max" &#8594; "forward request") &#8212; a specific header plus a specific metadata key, not an unspecified internal handoff.</p>
+<p>If the picker needs to constrain the gateway to a subset of the pool rather than a single pod &#8212; useful for a scorer that has ranked several roughly-equal candidates and wants Envoy's own connection-level load balancing to pick among them &#8212; it sets <code>x-gateway-destination-endpoint-subset</code> instead; if that key is absent, the EPP is expected to select from the full set defined by the InferencePool's own selector<a class="cite" href="#ref-8">8</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">Sequence diagram of the ext-proc gRPC exchange between Envoy and the EPP, including the success path and the two failure responses</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="150" y="22" text-anchor="middle" class="d-small d-bold">Envoy (ext_proc filter)</text>
+<line x1="150" y1="32" x2="150" y2="280" class="d-outline d-dashed"/>
+<text x="500" y="22" text-anchor="middle" class="d-small d-bold">EPP</text>
+<line x1="500" y1="32" x2="500" y2="280" class="d-outline d-dashed"/>
+<path d="M150,56 L494,56" class="d-arrow" marker-end="url(#f3-arr)"/><text x="330" y="50" text-anchor="middle" class="d-small">ProcessingRequest (request headers[, body])</text>
+<rect x="440" y="66" width="120" height="30" rx="4" class="d-hl"/><text x="500" y="86" text-anchor="middle" class="d-small">filter &#8594; score &#8594; select</text>
+<path d="M500,100 L156,100" class="d-arrow" marker-end="url(#f3-arr)"/><text x="330" y="94" text-anchor="middle" class="d-small d-bold">ProcessingResponse: success</text>
+<text x="330" y="118" text-anchor="middle" class="d-mono d-small">header x-gateway-destination-endpoint = 10.0.4.12:8000</text>
+<text x="330" y="134" text-anchor="middle" class="d-mono d-small">dynamic_metadata.envoy.lb.x-gateway-destination-endpoint (same value)</text>
+<path d="M150,156 L494,156" class="d-arrow" marker-end="url(#f3-arr)"/><text x="330" y="150" text-anchor="middle" class="d-small">forward request to 10.0.4.12:8000</text>
+<line x1="60" y1="180" x2="740" y2="180" class="d-dashed d-outline"/>
+<text x="400" y="196" text-anchor="middle" class="d-small d-text-light">if the EPP does not respond (failureMode)</text>
+<path d="M500,214 L156,214" class="d-arrow" marker-end="url(#f3-arr)"/><text x="330" y="208" text-anchor="middle" class="d-small">ImmediateResponse 503 &#8212; no ready endpoints</text>
+<path d="M500,238 L156,238" class="d-arrow" marker-end="url(#f3-arr)"/><text x="330" y="232" text-anchor="middle" class="d-small">ImmediateResponse 429 &#8212; drop, overloaded</text>
+<text x="330" y="262" text-anchor="middle" class="d-small d-text-light">EPP process unresponsive, no message at all</text>
+<path d="M150,262 L494,262" class="d-dashed d-outline" marker-end="url(#f3-arr)"/><text x="330" y="278" text-anchor="middle" class="d-small">FailClose: drop request &#8212; FailOpen: gateway picks its own endpoint</text>
+</svg>
+<figcaption><b>Figure 3.</b> The exact wire exchange behind Module 2's abstract "select max &#8594; forward request" step: a bidirectional ext-proc gRPC stream carrying a header and matching metadata key back to Envoy, plus the two explicit ImmediateResponse failure codes the EPP can emit and the CRD-level <code>failureMode</code> fallback for when it emits nothing at all. Protocol per the Endpoint Picker Protocol spec<a class="cite" href="#ref-8">8</a> and Envoy's ext_proc filter documentation<a class="cite" href="#ref-7">7</a>; failure-mode fallback per the InferencePool field reference<a class="cite" href="#ref-14">14</a>.</figcaption>
+</figure>
+
+<h3 id="explicit-failure-signaling">4.3 Two layers of failure handling</h3>
+<p>There are two distinct places a request can fail on this path, and they are handled at two different layers. Inside a live ext-proc exchange, the EPP itself can explicitly signal failure with an <code>ImmediateResponse</code>: HTTP 503 if there are no ready endpoints in the pool at all, or HTTP 429 if the request should be dropped &#8212; for instance, because the Flow Controller's admission logic (Module 2's Request Control stage) rejected it<a class="cite" href="#ref-8">8</a>. Those are ordinary, expected outcomes of running the scheduler and are visible to the client as normal HTTP status codes. The <code>failureMode</code> field from section 3.2 covers the different case where the EPP does not respond on the stream at all &#8212; a crash, a network partition, a deployment rollout with zero available replicas of the EPP itself &#8212; and that fallback is decided once, at the CRD level, rather than per-request.</p>
+
+<h2 id="llmd-reference-epp">5. llm-d as the reference Endpoint Picker implementation</h2>
+<h3 id="llmd-router-repo">5.1 llm-d-router: where GAIE's own reference EPP now lives</h3>
+<p>GAIE's own project FAQ states plainly that its repository no longer hosts a full reference EPP: "Although this project previously hosted a reference Endpoint Picker (EPP) implementation (which has now been moved to the llm-d-router repository), this project now provides only a lightweight reference extension to support conformance testing"<a class="cite" href="#ref-11">11</a>. The FAQ adds that "individual Gateway controllers should implement their own extension or use an existing one"<a class="cite" href="#ref-11">11</a> &#8212; a direct statement that GAIE itself does not ship a production EPP, and that llm-d's is the one the standard's own maintainers point to. Module 2's primary source for llm-d's scheduler, the <code>llm-d-inference-scheduler</code> repository<a class="cite" href="#ref-10">10</a>, is the same repository under an earlier name; its GitHub URL now redirects to <code>llm-d/llm-d-router</code>, described on its own page as "the intelligent entry point for inference requests."</p>
+<p>This is the precise sense in which llm-d is not merely <i>an</i> implementation of the Gateway API Inference Extension among equals &#8212; it is the specific project the standard's own upstream repository now delegates its reference implementation to. That does not make llm-d the only conformant EPP (section 6 covers what else exists), but it does mean the mechanism Module 2 taught in detail &#8212; block hashing, KVEvents, the weighted scorer set &#8212; is not an arbitrary third-party design bolted onto GAIE; it is the implementation GAIE's maintainers migrated their own reference code into.</p>
+<h3 id="router-proxy-epp">5.2 "Router" in llm-d's own vocabulary: Proxy plus EPP</h3>
+<p>llm-d's architecture documentation names three top-level components: a Router, an InferencePool, and the Model Server<a class="cite" href="#ref-12">12</a>. Confusingly for a reader coming from GAIE's own terminology, llm-d's "Router" is itself two parts: a Proxy, "a high-performance L7 proxy that conforms to the Gateway API Inference Extension standard, accepting requests and consulting the Endpoint Picker via the ext-proc protocol," and the Endpoint Picker itself, "the routing engine that scores and selects model server pods based on real-time metrics, KV-cache affinity, and configured policies"<a class="cite" href="#ref-12">12</a>. Mapped onto Figure 1: llm-d's Proxy is the Envoy gateway box, and llm-d's EPP is the EPP box &#8212; llm-d's own "Router" is the Proxy-plus-EPP pair together, not a separate third component. The InferencePool sits between them as the CRD-level contract, and the Model Server is any pod matching that pool's selector.</p>
+<h3 id="stitched-path">5.3 The end-to-end path, stitched together</h3>
+<p>Combining sections 2&#8211;5 with Module 2's scheduler internals gives the complete path for one request: an <code>HTTPRoute</code> sends it to an <code>InferencePool</code> (section 3); Envoy's ext-proc filter opens a gRPC stream to the pool's referenced EPP &#8212; concretely, llm-d's Proxy-plus-EPP pair (section 5.1&#8211;5.2) &#8212; and sends a <code>ProcessingRequest</code> (section 4.1); the EPP runs the filter-score-select pipeline Module 2 already covers in full, using whichever combination of prefix-cache, session-affinity, load, and decode-stage scorers is configured; the EPP replies with a <code>ProcessingResponse</code> carrying <code>x-gateway-destination-endpoint</code> and matching <code>dynamic_metadata</code> (section 4.2); Envoy forwards the request to that pod, bypassing ordinary load balancing. Nothing in this module changes what happens inside the scheduler box in Figure 1 &#8212; it only makes precise everything around that box.</p>
+
+<h2 id="standard-vs-implementations">6. The standard, and its other implementations</h2>
+<h3 id="llmd-vs-dynamo-detail">6.1 llm-d versus Dynamo: standardized contract versus vertical integration</h3>
+<p>Dynamo's own README describes its Router as one of five named components &#8212; alongside a Planner, a KV Block Manager, ModelExpress, and Grove &#8212; bundled into one orchestration layer that also names its own backend list (vLLM, SGLang, TensorRT-LLM)<a class="cite" href="#ref-13">13</a>. That Router is Dynamo's own component, not an implementation of GAIE's EPP contract; Dynamo does not describe itself in terms of <code>InferencePool</code> or ext-proc in its own README<a class="cite" href="#ref-13">13</a>. llm-d instead has no equivalent to a single named "Router" outside of the Proxy-plus-EPP pair described in section 5.2, both of which exist specifically to satisfy the GAIE contract rather than an internally-designed API.</p>
+<p>The practical consequence is where each project's portability comes from. llm-d's scheduling logic is portable across any Gateway API implementation that adds ext-proc support and speaks the InferencePool contract &#8212; Envoy Gateway, kgateway, and GKE Gateway are named gateway implementations of that contract. Dynamo's Router is portable across Dynamo's own three supported engines, but is not built to be swapped for a different orchestration layer's router behind a shared standard. Table 3 makes this contrast explicit against a third project.</p>
+<h3 id="other-epps">6.2 Other implementations of the same contract</h3>
+<p>llm-d is not the only project building against InferencePool and the Endpoint Picker Protocol. GAIE's own FAQ, in stating that "individual Gateway controllers should implement their own extension or use an existing one"<a class="cite" href="#ref-11">11</a>, frames llm-d-router as the default rather than the only choice. AIBrix is the other named EPP-adjacent Kubernetes-native inference stack this course covers, with its own gateway/routing, autoscaling, and distributed-KV-cache components; Module 14 covers it in the depth its own operational scope deserves. The point worth carrying forward from this module alone is definitional: <b>Gateway API Inference Extension</b> is the Kubernetes-standard API (InferencePool, the ext-proc contract); <b>llm-d</b> is the project that currently hosts the reference implementation of the EPP side of that API and the scheduler mechanism Module 2 covers in depth; other EPP implementations, AIBrix among them, can and do exist against the same standard without needing to re-implement the wire protocol from section 4.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 3.</b> Positioning the standard against three Kubernetes-native orchestration answers<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-13">13</a>.</caption>
+<thead><tr><th>Property</th><th>Gateway API Inference Extension</th><th>llm-d</th><th>NVIDIA Dynamo (Module 9)</th></tr></thead>
+<tbody>
+<tr><td class="row">What it is</td><td class="d-mono" data-best>a Kubernetes API standard</td><td>the standard's reference EPP implementation</td><td>a vertically integrated orchestration layer</td></tr>
+<tr><td class="row">Routing API surface</td><td>InferencePool CRD + ext-proc contract</td><td class="d-mono" data-best>implements the CRD + contract</td><td>own Router component, not CRD-based</td></tr>
+<tr><td class="row">Supported engines</td><td>engine-agnostic by design</td><td>vLLM, SGLang<a class="cite" href="#ref-2">2</a></td><td>vLLM, SGLang, TensorRT-LLM<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">Portable across gateways</td><td class="d-mono" data-best>yes, by definition</td><td>yes, any GAIE-conformant gateway</td><td>no, own frontend</td></tr>
+<tr><td class="row">Governance</td><td>Kubernetes SIG</td><td>CNCF Sandbox (since 2026-03-12)<a class="cite" href="#ref-4">4</a></td><td>NVIDIA-led open source<a class="cite" href="#ref-13">13</a></td></tr>
+</tbody>
+</table>
+
+<h2 id="headline-numbers">7. llm-d's headline numbers, read with their scope</h2>
+<p>llm-d's own README publishes several throughput and latency claims. Each is attached to a specific model, GPU count, and comparison baseline &#8212; reading the scope alongside the number is what turns a marketing figure into something usable for capacity planning.</p>
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 2.</b> llm-d's self-reported headline numbers, with the hardware, model, and comparison baseline each is attached to<a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Claim</th><th>Model</th><th>Hardware</th><th>Comparison</th></tr></thead>
+<tbody>
+<tr><td class="row">3&#215; output throughput, 2&#215; faster TTFT</td><td>Llama 3.1 70B</td><td>4&#215; AMD MI300X</td><td>prefix-cache routing vs. round-robin</td></tr>
+<tr><td class="row">40% lower TTFT and ITL</td><td>not specified</td><td>NVIDIA GPUs (unspecified)</td><td>predicted-latency scheduling vs. heuristics</td></tr>
+<tr><td class="row">70% higher tok/s</td><td>GPT-OSS</td><td>NVIDIA B200 (p6-b200)</td><td>disaggregation vs. standard vLLM</td></tr>
+<tr><td class="row">10&#8211;30% throughput gain</td><td>GPT-OSS-120B, Llama 3.3 70B</td><td>AMD MI300X</td><td>disaggregated serving</td></tr>
+<tr><td class="row">50k tok/s cluster throughput</td><td>not specified</td><td>16&#215;16 NVIDIA B200 (256 GPUs)</td><td>wide expert-parallelism</td></tr>
+<tr><td class="row">13.9&#215; throughput</td><td>not specified</td><td>4&#215; NVIDIA H100</td><td>hierarchical KV offload, 250 concurrent users</td></tr>
+</tbody>
+</table>
+<p>The 50k-tok/s cluster figure is worth converting to a per-GPU number, because "cluster throughput" scales trivially with GPU count and is not by itself comparable to any single-node figure this course has cited. At 16&#215;16 B200 &#8212; 256 GPUs total &#8212; 50,000 tokens/s of aggregate cluster throughput works out to</p>
+$$ \frac{50{,}000\ \text{tok/s}}{256\ \text{GPUs}} \approx 195\ \text{tok/s per GPU} $$
+<p>Module 6 established DeepSeek's own production decode throughput at roughly 1.85k output tokens/s per H800 GPU, derived directly from DeepSeek's published per-node figure. The two numbers are not measuring the same thing &#8212; different model, different hardware generation, an unspecified model and workload mix behind llm-d's 50k-tok/s claim, and llm-d's figure is not stated to be decode-only &#8212; so this is not a claim that one system is roughly ten times worse than the other. It is the arithmetic every headline cluster-throughput number should get before it is used for planning: divide by GPU count, and check what stage of serving (prefill, decode, or a mix) the number actually describes before comparing it to anything.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f4t"><title id="f4t">llm-d's five well-lit paths, each paired with its own headline benchmark claim and the module in this course that covers its mechanism</title>
+<g>
+<rect x="10" y="40" width="150" height="130" rx="8" class="d-block"/>
+<text x="85" y="64" text-anchor="middle" class="d-text-inv d-small d-bold">Intelligent</text>
+<text x="85" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">Routing</text>
+<text x="85" y="104" text-anchor="middle" class="d-text-inv d-small">3&#215; throughput</text>
+<text x="85" y="120" text-anchor="middle" class="d-text-inv d-small">2&#215; TTFT</text>
+<text x="85" y="148" text-anchor="middle" class="d-text-inv d-small d-mono">Module 2</text>
+</g>
+<g>
+<rect x="170" y="40" width="150" height="130" rx="8" class="d-block-2"/>
+<text x="245" y="64" text-anchor="middle" class="d-text-inv d-small d-bold">Advanced</text>
+<text x="245" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">KV-Cache Mgmt</text>
+<text x="245" y="104" text-anchor="middle" class="d-text-inv d-small">13.9&#215; throughput</text>
+<text x="245" y="120" text-anchor="middle" class="d-text-inv d-small">(hierarchical offload)</text>
+<text x="245" y="148" text-anchor="middle" class="d-text-inv d-small d-mono">Modules 7-8</text>
+</g>
+<g>
+<rect x="330" y="40" width="150" height="130" rx="8" class="d-block-accent"/>
+<text x="405" y="64" text-anchor="middle" class="d-text-inv d-small d-bold">Serving Large</text>
+<text x="405" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">Models</text>
+<text x="405" y="104" text-anchor="middle" class="d-text-inv d-small">70% higher tok/s</text>
+<text x="405" y="120" text-anchor="middle" class="d-text-inv d-small">50k tok/s cluster</text>
+<text x="405" y="148" text-anchor="middle" class="d-text-inv d-small d-mono">Modules 3-6</text>
+</g>
+<g>
+<rect x="490" y="40" width="150" height="130" rx="8" class="d-block-muted"/>
+<text x="565" y="64" text-anchor="middle" class="d-text-inv d-small d-bold">Operational</text>
+<text x="565" y="80" text-anchor="middle" class="d-text-inv d-small d-bold">Excellence</text>
+<text x="565" y="104" text-anchor="middle" class="d-text-inv d-small">40% lower TTFT/ITL</text>
+<text x="565" y="120" text-anchor="middle" class="d-text-inv d-small">(predicted latency)</text>
+<text x="565" y="148" text-anchor="middle" class="d-text-inv d-small d-mono">Module 15</text>
+</g>
+<g>
+<rect x="650" y="40" width="140" height="130" rx="8" class="d-panel"/>
+<text x="720" y="64" text-anchor="middle" class="d-small d-bold">Batch</text>
+<text x="720" y="80" text-anchor="middle" class="d-small d-bold">Processing</text>
+<text x="720" y="104" text-anchor="middle" class="d-small">OpenAI-compatible</text>
+<text x="720" y="120" text-anchor="middle" class="d-small">batch APIs</text>
+<text x="720" y="148" text-anchor="middle" class="d-small d-text-light">not benchmarked</text>
+</g>
+<text x="400" y="200" text-anchor="middle" class="d-small d-text-light">This module (10) covers the InferencePool/EPP plumbing all five paths route through</text>
+<text x="400" y="220" text-anchor="middle" class="d-small d-text-light">rather than any one path's own mechanism</text>
+</svg>
+</figure>
+<figcaption><b>Figure 4.</b> llm-d's five well-lit paths and their headline numbers<a class="cite" href="#ref-2">2</a>, cross-referenced to the modules in this course that cover each mechanism in depth &#8212; this module covers none of the five mechanisms themselves, only the Kubernetes plumbing every one of them is delivered through.</figcaption>
+</figure>
+
+<h2 id="production-grade-today">8. Is llm-d production-grade today?</h2>
+<p>CNCF's own definition of the Sandbox maturity tier, the one llm-d holds, is explicit: Sandbox projects are "experimental projects not yet widely tested in production," a category CNCF distinguishes from Incubating projects (already used in production by select adopters) and Graduated projects (stable, widely adopted, production-ready)<a class="cite" href="#ref-4">4</a>. That is not this module's own assessment; it is the governing foundation's structural definition of the tier the project itself applied for and holds as of this module's access date. Neither llm-d's README nor its architecture documentation contains a claim to the contrary &#8212; the v0.9.0 release notes describe hardening work (router high availability, enhanced autoscaling, broader hardware support) precisely because those properties were not yet solid in earlier releases<a class="cite" href="#ref-12">12</a>, and nine minor-version releases in thirteen months is the release cadence of a project still finding its stable API surface, not one that has settled it.</p>
+<p>The Gateway API Inference Extension standard llm-d builds on is further along by one meaningful measure &#8212; <code>InferencePool</code>'s <code>v1</code> API type is GA, stable since v1.0.0<a class="cite" href="#ref-5">5</a> &#8212; but GA API stability is a narrower claim than production-readiness for the whole stack: it says the CRD's shape will not break compatibility, not that any given EPP behind it, llm-d's included, has been operated at scale long enough to have shaken out its failure modes. Section 4.3's two-tier failure handling (explicit 503/429 from a live EPP versus CRD-level <code>failureMode</code> for a dead one) is evidence of a design that has thought carefully about failure, which is a different thing from evidence that failure has been exercised in production at fleet scale.</p>
+<p>The honest, source-grounded answer: no, not as of 2026-09-17, by the standard the project's own governing foundation applies to it. It is further along than a research prototype &#8212; it has a GA-stable CRD underneath it, five NVIDIA/AMD-hardware-backed benchmark numbers with disclosed scope, and five founding organizations with production Kubernetes experience contributing to it &#8212; but "Sandbox, not yet widely tested in production" is CNCF's own phrase, not an inference drawn from silence.</p>
+<p>What would change this answer is not a new benchmark number but a governance event: promotion out of Sandbox to Incubating status, which CNCF reserves for projects already in production use by select adopters<a class="cite" href="#ref-4">4</a>. Until that happens, an operator's own risk posture &#8212; not this module's assessment &#8212; is what should decide whether a given pool runs behind llm-d's EPP with <code>FailClose</code> (section 3.2) or behind a vertically integrated alternative whose own maturity claims (Module 9) come with a different, but equally unresolved, evidentiary basis.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The disagreement here is not about llm-d's maturity, which the sources agree on (section 8). It is about whether building a Kubernetes-native scheduler as an implementation of an external, evolving standard (llm-d's bet) or as a self-contained, vertically integrated orchestration layer (Dynamo's bet, Module 9) is the better architecture for production inference serving on Kubernetes today.</p>
+<div class="positions">
+<article class="position">
+<h4>Standardize on the CRD and the wire protocol</h4>
+<p class="who">llm-d and the Gateway API Inference Extension's own Kubernetes SIG maintainers<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-11">11</a></p>
+<p>Building the scheduler behind <code>InferencePool</code> and the ext-proc contract means the routing logic is portable to any conformant gateway (Envoy Gateway, kgateway, GKE Gateway) and interoperable with anything else that speaks the same standard, including future EPPs this course has not covered. GAIE's own decision to move its reference EPP into llm-d-router, rather than keep maintaining one itself, is evidence the standard's maintainers consider this the right division of labor: the SIG owns the contract, llm-d owns a conformant, actively developed implementation of it.</p>
+<ul class="pros"><li>Portable across gateway vendors by construction, not by later integration work.</li><li>A GA-stable CRD (<code>InferencePool</code> <code>v1</code>) underneath a still-evolving scheduler limits how much the API surface operators depend on can break.</li><li>Multiple independent EPP implementations (llm-d, and others per Module 14) can compete or specialize without forking the API.</li></ul>
+<ul class="cons"><li>The standard itself is under a year old past GA and still changing defaults (<code>endpointPickerRef</code> optionality at v1.5.0) &#8212; operators must track two version histories, not one.</li><li>Two layers of indirection (HTTPRoute &#8594; InferencePool &#8594; EPP Service) to debug versus a single vendor-owned frontend.</li></ul>
+</article>
+<article class="position">
+<h4>Ship one vertically integrated orchestration layer</h4>
+<p class="who">NVIDIA Dynamo, per its own README's component list and backend framing (Module 9)<a class="cite" href="#ref-13">13</a></p>
+<p>A single project that owns its Router, Planner, KV Block Manager, and weight-streaming component end to end can move faster on cross-component optimizations &#8212; the Planner's scaling decisions and the Router's KV-aware routing can share internal state without needing to pass through a standardized, generic external contract. Dynamo does not need to wait for a Kubernetes SIG's release cadence to ship a routing change.</p>
+<ul class="pros"><li>No dependency on an external CRD's version history or default changes.</li><li>Tighter internal coupling between routing and autoscaling decisions (Module 9's Planner detail).</li><li>Single, coherent versioning and support surface (one project, one release cadence) rather than a standard-plus-implementation pair.</li></ul>
+<ul class="cons"><li>Router logic is not portable to a non-Dynamo frontend without reimplementation.</li><li>No Kubernetes-SIG-level conformance guarantee comparable to GAIE's for any component.</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Neither position is settled by the evidence available today, because both projects are pre-GA by their own governance's admission &#8212; llm-d explicitly (CNCF Sandbox, section 8), and Dynamo implicitly, by the same fast, patch-heavy release cadence Module 9 documents. The standardization bet pays off specifically when an operator needs gateway-vendor portability or wants to mix EPP implementations across pools on the same cluster (Table 3, section 3.3's multi-pool HTTPRoute pattern) &#8212; a real, concrete advantage the CRD structure enables today, independent of either project's overall maturity. The vertical-integration bet pays off when an operator has already standardized on one vendor's full stack (NVIDIA hardware, NVIDIA orchestration) and values a single support surface over API portability. What would settle this more generally is public, apples-to-apples throughput and TTFT comparisons between llm-d-fronted and Dynamo-fronted deployments of the same model on the same hardware &#8212; a controlled comparison neither project's own published numbers (Table 2 here, Module 9's headline figures) provides, since each publishes benchmarks against its own baseline, not against the other.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Three things in this module are more likely to be stale within a year than the InferencePool/ext-proc mechanism itself. First, llm-d's own website already organizes its well-lit paths differently from its README's five abstract themes &#8212; the live site lists concrete named guides ("Deploy an optimized baseline," "Route Requests by Predicted Latency," "Enable Precise Prefix-Cache Aware Routing," "Configure a Tiered Prefix Cache," "Deploy Prefill/Decode Disaggregation")<a class="cite" href="#ref-15">15</a> rather than the five category names this module used for Figure 4, evidence the project is converging on specific, testable deployment recipes faster than its own README text is being updated to match. Second, GAIE's field defaults have already changed once (<code>endpointPickerRef</code> optionality at v1.5.0) and the six-releases-in-a-year cadence in Figure 5 makes a second default change plausible within the shelf life of this module. Third, and most consequential for a production decision: CNCF Sandbox is not a terminal state. If llm-d is promoted to Incubating or Graduated status, the production-readiness assessment in section 8 changes directly, since it rests on CNCF's own tier definition rather than on any property of the code that this module can otherwise verify independently.</p>
+<p>Module 11 picks up vLLM itself &#8212; llm-d's default supported engine alongside SGLang<a class="cite" href="#ref-2">2</a> &#8212; and covers what happens inside the pods this module's InferencePool addresses: vLLM's own disaggregated-prefill connectors, its data-parallel-plus-expert-parallel CLI arithmetic, and the production-stack reference deployment vLLM ships independent of llm-d.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">repo</span>Kubernetes SIG contributors. <em>kubernetes-sigs/gateway-api-inference-extension (README)</em>. Kubernetes SIGs, GA since v1.0.0, 2026. <a href="https://github.com/kubernetes-sigs/gateway-api-inference-extension">https://github.com/kubernetes-sigs/gateway-api-inference-extension</a>. Accessed 2026-09-17. <span class="ref-use">Used for: GAIE's stated purpose, Endpoint Picker as a data-plane ext-proc component, engine-agnostic framing.</span></li>
+<li id="ref-2"><span class="ref-type">repo</span>llm-d contributors. <em>llm-d/llm-d (README)</em>. llm-d (CNCF Sandbox since 2026-03-12; Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA), v0.7-v0.9, 2026. <a href="https://github.com/llm-d/llm-d">https://github.com/llm-d/llm-d</a>. Accessed 2026-09-17. <span class="ref-use">Used for: five well-lit-path themes, supported engines (vLLM, SGLang), founding organizations, headline benchmark numbers and their hardware/model/comparison scope (Table 2), well-lit-path guide naming on the live site.</span></li>
+<li id="ref-3"><span class="ref-type">repo</span>llm-d contributors. <em>llm-d/llm-d Releases</em>. llm-d, v0.9.0 (2026-08-17), 2026. <a href="https://github.com/llm-d/llm-d/releases">https://github.com/llm-d/llm-d/releases</a>. Accessed 2026-09-17. <span class="ref-use">Used for: version history v0.2.0 (2025-07-29) through v0.9.0 (2026-08-17), release cadence (Figure 5).</span></li>
+<li id="ref-4"><span class="ref-type">blog</span>CNCF. <em>Welcome llm-d to the CNCF: Evolving Kubernetes into SOTA AI Infrastructure</em>. Cloud Native Computing Foundation, 2026-03-24. <a href="https://www.cncf.io/blog/2026/03/24/welcome-llm-d-to-the-cncf-evolving-kubernetes-into-sota-ai-infrastructure/">https://www.cncf.io/blog/2026/03/24/welcome-llm-d-to-the-cncf-evolving-kubernetes-into-sota-ai-infrastructure/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: CNCF Sandbox acceptance date (2026-03-12), Sandbox tier definition ("not yet widely tested in production"), industry/academic contributors.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>Kubernetes SIG contributors. <em>InferencePool (Kubernetes Gateway API Inference Extension docs)</em>. Kubernetes SIGs, InferencePool GA since v1.0.0; endpointPickerRef optional since v1.5.0, 2026. <a href="https://gateway-api-inference-extension.sigs.k8s.io/api-types/inferencepool/">https://gateway-api-inference-extension.sigs.k8s.io/api-types/inferencepool/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: InferencePoolSpec fields, full YAML manifest example, endpointPickerRef required-then-optional history, HTTPRoute-to-multiple-InferencePools relationship.</span></li>
+<li id="ref-6"><span class="ref-type">repo</span>Kubernetes SIG contributors. <em>kubernetes-sigs/gateway-api-inference-extension Releases</em>. Kubernetes SIGs, v1.6.1 (2026-09-11), 2026. <a href="https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases">https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases</a>. Accessed 2026-09-17. <span class="ref-use">Used for: exact release dates v1.0.0 (2025-09-09, GA), v1.4.0 (2026-03-20, appProtocol/gRPC), v1.5.0 (2026-04-19, endpointPickerRef optional), v1.6.1 (2026-09-11, latest).</span></li>
+<li id="ref-7"><span class="ref-type">official</span>Envoy Proxy contributors. <em>External Processing Filter (ext_proc)</em>. Envoy Proxy, latest docs, 2026. <a href="https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter">https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter</a>. Accessed 2026-09-17. <span class="ref-use">Used for: bidirectional gRPC stream mechanism, ProcessingRequest/ProcessingResponse messages, which request/response phases can be intercepted.</span></li>
+<li id="ref-8"><span class="ref-type">repo</span>Kubernetes SIG / Gateway API Inference Extension contributors. <em>Endpoint Picker Protocol (004-endpoint-picker-protocol)</em>. Kubernetes SIGs, main branch proposal doc, 2026. <a href="https://github.com/kubernetes-sigs/gateway-api-inference-extension/tree/main/docs/proposals/004-endpoint-picker-protocol">https://github.com/kubernetes-sigs/gateway-api-inference-extension/tree/main/docs/proposals/004-endpoint-picker-protocol</a>. Accessed 2026-09-17. <span class="ref-use">Used for: x-gateway-destination-endpoint header and dynamic_metadata/envoy.lb format, ImmediateResponse 503/429 failure codes, x-gateway-destination-endpoint-subset.</span></li>
+<li id="ref-9"><span class="ref-type">repo</span>Kubernetes SIG / Gateway API Inference Extension contributors. <em>EPP Architecture Proposal (0683-epp-architecture-proposal)</em>. Kubernetes SIGs, main branch proposal doc, 2026. <a href="https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/0683-epp-architecture-proposal/README.md">https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/0683-epp-architecture-proposal/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Ext-Proc Server as a fixed, non-extensible protocol boundary; request buffering before the Routing Layer.</span></li>
+<li id="ref-10"><span class="ref-type">repo</span>llm-d contributors. <em>llm-d-inference-scheduler architecture.md</em>. llm-d (CNCF Sandbox; Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA), main branch, 2026. <a href="https://github.com/llm-d/llm-d-inference-scheduler/blob/main/docs/architecture.md">https://github.com/llm-d/llm-d-inference-scheduler/blob/main/docs/architecture.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: cross-reference to Module 2's scheduler mechanism; noting the repository's redirect to llm-d-router.</span></li>
+<li id="ref-11"><span class="ref-type">official</span>Kubernetes SIG contributors. <em>FAQ (Kubernetes Gateway API Inference Extension docs)</em>. Kubernetes SIGs, live docs, 2026. <a href="https://gateway-api-inference-extension.sigs.k8s.io/faq/">https://gateway-api-inference-extension.sigs.k8s.io/faq/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: statement that the reference EPP moved to llm-d-router, and that gateway controllers should implement or reuse an existing EPP.</span></li>
+<li id="ref-12"><span class="ref-type">official</span>llm-d contributors. <em>Architecture (llm-d docs)</em>. llm-d, live docs (v0.9.0 banner), 2026. <a href="https://llm-d.ai/docs/architecture">https://llm-d.ai/docs/architecture</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Router = Proxy + EPP terminology, v0.9.0 "hardened for scale" release description.</span></li>
+<li id="ref-13"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/dynamo (README)</em>. NVIDIA, v1.4.2, 2026. <a href="https://github.com/ai-dynamo/dynamo">https://github.com/ai-dynamo/dynamo</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Dynamo's named-component framing and supported-backend list, cited only for the brief contrast in sections 1.3 and 6.1.</span></li>
+<li id="ref-14"><span class="ref-type">official</span>Kubernetes SIG contributors. <em>API Reference: InferencePool (Kubernetes Gateway API Inference Extension docs)</em>. Kubernetes SIGs, live docs, 2026. <a href="https://gateway-api-inference-extension.sigs.k8s.io/reference/spec/">https://gateway-api-inference-extension.sigs.k8s.io/reference/spec/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: full InferencePoolSpec and endpointPickerRef field table, appProtocol default, failureMode values and defaults (FailClose/FailOpen).</span></li>
+<li id="ref-15"><span class="ref-type">official</span>llm-d contributors. <em>llm-d (homepage)</em>. llm-d, live site, 2026. <a href="https://llm-d.ai/">https://llm-d.ai/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: heterogeneous-hardware tagline (GPUs, TPUs, XPUs, CPUs, NPUs), current live naming of the well-lit-path guides.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

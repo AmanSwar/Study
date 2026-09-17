@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kubernetes Deployment Topologies and Operations at Fleet Scale · Multi-Node LLM Inference: From One Node to N</title>
+<meta name="description" content="LeaderWorkerSet as the multi-host replication primitive underneath most multi-node serving stacks, KServe's parallelism-to-GPU arithmetic, SLO-driven autoscaling that scales on TTFT/ITL instead of GPU utilization, the Ray Serve/KServe/AIBrix orchestration landscape, and upgrade/failure handling at fleet scale.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 14</p>
+<h1>Kubernetes Deployment Topologies and Operations at Fleet Scale</h1>
+<p class="lede">Every stack in Part 5 &#8212; Dynamo, llm-d, vLLM, SGLang, TensorRT-LLM &#8212; eventually has to answer the same four Kubernetes questions: how do you schedule a model that is sharded across physical nodes as one unit, how do you scale that unit without lying to yourself about GPU utilization, how do you route more than one model or tenant through the same fleet, and how do you upgrade or fail one node out of a group without taking the whole group down. This module answers those four questions at the mechanism level, using LeaderWorkerSet, KServe, KEDA, Ray Serve, and AIBrix as the concrete implementations. After it, you can specify a Kubernetes topology for an N-node deployment and place any orchestration project you encounter on the landscape it belongs to.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>35 min</b> read</span>
+<span class="chip"><b>13</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 9</b>, <b>Module 10</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 420" role="img" aria-labelledby="f1t"><title id="f1t">Full deployment stack: gateway routes to InferencePools, each pool is a set of LeaderWorkerSet groups spanning physical nodes, KEDA scales the pool on SLO metrics, an orchestration layer sits above coordinating both</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="16" width="150" height="46" rx="8" class="d-block-accent"/>
+<text x="95" y="35" text-anchor="middle" class="d-text-inv d-bold">HTTPRoute</text>
+<text x="95" y="51" text-anchor="middle" class="d-text-inv d-small">Gateway API</text>
+<path d="M170,39 L230,39" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="230" y="10" width="150" height="58" rx="8" class="d-block"/>
+<text x="305" y="32" text-anchor="middle" class="d-text-inv d-bold">InferencePool A</text>
+<text x="305" y="49" text-anchor="middle" class="d-text-inv d-small">model / tenant 1 (&#167;4)</text>
+<rect x="230" y="80" width="150" height="42" rx="8" class="d-block-2"/>
+<text x="305" y="98" text-anchor="middle" class="d-text-inv d-bold">InferencePool B</text>
+<text x="305" y="114" text-anchor="middle" class="d-text-inv d-small">model / tenant 2</text>
+
+<path d="M305,68 L305,150" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="180" y="150" width="440" height="150" rx="8" class="d-panel"/>
+<text x="400" y="172" text-anchor="middle" class="d-bold d-small">LeaderWorkerSet: replicas = 2 groups, size = 2 (&#167;1)</text>
+
+<rect x="200" y="188" width="180" height="90" rx="8" class="d-outline d-dashed"/>
+<text x="290" y="202" text-anchor="middle" class="d-small d-text-light">group 0 (1 replica)</text>
+<rect x="212" y="212" width="70" height="50" rx="6" class="d-block-2"/>
+<text x="247" y="232" text-anchor="middle" class="d-text-inv d-small">leader</text>
+<text x="247" y="248" text-anchor="middle" class="d-text-inv d-small">node A</text>
+<rect x="292" y="212" width="70" height="50" rx="6" class="d-block-2"/>
+<text x="327" y="232" text-anchor="middle" class="d-text-inv d-small">worker</text>
+<text x="327" y="248" text-anchor="middle" class="d-text-inv d-small">node B</text>
+
+<rect x="420" y="188" width="180" height="90" rx="8" class="d-outline d-dashed"/>
+<text x="510" y="202" text-anchor="middle" class="d-small d-text-light">group 1 (1 replica)</text>
+<rect x="432" y="212" width="70" height="50" rx="6" class="d-block-2"/>
+<text x="467" y="232" text-anchor="middle" class="d-text-inv d-small">leader</text>
+<text x="467" y="248" text-anchor="middle" class="d-text-inv d-small">node C</text>
+<rect x="512" y="212" width="70" height="50" rx="6" class="d-block-2"/>
+<text x="547" y="232" text-anchor="middle" class="d-text-inv d-small">worker</text>
+<text x="547" y="248" text-anchor="middle" class="d-text-inv d-small">node D</text>
+
+<text x="400" y="288" text-anchor="middle" class="d-mono d-small">TP/PP shard spans leader+worker &#8212; gang-scheduled as one unit</text>
+
+<rect x="630" y="150" width="150" height="150" rx="8" class="d-surface"/>
+<text x="705" y="172" text-anchor="middle" class="d-bold d-small">Orchestration</text>
+<text x="705" y="190" text-anchor="middle" class="d-small d-text-light">Dynamo / llm-d</text>
+<text x="705" y="206" text-anchor="middle" class="d-small d-text-light">(Mod. 9, 10)</text>
+<text x="705" y="228" text-anchor="middle" class="d-small d-text-light">or Ray Serve LLM /</text>
+<text x="705" y="244" text-anchor="middle" class="d-small d-text-light">KServe / AIBrix</text>
+<text x="705" y="262" text-anchor="middle" class="d-small d-text-light">(&#167;5)</text>
+<path d="M630,225 L620,225" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+
+<path d="M400,300 L400,330" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="230" y="330" width="340" height="70" rx="8" class="d-outline d-dashed"/>
+<text x="400" y="352" text-anchor="middle" class="d-small">Prometheus: TTFT/ITL, queue depth, KV-cache occupancy (&#167;3, &#167;6)</text>
+<text x="400" y="370" text-anchor="middle" class="d-mono d-small">KEDA ScaledObject &#8594; HPA &#8594; LWS replicas</text>
+<path d="M570,365 L700,320 L705,300" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+
+</svg>
+<figcaption><b>Figure 1.</b> The four layers this module covers: a Gateway API <code>HTTPRoute</code> fans out to one <code>InferencePool</code> per model/tenant (&#167;4, cross-referencing Module 10), each pool is backed by <code>LeaderWorkerSet</code> replica groups that gang-schedule a leader and worker pod across physical nodes as one unit (&#167;1), an orchestration layer (either an inference-specific control plane or a general-purpose Kubernetes/Ray project, &#167;5) sits above making placement and scaling decisions, and Prometheus-fed autoscaling adds or removes whole groups rather than resizing one (&#167;3). Structure per the LWS and Gateway API Inference Extension specifications<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="leaderworkerset">1. LeaderWorkerSet: the multi-host replication primitive</h2>
+<p>A dense 70B-class model sharded with tensor parallelism across two 8-GPU nodes is not, from Kubernetes' point of view, sixteen independent things. It is one thing that happens to occupy sixteen GPU slots on two machines: the sixteen ranks must start together, discover each other's addresses before the first forward pass, and — critically — if any single rank dies, the other fifteen are no longer a working replica and have to restart together too. None of Kubernetes' native workload controllers model this. A <code>Deployment</code> assumes every pod is independently replaceable; a <code>StatefulSet</code> gives pods stable identity and ordered rollout but still treats each pod as its own unit of readiness and failure, with no notion that pod 3 and pod 7 belong to the same logical replica and must live or die together.</p>
+<p><b>LeaderWorkerSet</b> (LWS) is the Kubernetes SIGs API built to close that gap: "an API for deploying a group of pods as a unit of replication," aimed specifically at "multi-host inference workloads where the LLM will be sharded and run across multiple devices on multiple nodes"<a class="cite" href="#ref-1">1</a>. It is co-designed with llm-d (Module 10) as one of the two projects driving its API surface<a class="cite" href="#ref-1">1</a>, and it is the substrate vLLM's own multi-node deployment guides, KServe's multi-node predecessor design, and SGLang's multi-node recipes (Module 12) all assume sits underneath a production router.</p>
+
+<h3 id="leaderworkerset-model">1.1 The leader/worker group model</h3>
+<p>An LWS resource's <code>spec.replicas</code> field is not a pod count — it is a count of <b>groups</b>, where each group is "a single leader and a set of workers"<a class="cite" href="#ref-2">2</a>. The group's actual pod count is a separate field, <code>leaderWorkerTemplate.size</code>: "the total number of pods in each group"<a class="cite" href="#ref-3">3</a>, with one pod running the <code>leaderTemplate</code> and the rest running the <code>workerTemplate</code><a class="cite" href="#ref-3">3</a>. Every pod in a group carries a unique index from 0 to <code>size</code> − 1, with index 0 reserved for the leader<a class="cite" href="#ref-2">2</a>, and — the property that makes gang scheduling work — "pods in the group will have the same lifecycle and be created in parallel"<a class="cite" href="#ref-2">2</a>, with an all-or-nothing restart policy on failure<a class="cite" href="#ref-3">3</a>: if one pod in the group dies, LWS restarts the whole group rather than leaving a half-formed shard limping along.</p>
+<p>Two templates instead of one matters mechanically, not just cosmetically. The leader pod typically runs the API server and is the one thing an external router or InferencePool endpoint points at; the worker pods run headless, contributing GPUs and layers to the shard but exposing no serving endpoint of their own. This maps directly onto how vLLM structures a multi-node launch: <code>--headless</code> on every non-leader rank, so exactly one process in the group answers HTTP requests while the rest exist purely as distributed-execution participants.</p>
+
+<h3 id="leaderworkerset-discovery">1.2 Group discovery and the two startup paths</h3>
+<p>Once Kubernetes has scheduled a group's pods, they still need to find each other and agree on ranks before a collective operation can run. LWS injects three environment variables into every pod for exactly this: <code>LWS_LEADER_ADDRESS</code> (the leader pod's network address), <code>LWS_GROUP_SIZE</code> (the group's total pod count, i.e. <code>leaderWorkerTemplate.size</code>), and <code>LWS_WORKER_INDEX</code> (0 for the leader, 1..<code>size</code>−1 for workers). vLLM's own reference deployment wires these three variables directly onto its distributed-launch flags: <code>--pipeline-parallel-size $(LWS_GROUP_SIZE)</code>, <code>--nnodes $(LWS_GROUP_SIZE)</code>, <code>--node-rank $(LWS_WORKER_INDEX)</code>, and <code>--master-addr $(LWS_LEADER_ADDRESS)</code>, with the leader serving on <code>--port 8080</code> and every worker adding <code>--headless</code><a class="cite" href="#ref-2">2</a>. A two-pod group (one leader, one worker) becomes, with zero YAML beyond the environment-variable substitution, a working two-node pipeline-parallel shard: the leader's <code>vllm serve</code> process is rank 0, the worker is rank 1, and both learn the leader's address from LWS rather than from any hand-written service-discovery step.</p>
+<p>vLLM documents a second startup path built on Ray instead of raw multiprocessing, and the distinction matters because it recurs in section 5's orchestration-layer landscape. Before <code>vllm serve</code> ever runs, a helper script forms a Ray cluster across the group: the leader runs <code>multi-node-serving.sh leader --ray_cluster_size=$(LWS_GROUP_SIZE)</code> to start the Ray head, and each worker runs <code>multi-node-serving.sh worker --ray_address=$(LWS_LEADER_ADDRESS)</code> to join it<a class="cite" href="#ref-2">2</a>. Only once the Ray cluster has formed does the leader invoke <code>vllm serve --distributed-executor-backend ray</code>, handing tensor- and pipeline-parallel execution to Ray's own actor placement rather than to raw <code>torchrun</code>-style rank assignment<a class="cite" href="#ref-2">2</a>. LWS's job in both paths is identical and stops at the same boundary: get the right pods scheduled together, on time, with known addresses. What runs inside the group once it is up — plain multiprocessing collectives or a Ray cluster — is the inference engine's choice, not LWS's.</p>
+
+<h3 id="leaderworkerset-rollout">1.3 Group-level rollout</h3>
+<p>LWS extends the same group-as-a-unit logic to upgrades. Its <code>rolloutStrategy</code> is presently fixed to <code>RollingUpdate</code>, configured with a <code>rollingUpdateConfiguration</code> carrying <code>maxUnavailable</code> and <code>maxSurge</code><a class="cite" href="#ref-3">3</a> — the same two knobs a <code>Deployment</code> exposes, but evaluated in units of whole groups rather than individual pods. The project's own framing is explicit: "groups are upgraded one by one as a unit (i.e. the pods within a group are updated together)"<a class="cite" href="#ref-2">2</a>. A rolling image bump on a fleet of eight two-node groups with <code>maxUnavailable: 1</code> takes one group fully offline (both its leader and worker pods), replaces both, waits for the new group to pass readiness, and only then moves to the next group — never partially updating a group's leader while its worker still runs the old image, which would otherwise break the two ranks' agreement on model weights and parallel-execution code paths. Section 7 returns to this mechanism directly, contrasted against the pool-level drain-before-remove pattern Module 4 already established for prefill/decode reconfiguration.</p>
+<p>LWS also exposes topology-placement and networking options relevant to why a group exists as one object instead of two independent pods with matching labels: it supports "opt-in support for pods in the same group to be co-located in the same topology"<a class="cite" href="#ref-2">2</a> (keeping a shard's cross-node traffic on fast interconnect, the same NVL72-domain reasoning Module 1 introduced), a configurable <code>subdomainPolicy</code> controlling how the per-group headless Service is created for pod-to-pod DNS<a class="cite" href="#ref-3">3</a>, and a scale subresource so an external HPA or KEDA object (section 3) can drive <code>replicas</code> directly without a custom controller in between<a class="cite" href="#ref-2">2</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">LeaderWorkerSet: one replica is a group of a leader pod and worker pods spanning two physical nodes, with environment variables carrying rank information</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="20" width="760" height="20" rx="4" class="d-outline d-dashed"/>
+<text x="400" y="34" text-anchor="middle" class="d-small d-text-light">LeaderWorkerSet: replicas = N groups &#8212; this figure shows one group</text>
+
+<rect x="60" y="60" width="330" height="150" rx="10" class="d-panel"/>
+<text x="225" y="82" text-anchor="middle" class="d-bold d-small">physical node A</text>
+<rect x="90" y="100" width="270" height="90" rx="8" class="d-block"/>
+<text x="225" y="124" text-anchor="middle" class="d-text-inv d-bold">leader pod &#8212; index 0</text>
+<text x="225" y="144" text-anchor="middle" class="d-text-inv d-mono d-small">LWS_WORKER_INDEX=0</text>
+<text x="225" y="160" text-anchor="middle" class="d-text-inv d-small">serves API on :8080</text>
+<text x="225" y="176" text-anchor="middle" class="d-text-inv d-small">rank 0 / node-rank 0</text>
+
+<rect x="410" y="60" width="330" height="150" rx="10" class="d-panel"/>
+<text x="575" y="82" text-anchor="middle" class="d-bold d-small">physical node B</text>
+<rect x="440" y="100" width="270" height="90" rx="8" class="d-block-2"/>
+<text x="575" y="124" text-anchor="middle" class="d-text-inv d-bold">worker pod &#8212; index 1</text>
+<text x="575" y="144" text-anchor="middle" class="d-text-inv d-mono d-small">LWS_WORKER_INDEX=1</text>
+<text x="575" y="160" text-anchor="middle" class="d-text-inv d-small">--headless (no API)</text>
+<text x="575" y="176" text-anchor="middle" class="d-text-inv d-small">rank 1 / node-rank 1</text>
+
+<path d="M360,145 L440,145" class="d-arrow" marker-end="url(#f2-arr)"/>
+<text x="400" y="135" text-anchor="middle" class="d-mono d-small">LWS_LEADER_ADDRESS</text>
+
+<rect x="230" y="230" width="340" height="55" rx="8" class="d-surface"/>
+<text x="400" y="250" text-anchor="middle" class="d-small">restartPolicy: all-or-nothing</text>
+<text x="400" y="268" text-anchor="middle" class="d-small d-text-light">either pod dies &#8594; the whole group restarts together</text>
+
+</svg>
+<figcaption><b>Figure 2.</b> One LWS replica group: a leader pod (index 0, serving) and a worker pod (index 1, headless) on separate physical nodes, discovering each other via LWS-injected environment variables and restarting as a single unit on failure. Field and variable names per the LWS README and vLLM's LWS deployment guide<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+<h2 id="kserve-topology">2. KServe's parallelism arithmetic and multi-node ServingRuntime</h2>
+<p>KServe (a CNCF project) is a Kubernetes-native model-serving control plane with its own <code>InferenceService</code> CRD, predating and independent of LWS: its multi-node <code>ServingRuntime</code>, <code>kserve-huggingfaceserver-multinode</code>, is "built on vLLM, which supports multi-node/multi-GPU feature"<a class="cite" href="#ref-4">4</a>, but its own documentation never mentions LeaderWorkerSet — it defines its own head-pod/worker-pod model directly, requiring "exactly one head pod" per deployment<a class="cite" href="#ref-4">4</a> and using a plain Kubernetes <code>Deployment</code> resource underneath rather than an LWS object. It is a useful second data point precisely because it solves the same gang-scheduling problem section 1 described without building on LWS at all.</p>
+
+<h3 id="kserve-formula">2.1 The GPU-count formula</h3>
+<p>KServe's <code>workerSpec</code> exposes two fields that are easy to misread as literal GPU counts but are not: <code>tensorParallelSize</code> "is only used to configure tensor parallelism — that is, how the model weights are sharded across GPUs," and <code>pipelineParallelSize</code> "is only used to configure pipeline parallelism — how the model layers are split across the GPUs"<a class="cite" href="#ref-4">4</a>. The actual GPU accounting is a separate, explicit mechanism KServe's own documentation spells out as four formulas<a class="cite" href="#ref-4">4</a>:</p>
+$$
+\text{Total GPUs} = \text{tensorParallelSize} \times \text{pipelineParallelSize}
+$$
+$$
+\text{Ray Node Count} = \left\lceil \frac{\text{Total GPUs}}{\text{workerSpec.resources.requests.gpu}} \right\rceil
+$$
+$$
+\text{Worker GPU Count} = \frac{\text{Total GPUs}}{\text{Ray Node Count}} - 1, \qquad \text{Head GPU Count} = \text{Total GPUs} - 1
+$$
+<p>Read plainly: total GPU demand is TP × PP, the number of physical <b>nodes</b> needed is that total divided by however many GPUs a single worker pod requests (rounded up), and — the detail that trips people up — the head pod itself only claims <code>Total GPUs − 1</code> because it counts as one of its own node's GPU-holding ranks. If <code>Total GPUs</code> equals <code>workerSpec.resources.requests.gpu</code> exactly, the division degenerates to one node and "only the head node will be deployed"<a class="cite" href="#ref-4">4</a> — there is no separate worker pod at all, and the multi-node machinery is silently a no-op.</p>
+
+<h3 id="kserve-worked-example">2.2 Worked example: 16 GPUs across 2 nodes</h3>
+<p>KServe's own reference environment is 16 GPUs split 8-per-node, worked three ways for the same total demand<a class="cite" href="#ref-4">4</a>:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> KServe's three documented ways to reach 16 GPUs across 2 nodes for the same model, and the <code>vllm serve</code> flags each one produces<a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Case</th><th class="num">pipelineParallelSize</th><th class="num">tensorParallelSize</th><th class="num">GPU / pod</th><th>Resulting topology</th><th>Resulting <code>vllm serve</code> flags</th></tr></thead>
+<tbody>
+<tr><td class="row">1 — explicit PP</td><td class="num">2</td><td class="num">8</td><td class="num">8</td><td>1 head + 1 worker pod, 2 nodes</td><td class="d-mono">--tensor-parallel-size 8 --pipeline-parallel-size 2</td></tr>
+<tr><td class="row">2 — TP only</td><td class="num">1 (default)</td><td class="num">16</td><td class="num">8</td><td>KServe derives PP=2, TP=8 internally to fit the 8-GPU pod request — same 2-node result</td><td class="d-mono">--tensor-parallel-size 16</td></tr>
+<tr><td class="row">3 — single node</td><td class="num">1</td><td class="num">8</td><td class="num">8</td><td>Total GPUs (8) = GPU/pod (8) &#8594; only the head pod deploys, no multi-node</td><td class="d-mono">--tensor-parallel-size 8</td></tr>
+</tbody>
+</table>
+<p>Case 1 and Case 2 land on the identical physical topology — two 8-GPU pods, one head and one worker — because KServe internally reduces a bare <code>tensorParallelSize=16</code> request down to a PP×TP factorization that fits the declared per-pod GPU budget<a class="cite" href="#ref-4">4</a>. Case 3 is the reminder that the formulas are unconditional: plug in numbers where Total GPUs already equals one pod's GPU request, and the "multi-node" ServingRuntime deploys nothing but a single pod.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f3t"><title id="f3t">KServe 16-GPU, 2-node worked example: pipelineParallelSize 2 times tensorParallelSize 8 equals 16 total GPUs split across a head pod and a worker pod</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<text x="400" y="30" text-anchor="middle" class="d-mono d-bold">Total GPUs = tensorParallelSize (8) &#215; pipelineParallelSize (2) = 16</text>
+
+<rect x="70" y="60" width="300" height="130" rx="10" class="d-panel"/>
+<text x="220" y="82" text-anchor="middle" class="d-bold d-small">head pod &#8212; node 1</text>
+<rect x="90" y="98" width="260" height="70" rx="8" class="d-block"/>
+<text x="220" y="122" text-anchor="middle" class="d-text-inv d-small">tensor-parallel-size 8</text>
+<text x="220" y="140" text-anchor="middle" class="d-text-inv d-small">Head GPU Count = 16 &#8722; 1 = 7 claimed</text>
+<text x="220" y="156" text-anchor="middle" class="d-text-inv d-small">+ 1 self &#8594; 8 GPUs / pod</text>
+
+<rect x="430" y="60" width="300" height="130" rx="10" class="d-panel"/>
+<text x="580" y="82" text-anchor="middle" class="d-bold d-small">worker pod &#8212; node 2</text>
+<rect x="450" y="98" width="260" height="70" rx="8" class="d-block-2"/>
+<text x="580" y="122" text-anchor="middle" class="d-text-inv d-small">Worker GPU Count</text>
+<text x="580" y="140" text-anchor="middle" class="d-text-inv d-small">= 16/2 &#8722; 1 = 7 claimed</text>
+<text x="580" y="156" text-anchor="middle" class="d-text-inv d-small">+ 1 self &#8594; 8 GPUs / pod</text>
+
+<path d="M370,125 L430,125" class="d-arrow" marker-end="url(#f3-arr)"/>
+<text x="400" y="115" text-anchor="middle" class="d-mono d-small">Ray cluster</text>
+
+<rect x="230" y="210" width="340" height="40" rx="8" class="d-surface"/>
+<text x="400" y="235" text-anchor="middle" class="d-small">Ray Node Count = ceil(16 / 8) = 2 &#8212; autoscalerClass must be none</text>
+
+</svg>
+<figcaption><b>Figure 3.</b> KServe's 16-GPU/2-node worked example (Case 1 of Table 1): the head pod and worker pod each request 8 GPUs, with the formula's &#8722;1 term accounting for the pod's own rank inside its GPU count. Numbers per KServe's multi-node documentation<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h3 id="kserve-constraints">2.3 What the formulas cost you</h3>
+<p>KServe's multi-node path carries three explicit, non-negotiable constraints its own documentation states directly. First, "the Autoscaler must be configured as none"<a class="cite" href="#ref-4">4</a> — a multi-node <code>InferenceService</code> sets <code>serving.kserve.io/autoscalerClass: none</code> and does not participate in KServe's usual scale-to-N-replicas behavior at all; section 3 returns to why, and to how other projects answer the same problem differently. Second, resizing <code>pipelineParallelSize</code> in production is explicitly discouraged: it "is not an autoscaling concept; rather, it determines how many nodes will be used to run the model," and changing it live "can impact the existing service due to the default behavior of the Deployment resource" — the documented workaround is deleting and recreating the <code>InferenceService</code> rather than patching it in place<a class="cite" href="#ref-4">4</a>. Third, the choice between <code>RollingUpdate</code> and <code>Recreate</code> deployment strategy is a real resource trade-off, not a style preference: <code>RollingUpdate</code> "ensures that the existing service remains operational until the new service becomes Ready" but "requires more than twice the resources to function effectively," since a full second 16-GPU topology must exist before the first one is torn down<a class="cite" href="#ref-4">4</a> — expensive enough that KServe's own guidance recommends <code>Recreate</code> during development and reserves <code>RollingUpdate</code> for production paths that can actually absorb the doubled GPU footprint.</p>
+<h2 id="slo-autoscaling">3. Autoscaling on SLOs, not utilization</h2>
+<p>Section 2.3 flagged that KServe disables autoscaling outright for multi-node deployments. That is a real constraint, but it is not evidence that multi-node fleets cannot be autoscaled — it is evidence that the metric Kubernetes' default <code>HorizontalPodAutoscaler</code> (HPA) reaches for, CPU or GPU utilization, is the wrong signal for an LLM engine in the first place, multi-node or not. Fixing that is a prerequisite this section works through before returning to how a pool of LWS groups actually gets scaled.</p>
+
+<h3 id="slo-autoscaling-why-util-fails">3.1 Why GPU utilization is a broken scaling signal</h3>
+<p>A continuous-batching engine keeps its GPU busy by design: it packs whatever requests are in flight into the largest batch the KV-cache budget allows, on every decode step. That means GPU utilization sits near saturation whether the engine is serving 4 requests or 40 — the metric conflates "the GPU is doing work" with "the GPU has no more headroom," and an HPA driven by it reacts to the wrong condition or reacts too late. llm-d's own autoscaling documentation states the failure mode directly: "during active token generation, GPU utilization can remain high whether a model server is lightly loaded or saturated," which makes DCGM-style utilization metrics unable to distinguish an underloaded replica from an overloaded one<a class="cite" href="#ref-7">7</a>. AIBrix's paper frames the same problem from the deployment-latency side: LLM request complexity and I/O size vary widely enough to overwhelm a utilization-based autoscaler before it reacts, and large model images with slow model distribution already add a 2–3 minute delay before a newly scaled pod is useful — compounding a signal that was already lagging<a class="cite" href="#ref-12">12</a>. The llm-d workload-autoscaling guide adds a second reason traditional resource metrics fail structurally, not just numerically: "resource utilization metrics (CPU/GPU) are... lagging indicators — they only reflect saturation after it has already occurred"<a class="cite" href="#ref-8">8</a>, whereas the quantity that actually determines whether new requests will meet their latency SLO is queueing and cache pressure building up right now, upstream of the compute engine even noticing.</p>
+
+<h3 id="slo-autoscaling-metrics">3.2 The demand-driven metric vocabulary</h3>
+<p>Modules 9 through 12 each documented a Prometheus surface for their own stack; none of those modules built a scaling trigger out of them, because that was explicitly this module's job. Pulled together, the metrics that actually predict SLO breach before it happens cluster into four categories, present in some form in every stack this course has covered:</p>
+<table class="tbl tbl-dense">
+<caption><b>Table 2.</b> The demand-driven metric vocabulary used as autoscaling triggers, by project, synthesized from the Prometheus surfaces Modules 9&#8211;12 already documented plus llm-d's EPP-specific additions<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-8">8</a>.</caption>
+<thead><tr><th>Signal</th><th>vLLM metric</th><th>llm-d EPP metric</th><th>What it predicts</th></tr></thead>
+<tbody>
+<tr><td class="row">Queue depth</td><td class="d-mono">vllm:num_requests_waiting</td><td class="d-mono">llm_d_epp_flow_control_queue_size</td><td>requests buffered, not yet admitted &#8212; direct backlog</td></tr>
+<tr><td class="row">Running requests</td><td class="d-mono">vllm:num_requests_running</td><td class="d-mono">llm_d_epp_request_running</td><td>in-flight concurrency, a proxy for near-term saturation</td></tr>
+<tr><td class="row">KV-cache occupancy</td><td class="d-mono">vllm:kv_cache_usage_perc</td><td>&#8212; (upstream of EPP, engine-native)</td><td>headroom before admission/eviction pressure hits</td></tr>
+<tr><td class="row">Pool saturation</td><td>&#8212;</td><td class="d-mono">llm_d_epp_flow_control_pool_saturation</td><td>normalized 0.0&#8211;1.0+ demand ratio, portable across pool sizes</td></tr>
+<tr><td class="row">TTFT / ITL</td><td class="d-mono">vllm:time_to_first_token_seconds</td><td>predicted/measured TTFT, TPOT histograms</td><td>the SLO itself, measured or estimated directly</td></tr>
+</tbody>
+</table>
+<p>Module 11 already built a four-series minimal SLO dashboard from vLLM's own metrics (TTFT on the prefill pool, ITL on the decode pool, KV-cache occupancy on both, phase-split histograms for diagnosis) — that same set is exactly what an autoscaling trigger consumes, just read as a live scalar rather than a plotted histogram. Queue depth and running-request count answer "is demand exceeding capacity right now"; KV-cache occupancy and pool saturation answer "how much headroom is left before it does"; TTFT/ITL histograms against the SLO answer "has it already failed." A trigger built on any single one of these is a reasonable starting point; llm-d's own guidance recommends combining at least two — one measuring unfulfilled demand (queue size) and one measuring active concurrency (running requests) — and taking the larger of the two resulting replica counts, "enabling holistic demand representation" rather than under-reacting to a spike that shows up in only one signal<a class="cite" href="#ref-7">7</a>.</p>
+
+<h3 id="slo-autoscaling-mechanisms">3.3 Mechanism comparison: how four projects turn these signals into replica counts</h3>
+<p>The mechanism that consumes Table 2's metrics differs by project in exactly the way section 5's landscape map will generalize: some are thin, portable glue on top of stock Kubernetes primitives, others are integrated performance models specific to one control plane.</p>
+<p><b>KEDA + Prometheus</b> is llm-d's recommended path and the most portable of the four. A <code>ScaledObject</code> — not a second, competing HPA — points at a PromQL query over any of Table 2's metrics; KEDA evaluates it directly against Prometheus (no Prometheus Adapter required) and creates/manages the underlying HPA against the model-server <code>Deployment</code> or the LWS group's scale subresource on the writer's behalf<a class="cite" href="#ref-7">7</a>. This is purely reactive — it scales on the current value of a live metric — but it composes cleanly with scale-to-zero, since the EPP can buffer requests during a cold-start pod's warmup rather than dropping them<a class="cite" href="#ref-7">7</a>. It also supports an explicit "SLO-aware" formulation: a Prometheus recording rule computes measured-latency ÷ SLO-target as a ratio, and KEDA scales on that ratio directly via its <code>scalingModifiers</code> expression support<a class="cite" href="#ref-8">8</a> — which is the cleanest way to fold TTFT/ITL directly into a scaling decision without leaving Kubernetes-native tooling.</p>
+<p><b>Dynamo's Planner</b> (Module 9, §4) sits at the other end: rather than reacting to a live metric, its <code>sla</code> mode runs a performance model — a Rust engine-performance shim backed by analytical (AIC) estimates or an observed-data regression fallback — to <i>predict</i> the replica count a given traffic forecast will need to hold TTFT and ITL at their configured targets, 500 ms and 50 ms by default<a class="cite" href="#ref-9">9</a>. This module does not re-derive that mechanism; the point worth carrying forward here is that it is predictive rather than reactive, trading the simplicity of "read a metric, scale on it" for a model that has to be bootstrapped with profiling data before it is trustworthy.</p>
+<p><b>Ray Serve LLM</b> uses Ray Serve's own generic autoscaler, configured per <code>LLMConfig</code> deployment with an <code>autoscaling_config</code> block (<code>min_replicas</code>, <code>max_replicas</code>, and Ray Serve's own request-concurrency target)<a class="cite" href="#ref-10">10</a> — reactive like KEDA, but scoped to Ray's own replica abstraction rather than a Kubernetes HPA, which matters directly for the Ray-vs-Kubernetes-native question section 5 returns to.</p>
+<p><b>AIBrix's</b> autoscaler is the fourth point on this spectrum: it explicitly bypasses the Kubernetes custom-metrics path and "maintains sliding window metric aggregation directly in the autoscaler for real-time load reporting," built on two selectable algorithms — Knative Pod Autoscaler (KPA) and AIBrix's own Pod Autoscaler (APA)<a class="cite" href="#ref-12">12</a>. AIBrix's own measured comparison against native HPA on these algorithms reports an 11.5% latency reduction, an 11.4% token-throughput increase, and a 33% reduction in scaling oscillations<a class="cite" href="#ref-12">12</a> — the oscillation number is the concrete cost of a lagging, noisy trigger that this section's argument predicts: fewer, better-timed scaling decisions instead of a controller thrashing up and down on a signal that does not track real demand.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Four autoscaling mechanisms compared on trigger source and reactive-vs-predictive character<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-10">10</a><a class="cite" href="#ref-12">12</a>.</caption>
+<thead><tr><th>Project</th><th>Trigger source</th><th>Character</th><th>Scales</th></tr></thead>
+<tbody>
+<tr><td class="row">llm-d + KEDA</td><td>Prometheus query over EPP/engine metrics</td><td>reactive (or SLO-ratio via recording rule)</td><td>standard HPA on Deployment/LWS scale subresource</td></tr>
+<tr><td class="row">Dynamo Planner (sla mode)</td><td>performance model + traffic forecast</td><td>predictive, bootstrapped from profiling</td><td>Planner-managed prefill/decode replica counts</td></tr>
+<tr><td class="row">Ray Serve LLM</td><td>Ray Serve's own concurrency target</td><td>reactive</td><td>Ray Serve deployment replicas</td></tr>
+<tr><td class="row">AIBrix (KPA/APA)</td><td>sliding-window aggregation, bypasses custom-metrics path</td><td>reactive, tuned for reduced oscillation</td><td>AIBrix Pod Autoscaler-managed pods</td></tr>
+</tbody>
+</table>
+<p>What all four share, and what section 2.3's KServe constraint should be read against, is that none of them resize the <i>inside</i> of a multi-host group — none changes a running replica's TP or PP degree. Every one of them scales the <i>count</i> of replicas (or replica groups), which is exactly the unit LWS's <code>replicas</code> field and scale subresource already expose. That distinction is the crux of this module's disagree section below.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 220" role="img" aria-labelledby="f4t"><title id="f4t">Autoscaling pipeline: engine and EPP metrics feed Prometheus, a scaler evaluates a trigger, and the resulting replica-count decision adds or removes whole LWS groups</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="70" width="150" height="70" rx="8" class="d-block"/>
+<text x="95" y="98" text-anchor="middle" class="d-text-inv d-bold">Engine + EPP</text>
+<text x="95" y="116" text-anchor="middle" class="d-text-inv d-small">queue, KV%, TTFT/ITL</text>
+<path d="M170,105 L230,105" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+<rect x="230" y="70" width="150" height="70" rx="8" class="d-block-2"/>
+<text x="305" y="98" text-anchor="middle" class="d-text-inv d-bold">Prometheus</text>
+<text x="305" y="116" text-anchor="middle" class="d-text-inv d-small">scrape + store (&#167;3.2)</text>
+<path d="M380,105 L440,105" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+<rect x="440" y="20" width="150" height="55" rx="8" class="d-surface"/>
+<text x="515" y="42" text-anchor="middle" class="d-bold d-small">KEDA ScaledObject</text>
+<text x="515" y="58" text-anchor="middle" class="d-small d-text-light">reactive PromQL (&#167;3.3)</text>
+
+<rect x="440" y="140" width="150" height="55" rx="8" class="d-surface"/>
+<text x="515" y="162" text-anchor="middle" class="d-bold d-small">Planner / APA</text>
+<text x="515" y="178" text-anchor="middle" class="d-small d-text-light">predictive model (&#167;3.3)</text>
+
+<path d="M590,48 L650,90" class="d-arrow" marker-end="url(#f4-arr)"/>
+<path d="M590,168 L650,120" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+<rect x="650" y="80" width="130" height="60" rx="8" class="d-block-accent"/>
+<text x="715" y="105" text-anchor="middle" class="d-text-inv d-bold">replica count</text>
+<text x="715" y="122" text-anchor="middle" class="d-text-inv d-small">+/&#8722; LWS groups</text>
+
+</svg>
+<figcaption><b>Figure 4.</b> The common shape underneath every mechanism in Table 3: engine and EPP metrics feed Prometheus, a reactive (KEDA) or predictive (Planner/APA) scaler evaluates a trigger against Table 2's demand signals, and the output is always a whole-group replica-count decision, never an in-place resize of one group's TP/PP shape.</figcaption>
+</figure>
+<h2 id="multi-model-multi-tenant">4. Multi-model and multi-tenant serving</h2>
+<p>Module 10 established the structural mechanism: an <code>HTTPRoute</code> "may reference multiple InferencePools," so one public endpoint can fan out by model name to several independently scheduled pools, each with its own selector, endpoint picker, and model-server fleet. This section covers what running that pattern operationally involves — how a request's declared model name actually reaches the right pool, how a base model's LoRA adapters get treated as first-class routable targets rather than static attachments, and how tenancy interacts with a fleet spanning more than one GPU type.</p>
+
+<h3 id="multi-model-lora">4.1 LoRA-adapter routing as a tenancy mechanism</h3>
+<p>Serving twenty fine-tuned variants of the same base model as twenty separate multi-GPU deployments wastes the memory duplicated base weights would otherwise share — the standard fix is multi-LoRA serving, where one base-model replica holds many small adapter deltas in GPU memory and switches between them per request. That only works as a fleet-level pattern if the routing layer can direct a request to a replica that already has the requested adapter loaded, which is why the Gateway API Inference Extension lists "routing client model names to use-case-specific LoRA adapters" as a named goal of the standard, alongside its KV-cache- and request-cost-aware scheduling goals<a class="cite" href="#ref-6">6</a> — the same InferencePool/HTTPRoute machinery Module 10 covers for base-model routing extends unchanged to adapter-level routing: "model name" in a request simply resolves to an adapter identifier instead of a different base model.</p>
+<p>AIBrix implements this concretely as "high-density LoRA management": a <code>LoraController</code> watches a LoRA custom resource, issues a <code>load_model_command</code> into the AI Engine Runtime sidecar to dynamically load or unload an adapter inside a running vLLM container, and republishes the adapter's availability through Kubernetes' native <code>Service</code> and <code>EndpointSlice</code> objects so the gateway's routing layer sees it as just another routable target<a class="cite" href="#ref-12">12</a> — the mechanism the paper frames as fixing "unreliable evictions" and "suboptimal failure handling" that ad hoc adapter management produces when LoRA is treated as a static, offline-configured attachment rather than a dynamically scheduled resource<a class="cite" href="#ref-12">12</a>.</p>
+
+<h3 id="multi-model-heterogeneous">4.2 Heterogeneous hardware as a second tenancy axis</h3>
+<p>Multi-tenancy is not only about serving multiple models behind one endpoint — a fleet mixing GPU generations (older L20s alongside newer A10s or V100s, in AIBrix's own experiment) forces a placement decision that ordinary Kubernetes scheduling does not make well, because request cost-efficiency varies by GPU type even for an identical model and workload shape<a class="cite" href="#ref-12">12</a>. AIBrix's GPU Optimizer addresses this as an integer-linear-programming assignment problem, informed by offline per-GPU-type throughput profiling (Mélange-style<a class="cite" href="#ref-12">12</a>), choosing which accelerator class should serve a given request-size distribution to balance cost against SLO adherence rather than routing purely on availability. In AIBrix's own reported comparison, a heterogeneous fleet (mixing GPU types) against a homogeneous, single-type fleet serving the same workload traded a latency increase of up to 20% — while staying within the declared SLO — for roughly a 10% cost reduction<a class="cite" href="#ref-12">12</a>. That trade-off is the concrete shape of what "multi-tenant" costs once tenants are allowed to land on cheaper hardware: it is not free, and the number that should gate the decision is the SLO headroom left after the latency increase, not the cost saving alone.</p>
+<h2 id="orchestration-landscape">5. The orchestration-layer landscape</h2>
+<p>Sections 1–4 named five different projects solving overlapping pieces of the same problem: raw LWS, KServe, Ray Serve LLM, AIBrix, and — by cross-reference — Dynamo and llm-d from Modules 9 and 10. None of these compete on identical terms; they sit at different points on two independent axes worth making explicit before comparing their feature lists.</p>
+
+<h3 id="orchestration-positioning">5.1 Positioning the five projects</h3>
+<p><b>Raw LWS</b> is a primitive, not a platform: it gang-schedules a group of pods and upgrades them as a unit, and does nothing else — no routing, no autoscaling policy, no observability. Every other project in this section either builds on it or reimplements its job independently.</p>
+<p><b>KServe</b> is Kubernetes-native by construction — its own CRD (<code>InferenceService</code>), its own head/worker pod model for multi-node (section 2, built without LWS), and, internally, Ray as the distributed-execution layer inside a multi-node <code>ServingRuntime</code> (the "Ray Node Count" terminology in section 2.1's formulas is not incidental — vLLM's Ray-based executor backend is what KServe's worker pods actually run). It is general-purpose model serving with LLM-specific runtimes bolted on, not an LLM-native control plane.</p>
+<p><b>Ray Serve LLM</b> inverts that emphasis: Ray owns placement and distributed execution natively, and Kubernetes (via KubeRay, outside this module's scope) is only the layer that gets a Ray cluster running in the first place. Its <code>LLMConfig</code>/<code>build_openai_app</code>/<code>serve.run</code> interface accepts a list of <code>llm_configs</code> for multi-model serving in one application and a per-deployment <code>autoscaling_config</code> for replica scaling<a class="cite" href="#ref-10">10</a> — multi-node and multi-model are both native Ray Serve concepts here, not Kubernetes CRD fields.</p>
+<p><b>AIBrix</b> names the trade-off between the previous two explicitly and builds a hybrid to resolve it: "Kubernetes operators offer coarse-grained resource management but can be complex for fine-grained scheduling, whereas Ray excels in distributed communication but lacks holistic resource control"<a class="cite" href="#ref-12">12</a>. Its answer is what the paper calls Mix-Grain orchestration — a <code>RayClusterFleet</code> and <code>RayClusterReplicaSet</code> layer that gives Kubernetes-style rolling updates, self-healing, and scalable desired-state semantics to a collection of underlying Ray clusters, each Ray cluster internally handling fine-grained rank placement (including, in its disaggregated variant, separate prefill and decode Ray clusters coordinating directly)<a class="cite" href="#ref-12">12</a>. It is, structurally, Kubernetes wrapping Ray wrapping the inference engine — a third point that is neither pure-Kubernetes (KServe) nor pure-Ray (Ray Serve LLM).</p>
+<p><b>Dynamo and llm-d</b> (Modules 9, 10) sit on the second axis, not really the first: both are inference-specific control planes — KV-aware routing, disaggregation-aware scheduling, SLA-driven replica sizing — that need a scheduling substrate underneath them (Grove for Dynamo, LWS for llm-d) rather than replacing it. They compete with each other on how much inference-specific intelligence to build in-house versus standardize at the Kubernetes API level (Module 9's own disagree section covers that split directly); they do not compete with KServe or Ray Serve LLM on the Kubernetes-native-vs-Ray-native axis at all, because neither one is a general-purpose model-serving platform.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f5t"><title id="f5t">Orchestration landscape map: Kubernetes-native versus Ray-native on one axis, generic model-serving platform versus inference-specific control plane on the other</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<line x1="60" y1="170" x2="760" y2="170" class="d-axis"/>
+<line x1="400" y1="30" x2="400" y2="310" class="d-axis"/>
+<text x="90" y="190" class="d-small d-text-light">K8s-native</text>
+<text x="700" y="190" text-anchor="end" class="d-small d-text-light">Ray-native</text>
+<text x="410" y="45" class="d-small d-text-light">inference-specific</text>
+<text x="410" y="300" class="d-small d-text-light">generic platform</text>
+
+<rect x="120" y="230" width="140" height="46" rx="8" class="d-block-2"/>
+<text x="190" y="253" text-anchor="middle" class="d-text-inv d-small">raw LWS</text>
+<text x="190" y="267" text-anchor="middle" class="d-text-inv d-small">(&#167;1)</text>
+
+<rect x="180" y="130" width="150" height="46" rx="8" class="d-block-2"/>
+<text x="255" y="153" text-anchor="middle" class="d-text-inv d-small">KServe</text>
+<text x="255" y="167" text-anchor="middle" class="d-text-inv d-small">(&#167;2, generic + LLM)</text>
+
+<rect x="470" y="230" width="150" height="46" rx="8" class="d-block-2"/>
+<text x="545" y="253" text-anchor="middle" class="d-text-inv d-small">Ray Serve LLM</text>
+<text x="545" y="267" text-anchor="middle" class="d-text-inv d-small">(&#167;3.3, &#167;5.1)</text>
+
+<rect x="440" y="80" width="170" height="46" rx="8" class="d-block"/>
+<text x="525" y="103" text-anchor="middle" class="d-text-inv d-small">AIBrix</text>
+<text x="525" y="117" text-anchor="middle" class="d-text-inv d-small">(hybrid, &#167;5.1)</text>
+
+<rect x="120" y="40" width="150" height="46" rx="8" class="d-block-accent"/>
+<text x="195" y="63" text-anchor="middle" class="d-text-inv d-small">llm-d</text>
+<text x="195" y="77" text-anchor="middle" class="d-text-inv d-small">(Mod. 10, on LWS)</text>
+
+<rect x="300" y="40" width="150" height="46" rx="8" class="d-block-accent"/>
+<text x="375" y="63" text-anchor="middle" class="d-text-inv d-small">Dynamo</text>
+<text x="375" y="77" text-anchor="middle" class="d-text-inv d-small">(Mod. 9, on Grove)</text>
+
+</svg>
+<figcaption><b>Figure 5.</b> Two independent axes place these six projects: Kubernetes-native versus Ray-native scheduling substrate on the horizontal, generic model-serving platform versus inference-specific control plane on the vertical. AIBrix's own stated design rationale is the source for its position as a deliberate hybrid<a class="cite" href="#ref-12">12</a>.</figcaption>
+</figure>
+
+<h3 id="orchestration-aibrix-components">5.2 AIBrix's component list against what it replaces or complements</h3>
+<p>AIBrix is the widest single project surveyed in this module, and its component list is a useful checklist for what a fleet built purely from generic Kubernetes primitives (raw LWS, KServe, KEDA, InferencePool) would otherwise need to assemble separately.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 4.</b> AIBrix's named components and their closest generic-stack equivalent, per AIBrix's own README and paper<a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-12">12</a>.</caption>
+<thead><tr><th>AIBrix component</th><th>What it does</th><th>Closest generic-stack equivalent</th></tr></thead>
+<tbody>
+<tr><td class="row">LLM Gateway and Routing</td><td>Envoy-Gateway-based routing on token patterns, prefix-cache availability, compute overhead; five policies (random, throughput, least-request, least-kv-cache, least-latency, prefix-cache-aware)<a class="cite" href="#ref-12">12</a></td><td>InferencePool + EPP (Module 2, 10) — same scoring problem, different implementation</td></tr>
+<tr><td class="row">App-Tailored Autoscaler</td><td>Sliding-window metric aggregation, KPA/APA algorithms bypassing custom-metrics path (&#167;3.3)</td><td>KEDA + Prometheus (llm-d path)</td></tr>
+<tr><td class="row">Distributed KV Cache Pool</td><td>Cross-engine KV reuse pool with scan-resistant eviction; combined with prefix caching, measured at approximately 50% higher peak throughput and approximately 70% lower P99 TTFT/ITL versus vLLM's own built-in prefix caching<a class="cite" href="#ref-12">12</a></td><td>LMCache / Mooncake (Module 7, 8) — same problem, project-specific implementation</td></tr>
+<tr><td class="row">High-Density LoRA Management</td><td>Dynamic LoRA CR, controller-driven load/unload (&#167;4.1)</td><td>GAIE's stated LoRA-routing goal — a standard, not yet a shipped generic implementation<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">GPU Hardware Failure Detection</td><td>Automated fault diagnostics plus a failure mock-up/injection tool, Nvidia GPUs and Ascend 910B NPUs supported<a class="cite" href="#ref-12">12</a></td><td>No standardized generic-stack equivalent (&#167;7.3)</td></tr>
+</tbody>
+</table>
+<p>Reading this table against the landscape map: everything in the "closest equivalent" column exists somewhere else in this course as a project-specific solution to the same problem, which is the general pattern an integrated platform like AIBrix (or Dynamo, per Module 9) is selling — one coherently designed answer to five problems, versus assembling five separately governed generic-stack pieces yourself. Only GPU hardware-failure detection lacks a real generic-stack alternative as of this module's access date, which is why section 7.3 uses AIBrix as the concrete worked example for that specific capability rather than as one option among several.</p>
+<h2 id="observability">6. Observability: what actually matters at fleet scale</h2>
+<p>Modules 9 through 12 each documented their own project's Prometheus surface in full — Dynamo's <code>dynamo_*</code>-prefixed metrics, vLLM's <code>vllm:*</code> gauges and histograms, SGLang's <code>smg_*</code> metrics spanning over 40 series across HTTP, router, worker, and circuit-breaker layers, and llm-d's EPP-level flow-control metrics this module has already used as autoscaling triggers. None of those modules asked which subset of that surface a fleet operator should actually put on a dashboard with an alert threshold attached, versus which subset exists purely to debug a specific incident after the fact. That question does not change by stack — the same answer applies whether the engine underneath is vLLM, SGLang, or TensorRT-LLM.</p>
+
+<h3 id="observability-alert-tier">6.1 What gates an alert</h3>
+<p>Module 11 already worked out the minimal set for a single vLLM disaggregated deployment: TTFT scraped from the prefill pool, ITL from the decode pool, KV-cache occupancy on both, and the phase-split histograms to distinguish which stage regressed. Generalized across every project this course covers, that same four-signal shape recurs because it maps directly onto Table 2's demand vocabulary from section 3: TTFT and ITL percentiles are the SLO itself, and queue depth / pool saturation / KV-cache occupancy are the leading indicators that predict an SLO breach before it shows up in the latency histograms. A fleet-level dashboard needs these <i>per pool</i>, not fleet-aggregated — an aggregate p99 TTFT across ten prefill pools can look fine while one pool is badly degraded and the other nine are idle, exactly the failure mode a per-pool breakdown catches and a single global number hides.</p>
+<p>GPU power draw and utilization belong on the same dashboard, but as a secondary, diagnostic signal rather than an alert trigger — section 3.1 established why: utilization saturates under continuous batching regardless of whether the pool is meeting its SLO, so an alert on "GPU utilization above 90%" fires constantly and means nothing. It is still useful for capacity planning and for confirming a pool is not idling unexpectedly, just not for answering "is this pool currently failing its SLO."</p>
+
+<h3 id="observability-diagnostic-tier">6.2 What is diagnostic-only</h3>
+<p>The rest of any given stack's metric surface is real, and useful during an incident, but does not earn a standing alert threshold. Module 11's own framing of vLLM's surface is the template: the LoRA-adapter gauge, the static cache-config-info gauge, and the KV-block-lifetime/idle-before-evict histograms are "diagnostic detail for debugging a specific incident, not something worth an alert threshold on its own." The same split applies to SGLang's circuit-breaker metrics (<code>smg_worker_cb_*</code>) and service-discovery counters (<code>smg_discovery_*</code>) — they tell you why a router made a particular decision after something has already gone wrong, not whether something is currently wrong. Deprecated v0-era vLLM metrics (<code>vllm:num_requests_swapped</code>, <code>vllm:cpu_cache_usage_perc</code>, <code>vllm:time_in_queue_requests</code>) belong on neither tier; Module 11 already flagged that a dashboard built against an older metrics reference will alert on gauges that no longer move at all.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 280" role="img" aria-labelledby="f6t"><title id="f6t">Dashboard sketch grouping metrics into an alert tier per pool and an informational tier for incident debugging</title>
+<defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="20" width="370" height="230" rx="10" class="d-panel"/>
+<text x="205" y="44" text-anchor="middle" class="d-bold d-small">alert tier &#8212; per pool (&#167;6.1)</text>
+<rect x="40" y="58" width="330" height="34" rx="6" class="d-fill-red-soft"/>
+<text x="205" y="80" text-anchor="middle" class="d-small">TTFT p50/p90/p99 vs. SLO</text>
+<rect x="40" y="100" width="330" height="34" rx="6" class="d-fill-red-soft"/>
+<text x="205" y="122" text-anchor="middle" class="d-small">ITL p50/p90/p99 vs. SLO</text>
+<rect x="40" y="142" width="330" height="34" rx="6" class="d-fill-amber-soft"/>
+<text x="205" y="164" text-anchor="middle" class="d-small">KV-cache occupancy / pool saturation</text>
+<rect x="40" y="184" width="330" height="34" rx="6" class="d-fill-amber-soft"/>
+<text x="205" y="206" text-anchor="middle" class="d-small">queue depth / running requests</text>
+<text x="205" y="235" text-anchor="middle" class="d-small d-text-light">these four drive KEDA/Planner triggers (&#167;3.3)</text>
+
+<rect x="410" y="20" width="370" height="230" rx="10" class="d-panel"/>
+<text x="595" y="44" text-anchor="middle" class="d-bold d-small">informational tier (&#167;6.2)</text>
+<rect x="430" y="58" width="330" height="34" rx="6" class="d-fill-blue-soft"/>
+<text x="595" y="80" text-anchor="middle" class="d-small">GPU power draw / utilization</text>
+<rect x="430" y="100" width="330" height="34" rx="6" class="d-fill-blue-soft"/>
+<text x="595" y="122" text-anchor="middle" class="d-small">phase-split (prefill/decode time) histograms</text>
+<rect x="430" y="142" width="330" height="34" rx="6" class="d-fill-blue-soft"/>
+<text x="595" y="164" text-anchor="middle" class="d-small">KV-block lifetime / eviction histograms</text>
+<rect x="430" y="184" width="330" height="34" rx="6" class="d-fill-blue-soft"/>
+<text x="595" y="206" text-anchor="middle" class="d-small">circuit-breaker / discovery counters</text>
+<text x="595" y="235" text-anchor="middle" class="d-small d-text-light">pulled up only during incident review</text>
+
+</svg>
+<figcaption><b>Figure 6.</b> A fleet-level dashboard sketch, generalized from Module 11's vLLM-specific minimal SLO dashboard: per-pool latency and demand signals gate an alert and drive autoscaling triggers (&#167;3), everything else is pulled up only to explain an already-detected incident.</figcaption>
+</figure>
+
+<h2 id="upgrade-failure-handling">7. Upgrade and failure handling at fleet scale</h2>
+
+<h3 id="upgrade-rolling">7.1 Rolling upgrade of a stateful multi-host sharded unit</h3>
+<p>Section 1.3 already described LWS's mechanism directly: <code>rollingUpdateConfiguration</code>'s <code>maxUnavailable</code>/<code>maxSurge</code> operate on whole groups, and a group's leader and worker pods are always replaced together — "groups are upgraded one by one as a unit." Section 2.3 gave KServe's version of the same trade-off from the resource-cost side: <code>RollingUpdate</code> keeps the old topology serving until the new one is ready, at the price of needing more than twice the GPU footprint during the transition, which is exactly why KServe's own guidance reserves it for production and defaults development environments to the cheaper, disruptive <code>Recreate</code> strategy.</p>
+<p>This is the same shape of trade-off Module 4 already worked through for xPyD reconfiguration — drain-before-remove, where a worker publishes a <code>RuntimeConfig</code> on join and drains its active requests before deregistering on removal — just applied one level up. Module 4's mechanism operates at the granularity of one prefill or decode <i>worker</i> joining or leaving a pool at runtime, driven by the orchestration layer's own scheduling decisions. This section's mechanism operates at the granularity of one multi-host <i>group</i> being replaced wholesale during a planned image or config upgrade, driven by a rollout controller. Both exist for the same underlying reason: neither an individual GPU rank nor half a sharded model can be swapped in isolation without either corrupting the shard's collective state or leaving a partially-upgraded, version-mismatched group serving traffic.</p>
+
+<h3 id="upgrade-drain">7.2 Drain, cordon, and PodDisruptionBudget underneath both</h3>
+<p>Both LWS's group-level rollout and any node-level maintenance operation ultimately reduce to two generic Kubernetes primitives. <code>kubectl drain</code> performs a cordon (marking the node unschedulable so no new pods land there) followed by eviction of the node's existing pods, respecting each pod's graceful-termination period<a class="cite" href="#ref-13">13</a>. A <code>PodDisruptionBudget</code> (PDB) sets a floor — <code>minAvailable</code> or a ceiling, <code>maxUnavailable</code> — on how many pods matching a selector may be simultaneously unavailable, and the eviction API checks every proposed eviction against it before allowing it to proceed<a class="cite" href="#ref-13">13</a>. For an ordinary stateless <code>Deployment</code> this is enough on its own: a PDB with <code>minAvailable: 2</code> on a 3-replica set permits exactly one pod to be drained at a time.</p>
+<p>Applied naively to a multi-host LWS group, a plain pod-level PDB is the wrong granularity: it would happily permit draining the <i>worker</i> pod of a group while leaving the <i>leader</i> pod of that same group still marked available, which satisfies the PDB's counting rule while producing exactly the half-formed shard section 1.1's all-or-nothing restart policy exists to prevent. The correct application of PDB-style reasoning to a gang-scheduled group has to operate at group granularity, not pod granularity — either by selecting whole groups as the disruption-budget unit, or, as Module 9 covers for Dynamo's Grove component, by having a purpose-built gang scheduler (Grove's <code>PodGang</code> object, read and enforced by the KAI Scheduler) reject any partial-group disruption outright rather than relying on a PDB's per-pod counting to happen to preserve group integrity. This module does not re-derive Grove's mechanism — the point to carry forward is that plain Kubernetes PDBs are a necessary but not sufficient primitive once the unit of availability is a multi-pod group rather than a single pod.</p>
+
+<h3 id="upgrade-gpu-failure">7.3 GPU hardware failure detection</h3>
+<p>A GPU that degrades silently — ECC errors climbing, a fabric link intermittently dropping, a card overheating under sustained load without crashing outright — is a harder failure mode than a pod simply dying, because nothing about the pod's own liveness/readiness probes necessarily notices. Table 4 already flagged this as the one AIBrix component without a standardized generic-Kubernetes-stack equivalent as of this module's access date: AIBrix's Accelerator Diagnostic tooling "automates fault detection, helping users proactively identify and resolve GPU-related performance issues before they impact workloads," paired with a failure mock-up tool that deliberately simulates hardware failures so a fleet's recovery path can be exercised under controlled conditions rather than discovered for the first time during a real outage<a class="cite" href="#ref-12">12</a>. Support currently spans Nvidia GPUs and Ascend 910B NPUs, with additional accelerator support planned<a class="cite" href="#ref-12">12</a>.</p>
+<p>Once a fault is detected, the remediation path is the same drain-before-remove mechanism sections 7.1 and 7.2 already established: the affected node is cordoned so no new pods schedule onto it, the pod (or, for a multi-host group, the whole group) is evicted respecting whatever group-level disruption constraint applies, and — for an orchestration layer with its own worker-registration lifecycle, as Module 9 covers for Dynamo's <code>RuntimeConfig</code> publish/deregister path — the control plane routes around the missing capacity automatically rather than requiring a human to manually rebalance. What AIBrix's tooling adds on top of that generic remediation path is the detection step itself: catching a degrading GPU before it produces a failed or, worse, silently-corrupted forward pass, rather than only reacting once the pod has already crashed and Kubernetes' own liveness probe has caught it.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Section 3.3 closed on a claim worth stating as a real disagreement rather than a settled fact: that every autoscaling mechanism this module covers scales the <i>count</i> of multi-host replica groups, never the internal shape of one group. Section 2.3 showed KServe going further than that and disabling autoscaling outright for multi-node deployments. Those two positions look contradictory on the surface — one treats a gang-scheduled group as a fine autoscaling unit, the other treats "multi-node" and "autoscaled" as close to mutually exclusive — and the disagreement is real enough that it is worth separating what each side is actually claiming.</p>
+<div class="positions">
+<article class="position">
+<h4>Multi-node topology is not autoscaling's job</h4>
+<p class="who">KServe's own multi-node documentation<a class="cite" href="#ref-4">4</a></p>
+<p>KServe requires <code>autoscalerClass: none</code> for every multi-node <code>InferenceService</code> and states directly that <code>pipelineParallelSize</code> "is not an autoscaling concept" — changing it in production is discouraged strongly enough that the documented path is deleting and recreating the deployment rather than patching it live. Nothing in KServe's own multi-node <code>ServingRuntime</code> exposes a scale-the-group-count path at all; the entire multi-node feature is framed as fixed-topology by design.</p>
+<ul class="pros"><li>Honest about a real constraint: TP/PP degree genuinely cannot be resized inside a running shard without breaking collective-communication assumptions, and pretending otherwise invites a worse failure than just not autoscaling.</li><li>Simpler operationally — no risk of an autoscaler racing a rollout or fighting a manual scale command on a topology that cannot safely change shape.</li></ul>
+<ul class="cons"><li>Conflates "cannot resize a group's internal shape" with "cannot change how many groups exist," which are different claims — the second one is exactly what section 3.3's four mechanisms do successfully.</li><li>Leaves an operator manually sizing a multi-node fleet to peak demand, since KServe's own multi-node path offers no automated alternative.</li></ul>
+</article>
+<article class="position">
+<h4>Scale the pool of groups, not the group itself</h4>
+<p class="who">Dynamo's Planner (Module 9) and llm-d's KEDA+EPP autoscaling path<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-9">9</a></p>
+<p>Both treat a multi-host group — an LWS replica, or the equivalent unit under Grove — as the atomic thing that gets added or removed, driven continuously by TTFT/ITL-derived demand signals rather than fixed at deploy time. Neither one ever resizes a running group's TP or PP degree; the Planner's <code>sla</code> mode and llm-d's KEDA <code>ScaledObject</code> both output a target <i>replica count</i>, which LWS's scale subresource or Grove's <code>PodCliqueSet</code> replica field then satisfies by adding or removing whole, unchanged-shape groups.</p>
+<ul class="pros"><li>Matches what section 3.1 established: utilization-based signals are broken for LLM serving, and a fleet that cannot scale its group count at all is stuck over-provisioning for peak demand or accepting SLO breaches at the trough.</li><li>Grounded in the same TTFT/ITL SLO vocabulary this module and Module 15 both use, rather than a separate ad hoc metric.</li></ul>
+<ul class="cons"><li>Both mechanisms need a working worker-registration/deregistration path underneath them (Module 4's drain-before-remove, Module 9's <code>RuntimeConfig</code> publish) that a simpler stack may not have implemented; KServe's own multi-node path, notably, does not have one.</li><li>Predictive modes (Dynamo's <code>sla</code>) carry the bootstrap-accuracy caveat Module 9 already flagged — a performance model with no accuracy guarantee is not obviously safer than KServe's "don't autoscale at all" position during a deployment's early life.</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>These are not actually opposed once "autoscale" is disambiguated into two separate claims. KServe is correct that a running group's internal TP × PP shape cannot be elastically resized — vLLM's own guidance against changing <code>PipelineParallelSize</code> live agrees, and no project surveyed in this module claims otherwise. Dynamo and llm-d are correct that the group as a whole is a perfectly good autoscaling unit, and Table 3's four mechanisms are existence proofs, not proposals. KServe's blanket "no autoscaling for multi-node" position is better read as an honest statement of its own current implementation gap — it has not built a group-level HPA-friendly scale path for its multi-node <code>ServingRuntime</code> — rather than as evidence that group-level autoscaling is unsafe or unworkable in general. What would settle this cleanly is KServe shipping its own group-count autoscaling path for multi-node <code>InferenceService</code>s (there is no committed timeline for this in the documentation available as of this module's access date) and, on the other side, a published incident report of a Planner- or KEDA-driven group-count scaling decision going wrong in production — neither exists yet to falsify the position it would bear on.</p></div>
+</section>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">repo</span>Kubernetes SIG contributors. <em>kubernetes-sigs/lws</em> (LeaderWorkerSet README). Main branch. <a href="https://github.com/kubernetes-sigs/lws/blob/main/README.md">https://github.com/kubernetes-sigs/lws/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: LWS's purpose statement, group/leader/worker model, all-or-nothing restart and rollout framing ("groups are upgraded one by one as a unit"), co-design with llm-d, topology co-location and scale-subresource support.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>vLLM contributors. <em>LWS</em> (vLLM Documentation, deployment/frameworks/lws). <a href="https://docs.vllm.ai/en/stable/deployment/frameworks/lws/">https://docs.vllm.ai/en/stable/deployment/frameworks/lws/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: LWS_LEADER_ADDRESS/LWS_GROUP_SIZE/LWS_WORKER_INDEX environment variables, the multiprocessing vLLM-flag mapping, and the Ray-based multi-node-serving.sh startup path.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>Kubernetes SIG contributors. <em>LeaderWorkerSetSpec API Reference</em> (LWS documentation). <a href="https://lws.sigs.k8s.io/docs/reference/leaderworkerset.v1/">https://lws.sigs.k8s.io/docs/reference/leaderworkerset.v1/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: exact field names and semantics — replicas, leaderWorkerTemplate.size, leaderTemplate/workerTemplate, restartPolicy, subGroupPolicy, rolloutStrategy.rollingUpdateConfiguration (maxUnavailable/maxSurge), networkConfig.subdomainPolicy.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>KServe contributors. <em>Multi-node/Multi-GPU Inference</em> (KServe docs). <a href="https://kserve.github.io/website/docs/model-serving/generative-inference/multi-node">https://kserve.github.io/website/docs/model-serving/generative-inference/multi-node</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the tensorParallelSize x pipelineParallelSize = Total GPUs formula set, the 16-GPU/2-node worked cases (Table 1), the autoscalerClass: none requirement, exactly-one-head-pod constraint, and the RollingUpdate-vs-Recreate resource trade-off.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>vLLM contributors. <em>Metrics</em> (vLLM Design Documentation, v1 engine). <a href="https://docs.vllm.ai/en/latest/design/metrics/">https://docs.vllm.ai/en/latest/design/metrics/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: named vLLM Prometheus gauges/histograms (num_requests_waiting, num_requests_running, kv_cache_usage_perc, TTFT/ITL histograms) reused in Table 2's demand-signal vocabulary.</span></li>
+<li id="ref-6"><span class="ref-type">repo</span>Kubernetes SIG contributors. <em>kubernetes-sigs/gateway-api-inference-extension</em> (README). <a href="https://github.com/kubernetes-sigs/gateway-api-inference-extension">https://github.com/kubernetes-sigs/gateway-api-inference-extension</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the standard's stated goal of routing client model names to LoRA adapters, grounding section 4.1's multi-tenant LoRA-routing pattern.</span></li>
+<li id="ref-7"><span class="ref-type">official</span>llm-d contributors. <em>KEDA with EPP Metrics</em> (llm-d docs). <a href="https://llm-d.ai/docs/dev/architecture/advanced/autoscaling/keda-epp">https://llm-d.ai/docs/dev/architecture/advanced/autoscaling/keda-epp</a>. Accessed 2026-09-17. <span class="ref-use">Used for: why GPU utilization fails as a scaling signal, the EPP-exposed metric set (queue size, pool saturation, running requests, inflight tokens), the KEDA ScaledObject-not-a-second-HPA architecture, and the dual-trigger (queue + running-requests) recommendation.</span></li>
+<li id="ref-8"><span class="ref-type">repo</span>llm-d contributors. <em>workload-autoscaling guide</em> (llm-d/llm-d repository, main branch). <a href="https://github.com/llm-d/llm-d/blob/main/guides/workload-autoscaling/README.md">https://github.com/llm-d/llm-d/blob/main/guides/workload-autoscaling/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the "lagging indicator" critique of CPU/GPU-based autoscaling, the vllm:num_requests_waiting/kv_cache_usage_perc trigger examples, and the SLO-aware recording-rule scaling path via KEDA scalingModifiers.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>NVIDIA. <em>Planner Guide</em> (NVIDIA Dynamo Documentation). v1.2.1. <a href="https://docs.nvidia.com/dynamo/v1.2.1/components/planner/planner-guide">https://docs.nvidia.com/dynamo/v1.2.1/components/planner/planner-guide</a>. Accessed 2026-09-17. <span class="ref-use">Used for: default SLA targets (TTFT 500 ms, ITL 50 ms) cited in section 3.3, cross-referencing Module 9's fuller treatment of the Planner's sla mode without re-deriving it.</span></li>
+<li id="ref-10"><span class="ref-type">official</span>Ray / Anyscale contributors. <em>Serving LLMs</em> (Ray Serve Documentation). Ray 2.58.0. <a href="https://docs.ray.io/en/latest/serve/llm/index.html">https://docs.ray.io/en/latest/serve/llm/index.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: LLMConfig/build_openai_app/serve.run interface, multi-model llm_configs list, per-deployment autoscaling_config, and Ray-native placement as the basis for section 5.1's Ray-native positioning.</span></li>
+<li id="ref-11"><span class="ref-type">repo</span>AIBrix contributors. <em>vllm-project/aibrix</em> (README). v0.7.0 (2026-06-16). <a href="https://github.com/vllm-project/aibrix">https://github.com/vllm-project/aibrix</a>. Accessed 2026-09-17. <span class="ref-use">Used for: AIBrix's top-level component list (Table 4) and current release version.</span></li>
+<li id="ref-12"><span class="ref-type">paper</span>The AIBrix Team. <em>AIBrix: Towards Scalable, Cost-Effective Large Language Model Inference Infrastructure</em>. arXiv:2504.03648, 2025. <a href="https://arxiv.org/abs/2504.03648">https://arxiv.org/abs/2504.03648</a>. Accessed 2026-09-17. <span class="ref-use">Used for: LLM-specific autoscaling policies and KPA/APA measured gains (&#167;3.1, &#167;3.3), high-density LoRA management mechanism (&#167;4.1), GPU Optimizer ILP heterogeneous-serving trade-off (&#167;4.2), Mix-Grain Ray+Kubernetes orchestration rationale (&#167;5.1), distributed KV cache benchmark numbers (Table 4), and accelerator diagnostic/failure mock-up tooling (&#167;7.3).</span></li>
+<li id="ref-13"><span class="ref-type">official</span>Kubernetes contributors. <em>Safely Drain a Node</em> (Kubernetes Documentation). <a href="https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/">https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the cordon-then-evict mechanism of kubectl drain and the PodDisruptionBudget minAvailable/maxUnavailable eviction-blocking rule underlying section 7.2.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

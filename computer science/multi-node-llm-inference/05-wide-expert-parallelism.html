@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wide Expert Parallelism: DeepEP, Placement, and Load Balancing &#183; Multi-Node LLM Inference</title>
+<meta name="description" content="Why cross-node MoE parallelism is an all-to-all traffic problem, DeepEP's two kernel modes with measured bandwidth by configuration, EPLB's redundant-expert placement, the attention-DP + EP layout pattern, and what NVL72 changes about the EP domain.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Multi-Node LLM Inference: From One Node to N &#183; Module 5</p>
+  <h1>Wide Expert Parallelism: DeepEP, Placement, and Load Balancing</h1>
+  <p class="lede">Tensor and pipeline parallelism move a known amount of data along a fixed pattern every step; expert parallelism moves a data-dependent amount of data to a destination the router only decides at runtime. This module works through why that distinction makes cross-node MoE an all-to-all problem, what DeepEP's two kernel modes do about it with real measured bandwidth by configuration, how EPLB decides which experts to duplicate and where to place them, and how the attention-DP + EP layout and NVL72's larger NVLink domain change the arithmetic. After it, you can reason about EP degree, placement policy, and expected dispatch bandwidth for a given cluster topology.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>30 min</b> read</span>
+    <span class="chip"><b>6</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 1</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">All-to-all MoE dispatch fan-out compared with ring all-reduce's fixed neighbor-to-neighbor pattern</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="200" y="24" text-anchor="middle" class="d-title d-bold">All-to-all: MoE dispatch</text>
+    <g>
+      <rect x="60" y="60" width="90" height="40" rx="8" class="d-block"/><text x="105" y="85" text-anchor="middle" class="d-text-inv d-bold d-small">GPU 0</text>
+      <rect x="230" y="60" width="90" height="40" rx="8" class="d-block"/><text x="275" y="85" text-anchor="middle" class="d-text-inv d-bold d-small">GPU 1</text>
+      <rect x="60" y="220" width="90" height="40" rx="8" class="d-block-2"/><text x="105" y="245" text-anchor="middle" class="d-text-inv d-bold d-small">GPU 2</text>
+      <rect x="230" y="220" width="90" height="40" rx="8" class="d-block-2"/><text x="275" y="245" text-anchor="middle" class="d-text-inv d-bold d-small">GPU 3</text>
+      <path d="M150,72 L228,72" class="d-arrow" marker-end="url(#f1-arr)"/>
+      <path d="M150,88 L228,232" class="d-arrow" marker-end="url(#f1-arr)"/>
+      <path d="M105,100 L105,218" class="d-arrow" marker-end="url(#f1-arr)"/>
+      <path d="M120,100 L268,218" class="d-arrow" marker-end="url(#f1-arr)"/>
+      <path d="M230,80 L152,240" class="d-arrow" marker-end="url(#f1-arr)"/>
+      <path d="M275,102 L275,218" class="d-arrow" marker-end="url(#f1-arr)"/>
+      <text x="190" y="160" text-anchor="middle" class="d-small d-text-light">token &#8594; whichever GPU</text>
+      <text x="190" y="174" text-anchor="middle" class="d-small d-text-light">holds its top-k expert</text>
+    </g>
+    <text x="190" y="300" text-anchor="middle" class="d-small">personalized, data-dependent scatter &#8212; volume per link set by the router at runtime</text>
+
+    <text x="600" y="24" text-anchor="middle" class="d-title d-bold">All-reduce: TP/PP partial sums</text>
+    <g>
+      <circle cx="600" cy="150" r="90" class="d-outline d-dashed"/>
+      <rect x="555" y="60" width="90" height="36" rx="8" class="d-block-accent"/><text x="600" y="83" text-anchor="middle" class="d-text-inv d-bold d-small">GPU 0</text>
+      <rect x="645" y="132" width="90" height="36" rx="8" class="d-block-accent"/><text x="690" y="155" text-anchor="middle" class="d-text-inv d-bold d-small">GPU 1</text>
+      <rect x="555" y="204" width="90" height="36" rx="8" class="d-block-accent"/><text x="600" y="227" text-anchor="middle" class="d-text-inv d-bold d-small">GPU 2</text>
+      <rect x="465" y="132" width="90" height="36" rx="8" class="d-block-accent"/><text x="510" y="155" text-anchor="middle" class="d-text-inv d-bold d-small">GPU 3</text>
+      <path d="M628,84 Q690,100 680,130" class="d-arrow" marker-end="url(#f1-arr)"/>
+      <path d="M680,170 Q690,200 628,216" class="d-arrow" marker-end="url(#f1-arr)"/>
+      <path d="M572,216 Q510,200 520,170" class="d-arrow" marker-end="url(#f1-arr)"/>
+      <path d="M520,132 Q510,100 572,84" class="d-arrow" marker-end="url(#f1-arr)"/>
+    </g>
+    <text x="600" y="300" text-anchor="middle" class="d-small">fixed ring pattern &#8212; every rank sends/receives the same, known volume every step</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> A tensor/pipeline-parallel all-reduce moves a fixed volume along a fixed ring known at graph-compile time. MoE dispatch is a personalized all-to-all: each token's destination GPU depends on a runtime routing decision, so the bytes any given link carries change batch to batch. DeepEP implements this scatter/gather as dedicated dispatch and combine kernels<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="all-to-all-not-all-reduce">1. Why cross-node MoE parallelism is an all-to-all problem</h2>
+<p>Tensor parallelism and pipeline parallelism, which you already know from single-node serving, both reduce to communication patterns that are fixed by the parallelism degree and the tensor shape, not by the data flowing through the model. A TP all-reduce sums <em>partial</em> results that every rank already holds a same-shaped share of; a ring all-reduce over <em>P</em> ranks moves \( 2(P-1)/P \) times the payload per rank regardless of which tokens are in the batch, and every rank talks to the same fixed set of neighbors every step. PP send/recv is even more constrained: a fixed pair of ranks exchanges a fixed-shape activation tensor at each pipeline boundary. Both patterns are known entirely at graph-compile time &#8212; the compiler can schedule the exact communication volume and destination set before a single token arrives.</p>
+<p>Expert-parallel dispatch does not have that property. A token's destination is the output of the router: a top-k gate computed from that token's own hidden state, decided at runtime, different for every token in the batch. If expert <em>e</em> lives on GPU <em>g</em>, every token the router sends to <em>e</em> has to physically move to <em>g</em> &#8212; and which tokens those are, and how many, is data-dependent and changes every forward pass. The result is not a reduction (many partial values combining into one) but a <em>personalized</em> scatter: each of the <em>N</em> participating ranks sends a different, batch-dependent subset of tokens to each of the other ranks, then later gathers the corresponding expert outputs back. This is the all-to-all pattern (in MPI terms, closer to <code>Alltoallv</code> with variable-size messages than to <code>Allreduce</code>), and it is why DeepSeek built DeepEP specifically as "high-throughput and low-latency all-to-all GPU kernels (MoE dispatch and combine)" rather than reusing a collective-communication library's all-reduce path<a class="cite" href="#ref-1">1</a>.</p>
+<p>Two consequences follow directly from the pattern being all-to-all rather than all-reduce:</p>
+<ul>
+<li><strong>Volume does not shrink with degree the way all-reduce volume does.</strong> Ring all-reduce's per-rank cost falls toward \( 2 \times \text{payload} \) as <em>P</em> grows large and eventually plateaus; widening the ring past that point buys latency (more, smaller hops) more than it buys bandwidth relief. All-to-all dispatch has no such ceiling effect: each rank's fixed traffic budget (its own NIC/NVLink bandwidth) has to reach more distinct destinations as expert-parallel degree grows, because there are more remote GPUs each holding a piece of the expert population the router might send to. &#167;3 quantifies this directly against DeepEP's own measured numbers.</li>
+<li><strong>The traffic pattern is irregular per step, not just per model.</strong> Even at fixed batch size and fixed EP degree, the exact byte count each link carries varies token by token and step by step, because it depends on which experts this particular batch's tokens happened to route to. A well-balanced expert population smooths this out on average; a skewed one (a handful of "hot" experts) concentrates traffic on a handful of destination GPUs. &#167;4 covers EPLB, the mechanism DeepSeek built to keep that skew from turning into a bottleneck.</li>
+</ul>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>TP/PP collectives are a scheduling problem the compiler can solve once, ahead of time. MoE dispatch is a scheduling problem the runtime has to solve every forward pass, because the router's decision is the input to the communication pattern, not a side effect of it.</p></aside>
+<h2 id="deepep-kernel-modes">2. DeepEP: two kernel modes for two traffic regimes</h2>
+<p>DeepEP ships two distinct kernel families rather than one general-purpose all-to-all, because prefill/training dispatch and decode dispatch stress completely different things. Prefill and training move large batches and want maximum aggregate throughput; decode moves a handful of tokens per GPU per step and wants the shortest possible wall-clock time per call, even at the cost of throughput. DeepSeek's own description of the split, from the still-current documentation of the library's original (V1) architecture: normal kernels are "optimized for asymmetric-domain bandwidth forwarding, such as forwarding data from NVLink domain to RDMA domain," suitable for "both training and inference prefilling tasks," while a separate set of "low-latency kernels with pure RDMA" targets "latency-sensitive inference decoding"<a class="cite" href="#ref-2">2</a>. The current V2 release keeps this same two-regime design but exposes both through one unified <code>ElasticBuffer</code> interface rather than two separate buffer types<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="normal-kernels">2.1 Normal kernels: NVLink-to-RDMA-domain forwarding</h3>
+<p>A normal-kernel dispatch call has to move tokens from every GPU to every GPU across a two-tier fabric: NVLink inside a node, RDMA between nodes. The naive way to do this is for the source GPU to push each token directly over RDMA to whichever remote GPU holds its destination expert &#8212; but that means, for a target node with 8 GPUs, up to 8 separate small RDMA sends per source GPU per destination node, which wastes message-rate budget on small transfers. DeepEP's normal kernels instead forward asymmetrically: a token destined for a remote node crosses the RDMA link once, to a single "gateway" rank on the destination node, then fans out to its final GPU over that node's internal NVLink fabric<a class="cite" href="#ref-2">2</a>. This collapses many small inter-node messages into fewer, larger ones and lets the RDMA link run closer to its rated bandwidth instead of message-rate-limited small-payload rates. Normal kernels also expose SM (streaming-multiprocessor) count as a tunable &#8212; more SMs devoted to the communication kernel raise achieved bandwidth at the cost of SMs the GEMM stages don't get to use, a trade-off &#167;3.1 quantifies.</p>
+
+<h3 id="low-latency-kernels">2.2 Low-latency kernels: pure RDMA</h3>
+<p>Decode cannot afford the gateway-forwarding hop. At a typical production decode batch (DeepSeek's own low-latency benchmark uses 128 tokens per batch, two orders of magnitude smaller than the 8,192-token prefill benchmark<a class="cite" href="#ref-2">2</a>), the token count routed to any single remote GPU on any given step is small enough that an extra forwarding hop adds pure latency without buying meaningful throughput headroom. Low-latency kernels instead route every token directly over RDMA, GPU to GPU, with no NVLink-domain forwarding stage. The library backs this with a hook-based communication/computation overlap mechanism: a dispatch call returns immediately with a "hook" the caller invokes only when it actually needs the received tensor, and the RDMA transfer runs in the background using zero SM occupancy &#8212; the network interface, not a GPU streaming multiprocessor, does the work of moving bytes<a class="cite" href="#ref-2">2</a>. That zero-SM property matters specifically because decode's compute stages (attention, the routed-expert GEMM) already run at small batch and are latency-bound; stealing SMs for communication would directly lengthen the decode step's critical path.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">DeepEP normal kernels forward NVLink to RDMA via a gateway rank; low-latency kernels go direct RDMA GPU to GPU</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="200" y="22" text-anchor="middle" class="d-title d-bold">2.1 Normal kernels (prefill/training)</text>
+<rect x="20" y="50" width="340" height="90" rx="10" class="d-panel"/><text x="190" y="66" text-anchor="middle" class="d-small d-text-light">Node A (source)</text>
+<rect x="40" y="80" width="70" height="36" rx="6" class="d-block"/><text x="75" y="103" text-anchor="middle" class="d-text-inv d-small">GPU src</text>
+<rect x="440" y="50" width="340" height="90" rx="10" class="d-panel"/><text x="610" y="66" text-anchor="middle" class="d-small d-text-light">Node B (destination)</text>
+<rect x="460" y="80" width="80" height="36" rx="6" class="d-block-2"/><text x="500" y="103" text-anchor="middle" class="d-text-inv d-small">gateway rank</text>
+<rect x="670" y="80" width="80" height="36" rx="6" class="d-block-2"/><text x="710" y="103" text-anchor="middle" class="d-text-inv d-small">GPU dst</text>
+<path d="M110,98 L458,98" class="d-arrow" marker-end="url(#f2-arr)"/><text x="284" y="90" text-anchor="middle" class="d-mono d-small">RDMA, one hop</text>
+<path d="M540,98 L668,98" class="d-arrow" marker-end="url(#f2-arr)"/><text x="604" y="90" text-anchor="middle" class="d-mono d-small">NVLink fan-out</text>
+<text x="400" y="160" text-anchor="middle" class="d-small">tunable SM count &#8212; more SMs, higher bandwidth, fewer SMs left for GEMM</text>
+
+<text x="200" y="200" text-anchor="middle" class="d-title d-bold">2.2 Low-latency kernels (decode)</text>
+<rect x="20" y="220" width="340" height="70" rx="10" class="d-panel"/><text x="190" y="236" text-anchor="middle" class="d-small d-text-light">Node A</text>
+<rect x="40" y="248" width="80" height="34" rx="6" class="d-block-accent"/><text x="80" y="270" text-anchor="middle" class="d-text-inv d-small">GPU src</text>
+<rect x="440" y="220" width="340" height="70" rx="10" class="d-panel"/><text x="610" y="236" text-anchor="middle" class="d-small d-text-light">Node B</text>
+<rect x="700" y="248" width="80" height="34" rx="6" class="d-block-accent"/><text x="740" y="270" text-anchor="middle" class="d-text-inv d-small">GPU dst</text>
+<path d="M120,265 L698,265" class="d-arrow-active" marker-end="url(#f2-arr)"/><text x="400" y="255" text-anchor="middle" class="d-mono d-small">direct RDMA, 0 SM occupancy, hook-based overlap</text>
+</svg>
+<figcaption><b>Figure 2.</b> Normal kernels forward a token across the NVLink&#8594;RDMA boundary through a gateway rank on the destination node, then fan out locally over NVLink &#8212; the pattern DeepSeek describes as "asymmetric-domain bandwidth forwarding." Low-latency kernels skip the forwarding stage and send GPU-to-GPU over RDMA directly, using a hook-based callback so the transfer occupies no streaming multiprocessors<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>Both kernel families dispatch in FP8 and combine in BF16<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>. &#167;3.3 works out why the two directions use different precisions and what that costs in bytes moved.</p></aside>
+<h2 id="measured-bandwidth">3. Measured bandwidth: the cliff, and what happens at small batch</h2>
+<p>Module 1 &#167;6 already introduced DeepEP's headline normal-kernel numbers as evidence for the NVLink/RDMA bandwidth cliff. This section goes one level deeper: the SM-count trade-off behind those numbers, the separate low-latency-kernel numbers Module 1 did not cover, and a worked derivation of what those bandwidth figures mean in wall-clock time for one MoE layer's dispatch and combine step.</p>
+
+<h3 id="normal-kernel-throughput">3.1 Normal-kernel throughput by configuration</h3>
+<p>DeepEP's own published benchmark uses a training/prefill-scale workload &#8212; 8,192 tokens per batch, 7,168 hidden dimensions, top-8 expert routing, FP8 dispatch and BF16 combine<a class="cite" href="#ref-1">1</a> &#8212; and reports:</p>
+<ul>
+<li>NVLink-domain, EP8 (single 8-GPU node), 64 SMs devoted to communication: <strong>726 GB/s dispatch, 740 GB/s combine</strong>.</li>
+<li>NVLink-domain, EP8, only 24 SMs devoted to communication: <strong>643 GB/s dispatch, 675 GB/s combine</strong> &#8212; a 60% cut in communication SMs costs about 11&#8211;9% of achieved bandwidth<a class="cite" href="#ref-1">1</a>.</li>
+<li>RDMA-domain, EP8&#215;2 (two 8-GPU nodes' worth of experts), 12 SMs: <strong>90 GB/s dispatch, 81 GB/s combine</strong>.</li>
+<li>RDMA-domain, EP8&#215;4 (four nodes' worth), 6 SMs: <strong>61 GB/s dispatch, 61 GB/s combine</strong><a class="cite" href="#ref-1">1</a>.</li>
+</ul>
+<p>The 24-versus-64-SM comparison is the concrete version of the trade-off &#167;2.1 named: a serving engine that needs those SMs for GEMM work can drop from 64 to 24 communication SMs and give up only about a tenth of dispatch bandwidth, which is often the right trade at prefill scale where compute is the bottleneck resource. DeepEP's own release notes flag this explicitly as a benefit of its second major version, reporting "up to 1.3x peak performance" over the prior version "while saving up to 4x SM count"<a class="cite" href="#ref-1">1</a>. The library's documentation also flags a measurement caveat worth carrying forward: the reported numbers are <em>logical</em> bandwidth, and "under the EP 8 x 2 case, 90 GB/s actually contains local rank traffic" &#8212; meaning part of that figure reflects the intra-node NVLink hop from &#167;2.1's gateway-forwarding step, not purely the cross-node RDMA wire rate<a class="cite" href="#ref-1">1</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f3t"><title id="f3t">DeepEP normal-kernel measured dispatch and combine bandwidth by EP configuration and SM budget</title>
+<line x1="70" y1="250" x2="760" y2="250" class="d-axis"/>
+<line x1="70" y1="190" x2="760" y2="190" class="d-grid"/>
+<line x1="70" y1="130" x2="760" y2="130" class="d-grid"/>
+<line x1="70" y1="70" x2="760" y2="70" class="d-grid"/>
+<text x="60" y="254" text-anchor="end" class="d-small d-text-light">0</text>
+<text x="60" y="194" text-anchor="end" class="d-small d-text-light">200</text>
+<text x="60" y="134" text-anchor="end" class="d-small d-text-light">400</text>
+<text x="60" y="74" text-anchor="end" class="d-small d-text-light">600</text>
+<text x="30" y="160" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 30 160)">GB/s</text>
+<rect x="100" y="88" width="34" height="162" class="d-fill-blue"/><text x="117" y="80" text-anchor="middle" class="d-mono d-small">726</text>
+<rect x="140" y="76" width="34" height="174" class="d-fill-blue"/><text x="157" y="68" text-anchor="middle" class="d-mono d-small">740</text>
+<text x="137" y="268" text-anchor="middle" class="d-small">NVLink EP8</text><text x="137" y="282" text-anchor="middle" class="d-text-light d-small">64 SM</text>
+<rect x="210" y="107" width="34" height="143" class="d-fill-blue-soft"/><text x="227" y="99" text-anchor="middle" class="d-mono d-small">643</text>
+<rect x="250" y="93" width="34" height="157" class="d-fill-blue-soft"/><text x="267" y="85" text-anchor="middle" class="d-mono d-small">675</text>
+<text x="247" y="268" text-anchor="middle" class="d-small">NVLink EP8</text><text x="247" y="282" text-anchor="middle" class="d-text-light d-small">24 SM</text>
+<rect x="380" y="223" width="34" height="27" class="d-fill-cyan"/><text x="397" y="216" text-anchor="middle" class="d-mono d-small">90</text>
+<rect x="420" y="226" width="34" height="24" class="d-fill-cyan"/><text x="437" y="219" text-anchor="middle" class="d-mono d-small">81</text>
+<text x="417" y="268" text-anchor="middle" class="d-small">RDMA EP8&#215;2</text><text x="417" y="282" text-anchor="middle" class="d-text-light d-small">12 SM</text>
+<rect x="550" y="232" width="34" height="18" class="d-fill-orange"/><text x="567" y="225" text-anchor="middle" class="d-mono d-small">61</text>
+<rect x="590" y="232" width="34" height="18" class="d-fill-orange"/><text x="607" y="225" text-anchor="middle" class="d-mono d-small">61</text>
+<text x="587" y="268" text-anchor="middle" class="d-small">RDMA EP8&#215;4</text><text x="587" y="282" text-anchor="middle" class="d-text-light d-small">6 SM</text>
+</svg>
+<figcaption><b>Figure 3.</b> DeepEP normal-kernel measured bandwidth (dispatch, then combine) at 8,192 tokens/batch, top-8 routing, FP8 dispatch/BF16 combine. NVLink EP8 sustains 643&#8211;740 GB/s across both SM budgets tested; crossing into RDMA drops to 81&#8211;90 GB/s at EP8&#215;2 and 61 GB/s at EP8&#215;4, and achieved bandwidth per rank falls further as the RDMA domain widens even though more experts become reachable<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="low-latency-throughput">3.2 Low-latency-kernel latency and bandwidth by EP degree</h3>
+<p>The normal-kernel table above is a prefill-scale measurement; DeepEP's documentation of its low-latency kernels reports a separate benchmark at decode scale &#8212; 128 tokens per batch (versus 8,192 for the normal-kernel table), 7,168 hidden dimensions, top-8 experts, FP8 dispatch and BF16 combine, on H800 with ConnectX-7 400 Gb/s (&#8776;50 GB/s per-port maximum) RDMA<a class="cite" href="#ref-2">2</a>. Because the traffic is small-message and latency-bound rather than throughput-bound, the library reports both a per-call latency in microseconds and an achieved bandwidth in GB/s:</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> DeepEP low-latency kernel measured latency and RDMA bandwidth by EP degree, 128 tokens/batch, H800 + ConnectX-7<a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>EP degree</th><th class="num">Dispatch latency (&#181;s)</th><th class="num">Dispatch BW (GB/s)</th><th class="num">Combine latency (&#181;s)</th><th class="num">Combine BW (GB/s)</th></tr></thead>
+<tbody>
+<tr><td class="row">8</td><td class="num" data-best>77</td><td class="num" data-best>98</td><td class="num" data-best>114</td><td class="num" data-best>127</td></tr>
+<tr><td class="row">16</td><td class="num">118</td><td class="num">63</td><td class="num">195</td><td class="num">74</td></tr>
+<tr><td class="row">32</td><td class="num">155</td><td class="num">48</td><td class="num">273</td><td class="num">53</td></tr>
+<tr><td class="row">64</td><td class="num">173</td><td class="num">43</td><td class="num">314</td><td class="num">46</td></tr>
+<tr><td class="row">128</td><td class="num">192</td><td class="num">39</td><td class="num">369</td><td class="num">39</td></tr>
+<tr><td class="row">256</td><td class="num" data-worst>194</td><td class="num" data-worst>39</td><td class="num" data-worst>360</td><td class="num" data-worst>40</td></tr>
+</tbody>
+</table>
+
+<p>Two things stand out against the &#167;3.1 normal-kernel table. First, dispatch latency roughly triples between EP8 and EP128 (77&#8201;&#181;s &#8594; 192&#8201;&#181;s), but the growth is sharply sublinear in EP degree &#8212; going from 128 to 256 ranks adds essentially nothing (192&#8201;&#181;s &#8594; 194&#8201;&#181;s), because at large EP degree the per-destination payload shrinks (fewer tokens per remote rank at a fixed 128-token batch) and RDMA message-rate/round-trip latency, not bandwidth, dominates. Second, achieved bandwidth falls monotonically with EP degree in both tables, for the same underlying reason &#167;1 named structurally: a fixed per-rank NIC budget has to reach more distinct remote destinations as the domain widens, so each individual flow's share of that budget shrinks even as the aggregate reachable-expert count grows.</p>
+<p>DeepSeek's own architecture notes tie the two kernel modes directly to the two serving phases this course's Module 3 distinguishes: normal kernels are the right tool "for both training and inference prefilling," low-latency kernels for "inference decoding"<a class="cite" href="#ref-2">2</a> &#8212; the prefill/decode split is not incidental to which DeepEP kernel a serving engine calls, it determines it.</p>
+
+<h3 id="worked-derivation">3.3 Worked derivation: dispatch and combine payload for one MoE layer</h3>
+<p>The GB/s figures in &#167;3.1 are useful for comparing configurations, but a concrete wall-clock number for a single MoE layer's dispatch and combine step makes the FP8/BF16 asymmetry from &#167;2 tangible. Take DeepEP's own normal-kernel benchmark parameters<a class="cite" href="#ref-1">1</a>: 8,192 tokens per batch, hidden dimension 7,168, top-8 routing.</p>
+<p>Dispatch moves one hidden-state vector per (token, chosen-expert) pair, quantized to FP8 (1 byte/element):</p>
+$$ \text{dispatch bytes} = T \times k \times H \times 1\ \text{B} = 8192 \times 8 \times 7168 \times 1\ \text{B} \approx 469.8\ \text{MB} $$
+<p>Combine moves the corresponding expert outputs back, kept in BF16 (2 bytes/element) rather than FP8:</p>
+$$ \text{combine bytes} = T \times k \times H \times 2\ \text{B} = 8192 \times 8 \times 7168 \times 2\ \text{B} \approx 939.5\ \text{MB} $$
+<p>Dividing each payload by the &#167;3.1 measured bandwidths gives the time one dispatch or combine call takes at each configuration (these are computed from the stated parameters and measured bandwidth, not numbers DeepEP publishes directly as latencies):</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Computed dispatch/combine time for one MoE layer at DeepEP's own benchmark parameters (8,192 tokens, top-8, hidden 7,168), derived from the &#167;3.1 measured bandwidths<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Configuration</th><th class="num">Dispatch BW</th><th class="num">Dispatch time (&#8776;470 MB)</th><th class="num">Combine BW</th><th class="num">Combine time (&#8776;940 MB)</th></tr></thead>
+<tbody>
+<tr><td class="row">NVLink EP8 (64 SM)</td><td class="num" data-best>726 GB/s</td><td class="num" data-best>0.65 ms</td><td class="num" data-best>740 GB/s</td><td class="num" data-best>1.27 ms</td></tr>
+<tr><td class="row">RDMA EP8&#215;2</td><td class="num">90 GB/s</td><td class="num">5.22 ms</td><td class="num">81 GB/s</td><td class="num">11.60 ms</td></tr>
+<tr><td class="row">RDMA EP8&#215;4</td><td class="num" data-worst>61 GB/s</td><td class="num" data-worst>7.70 ms</td><td class="num" data-worst>61 GB/s</td><td class="num" data-worst>15.40 ms</td></tr>
+</tbody>
+</table>
+
+<p>Combine consistently takes longer than dispatch at the same configuration &#8212; roughly 2&#215; at NVLink and RDMA EP8&#215;2, converging closer to 2&#215; at EP8&#215;4 &#8212; and that ratio is exactly the FP8-versus-BF16 byte-width ratio, not a difference in achieved bandwidth (combine bandwidth is close to dispatch bandwidth at every configuration in &#167;3.1). The precision asymmetry is deliberate: dispatch delivers a raw hidden-state vector to an expert's GEMM, which is already going to run in FP8 on current DeepSeek-class deployments, so quantizing before the network hop costs no additional precision the GEMM wasn't already going to discard. Combine, in contrast, sums up to <em>k</em> already-independently-quantized expert outputs weighted by the router's gate values &#8212; doing that reduction in FP8 would compound rounding error across as many as 8 summed terms, so it happens in BF16 despite doubling the bytes moved<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</p>
+<h2 id="eplb">4. EPLB: redundant experts and placement</h2>
+<p>&#167;1 named the second consequence of all-to-all dispatch: even a well-designed router does not guarantee an even load across experts. Some experts specialize in common patterns and get routed to far more often than others; at any fixed EP degree, if expert placement is naive (expert <em>i</em> always on GPU <em>i</em> mod <em>N</em>), a hot expert makes its host GPU the bottleneck for every step, regardless of how much idle capacity sits on the GPUs holding cold experts. EPLB (Expert-Parallelism Load Balancer) is DeepSeek's open-sourced answer: rather than changing the router, it changes <em>where experts live</em> and <em>how many copies of each exist</em>.</p>
+
+<h3 id="eplb-strategy">4.1 The redundant-experts strategy</h3>
+<p>EPLB's core mechanism, as its own documentation states it: "a redundant experts strategy that duplicates heavy-loaded experts," followed by heuristically packing "the duplicated experts to GPUs to ensure load balancing across different GPUs"<a class="cite" href="#ref-3">3</a>. Concretely: given a per-expert load estimate (the library takes the load matrix as an input and is explicit that predicting those loads &#8212; typically a moving average of recent routing statistics &#8212; is the caller's responsibility, not EPLB's<a class="cite" href="#ref-3">3</a>), EPLB decides how many physical replicas each logical expert gets and which GPU each replica lives on, so that the sum of load assigned to each GPU is as even as possible. A hot expert might get two or three physical copies spread across different GPUs; a cold expert gets exactly one. This only works because the router itself is unaware of the duplication &#8212; from the router's perspective it picks a logical expert, and a separate lookup resolves that to whichever physical replica the placement plan assigned for the current step.</p>
+<p>A second mechanism compounds with replication: group-limited expert routing. DeepSeek-V3's router constrains each token to choose experts from only a limited number of expert groups rather than the full expert population, and EPLB exploits that constraint by trying "to place the experts of the same group to the same node to reduce inter-node data traffic, whenever possible"<a class="cite" href="#ref-3">3</a>. If a token's routing choices are confined to one or two groups, and every expert in those groups lives on the same node, then a large share of that token's dispatch traffic never has to leave the node &#8212; it stays on the &#167;3.1 NVLink-domain bandwidth tier instead of falling to the RDMA tier.</p>
+
+<h3 id="eplb-policies">4.2 Hierarchical versus global load balancing</h3>
+<p>EPLB ships two distinct packing policies, and which one applies is a direct function of expert-parallel degree, not a free choice:</p>
+<ul>
+<li><strong>Hierarchical load balancing</strong> applies "when the number of server nodes divides the number of expert groups"<a class="cite" href="#ref-3">3</a>. The algorithm runs in three stages: pack whole expert groups onto nodes evenly (balancing load at the node level while keeping every group intact on one node), then replicate experts within each node, then pack the replicated experts onto that node's individual GPUs. Because it preserves the group-locality property from &#167;4.1, DeepSeek recommends this policy "in prefilling stage with a smaller expert-parallel size"<a class="cite" href="#ref-3">3</a> &#8212; prefill EP degrees are typically small enough that the node-count-divides-group-count condition holds.</li>
+<li><strong>Global load balancing</strong> is the fallback "in other cases": it "replicates the experts globally regardless of expert groups, and pack[s] the replicated experts to individual GPUs"<a class="cite" href="#ref-3">3</a>, giving up the group-locality guarantee in exchange for a placement that works at any EP degree. DeepSeek's own guidance is that this policy is "adopted in decoding stage with a larger expert-parallel size"<a class="cite" href="#ref-3">3</a> &#8212; at decode-scale EP degrees, the node-count/group-count divisibility condition hierarchical balancing needs is less likely to hold, and the priority shifts from minimizing inter-node traffic to simply keeping every GPU's load even.</li>
+</ul>
+
+<h3 id="eplb-worked-example">4.3 A worked placement, straight from EPLB's own example</h3>
+<p>EPLB's repository ships a literal worked example that is small enough to trace by hand and shows exactly what the hierarchical policy's three stages produce. The setup: a two-layer MoE model, 12 experts per layer, 4 redundant experts introduced per layer (16 physical replicas total), placed across <code>num_groups=4</code> expert groups, <code>num_nodes=2</code>, <code>num_gpus=8</code> (4 GPUs per node)<a class="cite" href="#ref-3">3</a>. The call <code>eplb.rebalance_experts(weight, num_replicas=16, num_groups=4, num_nodes=2, num_gpus=8)</code> takes a per-expert load matrix and returns <code>phy2log</code>, the physical-slot-to-logical-expert mapping<a class="cite" href="#ref-3">3</a>.</p>
+<p>For layer 0, with logical experts 0&#8211;11 split into four groups of three ({0,1,2}, {3,4,5}, {6,7,8}, {9,10,11}) and load weights <code>[90, 132, 40, 61, 104, 165, 39, 4, 73, 56, 183, 86]</code>, the returned placement puts logical experts {3, 4, 5} and {6, 7, 8} &#8212; groups 1 and 2 &#8212; entirely on node 0's four GPUs, and logical experts {0, 1, 2} and {9, 10, 11} &#8212; groups 0 and 3 &#8212; entirely on node 1's four GPUs<a class="cite" href="#ref-3">3</a>. No group is split across the node boundary. Within that constraint, the heaviest-loaded experts get duplicated: logical experts 1 (weight 132), 4 (weight 104), 5 (weight 165), and 10 (weight 183) &#8212; the four highest-load experts in the layer &#8212; each receive a second physical copy, which is exactly the 4 redundant experts the setup specified<a class="cite" href="#ref-3">3</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">EPLB hierarchical placement: expert groups packed whole onto nodes, heaviest experts duplicated across two different GPUs within that node</title>
+<text x="400" y="20" text-anchor="middle" class="d-small d-text-light">layer 0, 12 logical experts, 4 groups, 4 redundant &#8212; EPLB's own worked example, actual phy2log output</text>
+<rect x="20" y="40" width="380" height="200" rx="10" class="d-panel"/><text x="210" y="58" text-anchor="middle" class="d-bold d-small">Node 0 &#8212; groups 1 {3,4,5} + 2 {6,7,8}</text>
+<rect x="35" y="75" width="80" height="90" rx="6" class="d-outline"/><text x="75" y="90" text-anchor="middle" class="d-small d-text-light">GPU 0</text>
+<rect x="42" y="98" width="66" height="24" rx="4" class="d-fill-blue"/><text x="75" y="114" text-anchor="middle" class="d-text-inv d-mono d-small">e5 (165)</text>
+<rect x="42" y="128" width="66" height="24" rx="4" class="d-fill-blue-soft"/><text x="75" y="144" text-anchor="middle" class="d-mono d-small">e6 (39)</text>
+<rect x="122" y="75" width="80" height="90" rx="6" class="d-outline"/><text x="162" y="90" text-anchor="middle" class="d-small d-text-light">GPU 1</text>
+<rect x="129" y="98" width="66" height="24" rx="4" class="d-fill-blue"/><text x="162" y="114" text-anchor="middle" class="d-text-inv d-mono d-small">e5&#8217; dup</text>
+<rect x="129" y="128" width="66" height="24" rx="4" class="d-fill-blue-soft"/><text x="162" y="144" text-anchor="middle" class="d-mono d-small">e7 (4)</text>
+<rect x="209" y="75" width="80" height="90" rx="6" class="d-outline"/><text x="249" y="90" text-anchor="middle" class="d-small d-text-light">GPU 2</text>
+<rect x="216" y="98" width="66" height="24" rx="4" class="d-fill-blue-soft"/><text x="249" y="114" text-anchor="middle" class="d-mono d-small">e8 (73)</text>
+<rect x="216" y="128" width="66" height="24" rx="4" class="d-fill-blue"/><text x="249" y="144" text-anchor="middle" class="d-text-inv d-mono d-small">e4 (104)</text>
+<rect x="296" y="75" width="80" height="90" rx="6" class="d-outline"/><text x="336" y="90" text-anchor="middle" class="d-small d-text-light">GPU 3</text>
+<rect x="303" y="98" width="66" height="24" rx="4" class="d-fill-blue"/><text x="336" y="114" text-anchor="middle" class="d-text-inv d-mono d-small">e4&#8217; dup</text>
+<rect x="303" y="128" width="66" height="24" rx="4" class="d-fill-blue-soft"/><text x="336" y="144" text-anchor="middle" class="d-mono d-small">e3 (61)</text>
+<text x="210" y="185" text-anchor="middle" class="d-small">e5, e4 each duplicated &#8212; once per copy, on two different GPUs</text>
+<text x="210" y="222" text-anchor="middle" class="d-small">no expert from groups 0 or 3 appears on node 0</text>
+
+<rect x="410" y="40" width="380" height="200" rx="10" class="d-panel"/><text x="600" y="58" text-anchor="middle" class="d-bold d-small">Node 1 &#8212; groups 0 {0,1,2} + 3 {9,10,11}</text>
+<rect x="425" y="75" width="80" height="90" rx="6" class="d-outline"/><text x="465" y="90" text-anchor="middle" class="d-small d-text-light">GPU 4</text>
+<rect x="432" y="98" width="66" height="24" rx="4" class="d-fill-cyan"/><text x="465" y="114" text-anchor="middle" class="d-text-inv d-mono d-small">e10 (183)</text>
+<rect x="432" y="128" width="66" height="24" rx="4" class="d-fill-cyan-soft"/><text x="465" y="144" text-anchor="middle" class="d-mono d-small">e9 (56)</text>
+<rect x="512" y="75" width="80" height="90" rx="6" class="d-outline"/><text x="552" y="90" text-anchor="middle" class="d-small d-text-light">GPU 5</text>
+<rect x="519" y="98" width="66" height="24" rx="4" class="d-fill-cyan"/><text x="552" y="114" text-anchor="middle" class="d-text-inv d-mono d-small">e10&#8217; dup</text>
+<rect x="519" y="128" width="66" height="24" rx="4" class="d-fill-cyan-soft"/><text x="552" y="144" text-anchor="middle" class="d-mono d-small">e2 (40)</text>
+<rect x="599" y="75" width="80" height="90" rx="6" class="d-outline"/><text x="639" y="90" text-anchor="middle" class="d-small d-text-light">GPU 6</text>
+<rect x="606" y="98" width="66" height="24" rx="4" class="d-fill-cyan-soft"/><text x="639" y="114" text-anchor="middle" class="d-mono d-small">e0 (90)</text>
+<rect x="606" y="128" width="66" height="24" rx="4" class="d-fill-cyan"/><text x="639" y="144" text-anchor="middle" class="d-text-inv d-mono d-small">e1 (132)</text>
+<rect x="686" y="75" width="80" height="90" rx="6" class="d-outline"/><text x="726" y="90" text-anchor="middle" class="d-small d-text-light">GPU 7</text>
+<rect x="693" y="98" width="66" height="24" rx="4" class="d-fill-cyan-soft"/><text x="726" y="114" text-anchor="middle" class="d-mono d-small">e11 (86)</text>
+<rect x="693" y="128" width="66" height="24" rx="4" class="d-fill-cyan"/><text x="726" y="144" text-anchor="middle" class="d-text-inv d-mono d-small">e1&#8217; dup</text>
+<text x="600" y="185" text-anchor="middle" class="d-small">e10, e1 each duplicated &#8212; once per copy, on two different GPUs</text>
+<text x="600" y="222" text-anchor="middle" class="d-small">no expert from groups 1 or 2 appears on node 1</text>
+</svg>
+<figcaption><b>Figure 4.</b> The hierarchical policy applied to EPLB's own README example (<code>phy2log</code> output, layer 0): groups {1,2} pack entirely onto node 0, groups {0,3} entirely onto node 1, and the four heaviest-loaded logical experts in the layer &#8212; e1 (132), e4 (104), e5 (165), e10 (183) &#8212; each get a second physical copy placed on a <em>different</em> GPU from the first, spreading their load rather than doubling it on one card. A token constrained to one group by group-limited routing never needs an inter-node hop to reach any of its candidate experts<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<h3 id="eplb-memory-overhead">4.4 Memory overhead</h3>
+<p>Redundancy is not free: every duplicate expert is a full copy of that expert's weights resident in HBM on top of the GPU's regular allocation. vLLM's own EPLB integration documentation quantifies this for a concrete model: roughly <strong>2.4 GB per redundant expert per EP rank on DeepSeek-V3</strong><a class="cite" href="#ref-4">4</a>. That number sets a hard planning constraint &#8212; a deployment that wants headroom for, say, 8 redundant experts per rank to absorb load skew has to budget roughly 19 GB of HBM per GPU for that headroom alone, on top of the base per-GPU expert allocation, before a single activation or KV-cache byte is counted.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>vLLM's EPLB integration rebalances periodically rather than continuously: a default <code>window_size</code> of 1,000 engine steps for tracking per-expert load, and a default <code>step_interval</code> of 3,000 steps between rebalancing passes<a class="cite" href="#ref-4">4</a>. Continuous rebalancing would itself add communication overhead (weights have to move to wherever a new replica is placed); the windowed approach trades some responsiveness to sudden load shifts for keeping that overhead off the critical path.</p></aside>
+<h2 id="attention-dp-ep">5. Attention-DP + EP: the general layout pattern</h2>
+<p>&#167;1&#8211;4 established the dispatch/combine mechanism and the placement problem it creates. This section covers the layout decision every wide-EP deployment has to make: what happens to the attention layers while the MoE layers are sharded across an EP group.</p>
+
+<h3 id="attention-dp-ep-mechanism">5.1 Why attention goes data-parallel</h3>
+<p>Under plain tensor parallelism, every layer &#8212; attention and MoE alike &#8212; shards across the same TP group. That is a reasonable default for a dense model, but it is a poor fit once MoE layers need to shard across an EP group that is much wider than attention needs to be: attention's compute and KV-cache footprint scale with sequence length and head count, not with expert count, so forcing attention to shard across a 32- or 64-wide EP group buys it nothing and adds all-reduce overhead on every attention block. vLLM's own documentation states the alternative directly: with tensor-parallel size set to 1, "attention weights remain replicated across all DP ranks," while the "Expert (MoE) Layers" are "sharded across all EP ranks" using the full expert-parallel group<a class="cite" href="#ref-4">4</a>. Each data-parallel rank runs its own complete, unsharded copy of the attention stack against its own independent slice of the request batch and its own private KV cache; only at the MoE layer boundary does a token leave its DP rank, cross the &#167;1&#8211;3 all-to-all fabric to reach its routed expert, and come back.</p>
+<p>The relationship between the three parallelism dimensions is arithmetic, and vLLM states it as such: expert-parallel size is <em>computed</em>, not set directly &#8212; "EP_SIZE = TP_SIZE &#215; DP_SIZE"<a class="cite" href="#ref-4">4</a>. Setting tensor-parallel size above 1 does not disappear from the picture; it changes what attention does instead of what MoE does: at TP&#8201;>&#8201;1, "attention weights are sharded using tensor parallelism across TP ranks within each DP group," while MoE layers still span the full <em>TP &#215; DP</em> membership<a class="cite" href="#ref-4">4</a>. vLLM's own worked example is TP=2, DP=4 on 8 GPUs: "Expert layers form an EP group of size 8, with experts distributed across all GPUs. Attention layers use TP=2 within each of the 4 DP groups"<a class="cite" href="#ref-4">4</a> &#8212; the same 8 physical GPUs simultaneously belong to one 8-wide EP group and to four separate 2-wide attention TP groups.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f5t"><title id="f5t">Attention-DP plus expert-parallel layout: attention TP groups nested inside DP ranks, MoE sharded across the full EP group spanning all GPUs</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="400" y="20" text-anchor="middle" class="d-small d-text-light">vLLM worked example: TP=2, DP=4, 8 GPUs &#8212; EP_SIZE = 2 &#215; 4 = 8</text>
+<text x="150" y="46" text-anchor="middle" class="d-bold d-small">Attention layer: 4 DP groups, TP=2 each</text>
+<g>
+<rect x="30" y="60" width="110" height="50" rx="8" class="d-outline"/><text x="85" y="80" text-anchor="middle" class="d-small d-text-light">DP 0</text>
+<rect x="38" y="90" width="44" height="16" rx="3" class="d-block"/><text x="60" y="102" text-anchor="middle" class="d-text-inv d-small">g0</text>
+<rect x="86" y="90" width="44" height="16" rx="3" class="d-block"/><text x="108" y="102" text-anchor="middle" class="d-text-inv d-small">g1</text>
+<rect x="150" y="60" width="110" height="50" rx="8" class="d-outline"/><text x="205" y="80" text-anchor="middle" class="d-small d-text-light">DP 1</text>
+<rect x="158" y="90" width="44" height="16" rx="3" class="d-block"/><text x="180" y="102" text-anchor="middle" class="d-text-inv d-small">g2</text>
+<rect x="206" y="90" width="44" height="16" rx="3" class="d-block"/><text x="228" y="102" text-anchor="middle" class="d-text-inv d-small">g3</text>
+<rect x="270" y="60" width="110" height="50" rx="8" class="d-outline"/><text x="325" y="80" text-anchor="middle" class="d-small d-text-light">DP 2</text>
+<rect x="278" y="90" width="44" height="16" rx="3" class="d-block"/><text x="300" y="102" text-anchor="middle" class="d-text-inv d-small">g4</text>
+<rect x="326" y="90" width="44" height="16" rx="3" class="d-block"/><text x="348" y="102" text-anchor="middle" class="d-text-inv d-small">g5</text>
+<rect x="390" y="60" width="110" height="50" rx="8" class="d-outline"/><text x="445" y="80" text-anchor="middle" class="d-small d-text-light">DP 3</text>
+<rect x="398" y="90" width="44" height="16" rx="3" class="d-block"/><text x="420" y="102" text-anchor="middle" class="d-text-inv d-small">g6</text>
+<rect x="446" y="90" width="44" height="16" rx="3" class="d-block"/><text x="468" y="102" text-anchor="middle" class="d-text-inv d-small">g7</text>
+</g>
+<text x="530" y="80" text-anchor="middle" class="d-small">each GPU: full, replicated</text>
+<text x="530" y="96" text-anchor="middle" class="d-small">attention weights + private KV cache</text>
+
+<text x="400" y="150" text-anchor="middle" class="d-bold d-small">MoE layer: one EP group of size 8, all GPUs</text>
+<rect x="30" y="165" width="520" height="60" rx="10" class="d-panel"/>
+<g>
+<rect x="42" y="182" width="52" height="26" rx="4" class="d-fill-cyan"/><text x="68" y="199" text-anchor="middle" class="d-text-inv d-small">g0</text>
+<rect x="100" y="182" width="52" height="26" rx="4" class="d-fill-cyan"/><text x="126" y="199" text-anchor="middle" class="d-text-inv d-small">g1</text>
+<rect x="158" y="182" width="52" height="26" rx="4" class="d-fill-cyan"/><text x="184" y="199" text-anchor="middle" class="d-text-inv d-small">g2</text>
+<rect x="216" y="182" width="52" height="26" rx="4" class="d-fill-cyan"/><text x="242" y="199" text-anchor="middle" class="d-text-inv d-small">g3</text>
+<rect x="274" y="182" width="52" height="26" rx="4" class="d-fill-cyan"/><text x="300" y="199" text-anchor="middle" class="d-text-inv d-small">g4</text>
+<rect x="332" y="182" width="52" height="26" rx="4" class="d-fill-cyan"/><text x="358" y="199" text-anchor="middle" class="d-text-inv d-small">g5</text>
+<rect x="390" y="182" width="52" height="26" rx="4" class="d-fill-cyan"/><text x="416" y="199" text-anchor="middle" class="d-text-inv d-small">g6</text>
+<rect x="448" y="182" width="52" height="26" rx="4" class="d-fill-cyan"/><text x="474" y="199" text-anchor="middle" class="d-text-inv d-small">g7</text>
+</g>
+<text x="640" y="199" text-anchor="middle" class="d-small">one expert shard</text>
+<text x="640" y="215" text-anchor="middle" class="d-small">per GPU, EP degree 8</text>
+<path d="M100,111 L100,163" class="d-arrow" marker-end="url(#f5-arr)"/><path d="M300,111 L300,163" class="d-arrow" marker-end="url(#f5-arr)"/><path d="M470,111 L470,163" class="d-arrow" marker-end="url(#f5-arr)"/>
+<text x="400" y="255" text-anchor="middle" class="d-small">all-to-all dispatch/combine crosses DP-group boundaries only at the MoE layer</text>
+</svg>
+<figcaption><b>Figure 5.</b> vLLM's TP=2/DP=4/8-GPU example: attention runs as four independent 2-way tensor-parallel groups, each with its own replicated request stream and KV cache; MoE layers ignore that grouping and shard as one 8-wide expert-parallel group spanning every GPU, so EP_SIZE = TP_SIZE &#215; DP_SIZE = 2 &#215; 4 = 8<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h3 id="vllm-cli-arithmetic">5.2 vLLM's multi-node CLI arithmetic</h3>
+<p>vLLM exposes this layout entirely through flags, and a real two-node example from its own documentation makes the arithmetic concrete. The primary node launches with the total DP size, its own local share, and networking coordinates; the secondary node repeats the total but adds a start-rank offset and runs headless (no API server, worker ranks only)<a class="cite" href="#ref-4">4</a>:</p>
+<pre class="code" data-lang="bash" data-title="Node 1 (primary) &#8212; from vLLM's expert-parallel deployment guide"><code>vllm serve deepseek-ai/DeepSeek-V3-0324 \
+    --all2all-backend deepep_low_latency \
+    --tensor-parallel-size 1 \
+    --enable-expert-parallel \
+    --data-parallel-size 16 \
+    --data-parallel-size-local 8 \
+    --data-parallel-address 192.168.1.100 \
+    --data-parallel-rpc-port 13345 \
+    --api-server-count=8</code></pre>
+<pre class="code" data-lang="bash" data-title="Node 2 (secondary, headless) &#8212; from vLLM's expert-parallel deployment guide"><code>vllm serve deepseek-ai/DeepSeek-V3-0324 \
+    --all2all-backend deepep_low_latency \
+    --tensor-parallel-size 1 \
+    --enable-expert-parallel \
+    --data-parallel-size 16 \
+    --data-parallel-size-local 8 \
+    --data-parallel-start-rank 8 \
+    --data-parallel-address 192.168.1.100 \
+    --data-parallel-rpc-port 13345 \
+    --headless</code></pre>
+<p>Both nodes agree on <code>--data-parallel-size 16</code> (the global total); each reports <code>--data-parallel-size-local 8</code> (its own share); node 2's <code>--data-parallel-start-rank 8</code> tells the cluster its 8 local ranks are global DP ranks 8&#8211;15, "equal to the cumulative local DP size of previous nodes"<a class="cite" href="#ref-4">4</a>. With <code>--tensor-parallel-size 1</code> on both nodes, EP_SIZE = 1 &#215; 16 = 16: the MoE layers shard across all 16 GPUs on both nodes as one EP group, while attention runs fully replicated per DP rank &#8212; this is the low-latency, decode-oriented case from &#167;2.2, signaled explicitly by <code>--all2all-backend deepep_low_latency</code>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> vLLM's two-node DP+EP flags mapped to the resulting physical layout, from its own documented example<a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Flag</th><th>Node 1 value</th><th>Node 2 value</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td class="row"><code>--tensor-parallel-size</code></td><td>1</td><td>1</td><td>Attention fully replicated per DP rank, no attention sharding</td></tr>
+<tr><td class="row"><code>--data-parallel-size</code></td><td>16</td><td>16</td><td>Total DP ranks cluster-wide (= EP_SIZE, since TP=1)</td></tr>
+<tr><td class="row"><code>--data-parallel-size-local</code></td><td>8</td><td>8</td><td>DP ranks hosted on this node</td></tr>
+<tr><td class="row"><code>--data-parallel-start-rank</code></td><td>0 (default)</td><td>8</td><td>Node 2's local ranks 0&#8211;7 map to global ranks 8&#8211;15</td></tr>
+<tr><td class="row"><code>--headless</code></td><td>absent</td><td>set</td><td>Only node 1 runs the API server; node 2 is worker-only</td></tr>
+</tbody>
+</table>
+
+<h3 id="sglang-dp-attention">5.3 SGLang's --enable-dp-attention</h3>
+<p>SGLang implements the same general pattern under a differently named flag: <code>--enable-dp-attention</code> activates data-parallel attention so that, as in vLLM's TP=1 case, each DP rank runs attention against its own request slice and private KV cache while MoE layers dispatch across the wider expert-parallel group via a configurable all-to-all backend (<code>--moe-a2a-backend deepep</code> selects DeepEP specifically)<a class="cite" href="#ref-5">5</a>. The mechanism is the one this section already covers in full; the concrete multi-node deployment recipe &#8212; specific TP/DP degrees, separate prefill and decode master nodes, and how SGLang wires the flag into a running cluster &#8212; belongs to Module 12, not here.</p>
+<h2 id="nvl72-ep-domain">6. What NVL72 changes about the EP domain</h2>
+<p>Every dispatch/combine number in &#167;3 crosses from the NVLink domain to the RDMA domain at exactly the 8-GPU boundary, because that is where a conventional HGX/DGX node ends. Module 1 &#167;5 established that GB200 NVL72 moves that boundary out to 72 GPUs: the rack's NVLink switch fabric delivers 130 TB/s of aggregate bandwidth across all 72 GPUs and 36 Grace CPUs, and any two of those 72 GPUs reach each other over the switch fabric at the full per-GPU NVLink5 rate with no RDMA hop, regardless of which of the rack's compute trays they sit on<a class="cite" href="#ref-6">6</a>. For wide expert parallelism specifically, that changes which EP degrees pay the &#167;3.1 cliff and which do not.</p>
+<p>On a conventional 8-GPU-node cluster, any EP degree above 8 necessarily spans a node boundary and falls onto the RDMA tier &#8212; EP16 measured at 90 GB/s dispatch, EP32 at 61 GB/s, both roughly an order of magnitude below the EP8 NVLink-domain figure of 726 GB/s<a class="cite" href="#ref-1">1</a>. Inside one NVL72 rack, that same EP16 or EP32 group never leaves the NVLink domain: it is still 16 or 32 GPUs out of the rack's 72, all reachable over the same switch fabric that gives any pair of GPUs the full per-GPU NVLink5 rate. An expert-parallel group that would have needed to stay at EP&#8201;&#8804;&#8201;8 to avoid the RDMA cliff can run at EP32, EP64, or the full EP72 and still avoid it entirely &#8212; the constraint that forces EP degree down to node size on conventional clusters simply does not apply inside one NVL72 rack.</p>
+<p>The cliff is not eliminated, only relocated. Scaling an EP group past 72 GPUs &#8212; more experts than one rack can host, or an EP group deliberately spread across racks for other reasons &#8212; still means crossing to Quantum-X800 InfiniBand or Spectrum-X800 Ethernet at the rack's edge<a class="cite" href="#ref-6">6</a>, and paying a version of the same &#167;3.1 RDMA-tier bandwidth penalty, just one level higher in the hierarchy than the conventional 8-GPU case.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 4.</b> EP domain size against interconnect tier and the resulting dispatch bandwidth regime, on a conventional 8-GPU-node cluster versus inside one NVL72 rack<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-6">6</a>.</caption>
+<thead><tr><th>EP degree</th><th>On 8-GPU-node cluster</th><th class="num">Measured dispatch BW</th><th>Inside one NVL72 rack (72 GPUs)</th></tr></thead>
+<tbody>
+<tr><td class="row">EP8</td><td>Intra-node, NVLink</td><td class="num" data-best>726 GB/s</td><td>Intra-rack, NVLink (identical tier)</td></tr>
+<tr><td class="row">EP16</td><td>2 nodes, RDMA EP8&#215;2</td><td class="num">90 GB/s</td><td>Intra-rack, NVLink &#8212; no RDMA hop</td></tr>
+<tr><td class="row">EP32</td><td>4 nodes, RDMA EP8&#215;4</td><td class="num" data-worst>61 GB/s</td><td>Intra-rack, NVLink &#8212; no RDMA hop</td></tr>
+<tr><td class="row">EP72</td><td>9 nodes, RDMA (not published at this width)</td><td class="num">&#8212;</td><td>Intra-rack, NVLink &#8212; entire rack, no RDMA hop</td></tr>
+</tbody>
+</table>
+<p class="small muted">The NVL72 column states a structural fact (no RDMA hop is required, because the destination GPUs sit inside the same 130 TB/s switch fabric<a class="cite" href="#ref-6">6</a>), not a measured DeepEP figure &#8212; no public DeepEP benchmark run inside an NVL72 rack at these EP degrees was found for this module; the achieved GB/s on such a rack, as opposed to the topological absence of an RDMA hop, remains <mark class="unverified" title="No public DeepEP benchmark on NVL72 hardware found as of 2026-09-17; the claim made is structural (no RDMA hop required), not a specific measured bandwidth figure">unmeasured in public sources as of this writing</mark>.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>&#167;3.1 already flagged a tension in DeepEP's own numbers: RDMA-domain achieved bandwidth per rank falls as EP degree widens (90 GB/s at EP8&#215;2 down to 61 GB/s at EP8&#215;4), even though the aggregate number of experts a wider EP group can reach only grows. That tension sits underneath a genuine design question every wide-EP deployment has to answer: how wide should the expert-parallel group actually be?</p>
+<div class="positions">
+<article class="position">
+<h4>Widen EP as far as the interconnect allows</h4>
+<p class="who">vLLM's deployment guidance and EPLB's own policy design<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-3">3</a></p>
+<p>vLLM states plainly that expert parallelism "is more efficient when used in conjunction with DP"<a class="cite" href="#ref-4">4</a>, and its arithmetic (EP_SIZE = TP_SIZE &#215; DP_SIZE) means scaling data parallelism for throughput automatically widens EP alongside it. EPLB's own two-policy design points the same direction for decode specifically: the global load-balancing policy, which gives up group-locality entirely, is the one DeepSeek recommends "in decoding stage with a larger expert-parallel size"<a class="cite" href="#ref-3">3</a> &#8212; the library's own authors built a policy whose explicit purpose is to work well at wide EP. A wider EP group also means fewer experts resident per GPU, which at fixed total expert count leaves more HBM headroom for the &#167;4.4 redundant-expert copies that absorb load skew, and a larger effective batch of tokens landing on each remaining expert per decode step, which is the difference between an expert's GEMM running at a batch size that uses the GPU well and one that does not.</p>
+<ul class="pros"><li>Smaller per-GPU expert count leaves more HBM for redundant-expert replicas</li><li>Larger per-expert token batch at fixed total decode batch size, better GEMM utilization</li><li>The tooling (EPLB's global policy, vLLM's DP+EP arithmetic) is explicitly built for this regime</li></ul>
+<ul class="cons"><li>Requires more physical GPUs able to reach each other at usable bandwidth &#8212; only fully solved inside one NVLink domain (&#167;6)</li><li>Every widening step, once past the NVLink domain, crosses into a slower RDMA tier</li></ul>
+</article>
+<article class="position">
+<h4>Widening EP has a real, measured communication cost</h4>
+<p class="who">DeepEP's own published benchmark numbers<a class="cite" href="#ref-1">1</a></p>
+<p>Read &#167;3.1's numbers as a trend rather than two isolated data points: RDMA-domain dispatch bandwidth drops from 90 GB/s at EP8&#215;2 to 61 GB/s at EP8&#215;4, a roughly one-third reduction in per-rank achieved throughput from doubling the RDMA domain width. The &#167;3.2 low-latency table shows the same direction even more sharply &#8212; dispatch bandwidth falls from 98 GB/s at EP8 to 39 GB/s at EP128, an approximately 2.5&#215; drop across a 16&#215; increase in EP degree, while dispatch latency more than doubles (77&#8201;&#181;s to 192&#8201;&#181;s). A fixed per-rank NIC budget spread across more remote destinations is a physical constraint, not a tuning problem DeepEP's SM-count knob (&#167;3.1) can fully compensate for once the domain has left NVLink. For a decode workload with a hard inter-token-latency SLO, that latency growth &#8212; not the GB/s figure &#8212; is often the number that matters, and it argues for capping EP degree at whatever the NVLink or lowest-hop RDMA domain will bear.</p>
+<ul class="pros"><li>Grounded directly in DeepEP's own measured numbers, not a general argument</li><li>Latency growth is the metric that actually gates a fixed decode SLO, and it is monotonic with EP degree</li></ul>
+<ul class="cons"><li>Capping EP degree caps how many redundant-expert replicas and how large a per-expert batch a deployment can support</li><li>Ignores whatever a specific interconnect topology (NVL72, &#167;6) can do to move the cliff outward</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Neither position is wrong on its own terms; they are optimizing different things. Batch-efficiency and redundancy headroom (position one) matter most when the deployment is throughput-bound and has SLO slack; the measured communication cost (position two) matters most when the deployment is a hard-latency decode path where every added microsecond of dispatch time shows up directly in inter-token latency. &#167;6's NVL72 finding partially resolves the tension for one specific case: inside a single NVL72 rack, EP degrees up to 72 avoid the RDMA-tier penalty position two is built on, so the trade-off collapses back toward position one as long as the deployment fits inside one rack. Outside that regime &#8212; EP degrees that must cross node or rack boundaries on conventional hardware &#8212; the trade-off is real and has to be decided per deployment. Module 6 works through one production system's own resolution of exactly this trade-off, observed at two different points in time, without assuming either position was simply a mistake.</p>
+</div>
+</section>
+<h2 id="what-is-changing">What is changing</h2>
+<p>DeepEP itself is mid-refactor as of this writing. The library's second major version unifies what were previously two separate buffer types (a standard <code>Buffer</code> for normal kernels, a separate low-latency-mode buffer) into a single <code>ElasticBuffer</code> interface covering both regimes, switches its underlying transport from NVSHMEM to what the project calls an "NCCL Gin backend," and extends supported expert-parallel scale-out to "up to EP2048"<a class="cite" href="#ref-1">1</a> &#8212; two orders of magnitude past the EP8&#215;4 configuration this module's &#167;3.1 table measures. The same release claims up to 1.3&#215; the prior version's peak performance while using up to 4&#215; fewer SMs for communication<a class="cite" href="#ref-1">1</a>, which would shift the &#167;3.1 SM-versus-bandwidth trade-off further in favor of leaving SMs for compute.</p>
+<p>One regression is worth flagging precisely because it affects this module's own sourcing: the current release notes state "0 SM RDMA low-latency EP is no longer supported"<a class="cite" href="#ref-1">1</a>, and the project's current main documentation no longer publishes a standalone low-latency-kernel benchmark table with the microsecond-level detail &#167;3.2's numbers came from &#8212; those numbers are sourced from the project's own archived V1 documentation, which remains hosted in the same repository but is explicitly marked legacy<a class="cite" href="#ref-2">2</a>. Whether the V2 <code>ElasticBuffer</code> interface reproduces, improves on, or regresses those specific latency numbers has not been separately published as of 2026-09-17; anyone deploying against a current DeepEP checkout should treat &#167;3.2's figures as the last publicly documented low-latency baseline, not a live V2 measurement.</p>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">repo</span>DeepSeek-AI. <em>deepseek-ai/DeepEP</em> (README, main branch, V2). 2026. <a href="https://github.com/deepseek-ai/DeepEP/blob/main/README.md">https://github.com/deepseek-ai/DeepEP/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: all-to-all dispatch/combine kernel framing, FP8 dispatch/BF16 combine, normal-kernel performance table (726/740 GB/s NVLink EP8 at 64 and 24 SMs, 90/81 GB/s RDMA EP8&#215;2, 61/61 GB/s RDMA EP8&#215;4), "logical bandwidth" caveat, V2 ElasticBuffer unification, EP2048 scale-out, SM-count savings, "0 SM RDMA low-latency EP no longer supported."</span></li>
+<li id="ref-2"><span class="ref-type">repo</span>DeepSeek-AI. <em>deepseek-ai/DeepEP</em> (docs/legacy.md, V1 archived documentation). 2026. <a href="https://github.com/deepseek-ai/DeepEP/blob/main/docs/legacy.md">https://github.com/deepseek-ai/DeepEP/blob/main/docs/legacy.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: normal-vs-low-latency kernel mode descriptions (NVLink-to-RDMA-domain forwarding vs. pure RDMA), hook-based zero-SM communication/computation overlap, low-latency kernel benchmark table (77&#8211;194 &#181;s latency, 39&#8211;127 GB/s by EP degree 8&#8211;256, 128 tokens/batch on H800 + ConnectX-7).</span></li>
+<li id="ref-3"><span class="ref-type">repo</span>DeepSeek-AI. <em>deepseek-ai/EPLB</em> (README, main branch). 2026. <a href="https://github.com/deepseek-ai/EPLB/blob/main/README.md">https://github.com/deepseek-ai/EPLB/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: redundant-experts strategy, group-limited routing and node-local group placement, hierarchical vs. global load-balancing policy definitions, worked placement example (2-layer, 12 experts/layer, 4 redundant, num_groups=4/num_nodes=2/num_gpus=8, weight matrix and phy2log output), rebalance_experts interface.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>vLLM Project. <em>Expert Parallel Deployment</em> (vLLM Documentation). 2026. <a href="https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/">https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: EP_SIZE = TP_SIZE &#215; DP_SIZE, attention-DP + EP layout (TP=1 replicated attention vs. TP&gt;1 sharded attention within DP groups), TP=2/DP=4/8-GPU worked example, two-node CLI flags and worked example (--data-parallel-size, --data-parallel-size-local, --data-parallel-start-rank, --headless), EPLB integration parameters (window_size 1000, step_interval 3000), ~2.4 GB per redundant expert per EP rank on DeepSeek-V3.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>SGLang Contributors. <em>PD Disaggregation</em> (SGLang Documentation). 2026. <a href="https://docs.sglang.io/advanced_features/pd_disaggregation.html">https://docs.sglang.io/advanced_features/pd_disaggregation.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: --enable-dp-attention and --moe-a2a-backend deepep as SGLang's implementation of the attention-DP + EP pattern.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>NVIDIA. <em>GB200 NVL72</em> (product page). 2026. <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">https://www.nvidia.com/en-us/data-center/gb200-nvl72/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 72-GPU/36-Grace-CPU rack configuration, 130 TB/s rack-wide NVLink bandwidth, Quantum-X800/Spectrum-X800 as the rack-boundary scale-out fabric.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

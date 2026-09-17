@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NVIDIA Dynamo: Router, Planner, KV Block Manager, and Disaggregation Orchestration · Multi-Node LLM Inference</title>
+<meta name="description" content="Dynamo's architecture as an orchestration layer above vLLM/SGLang/TensorRT-LLM: the KV-aware Router's overlap-score cost function, KVBM's four-tier block manager, the Planner's SLA-driven autoscaling, ModelExpress, Grove, and what NVIDIA's own numbers and adoption list say about production readiness as of v1.4.2.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 9</p>
+<h1>NVIDIA Dynamo: Router, Planner, KV Block Manager, and Disaggregation Orchestration</h1>
+<p class="lede">Dynamo is not a fourth inference engine sitting next to vLLM, SGLang, and TensorRT-LLM &#8212; it is a control plane that sits above all three, making the placement, autoscaling, and KV-lifecycle decisions those engines don't make for themselves. This module works through Dynamo's five named components (Router, Planner, KVBM, ModelExpress, Grove) mechanism by mechanism, contrasts each against the generic routing, KV-transfer, and tiering patterns Modules 2&#8211;8 already established, and states plainly &#8212; from NVIDIA's own release notes, adoption list, and documented version churn &#8212; how production-grade the stack is as of v1.4.2. After reading, you can place any Dynamo deployment flag or metric in its correct architectural layer.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>35 min</b> read</span>
+<span class="chip"><b>16</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 2</b></span>
+<span class="chip">Prerequisite: <b>Module 4</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 400" role="img" aria-labelledby="f1t"><title id="f1t">Dynamo's five named components sitting above three backend inference engines, with NIXL as the shared transfer substrate underneath</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="20" width="760" height="40" rx="8" class="d-panel"/>
+<text x="400" y="45" text-anchor="middle" class="d-title d-bold">Dynamo &#8212; orchestration layer</text>
+
+<rect x="20" y="76" width="140" height="60" rx="8" class="d-block"/>
+<text x="90" y="100" text-anchor="middle" class="d-text-inv d-bold">Router</text>
+<text x="90" y="118" text-anchor="middle" class="d-text-inv d-small">KV-aware placement</text>
+
+<rect x="175" y="76" width="140" height="60" rx="8" class="d-block"/>
+<text x="245" y="100" text-anchor="middle" class="d-text-inv d-bold">Planner</text>
+<text x="245" y="118" text-anchor="middle" class="d-text-inv d-small">SLA autoscaler</text>
+
+<rect x="330" y="76" width="140" height="60" rx="8" class="d-block"/>
+<text x="400" y="100" text-anchor="middle" class="d-text-inv d-bold">KVBM</text>
+<text x="400" y="118" text-anchor="middle" class="d-text-inv d-small">GPU&#8594;CPU&#8594;SSD&#8594;remote</text>
+
+<rect x="485" y="76" width="140" height="60" rx="8" class="d-block"/>
+<text x="555" y="100" text-anchor="middle" class="d-text-inv d-bold">ModelExpress</text>
+<text x="555" y="118" text-anchor="middle" class="d-text-inv d-small">GPU&#8594;GPU weights</text>
+
+<rect x="640" y="76" width="140" height="60" rx="8" class="d-block"/>
+<text x="710" y="100" text-anchor="middle" class="d-text-inv d-bold">Grove</text>
+<text x="710" y="118" text-anchor="middle" class="d-text-inv d-small">K8s gang scheduling</text>
+
+<path d="M90,136 L90,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M245,136 L245,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M400,136 L400,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M555,136 L555,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M710,136 L710,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="20" y="182" width="760" height="55" rx="8" class="d-hl"/>
+<text x="400" y="204" text-anchor="middle" class="d-bold">Backend inference engines</text>
+<text x="400" y="222" text-anchor="middle" class="d-small">vLLM &#183; SGLang &#183; TensorRT-LLM (Dynamo runs and coordinates these, it does not replace them)</text>
+
+<path d="M400,237 L400,280" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="20" y="282" width="760" height="50" rx="8" class="d-block-2"/>
+<text x="400" y="304" text-anchor="middle" class="d-text-inv d-bold">NIXL</text>
+<text x="400" y="320" text-anchor="middle" class="d-text-inv d-small">point-to-point transfer substrate (Module 8) &#8212; KVBM, ModelExpress, and disaggregated KV transfer all move bytes through it</text>
+
+<path d="M400,332 L400,352" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="20" y="354" width="760" height="34" rx="8" class="d-panel"/>
+<text x="400" y="376" text-anchor="middle" class="d-mono d-small">NVLink &#183; InfiniBand/RoCE &#183; GPUDirect RDMA &#183; NVMe-oF (Module 1)</text>
+
+</svg>
+<figcaption><b>Figure 1.</b> Dynamo's five named components run as a control plane above the three engines it supports as backends, coordinating them through NIXL rather than reimplementing KV-cache management, batching, or attention kernels inside itself. Component list and backend list per the project README<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="orchestration-layer">1. Dynamo's position: orchestration layer, not an engine</h2>
+<p>Every mechanism in Modules 2&#8211;8 &#8212; prefix-cache-aware routing, prefill/decode connectors, wide-EP dispatch, tiered KV offload, NIXL transfer &#8212; is something a serving <i>engine</i> (vLLM, SGLang, TensorRT-LLM) or a companion project (Mooncake, LMCache) implements at the level of one replica's forward pass or one pod's KV cache. Dynamo's own framing draws a hard line above that level: its README states plainly that it is "the orchestration layer above inference engines"<a class="cite" href="#ref-1">1</a>. It does not run attention kernels, does not own a paged-KV allocator, and does not implement continuous batching &#8212; those stay inside whichever of vLLM, SGLang, or TensorRT-LLM is running as the backend<a class="cite" href="#ref-1">1</a>. What Dynamo adds is everything above that: which replica a request goes to, how many replicas of each pool should exist right now, where a cold KV block should live when GPU memory runs out, how a new replica gets its weights without hitting shared storage, and how a multi-node PodClique gets scheduled onto Kubernetes hardware as one atomic unit. Each of these is a decision Modules 1&#8211;8 already framed generically; this module is about Dynamo's specific, named implementation of each one.</p>
+
+<h3 id="components-glance">1.1 The five named components at a glance</h3>
+<p>Figure 1 lays out the shape: five components sit above the three supported backends, and four of the five (Router, KVBM, ModelExpress, and the disaggregation path in &#167;6) move bytes or metadata through NIXL, the point-to-point transfer library Module 8 already covered in full. Grove is the exception &#8212; it is Kubernetes-side scheduling, not a runtime data-plane component.</p>
+<dl class="spec-grid">
+<div class="spec"><dt>Router</dt><dd>KV-aware request routing: worker load + KV cache overlap<a class="cite" href="#ref-1">1</a></dd></div>
+<div class="spec"><dt>Planner</dt><dd>SLA-driven autoscaler: profiles workloads, right-sizes pools<a class="cite" href="#ref-1">1</a></dd></div>
+<div class="spec"><dt>KVBM</dt><dd>Offloads KV cache GPU &#8594; CPU &#8594; SSD &#8594; remote storage<a class="cite" href="#ref-1">1</a></dd></div>
+<div class="spec"><dt>ModelExpress</dt><dd>Streams model weights GPU-to-GPU via NIXL/NVLink<a class="cite" href="#ref-1">1</a></dd></div>
+<div class="spec"><dt>Grove</dt><dd>Kubernetes operator for topology-aware gang scheduling<a class="cite" href="#ref-1">1</a></dd></div>
+</dl>
+<p>Backends: vLLM, SGLang, TensorRT-LLM<a class="cite" href="#ref-1">1</a>. A Dynamo deployment is, mechanically, one or more of these engines running as workers, fronted by a Dynamo frontend process, with Router, Planner, and KVBM as separate control-plane services talking to the workers over the same distributed runtime.</p>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>"Orchestration layer" is doing real architectural work in that sentence, not marketing framing. Sections 2&#8211;5 show that each of Dynamo's five components is a specific, opinionated answer to a question this course has already posed generically: Router answers Module 2's routing question, KVBM answers Module 7's tiering question, the disaggregation path in &#167;6 answers Module 4's connector question. Dynamo's contribution is not a new mechanism category &#8212; it's a concrete, integrated implementation of the categories already established, bundled under one project with one version number.</p></aside>
+
+<h2 id="router">2. The Router: KV-aware placement as a cost function, not a scorer chain</h2>
+<p>Module 2 built two mechanisms for guessing where a prefix is cached &#8212; an approximate block-hash-plus-LRU-index path and a precise KVEvents-over-ZeroMQ path &#8212; then combined that signal with load through a weighted scorer set (<code>prefix-cache-scorer</code>, <code>inflight-load-producer</code>, and a weighted sum decided by <code>max-score-picker</code>). Dynamo's Router solves the identical problem &#8212; which worker minimizes recomputed prefill and queueing delay for this request &#8212; but expresses it as a single cost function evaluated per candidate worker, rather than a pluggable filter/score/select pipeline.</p>
+
+<h3 id="router-cost-function">2.1 The cost function: overlap score against projected load</h3>
+<p>The Router's documented cost function is a logit combining two terms: <code>logit = kv_overlap_score_weight &#215; potential_prefill_blocks + potential_active_blocks</code><a class="cite" href="#ref-4">4</a>. <code>potential_prefill_blocks</code> is the prefill work a worker would still have to do after subtracting whatever blocks of the incoming prompt it already has cached &#8212; a large cache overlap lowers this term directly, which is the same "avoid redundant compute" logic Module 2's prefix-cache-scorer expresses as a matched/total ratio, just folded into a cost rather than a normalized score<a class="cite" href="#ref-4">4</a>. <code>potential_active_blocks</code> folds in the worker's current decode load: active prefill blocks, active decode blocks, and optionally active-request count, so the same term that penalizes a cold worker's missing cache also penalizes a busy worker's existing queue<a class="cite" href="#ref-4">4</a>. The router picks the worker with the lowest resulting logit &#8212; framed explicitly in NVIDIA's own docs as "a placement decision, not an unconditional affinity rule"<a class="cite" href="#ref-4">4</a>, the same caution Module 2 made about prefix affinity never being the sole signal (&#167;6.2 of that module).</p>
+<p>The mechanism supplying <code>potential_prefill_blocks</code> is a two-source split that maps directly onto Module 2's approximate-versus-precise duality, just resolved differently: <b>Cached Blocks</b> are tracked globally by a component called the <code>KvIndexer</code>, which maintains a prefix tree (radix tree) built from KV creation/release events that every worker publishes<a class="cite" href="#ref-4">4</a> &#8212; structurally the same idea as Module 2's precise KVEvents-over-ZMQ path, an event-sourced index rather than an inferred one. <b>Active Decoding Blocks</b>, by contrast, are tracked locally by the router itself across a request's lifecycle rather than reported by the worker<a class="cite" href="#ref-4">4</a> &#8212; the router's own bookkeeping of what it has already sent where, the same shape as Module 2's approximate LRU index, but scoped to active decode state rather than prefix-cache state. Dynamo does not offer a router-level choice between an approximate and a precise mode the way llm-d does (Module 2, &#167;2&#8211;3); it always uses the event-sourced <code>KvIndexer</code> for cache overlap and always uses local bookkeeping for active load, because the two signals answer different questions rather than being two implementations of the same signal.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Dynamo Router's cost function combining a cache-overlap term from the global KvIndexer with an active-load term tracked locally, producing one logit per candidate worker</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="30" width="330" height="70" rx="8" class="d-block-2"/>
+<text x="185" y="55" text-anchor="middle" class="d-text-inv d-bold">KvIndexer (global)</text>
+<text x="185" y="73" text-anchor="middle" class="d-text-inv d-small">radix tree from worker-reported</text>
+<text x="185" y="89" text-anchor="middle" class="d-text-inv d-small">KV creation/release events</text>
+
+<rect x="450" y="30" width="330" height="70" rx="8" class="d-block-2"/>
+<text x="615" y="55" text-anchor="middle" class="d-text-inv d-bold">Router-local bookkeeping</text>
+<text x="615" y="73" text-anchor="middle" class="d-text-inv d-small">active prefill/decode blocks</text>
+<text x="615" y="89" text-anchor="middle" class="d-text-inv d-small">tracked per request in flight</text>
+
+<path d="M185,100 L185,140" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M615,100 L615,140" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+<rect x="60" y="142" width="250" height="50" rx="6" class="d-panel"/>
+<text x="185" y="165" text-anchor="middle" class="d-small d-bold">potential_prefill_blocks</text>
+<text x="185" y="182" text-anchor="middle" class="d-small d-text-light">work minus cache hit</text>
+
+<rect x="490" y="142" width="250" height="50" rx="6" class="d-panel"/>
+<text x="615" y="165" text-anchor="middle" class="d-small d-bold">potential_active_blocks</text>
+<text x="615" y="182" text-anchor="middle" class="d-small d-text-light">current load</text>
+
+<path d="M240,192 L370,225" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M560,192 L430,225" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+<rect x="290" y="227" width="220" height="55" rx="8" class="d-hl"/>
+<text x="400" y="250" text-anchor="middle" class="d-bold">logit = w &#215; prefill + active</text>
+<text x="400" y="268" text-anchor="middle" class="d-small">lowest logit wins</text>
+</svg>
+<figcaption><b>Figure 2.</b> The Router evaluates one cost per candidate worker, combining a global, event-sourced cache-overlap term with a locally-tracked load term &#8212; structurally the same two-signal idea as Module 2's prefix-cache-scorer plus inflight-load-producer, expressed as a single weighted cost instead of a pluggable weighted-sum scorer chain. Formula per NVIDIA's KV-aware routing documentation<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h3 id="router-parameter-churn">2.2 Parameter churn: a tuning surface still in motion</h3>
+<p>The exact name of the weight term in that cost function is not stable across Dynamo's own documentation. Older configuration docs (v1.2.1) already mark <code>--kv-overlap-score-weight</code> and its sibling <code>--router-kv-overlap-score-weight</code> as deprecated, emitting a warning but still accepted, in favor of a replacement parameter, <code>--router-kv-overlap-score-credit</code> (range 0.0&#8211;1.0, default 1), which credits device-local prefix overlap against prefill load, combined with a separate <code>--router-prefill-load-scale</code> multiplier (default 1) applied to the adjusted prompt-side load<a class="cite" href="#ref-5">5</a>. The resulting formula in that same documentation is written as <code>prefill_load_scale &#215; adjusted_prefill_blocks + decode_blocks</code>, where the adjusted-prefill term itself now incorporates separate credit weights for device-cache hits, host-cache hits (default 0.75), disk-cache hits (default 0.25), and shared-cache hits<a class="cite" href="#ref-5">5</a> &#8212; a finer-grained decomposition of "how much does a cache hit at this tier actually save" than the single <code>kv_overlap_score_weight</code> term implies. Read against Module 8's finding that NIXL shipped three functionally significant releases in about one month, this is the same signal from a different layer of the stack: the Router's own tuning surface has already been renamed and subdivided once, and a deployment pinning to a specific flag name in one Dynamo version should expect to re-verify it against the live docs at upgrade time rather than assume the name is stable.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>Because host-cache and disk-cache hits get their own credit weights (0.75 and 0.25 by default<a class="cite" href="#ref-5">5</a>) separate from a device-cache hit, the Router's cost function already assumes KVBM's tiered storage (&#167;3) is in the picture &#8212; a cache hit in KVBM's G2 (host) or G3 (disk) tier is worth something to the routing decision, just less than a hit still resident in G1 (device). The Router and KVBM are documented as separate components, but the Router's own cost function only makes sense once you know KVBM's tier hierarchy exists.</p></aside>
+
+<h2 id="kvbm">3. KVBM: the KV Block Manager</h2>
+<p>Module 7 established the generic offload-tier hierarchy &#8212; HBM &#8594; host DRAM &#8594; local SSD &#8594; remote &#8212; through Mooncake's KVCache-centric architecture, and Module 8 covered NIXL's Memory Sections as the abstraction that lets a single transfer call address any of those tiers uniformly. KVBM is Dynamo's own named component implementing that hierarchy specifically, with its own tier names, its own block lifecycle state machine, and NIXL as its data-movement layer underneath.</p>
+
+<h3 id="kvbm-layers">3.1 Three logical layers</h3>
+<p>KVBM's architecture documentation describes three layers stacked vertically<a class="cite" href="#ref-6">6</a>. The top layer is the LLM inference runtime itself &#8212; TensorRT-LLM, vLLM, or SGLang &#8212; integrated through a dedicated connector module per engine; these connectors act as "translation layers, mapping runtime-specific operations and events into the KVBM's block-oriented memory interface," which decouples KVBM's own memory management from any one engine's internal block representation<a class="cite" href="#ref-6">6</a>. The middle layer is KVBM's own core: it "encapsulates the core logic of the KV block manager and serves as the runtime substrate for managing block memory," handling table lookups, memory allocation, block layout management, lifecycle and state transitions, and reuse/eviction policy<a class="cite" href="#ref-6">6</a>. The bottom layer is NIXL, which "provides unified support for enabling all data and storage transactions" &#8212; P2P GPU transfers, RDMA and NVLink remote memory sharing, dynamic block registration, and metadata exchange<a class="cite" href="#ref-6">6</a>. That bottom layer is exactly Module 8's NIXL, unmodified: KVBM does not implement its own transport, it registers memory regions with NIXL and lets NIXL's Memory Sections and Transfer Backend Interface move the bytes.</p>
+
+<h3 id="kvbm-tiers">3.2 Four memory tiers: G1 through G4</h3>
+<p>KVBM names its tiers G1 through G4 rather than using Module 7's HBM/DRAM/SSD/remote labels directly, though the physical mapping is the same idea with one more layer of hierarchy inside the host tier<a class="cite" href="#ref-7">7</a>:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> KVBM's four memory tiers compared against Mooncake's tiering (Module 7) and NIXL's Memory Sections (Module 8). Data: KVBM design documentation<a class="cite" href="#ref-7">7</a>, cross-referenced against Mooncake's HBM&#8594;DRAM&#8594;SSD&#8594;remote hierarchy and NIXL's memory/storage unification<a class="cite" href="#ref-6">6</a>.</caption>
+<thead><tr><th>KVBM tier</th><th>Physical location</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td class="row">G1 &#8212; Device Pool</td><td>GPU HBM</td><td>"GPU-resident KV block pool. Allocates mutable GPU blocks, registers completed blocks (immutable)"<a class="cite" href="#ref-7">7</a> &#8212; the primary inference tier</td></tr>
+<tr><td class="row">G2 &#8212; Host Pool</td><td>CPU pinned memory</td><td>page-locked host memory, chosen specifically for efficient CUDA transfer to/from G1<a class="cite" href="#ref-7">7</a></td></tr>
+<tr><td class="row">G3 &#8212; Disk Pool</td><td>local NVMe SSD</td><td>"Local SSD NVMe-backed KV block pool" supporting zero-copy I/O and optional GPUDirect Storage<a class="cite" href="#ref-7">7</a> &#8212; the same GDS path NIXL exposes as a named backend (Module 8)</td></tr>
+<tr><td class="row">G4 &#8212; Remote Storage</td><td>remote or cloud-backed store</td><td>"KVBM treats G4 as an opaque blob store"<a class="cite" href="#ref-7">7</a> &#8212; KVBM does not know or care what is underneath, only that NIXL can address it</td></tr>
+</tbody>
+</table>
+<p>The G1&#8594;G4 naming is a direct match to Module 7's four-tier hierarchy in substance (HBM, host DRAM, local SSD, remote), with one addition worth flagging: G4 is explicitly documented as opaque to KVBM itself<a class="cite" href="#ref-7">7</a>, which is the same design choice NIXL's Memory Sections make one layer down &#8212; unify the addressing, but let the actual storage backend (object store, filesystem, block device) stay a plugin NIXL's Transfer Backend Interface resolves at transfer time, not something KVBM's own core logic needs to understand.</p>
+
+<h3 id="kvbm-lifecycle">3.3 Block lifecycle: a five-state machine with RAII cleanup</h3>
+<p>Where Mooncake's block model (Module 7) is defined by a content hash over 512-token blocks and Module 2's approximate/precise routing model is defined by whether the router's view of a block is inferred or event-sourced, KVBM defines its own blocks by an explicit state machine, independent of both<a class="cite" href="#ref-7">7</a>:</p>
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 220" role="img" aria-labelledby="f3t"><title id="f3t">KVBM's five-state block lifecycle: Reset, Partial, Complete, Registered, and Remove</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="70" width="130" height="60" rx="8" class="d-block-muted"/>
+<text x="85" y="95" text-anchor="middle" class="d-text-inv d-bold">Reset</text>
+<text x="85" y="113" text-anchor="middle" class="d-text-inv d-small">InactivePool</text>
+
+<g data-step="2">
+<path d="M150,100 L190,100" class="d-arrow" marker-end="url(#f3-arr)"/>
+<text x="170" y="90" text-anchor="middle" class="d-small">init_sequence()</text>
+<rect x="192" y="70" width="130" height="60" rx="8" class="d-block"/>
+<text x="257" y="95" text-anchor="middle" class="d-text-inv d-bold">Partial</text>
+<text x="257" y="113" text-anchor="middle" class="d-text-inv d-small">filling with tokens</text>
+</g>
+
+<g data-step="3">
+<path d="M322,100 L362,100" class="d-arrow" marker-end="url(#f3-arr)"/>
+<text x="342" y="90" text-anchor="middle" class="d-small">commit()</text>
+<rect x="364" y="70" width="130" height="60" rx="8" class="d-block"/>
+<text x="429" y="95" text-anchor="middle" class="d-text-inv d-bold">Complete</text>
+<text x="429" y="113" text-anchor="middle" class="d-text-inv d-small">finalized, not visible</text>
+</g>
+
+<g data-step="4">
+<path d="M494,100 L534,100" class="d-arrow" marker-end="url(#f3-arr)"/>
+<text x="514" y="90" text-anchor="middle" class="d-small">register()</text>
+<rect x="536" y="70" width="130" height="60" rx="8" class="d-hl"/>
+<text x="601" y="95" text-anchor="middle" class="d-bold">Registered</text>
+<text x="601" y="113" text-anchor="middle" class="d-small">hashed, lookup-visible</text>
+</g>
+
+<g data-step="5">
+<path d="M666,100 L706,100" class="d-arrow" marker-end="url(#f3-arr)"/>
+<text x="686" y="90" text-anchor="middle" class="d-small">drop</text>
+<rect x="708" y="70" width="72" height="60" rx="8" class="d-block-muted"/>
+<text x="744" y="95" text-anchor="middle" class="d-text-inv d-bold">Remove</text>
+</g>
+
+<g data-step="5">
+<path d="M744,130 Q744,180 85,150 Q40,145 85,130" class="d-arrow d-dashed" marker-end="url(#f3-arr)"/>
+<text x="400" y="185" text-anchor="middle" class="d-small d-text-light">Remove event returns block to Reset / InactivePool</text>
+</g>
+</svg>
+</figure>
+<ol class="steps">
+<li><b>Reset.</b> The block's initial state inside the InactivePool &#8212; unused, ready for allocation<a class="cite" href="#ref-7">7</a>.</li>
+<li><b>Partial.</b> <code>init_sequence()</code> moves the block into active use while it is still being filled with tokens<a class="cite" href="#ref-7">7</a>.</li>
+<li><b>Complete.</b> <code>commit()</code> finalizes a full block, but it is not yet visible for lookup by other requests<a class="cite" href="#ref-7">7</a>.</li>
+<li><b>Registered.</b> <code>register()</code> hashes the block by <code>sequence_hash</code> and moves it into a deduplication cache; only now can the block "be used for lookup" by a different request sharing that prefix<a class="cite" href="#ref-7">7</a>.</li>
+<li><b>Remove.</b> Automatically triggered when a handle drops (RAII), which deregisters the block from NIXL and returns it to Reset in the InactivePool<a class="cite" href="#ref-7">7</a>.</li>
+</ol>
+</div>
+<p>The RAII pattern in the final step is a specific engineering choice worth naming: KVBM's own documentation states this design "avoids stale memory access, dangling pointers on GPU or host, manual deregistration bugs"<a class="cite" href="#ref-7">7</a> &#8212; the block's NIXL registration and its logical lifetime are tied to the same handle, so a crashed or evicted request cannot leave a block registered with NIXL but logically abandoned, the class of bug that a manual deregister-on-eviction path would otherwise have to get right on every code path. Lookup itself works through the same <code>sequence_hash</code> mechanism as Registered blocks: a "deduplication cache" keyed by that hash lets a later request's prefix match resolve to an already-Registered block across any of the four tiers, without KVBM having to scan pools<a class="cite" href="#ref-7">7</a> &#8212; conceptually the same content-addressed lookup Mooncake's 512-token block hash performs (Module 7), implemented against KVBM's own block granularity rather than Mooncake's.</p>
+
+<h2 id="planner">4. The Planner: SLA-driven autoscaling</h2>
+<p>The Router and KVBM answer per-request questions &#8212; which worker, which tier. The Planner answers a fleet-level question none of Modules 1&#8211;8 addressed directly: given a current traffic pattern and a latency target, how many prefill and decode replicas should exist right now. It is a controller that "adjusts prefill and decode engine replica counts at runtime to meet latency SLAs," driven either by live Prometheus metrics or by a load-predictor's forecast, combined with an engine performance model<a class="cite" href="#ref-8">8</a>.</p>
+
+<h3 id="planner-modes">4.1 Four scaling modes and their composition order</h3>
+<p>The Planner supports four <code>optimization_target</code> modes, each a different answer to "scale on what signal":</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Dynamo Planner's four scaling modes. Data: Planner Guide<a class="cite" href="#ref-8">8</a>.</caption>
+<thead><tr><th>Mode</th><th>Signal</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td class="row">throughput</td><td>static thresholds on queue depth and KV-cache utilization</td><td>the default; needs no SLA target or profiling data<a class="cite" href="#ref-8">8</a></td></tr>
+<tr><td class="row">latency</td><td>more aggressive versions of the same thresholds</td><td>"scales up earlier and tolerates less queuing" than throughput mode<a class="cite" href="#ref-8">8</a></td></tr>
+<tr><td class="row">load</td><td>user-defined prefill queue-token and decode KV-utilization thresholds</td><td>reactive, threshold-driven scaling layered on top of the other modes<a class="cite" href="#ref-8">8</a></td></tr>
+<tr><td class="row">sla</td><td>a performance model targeting specific TTFT/ITL values</td><td>the only mode that predicts, rather than reacts to, replica needs (&#167;4.2)<a class="cite" href="#ref-8">8</a></td></tr>
+</tbody>
+</table>
+<p>These are not four mutually exclusive settings; they compose. When <code>optimization_target</code> is throughput, latency, or load, load-based scaling activates automatically alongside it, and throughput-based scaling disables<a class="cite" href="#ref-8">8</a>. When both throughput-based and load-based scaling are active in the same evaluation tick, throughput-based scaling sets the lower-bound replica count first, and load-based scaling can then adjust above that floor, subject to a global GPU budget clamp<a class="cite" href="#ref-8">8</a> &#8212; the manifest's framing of "load-based adjusts above the throughput-derived floor" is this exact mechanism. SLA mode is the odd one out: it requires explicitly enabling at least one of <code>enable_throughput_scaling</code> or <code>enable_load_scaling</code> alongside it, rather than composing automatically<a class="cite" href="#ref-8">8</a>, because SLA mode's own output is a target replica count derived from a performance model, and the deployer has to decide whether that target is additionally floored or bounded by the reactive modes.</p>
+
+<h3 id="planner-sla-model">4.2 SLA mode: the performance model underneath the prediction</h3>
+<p>SLA mode is the Planner's most involved path, and the one the manifest for this module singles out. It is built on "the Rust engine performance shim with native AIC estimates when available, plus online FPM tuning or FPM regression fallback, to target specific TTFT/ITL values"<a class="cite" href="#ref-8">8</a>. Unpacked, that shim initializes in one of two ways: if a native AIC (analytical/interpolated cost) performance model and the engine's own limits are available for the specific engine/model/hardware combination, it uses those directly; if no native AIC config is supported for that combination, it falls back automatically to an "observed-FPM regression" &#8212; a regression fitted from field performance measurements (FPM) rather than an analytical model<a class="cite" href="#ref-8">8</a>. Either way, the shim needs bootstrap data before it can estimate anything: that data comes from a self-benchmark fetched via the engine's own <code>get_perf_metrics</code> endpoint, or from rapid-mode AIC interpolation, or from profiler results read from a configured <code>profile_results_dir</code> (the npz/JSON profiler output the manifest references)<a class="cite" href="#ref-8">8</a>. Once running, online FPM tuning feeds live observations back into the model at a configured <code>load_adjustment_interval_seconds</code>, so the performance model itself keeps updating against reality rather than staying fixed at its bootstrap estimate<a class="cite" href="#ref-8">8</a>.</p>
+
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 200" role="img" aria-labelledby="f4t"><title id="f4t">SLA-mode's performance model pipeline: AIC estimate or regression fallback, bootstrapped from profiler or self-benchmark data, tuned online, producing a target replica count</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<g data-step="1">
+<rect x="20" y="30" width="220" height="60" rx="8" class="d-panel"/>
+<text x="130" y="52" text-anchor="middle" class="d-small d-bold">Bootstrap data</text>
+<text x="130" y="70" text-anchor="middle" class="d-small d-text-light">self-benchmark / profiler npz-json</text>
+</g>
+
+<g data-step="2">
+<path d="M240,60 L280,60" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="282" y="30" width="230" height="60" rx="8" class="d-block"/>
+<text x="397" y="52" text-anchor="middle" class="d-text-inv d-bold">Native AIC estimate</text>
+<text x="397" y="70" text-anchor="middle" class="d-text-inv d-small">if supported for engine/HW</text>
+</g>
+
+<g data-step="3">
+<text x="397" y="112" text-anchor="middle" class="d-small d-text-light">unsupported config &#8594; fallback</text>
+<path d="M397,90 L397,130" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="282" y="132" width="230" height="50" rx="8" class="d-block-2"/>
+<text x="397" y="152" text-anchor="middle" class="d-text-inv d-small d-bold">FPM regression fallback</text>
+<text x="397" y="168" text-anchor="middle" class="d-text-inv d-small">observed-performance fit</text>
+</g>
+
+<g data-step="4">
+<path d="M512,60 L560,60" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="562" y="30" width="200" height="60" rx="8" class="d-hl"/>
+<text x="662" y="52" text-anchor="middle" class="d-bold">Replica-count decision</text>
+<text x="662" y="70" text-anchor="middle" class="d-small">target TTFT 500ms / ITL 50ms</text>
+</g>
+
+<g data-step="5">
+<path d="M662,90 Q662,120 500,145 Q450,150 512,157" class="d-arrow d-dashed" marker-end="url(#f4-arr)"/>
+<text x="662" y="118" text-anchor="middle" class="d-small d-text-light">online FPM tuning, every</text>
+<text x="662" y="132" text-anchor="middle" class="d-small d-text-light">load_adjustment_interval_seconds</text>
+</g>
+</svg>
+</figure>
+<ol class="steps">
+<li><b>Bootstrap.</b> The shim gets initial performance data from a self-benchmark call to the engine's <code>get_perf_metrics</code> endpoint, or from profiler output in a configured directory<a class="cite" href="#ref-8">8</a>.</li>
+<li><b>Native AIC estimate.</b> If a native analytical/interpolated cost model exists for this engine/model/hardware combination, the shim uses it directly<a class="cite" href="#ref-8">8</a>.</li>
+<li><b>Regression fallback.</b> If no native AIC config is supported, the shim falls back to a regression fitted from observed field performance measurements (FPM)<a class="cite" href="#ref-8">8</a>.</li>
+<li><b>Replica-count decision.</b> Either path yields an estimate of engine performance under a given replica count, which the Planner uses to target the configured TTFT/ITL values (500 ms / 50 ms by default, &#167;4.3)<a class="cite" href="#ref-8">8</a>.</li>
+<li><b>Online tuning.</b> Live observations feed back into the model at a configured interval, so the estimate keeps correcting against measured reality rather than staying fixed<a class="cite" href="#ref-8">8</a>.</li>
+</ol>
+</div>
+
+<h3 id="planner-sla-targets-prediction">4.3 Default SLA targets and traffic prediction</h3>
+<p>The Planner's default SLA targets are a TTFT of 500.0 milliseconds and an ITL of 50.0 milliseconds<a class="cite" href="#ref-8">8</a> &#8212; both configurable, but these are the values a fresh deployment starts from. Feeding the SLA-mode decision is a separate traffic-prediction step: the <code>load_predictor</code> field accepts <code>constant</code>, <code>arima</code>, <code>kalman</code>, or <code>prophet</code> as the forecasting method<a class="cite" href="#ref-8">8</a>, with ARIMA and Prophet specifically used to predict request count, input sequence length (ISL), and output sequence length (OSL), while other runtime signals such as KV-cache hit rate instead use the latest observed value rather than a forecast<a class="cite" href="#ref-8">8</a>. NVIDIA's own Dynamo 0.4 announcement frames the same mechanism from the release-notes side: the Planner "predicts future traffic patterns using advanced time-series models such as ARIMA or Prophet," then calculates the minimum prefill/decode worker counts needed to meet SLA targets under that predicted demand<a class="cite" href="#ref-9">9</a>. The two sources agree on the mechanism; the Planner Guide is the more complete one, since it also documents the <code>kalman</code> and <code>constant</code> predictor options the announcement does not mention<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-9">9</a>.</p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>SLA mode's accuracy is bounded by how good its performance model is for your specific engine/model/hardware combination. When a native AIC estimate exists, the Planner is working from an analytical model; when it falls back to FPM regression, it is working from a fit to whatever field data has been observed so far, which is weaker early in a deployment's life before enough traffic has accumulated to make the regression reliable. Neither the Planner Guide nor the Dynamo 0.4 announcement publishes an accuracy figure for either path<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-9">9</a> &#8212; treat SLA mode as a real prediction mechanism, not a guaranteed one, until you have measured its replica-count decisions against actual TTFT/ITL on your own traffic.</p></aside>
+
+<h2 id="modelexpress-grove">5. ModelExpress and Grove: weight streaming and gang scheduling</h2>
+<p>The Router, KVBM, and Planner all operate on request- and cache-level state. ModelExpress and Grove sit further out, at cluster-lifecycle scale: getting a new replica's weights into GPU memory fast, and getting a multi-node group of pods scheduled onto hardware as one atomic unit in the first place. Neither is unique to serving &#8212; both matter equally for a training or RL rollout cluster &#8212; but both are load-bearing for how quickly a Dynamo deployment can scale out.</p>
+
+<h3 id="modelexpress">5.1 ModelExpress: weight streaming over NIXL instead of shared storage</h3>
+<p>The problem ModelExpress solves recurs across three scenarios: a cold start pulling weights from remote storage into GPU memory, an autoscaling event that needs to populate a brand-new replica, and reinforcement-learning post-training continuously moving updated weights between trainer and rollout workers<a class="cite" href="#ref-10">10</a>. Its mechanism is the same NIXL point-to-point transfer Module 8 covered, applied to model weights instead of KV cache: when a serving peer already holds compatible weights in GPU memory, ModelExpress "transfers them directly from GPU to GPU over P2P RDMA via NVIDIA Inference Xfer Library (NIXL), bypassing redundant access to object storage, local disk, and host memory"<a class="cite" href="#ref-10">10</a>. When no such peer exists yet, it falls back to the fastest supported bootstrap path &#8212; streaming from object storage via a Model Streamer component, or reading local files directly into GPU memory through GPUDirect Storage<a class="cite" href="#ref-10">10</a> &#8212; the same GDS backend NIXL exposes and KVBM's G3 tier uses (&#167;3.2).</p>
+<p>A second mechanism, the Model Cache Service, addresses a different failure mode: many replicas scaling up simultaneously would otherwise each independently hit external storage for the same weights. Instead, "an atomic claim in Metadata Store selects a downloader, while the remaining replicas track its progress and reuse the cached copy. The cluster pays the external download cost once"<a class="cite" href="#ref-10">10</a> &#8212; a single-flight pattern applied to weight loading, conceptually the same "avoid redundant work across replicas" logic the Router applies to KV-cache prefill.</p>
+<p>Two separate documented examples give ModelExpress's speedup a concrete range rather than one number to anchor on. NVIDIA's own README headline is 7x faster model startup for DeepSeek-V3 on H200<a class="cite" href="#ref-1">1</a>. A separate, more granular example from NVIDIA's ModelExpress blog post gives an end-to-end figure for a larger model: MX transfers DeepSeek-V4-Pro weights and JIT kernel-cache artifacts from a serving replica into a fresh replica on 8&#215;B200 in under 10 seconds, cutting total startup time from 8 minutes to 1 minute 44 seconds<a class="cite" href="#ref-10">10</a> &#8212; a roughly \(8 / 1.73 \approx 4.6\times\) reduction in that specific case, on different hardware and a different model than the headline 7x figure. Both are real, sourced numbers; neither should be read as the number for an arbitrary model/hardware pair, for the same reason &#167;8.2 treats every headline benchmark claim as workload-specific rather than a general constant.</p>
+
+<h3 id="grove">5.2 Grove: Kubernetes gang scheduling for multi-node inference</h3>
+<p>Grove solves a Kubernetes gap none of the generic scheduling primitives address directly: a single disaggregated Dynamo deployment is not one pod, or even one uniform group of identical pods &#8212; it is several distinct roles (prefill workers, decode workers, a frontend, a router) that must be scheduled and scaled together, sometimes spanning multiple physical nodes for one logical model instance. Grove is "a Kubernetes API that provides a single declarative interface for orchestrating any AI inference workload," from a single pod up to complex multi-node, disaggregated systems at data-center scale<a class="cite" href="#ref-11">11</a>.</p>
+<p>Its object model has two levels. A <b>PodClique</b> represents "a group of pods representing a specific role (e.g., leader, worker, frontend)" &#8212; all prefill workers, say, or all decode workers &#8212; with its own container spec, GPU resource claims, replica count, and scaling logic<a class="cite" href="#ref-11">11</a>. A <b>PodCliqueSet</b> is the top-level object composing multiple PodCliques into one group that is managed and colocated together, with autoscaling and topology-aware replica distribution<a class="cite" href="#ref-11">11</a>. Grove creates a <code>PodGang</code> resource for each PodCliqueSet, which a separate scheduler (KAI Scheduler) reads and enforces as an all-or-nothing constraint<a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-6">6</a>: if only a subset of the required pods across all cliques can be scheduled, none of them start, because a partially-scheduled disaggregated instance &#8212; prefill workers up, decode workers pending &#8212; is not a usable model instance and would otherwise leave GPUs allocated and idle. On top of that gang-scheduling guarantee, Grove also does topology-aware placement, described as "network optimized placement, e.g. within NVLink domains"<a class="cite" href="#ref-11">11</a> &#8212; the same NVL72-domain reasoning Module 1 introduced for wide expert parallelism, here applied to keeping a PodClique's pods close enough together that intra-clique traffic stays on fast interconnect rather than crossing a rack boundary.</p>
+<p>The division of labor between Dynamo and Grove is explicit in NVIDIA's own description: "Dynamo manages the inference control plane at runtime: routing incoming requests, tracking KV cache locations, and dispatching prefill/decode work to the right workers. Grove manages the Kubernetes workload lifecycle: starting pods in the right order, placing them on the right hardware, scaling them as a coordinated unit"<a class="cite" href="#ref-11">11</a>. That split maps cleanly onto this module's two halves so far: Router/Planner/KVBM (&#167;2&#8211;4) are the runtime control plane; Grove is the Kubernetes-side scheduling substrate underneath it. Module 14 covers Kubernetes deployment topology in general; Grove is Dynamo's own gang-scheduling answer to that general problem.</p>
+
+<h2 id="disaggregation-nixl">6. Disaggregation orchestration built on NIXL</h2>
+<p>Module 4 established the generic connector pattern &#8212; producer/consumer roles, a LookupBuffer, a Pipe &#8212; and the backend-specific choice between synchronous and overlapped transfer. Dynamo's own disaggregated-serving implementation is a concrete instance of that pattern, built directly on NIXL rather than a custom transport, and it is worth stating precisely rather than re-deriving, since Module 4 already covers the general shape in full.</p>
+<p>NVIDIA's own architecture documentation states the mechanism directly: "Dynamo leverages NIXL to transfer KV cache directly from the VRAM of the prefill engine to the VRAM of the decode engine. The KV transfer is non-blocking, allowing GPU forward passes to continue serving other requests during the transfer"<a class="cite" href="#ref-12">12</a>. That non-blocking property is the same one Module 4 flagged generically (&#8220;non-blocking KV transfer&#8221;) &#8212; here it is Dynamo's specific implementation of it, VRAM-to-VRAM via NIXL's Memory Sections rather than staging through host memory.</p>
+<p>Backend-specific synchronization behavior, already covered generically in Module 4, appears in Dynamo's own docs in the same terms: SGLang uses bootstrap coordination that lets the decode phase begin immediately while KV transfer proceeds in parallel, while vLLM and TensorRT-LLM run prefill synchronously, with decode waiting for prefill to complete before proceeding<a class="cite" href="#ref-12">12</a>. This is not a Dynamo-specific mechanism &#8212; it is each backend engine's own transfer behavior, which Dynamo's orchestration layer has to accommodate rather than override, since Dynamo does not reimplement any engine's internal KV-transfer logic. NVIDIA's own performance-characteristics documentation is explicit that it deliberately declines to encode the prefill/decode split point as "a universal token threshold"<a class="cite" href="#ref-12">12</a> &#8212; the right split is workload- and engine-dependent, not a constant Dynamo can bake in.</p>
+<p>What Dynamo's orchestration layer does add on top of the generic connector pattern is runtime-reconfigurable xPyD: <i>x</i> prefill workers and <i>y</i> decode workers, with both counts changeable at runtime rather than fixed at deployment time<a class="cite" href="#ref-12">12</a>. Workers register with a discovery service and publish a <code>RuntimeConfig</code> that includes their KV capacity when added, and drain their active requests before deregistering when removed<a class="cite" href="#ref-12">12</a> &#8212; the same drain-before-remove pattern Module 4 introduced generically, here as Dynamo's own worker-lifecycle mechanism, and the mechanism the Planner's SLA-mode replica-count decisions (&#167;4.2) actually act on: a Planner decision to add a decode replica has nowhere to take effect without this registration path underneath it.</p>
+
+<h2 id="observability">7. Observability: the Prometheus metrics surface</h2>
+<p>Every scaling and routing decision in &#167;2 and &#167;4 has to be driven by something measured. Dynamo exposes its own metrics in Prometheus exposition format at a <code>/metrics</code> endpoint, with every Dynamo-generated metric using a <code>dynamo_*</code> name prefix and labels (<code>dynamo_namespace</code>, <code>dynamo_component</code>, <code>dynamo_endpoint</code>) identifying which component and endpoint produced it<a class="cite" href="#ref-13">13</a>. NVIDIA's own Dynamo 0.4 announcement summarizes the categories at a high level &#8212; average requests per second and request duration; average TTFT and ITL; average input and output sequence length; GPU utilization and power usage<a class="cite" href="#ref-9">9</a> &#8212; and the live metrics catalog gives the specific named metrics underneath those categories, plus several categories the announcement does not mention (queue depth, cache-hit accounting, error/migration counters):</p>
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 3.</b> A representative selection of Dynamo's <code>dynamo_*</code> Prometheus metrics, grouped by category. Data: Dynamo metrics catalog<a class="cite" href="#ref-13">13</a>, categories cross-referenced against the Dynamo 0.4 announcement<a class="cite" href="#ref-9">9</a>.</caption>
+<thead><tr><th>Category</th><th>Metric</th><th>Type</th><th>What it measures</th></tr></thead>
+<tbody>
+<tr><td class="row">Request rate/duration</td><td class="d-mono">dynamo_frontend_requests_total</td><td>counter</td><td>total LLM requests<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">Request rate/duration</td><td class="d-mono">dynamo_frontend_request_duration_seconds</td><td>histogram</td><td>end-to-end request duration<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">TTFT</td><td class="d-mono">dynamo_frontend_time_to_first_token_seconds</td><td>histogram</td><td>time to first token<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">ITL</td><td class="d-mono">dynamo_frontend_inter_token_latency_seconds</td><td>histogram</td><td>inter-token latency<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">ISL/OSL</td><td class="d-mono">dynamo_frontend_input_sequence_tokens</td><td>histogram</td><td>input sequence length in tokens<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">ISL/OSL</td><td class="d-mono">dynamo_frontend_output_sequence_tokens</td><td>histogram</td><td>output sequence length in tokens<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">Queue / KV cache</td><td class="d-mono">dynamo_frontend_router_queue_pending_requests</td><td>gauge</td><td>requests pending in the router scheduler queue<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">Queue / KV cache</td><td class="d-mono">dynamo_component_router_kv_hit_rate</td><td>histogram</td><td>predicted KV-cache hit rate at routing time &#8212; the Router's own overlap-score input (&#167;2.1), exported as a metric<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">Queue / KV cache</td><td class="d-mono">dynamo_component_kv_cache_events_applied</td><td>counter</td><td>KV-cache events applied to the router's radix-tree index &#8212; the same <code>KvIndexer</code> event stream &#167;2.1 describes<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">Errors / migration</td><td class="d-mono">dynamo_frontend_model_rejection_total</td><td>counter</td><td>requests rejected because all workers were busy<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">Errors / migration</td><td class="d-mono">dynamo_frontend_model_migration_total</td><td>counter</td><td>request migrations due to worker unavailability<a class="cite" href="#ref-13">13</a></td></tr>
+<tr><td class="row">Routing overhead</td><td class="d-mono">dynamo_router_overhead_total_ms</td><td>histogram</td><td>total routing overhead per request, broken down into block-hashing, indexer-lookup, and scheduling sub-metrics<a class="cite" href="#ref-13">13</a></td></tr>
+</tbody>
+</table>
+<p>Two rows are worth reading against earlier sections directly. <code>dynamo_component_router_kv_hit_rate</code> and <code>dynamo_component_kv_cache_events_applied</code> are not generic serving metrics &#8212; they are the Router's own <code>KvIndexer</code> and cost-function machinery from &#167;2.1, exposed as Prometheus series so an operator can watch the overlap-score input directly rather than infer it from downstream latency. <code>dynamo_router_overhead_total_ms</code> and its sub-metrics are an admission the routing decision itself has a cost &#8212; block-hashing time, indexer-lookup time, scheduling time are each separately tracked<a class="cite" href="#ref-13">13</a>, the same category of overhead Module 2 flagged for the tokenization round-trip in precise KV-indexing, here quantified rather than described qualitatively. GPU utilization and power usage are named in the Dynamo 0.4 announcement as part of the observability surface<a class="cite" href="#ref-9">9</a>, but do not appear under the <code>dynamo_*</code> prefix in the metrics catalog reviewed for this module; they are exposed through separate GPU-telemetry integration (DCGM-style exporters) rather than as Dynamo-native metrics, and this module cannot source their exact metric names beyond what the announcement states in prose<a class="cite" href="#ref-9">9</a>.</p>
+
+<h2 id="version-benchmarks">8. Version, release cadence, and headline benchmarks</h2>
+<h3 id="version-timeline">8.1 Release cadence as evidence of pace</h3>
+<p>Dynamo's current tagged release is v1.4.2, dated 2026-08-29<a class="cite" href="#ref-14">14</a>. Reading the three releases immediately preceding it shows a cadence of roughly one release per week, each with functional changes rather than only cosmetic ones:</p>
+<ol class="timeline">
+<li><time>v1.4.0</time><b>Base of the v1.4.x series</b><p>Base version for the v1.4.x series, with multiple dev builds extending support to specialized models<a class="cite" href="#ref-14">14</a>.</p></li>
+<li><time>v1.4.1 &#8212; 2026-08-22</time><b>Classify/pooling endpoints; Router fix</b><p>Adds OpenAI-compatible <code>classify</code> and <code>pooling</code> endpoints to the Dynamo Frontend with vLLM worker support; fixes Router overload recovery, a <code>logprob_token_ids</code> passthrough rejection bug, and vLLM-Omni NIXL object-transfer failures<a class="cite" href="#ref-14">14</a>.</p></li>
+<li><time>v1.4.2 &#8212; 2026-08-29</time><b>NIXL loader-path patch</b><p>A patch release on top of v1.4.1 that fixes NIXL loader-path resolution in the Frontend and SGLang Runtime container images, where Rust bindings were running against non-functional stubs; also removes an unused profiling plugin and tightens dependency pins<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-14">14</a>.</p></li>
+<li><time>v1.5.0-dev builds &#8212; Sept. 2026</time><b>Model-specific dev containers</b><p>Multiple v1.5.0-dev tags ship in early September 2026 for specific new models: <code>v1.5.0-gemma-4-31b-dev.1</code> (Sept. 3) with early TensorRT-LLM 1.3.0rc25 support<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-14">14</a>, <code>v1.5.0-inkling-dev.1</code> (Sept. 3) with vLLM 0.28.0 for Thinking Machines' Inkling on GB300, and <code>v1.5.0-deepseek-v4-pro-0813-dev.1</code> (Sept. 4) adding DeepSeek-V4-Pro-0813 support on GB200/H200 with DSpark speculative decoding and KV-aware routing<a class="cite" href="#ref-14">14</a>.</p></li>
+</ol>
+<p>A patch release fixing a NIXL loader-path bug in the exact week following the previous patch is the same signal Module 8 documented for NIXL's own release history: this is a stack whose transport layer is still being hardened in production, not one where the last bug in that class was found years ago.</p>
+
+<h3 id="headline-benchmarks">8.2 Headline benchmark claims, read with their scope</h3>
+<p>Dynamo's own README and blog posts carry several large multiplier claims. Read individually, each is tied to a specific model, GPU generation, and mechanism &#8212; none is a general "Dynamo makes inference N&#215; faster" constant, and the manifest for this module is explicit that these should be read as vendor-reported.</p>
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 4.</b> Dynamo's headline performance claims, with the specific workload and hardware each is tied to. Data: project README<a class="cite" href="#ref-1">1</a> and the Dynamo 0.4 developer blog<a class="cite" href="#ref-9">9</a>.</caption>
+<thead><tr><th>Claim</th><th>Workload / hardware scope</th><th>Mechanism credited</th></tr></thead>
+<tbody>
+<tr><td class="row">7&#215; higher throughput per GPU</td><td>DeepSeek R1, GB200 NVL72<a class="cite" href="#ref-1">1</a></td><td>disaggregated serving + wide-EP, not attributed to one component alone</td></tr>
+<tr><td class="row">2&#215; faster TTFT</td><td>Qwen3-Coder 480B<a class="cite" href="#ref-1">1</a></td><td>KV-aware routing (&#167;2)</td></tr>
+<tr><td class="row">750&#215; higher throughput</td><td>DeepSeek-R1, GB300 NVL72<a class="cite" href="#ref-1">1</a></td><td>full-stack, hardware-generation-specific; not decomposed by component</td></tr>
+<tr><td class="row">7&#215; faster model startup</td><td>DeepSeek-V3, H200<a class="cite" href="#ref-1">1</a></td><td>ModelExpress weight streaming (&#167;5.1)</td></tr>
+<tr><td class="row">2.5&#215; higher throughput/GPU</td><td>DeepSeek-R1 671B, GB200 NVL72, TensorRT-LLM backend<a class="cite" href="#ref-9">9</a></td><td>full-stack, dated Aug. 2025 (Dynamo 0.4), superseded in scope by the newer 7&#215; claim above</td></tr>
+<tr><td class="row">Up to 4&#215; faster interactivity</td><td>gpt-oss-120b, B200, very long input sequences, TensorRT-LLM backend<a class="cite" href="#ref-9">9</a></td><td>full-stack; explicitly scoped to long-ISL workloads, not a general figure</td></tr>
+</tbody>
+</table>
+<p>Three things are worth noting about this table as a whole. First, the 7&#215;-per-GPU and 750&#215; figures are both tied to GB200/GB300 NVL72 and DeepSeek R1 specifically<a class="cite" href="#ref-1">1</a> &#8212; the same hardware and model class Module 6 grounded in DeepSeek's own published deployment, which is the correct reference point for sanity-checking these numbers, not a generic Llama-class deployment. Second, none of the entries in this table decomposes its multiplier into contributions from Router, Planner, and disaggregation separately &#8212; "7&#215; higher throughput per GPU" is a full-stack number, and this module cannot attribute what fraction of it comes from KV-aware routing versus disaggregated pools versus wide-EP placement, because NVIDIA's own sources do not publish that decomposition. Third, the 2.5&#215; and 4&#215; figures from the August 2025 Dynamo 0.4 announcement<a class="cite" href="#ref-9">9</a> predate the current v1.4.2 release by roughly a year and are smaller than the newer 7&#215; claim on similar hardware<a class="cite" href="#ref-1">1</a> &#8212; consistent with the stack having genuinely improved over that year, but also a reminder that any single headline number in this table has a shelf life measured in months, not years.</p>
+
+<h2 id="production-grade">9. Is Dynamo production-grade today?</h2>
+<p>Dynamo 1.0 reached general availability on March 16, 2026, at GTC<a class="cite" href="#ref-2">2</a>. NVIDIA's own production-readiness announcement states the year before that date was spent working "collaboratively with the open source ecosystem to harden Dynamo for production-grade performance and large-scale workloads"<a class="cite" href="#ref-15">15</a>, and frames the GA release around four additions: unified configuration, Kubernetes production readiness, multimodal serving, and an agents surface<a class="cite" href="#ref-15">15</a>. The adoption list accompanying the GA announcement is broad and spans several distinct categories rather than one or two logo-slide names: major cloud providers running it in managed Kubernetes (AWS, Microsoft Azure, Google Cloud, Oracle Cloud Infrastructure, Alibaba Cloud), GPU cloud partners (CoreWeave, Crusoe, DigitalOcean, Gcore, GMI Cloud, Lightning AI, Nebius, Nscale, Together AI, Vultr), AI-native companies (Cursor, Hebbia, Perplexity), inference-endpoint providers (Baseten, Deep Infra, Fireworks), and enterprises (AstraZeneca, BlackRock, ByteDance, Coupang, Instacart, Meituan, PayPal, Pinterest, Shopee, SoftBank Corp.)<a class="cite" href="#ref-2">2</a>. That breadth &#8212; hyperscalers, GPU clouds, and inference-specific vendors all named as running it &#8212; is a stronger production-readiness signal than a GA date alone, because it shows adoption at more than one layer of the serving stack, not just one hyperscaler badge-checking a launch.</p>
+<p>Set against that, two sources of counter-evidence in this module keep the assessment from being unqualified. The release cadence in &#167;8.1 shows Dynamo shipping a NIXL-loader-path bug fix in v1.4.2 &#8212; a patch release &#8212; the same week as v1.4.1's own bug fixes, roughly six months after the GA date<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-14">14</a>; a project six months past its 1.0 milestone is still finding and fixing loader-level bugs in its container images, which is normal for young infrastructure but is not the profile of a settled, slow-moving system. And Module 4 already noted that dynamic node joining and leaving &#8212; letting a prefill or decode pool grow or shrink without a full redeploy, beyond the RuntimeConfig registration path &#167;6 describes &#8212; is explicitly in progress, not GA, in the disaggregation stack generally; nothing in this module's Dynamo-specific sources states that capability has since reached GA status specifically inside Dynamo's own xPyD implementation.</p>
+<p>Put plainly: Dynamo is production-grade in the sense that matters most &#8212; it is GA, it has a real, diverse adoption list including major cloud providers running it in their own managed offerings, and its core mechanisms (Router, Planner, KVBM, disaggregation) are documented, versioned, and exercised by that adoption<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-15">15</a>. It is not production-grade in the sense of being a finished, slow-churn system: patch releases fixing functional bugs roughly weekly<a class="cite" href="#ref-14">14</a>, a router parameter already renamed and subdivided once (&#167;2.2), and specific capabilities (dynamic node joining) still marked in progress rather than complete, are all live as of this module's access date. Both statements are true simultaneously, and treating either one alone as the full picture would misread the evidence.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The disagreement in this module is not about whether Dynamo's mechanisms work &#8212; the adoption list in &#167;9 settles that they do, for a broad range of deployers. It is about whether an integrated, vendor-built full-stack orchestration platform is the right architectural bet for this layer of the serving stack at all, versus a modular set of Kubernetes-standard building blocks that any vendor's components can plug into. NVIDIA itself sits on both sides of this question, which is part of what makes it a genuine, unsettled disagreement rather than a marketing claim versus a critique.</p>
+<div class="positions">
+<article class="position">
+<h4>An integrated, purpose-built platform is the right bet</h4>
+<p class="who">Implicit in Dynamo's own design and its adoption evidence<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a></p>
+<p>Dynamo ships Router, Planner, KVBM, ModelExpress, and Grove as one versioned project, tested and released together, with each component already aware of the others &#8212; the Router's cost function already accounts for KVBM's tiered cache-hit weights (&#167;2.2), the Planner's replica decisions act through the same worker-registration path the disaggregation layer defines (&#167;6). A deployer adopting Dynamo gets a coherent system where the seams between routing, autoscaling, and KV tiering have already been designed to fit, rather than having to integrate five separately maintained open-source projects and resolve version-compatibility and interface mismatches themselves. The breadth of the GA adoption list &#8212; four major clouds and a dozen-plus GPU clouds and inference vendors<a class="cite" href="#ref-2">2</a> &#8212; is direct evidence this integration is worth paying for.</p>
+<ul class="pros"><li>One versioned system; components are designed to compose, not integrated after the fact.</li><li>Broad, diverse production adoption across cloud providers, GPU clouds, and inference vendors as of GA<a class="cite" href="#ref-2">2</a>.</li><li>NVIDIA-backed engineering investment funding rapid iteration (weekly-cadence patches, &#167;8.1).</li></ul>
+<ul class="cons"><li>Coupling to one project's release cadence and versioning; the router-parameter rename in &#167;2.2 shows internal APIs are not yet stable.</li><li>A single vendor's roadmap decides which backends and features get priority.</li></ul>
+</article>
+<article class="position">
+<h4>Kubernetes-standard modular building blocks are the more durable path</h4>
+<p class="who">The Gateway API Inference Extension's own design goal<a class="cite" href="#ref-16">16</a>, and NVIDIA's own stated intent to contribute Dynamo pieces into llm-d rather than only build its standalone stack<a class="cite" href="#ref-17">17</a></p>
+<p>The Gateway API Inference Extension (Module 2, &#167;5.2) standardizes the routing/scheduling contract at the Kubernetes API level &#8212; InferencePool, the Endpoint Picker protocol &#8212; so that any conformant implementation can plug in, and a deployer is not locked into one vendor's own runtime for that layer<a class="cite" href="#ref-16">16</a>. llm-d (Module 10) is one such implementation, built by a multi-vendor consortium rather than one company. The strongest evidence this position deserves real weight is not third-party skepticism, it is NVIDIA's own stated behavior: in a developer blog announcing collaboration with the llm-d community, NVIDIA committed to "bring the benefits of NVIDIA Dynamo Planner to the llm-d Variant Autoscaler component" and to "bring the benefits of the NVIDIA Dynamo KV Cache Manager to the llm-d KV Cache subsystem"<a class="cite" href="#ref-17">17</a> &#8212; contributing the ideas behind two of Dynamo's own named components into a separate, Kubernetes-standard project, rather than treating llm-d purely as a competitor to out-execute.</p>
+<ul class="pros"><li>No lock-in to one vendor's runtime for the routing/scheduling API surface; any conformant EPP implementation works.</li><li>Multi-vendor governance (Module 10: Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA) spreads maintenance burden and reduces single-vendor roadmap risk.</li></ul>
+<ul class="cons"><li>Modularity has an integration cost the deployer pays instead of the vendor &#8212; components from different projects have to be version-matched and interface-tested independently.</li><li>The 2025 collaboration announcement<a class="cite" href="#ref-17">17</a> is over a year old relative to this module's access date; this module found no equally recent, equally specific follow-up confirming how much of that integration actually shipped inside llm-d by v1.4.2's timeframe.</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>These are not mutually exclusive bets, and NVIDIA's own behavior &#8212; building Dynamo as an integrated platform while simultaneously contributing pieces of it into a Kubernetes-standard competitor &#8212; is the clearest evidence neither side has fully won the argument yet. The integrated-platform case is stronger for a deployer already committed to a single serving stack across their fleet, who values a router cost function that already knows about KVBM's tiers over one they would have to hand-tune themselves; the adoption list in &#167;9 shows this describes a large fraction of current production deployments. The modular-standard case is stronger for a deployer running a multi-vendor or multi-engine fleet, or one for whom avoiding dependency on a single company's release cadence outweighs the integration cost of assembling equivalent capability from separately governed projects. What would settle this more concretely is exactly the follow-up this module could not find: a dated status report on how much of Dynamo's Planner and KV Cache Manager logic has actually landed inside llm-d's own components, and a head-to-head benchmark of the two paths under identical traffic &#8212; neither exists in the sources available as of 2026-09-17.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/dynamo</em> (README). v1.4.2 container tags; v1.5.0-dev builds referenced, 2026. <a href="https://github.com/ai-dynamo/dynamo">https://github.com/ai-dynamo/dynamo</a>. Accessed 2026-09-17. <span class="ref-use">Used for: "orchestration layer above inference engines" framing, five named components (Router, Planner, KVBM, ModelExpress, Grove), backend list (vLLM, SGLang, TensorRT-LLM), headline benchmark claims (7x/GPU, 2x TTFT, 750x, 7x model startup), current version.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>NVIDIA. <em>NVIDIA Enters Production With Dynamo, the Broadly Adopted Inference Operating System for AI Factories</em>. NVIDIA Newsroom, 2026-03-16. <a href="https://nvidianews.nvidia.com/news/dynamo-1-0">https://nvidianews.nvidia.com/news/dynamo-1-0</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Dynamo 1.0 GA date, full production-adopter list across cloud providers, GPU clouds, AI-native companies, inference vendors, and enterprises.</span></li>
+<li id="ref-3"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/dynamo Releases</em>. v1.4.2 (2026-08-29), v1.5.0-dev builds in progress. <a href="https://github.com/ai-dynamo/dynamo/releases">https://github.com/ai-dynamo/dynamo/releases</a>. Accessed 2026-09-17. <span class="ref-use">Used for: v1.4.2 release date and NIXL loader-path fix, v1.5.0-dev build dates.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>NVIDIA. <em>KV-Aware Routing</em> (NVIDIA Dynamo Documentation). docs.nvidia.com/dynamo/dev/knowledge-base/concepts/system-architecture/kv-aware-routing, 2026. <a href="https://docs.nvidia.com/dynamo/dev/knowledge-base/concepts/system-architecture/kv-aware-routing">https://docs.nvidia.com/dynamo/dev/knowledge-base/concepts/system-architecture/kv-aware-routing</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Router's cost function (logit = kv_overlap_score_weight &#215; potential_prefill_blocks + potential_active_blocks), KvIndexer's global radix-tree/prefix-tree index built from worker-reported KV events, locally-tracked Active Decoding Blocks, "placement decision, not an unconditional affinity rule" framing.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>NVIDIA. <em>Router: Configuration and Tuning</em> (NVIDIA Dynamo Documentation). v1.2.1. <a href="https://docs.nvidia.com/dynamo/v1.2.1/components/router/configuration-and-tuning">https://docs.nvidia.com/dynamo/v1.2.1/components/router/configuration-and-tuning</a>. Accessed 2026-09-17. <span class="ref-use">Used for: deprecated kv_overlap_score_weight parameter, replacement router-kv-overlap-score-credit and router-prefill-load-scale parameters and defaults, host/disk cache-hit credit weights (0.75/0.25).</span></li>
+<li id="ref-6"><span class="ref-type">official</span>NVIDIA. <em>KVBM Architecture</em> (NVIDIA Dynamo Documentation). v-0-8-1. <a href="https://docs.nvidia.com/dynamo/v-0-8-1/components/kvbm/architecture">https://docs.nvidia.com/dynamo/v-0-8-1/components/kvbm/architecture</a>. Accessed 2026-09-17. <span class="ref-use">Used for: KVBM's three logical layers (engine connector translation layer, KVBM core, NIXL layer), NIXL's role providing P2P GPU transfer/RDMA/NVLink/dynamic block registration, PodGang/KAI Scheduler gang-scheduling cross-reference.</span></li>
+<li id="ref-7"><span class="ref-type">official</span>NVIDIA. <em>KVBM Design</em> (NVIDIA Dynamo Design Docs). v1.3.0. <a href="https://docs.nvidia.com/dynamo/v1.3.0/design-docs/component-design/kvbm-design">https://docs.nvidia.com/dynamo/v1.3.0/design-docs/component-design/kvbm-design</a>. Accessed 2026-09-17. <span class="ref-use">Used for: G1-G4 memory-tier definitions (Device Pool, Host Pool, Disk Pool, Remote Storage), five-state block lifecycle (Reset/Partial/Complete/Registered/Remove), RAII-based cleanup, sequence_hash deduplication lookup.</span></li>
+<li id="ref-8"><span class="ref-type">official</span>NVIDIA. <em>Planner Guide</em> (NVIDIA Dynamo Documentation). v1.2.1. <a href="https://docs.nvidia.com/dynamo/v1.2.1/components/planner/planner-guide">https://docs.nvidia.com/dynamo/v1.2.1/components/planner/planner-guide</a>. Accessed 2026-09-17. <span class="ref-use">Used for: four scaling modes and composition order, SLA-mode performance model (Rust engine shim, AIC estimates, FPM tuning/regression fallback, bootstrap sources), default SLA targets (TTFT 500ms, ITL 50ms), load_predictor options (constant/arima/kalman/prophet).</span></li>
+<li id="ref-9"><span class="ref-type">blog</span>NVIDIA. <em>NVIDIA Dynamo 0.4 Delivers 4x Faster Performance, SLO-Based Autoscaling, and Real-Time Observability</em>. NVIDIA Developer Blog, published 2025-08-13. <a href="https://developer.nvidia.com/blog/dynamo-0-4-delivers-4x-faster-performance-slo-based-autoscaling-and-real-time-observability">https://developer.nvidia.com/blog/dynamo-0-4-delivers-4x-faster-performance-slo-based-autoscaling-and-real-time-observability</a>. Accessed 2026-09-17. <span class="ref-use">Used for: ARIMA/Prophet traffic-prediction framing, Prometheus metric category list, 2.5x DeepSeek-R1/GB200 and 4x gpt-oss-120b/B200 benchmark figures.</span></li>
+<li id="ref-10"><span class="ref-type">blog</span>NVIDIA. <em>ModelExpress: Distributing Model Artifacts at the Speed of Light</em>. NVIDIA Developer Blog. <a href="https://developer.nvidia.com/blog/modelexpress-distributing-model-artifacts-at-the-speed-of-light">https://developer.nvidia.com/blog/modelexpress-distributing-model-artifacts-at-the-speed-of-light</a>. Accessed 2026-09-17. <span class="ref-use">Used for: ModelExpress's GPU-to-GPU P2P/NIXL transfer mechanism, bootstrap fallback path (Model Streamer, GDS), Model Cache Service single-download pattern, DeepSeek-V4-Pro 8xB200 startup example (8 min to 1 min 44 sec).</span></li>
+<li id="ref-11"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/grove</em> (README). <a href="https://github.com/ai-dynamo/grove">https://github.com/ai-dynamo/grove</a>. Accessed 2026-09-17. <span class="ref-use">Used for: PodClique/PodCliqueSet CRD definitions, PodGang gang-scheduling mechanism, NVLink-domain topology-aware placement, Dynamo/Grove division of labor.</span></li>
+<li id="ref-12"><span class="ref-type">official</span>NVIDIA. <em>Disaggregated Serving</em> (NVIDIA Dynamo Documentation). docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving. <a href="https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving">https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving</a>. Accessed 2026-09-17. <span class="ref-use">Used for: non-blocking VRAM-to-VRAM NIXL transfer, backend-specific sync/overlap behavior (SGLang bootstrap vs. vLLM/TensorRT-LLM synchronous), runtime-reconfigurable xPyD and RuntimeConfig registration, rejection of a universal token-threshold split point.</span></li>
+<li id="ref-13"><span class="ref-type">official</span>NVIDIA. <em>Metrics Catalog</em> (NVIDIA Dynamo Documentation, reference). docs.nvidia.com/dynamo/reference/observability/metrics-catalog. <a href="https://docs.nvidia.com/dynamo/reference/observability/metrics-catalog">https://docs.nvidia.com/dynamo/reference/observability/metrics-catalog</a>. Accessed 2026-09-17. <span class="ref-use">Used for: named dynamo_* Prometheus metrics grouped by category (request rate/duration, TTFT, ITL, ISL/OSL, queue/KV cache, errors/migration, routing overhead).</span></li>
+<li id="ref-14"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/dynamo Releases</em> (detailed changelog). v1.4.0, v1.4.1 (2026-08-22), v1.4.2 (2026-08-29), v1.5.0-dev builds (Sept. 2026). <a href="https://github.com/ai-dynamo/dynamo/releases">https://github.com/ai-dynamo/dynamo/releases</a>. Accessed 2026-09-17. <span class="ref-use">Used for: per-release changelog detail (classify/pooling endpoints, Router overload-recovery fix, NIXL loader-path fix, v1.5.0-dev model-specific containers).</span></li>
+<li id="ref-15"><span class="ref-type">blog</span>NVIDIA. <em>How NVIDIA Dynamo 1.0 Powers Multi-Node Inference at Production Scale</em>. NVIDIA Developer Blog. <a href="https://developer.nvidia.com/blog/nvidia-dynamo-1-production-ready/">https://developer.nvidia.com/blog/nvidia-dynamo-1-production-ready/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: "hardened Dynamo for production-grade performance" quote, the four GA additions (unified configuration, Kubernetes production readiness, multimodal serving, agents surface).</span></li>
+<li id="ref-16"><span class="ref-type">repo</span>Kubernetes SIG contributors. <em>kubernetes-sigs/gateway-api-inference-extension</em> (README). GA since v1.0.0, 2026. <a href="https://github.com/kubernetes-sigs/gateway-api-inference-extension">https://github.com/kubernetes-sigs/gateway-api-inference-extension</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Gateway API Inference Extension's design goal as a vendor-neutral, Kubernetes-standard routing/scheduling API any implementation can plug into.</span></li>
+<li id="ref-17"><span class="ref-type">blog</span>NVIDIA. <em>NVIDIA Dynamo Accelerates llm-d Community Initiatives for Advancing Large-Scale Distributed Inference</em>. NVIDIA Developer Blog, published 2025-05-21. <a href="https://developer.nvidia.com/blog/nvidia-dynamo-accelerates-llm-d-community-initiatives-for-advancing-large-scale-distributed-inference/">https://developer.nvidia.com/blog/nvidia-dynamo-accelerates-llm-d-community-initiatives-for-advancing-large-scale-distributed-inference/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NVIDIA's stated commitment to contribute Dynamo Planner and KV Cache Manager capabilities into llm-d's Variant Autoscaler and KV Cache subsystem.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefix Caching and Tiered KV Offload Across Nodes: Mooncake's Architecture · Multi-Node LLM Inference: From One Node to N</title>
+<meta name="description" content="The KVCache-centric view of a serving cluster: separated prefill/decode pools, Conductor's cache-aware scheduling algorithm, content-addressed block hashing, and the Transfer Engine's measured RoCE bandwidth, grounded in the Mooncake FAST'25 paper and its production repository.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Part 4: Multi-Node KV Cache Management · Module 7</p>
+<h1>Prefix Caching and Tiered KV Offload Across Nodes: Mooncake's Architecture</h1>
+<p class="lede">Every prior module in this course treated KV cache as something that lives inside one replica and gets routed around or transferred once, at the prefill/decode boundary. Mooncake treats it as a cluster-wide resource: paged blocks that are content-addressed, tiered across GPU HBM, host DRAM, local SSD, and remote nodes, scheduled by a component (Conductor) that is as central to the system as the model-parallel plan. This module works through that architecture &#8212; the four-step request workflow, the scheduling algorithm, the measured transfer bandwidth, and the production evidence &#8212; from the FAST'25 Best Paper and Mooncake's current open-source repository. After reading, you can explain why a serving cluster benefits from treating KV cache as a first-class, hash-addressed, tiered resource rather than private per-replica state, and reproduce the arithmetic behind Mooncake's own numbers.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>40 min</b> read</span>
+<span class="chip"><b>3</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 4</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 400" role="img" aria-labelledby="f1t"><title id="f1t">Mooncake's KVCache-centric disaggregated architecture: prefill pool, tiered KVCache pool, decode pool, and Conductor as global scheduler</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="20" width="150" height="360" rx="10" class="d-panel"/>
+<text x="95" y="42" text-anchor="middle" class="d-title d-bold">Conductor</text>
+<text x="95" y="60" text-anchor="middle" class="d-small d-text-light">global scheduler</text>
+<rect x="32" y="80" width="126" height="70" rx="6" class="d-block-muted"/>
+<text x="95" y="102" text-anchor="middle" class="d-small d-text-inv">Cache-aware</text>
+<text x="95" y="118" text-anchor="middle" class="d-small d-text-inv">prefill scheduler</text>
+<text x="95" y="138" text-anchor="middle" class="d-mono d-small d-text-inv">Algorithm 1</text>
+<rect x="32" y="165" width="126" height="60" rx="6" class="d-block-muted"/>
+<text x="95" y="188" text-anchor="middle" class="d-small d-text-inv">KVCache balance</text>
+<text x="95" y="204" text-anchor="middle" class="d-small d-text-inv">scheduler</text>
+<rect x="32" y="240" width="126" height="60" rx="6" class="d-block-muted"/>
+<text x="95" y="263" text-anchor="middle" class="d-small d-text-inv">Load-balance</text>
+<text x="95" y="279" text-anchor="middle" class="d-small d-text-inv">decoding scheduler</text>
+<text x="95" y="330" text-anchor="middle" class="d-small d-text-light">dispatches on current</text>
+<text x="95" y="346" text-anchor="middle" class="d-small d-text-light">KVCache distribution</text>
+<text x="95" y="362" text-anchor="middle" class="d-small d-text-light">+ instance load</text>
+<rect x="210" y="30" width="180" height="140" rx="8" class="d-block"/>
+<text x="300" y="55" text-anchor="middle" class="d-text-inv d-bold">Prefill pool</text>
+<text x="300" y="75" text-anchor="middle" class="d-small d-text-inv">GPU/VRAM</text>
+<text x="300" y="92" text-anchor="middle" class="d-small d-text-inv">paged KVCache</text>
+<text x="300" y="115" text-anchor="middle" class="d-small d-text-inv">goal: max cache reuse</text>
+<text x="300" y="131" text-anchor="middle" class="d-small d-text-inv">s.t. TTFT SLO, MFU floor</text>
+<text x="300" y="147" text-anchor="middle" class="d-small d-text-inv">KVCache &lt; DRAM</text>
+<rect x="210" y="230" width="180" height="140" rx="8" class="d-block-2"/>
+<text x="300" y="255" text-anchor="middle" class="d-text-inv d-bold">Decode pool</text>
+<text x="300" y="275" text-anchor="middle" class="d-small d-text-inv">GPU/VRAM</text>
+<text x="300" y="292" text-anchor="middle" class="d-small d-text-inv">paged KVCache</text>
+<text x="300" y="315" text-anchor="middle" class="d-small d-text-inv">goal: max throughput</text>
+<text x="300" y="331" text-anchor="middle" class="d-small d-text-inv">s.t. TBT SLO</text>
+<text x="300" y="347" text-anchor="middle" class="d-small d-text-inv">KVCache &lt; VRAM</text>
+<rect x="440" y="110" width="220" height="180" rx="10" class="d-surface"/>
+<text x="550" y="132" text-anchor="middle" class="d-bold">Distributed KVCache pool</text>
+<text x="550" y="150" text-anchor="middle" class="d-small d-text-light">CPU DRAM + local SSD</text>
+<rect x="460" y="165" width="180" height="34" rx="6" class="d-outline"/>
+<text x="550" y="186" text-anchor="middle" class="d-mono d-small">LRU / LFU / LengthAware</text>
+<text x="550" y="222" text-anchor="middle" class="d-small d-text-light">hash-addressed, 512-token</text>
+<text x="550" y="238" text-anchor="middle" class="d-small d-text-light">blocks, hash-of-hash chain</text>
+<text x="550" y="262" text-anchor="middle" class="d-mono d-small">store / read KVCache</text>
+<path d="M300,170 L300,230" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="315" y="205" class="d-small d-text-light">reuse /</text>
+<text x="315" y="219" class="d-small d-text-light">incremental</text>
+<path d="M390,150 L440,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M440,220 L390,250" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="690" y="150" width="95" height="100" rx="8" class="d-block-accent"/>
+<text x="737" y="180" text-anchor="middle" class="d-text-inv d-bold">Remote</text>
+<text x="737" y="196" text-anchor="middle" class="d-text-inv d-small">node's</text>
+<text x="737" y="212" text-anchor="middle" class="d-text-inv d-small">KVCache</text>
+<text x="737" y="228" text-anchor="middle" class="d-text-inv d-small">pool</text>
+<path d="M660,190 L690,190" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M690,210 L660,210" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="675" y="145" text-anchor="middle" class="d-mono d-small">Messenger</text>
+<text x="675" y="270" text-anchor="middle" class="d-mono d-small">RDMA, 87&#8211;190 GB/s</text>
+<text x="675" y="286" text-anchor="middle" class="d-small d-text-light">(&#167;9)</text>
+<path d="M170,100 L210,100" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M170,190 L210,190" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M170,190 Q195,270 210,300" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M170,270 L210,270" class="d-arrow" marker-end="url(#f1-arr)"/>
+</svg>
+<figcaption><b>Figure 1.</b> Mooncake's KVCache-centric disaggregated architecture: Conductor dispatches every request to a prefill instance and a decode instance based on the current KVCache distribution and instance load; the two pools never share GPU memory, only the tiered KVCache pool in between, moved by the RDMA-based Messenger component<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="kv-cache-as-scheduled-resource">1. KV cache as a scheduled resource, not private state</h2>
+<p>Mooncake is the serving platform for Kimi, Moonshot AI's LLM product, and the KVCache-centric architecture described in its FAST 2025 Best Paper is not a research prototype &#8212; it is the system that has run Kimi's production traffic since before the paper was written<a class="cite" href="#ref-1">1</a>. The paper's own framing of the problem is worth stating precisely, because it explains why Conductor (the global scheduler) is as architecturally central as the model-parallel plan: <q>the scheduling of KVCache is central to LLM serving scheduling. To improve overall throughput, there are typically two general approaches: 1) reuse KVCache as much as possible to reduce the required computation resources; and 2) maximize the number of tokens in each batch to improve the Model FLOPs Utilization (MFU)</q><a class="cite" href="#ref-1">1</a>. Those two goals pull in different directions &#8212; reusing a cache stored on a distant node prolongs time-to-first-token (TTFT), and a large batch increases time-between-tokens (TBT) &#8212; and the paper's stated conclusion is that "the utilization of both these throughput-oriented optimizations may lead to violations of latency-related SLOs" unless something schedules across them jointly<a class="cite" href="#ref-1">1</a>.</p>
+<p>Module 2 already covered one answer to the reuse question: route the request to whichever replica's <em>local</em> KV cache already has the matching prefix, using approximate block hashing or precise KVEvent streaming, and never move a byte of cache at all. That works when prefill and decode run on the same GPUs. Mooncake's starting point is different: prefill and decode are already separated onto physically distinct instances (Module 3 covers why that split pays off), which means the KV cache computed by a prefill instance is <em>never</em> local to the decode instance that needs it &#8212; routing alone cannot solve the problem, because there is no single replica that holds both the prefill history and the decode state. Something has to move the cache, and once you have a component that moves cache between nodes anyway, the natural next step is to make that movement general enough to also serve cross-request, cross-node prefix reuse, not just the mandatory prefill&#8594;decode handoff. That generalization is what makes the KVCache pool "distributed" rather than merely "a transfer channel."</p>
+<p>Figure 1 lays out the resulting architecture. A prefill instance's optimization goal is to maximize cache reuse subject to the TTFT SLO, a minimum MFU floor, and the constraint that its reserved KVCache footprint fit in host DRAM; a decode instance's goal is to maximize aggregate batch throughput subject to the TBT SLO and the constraint that the aggregated KVCache for its batch fit in GPU VRAM<a class="cite" href="#ref-1">1</a>. Table 1 makes that asymmetry explicit &#8212; it is the same prefill/decode split Module 3 derives from queueing theory, restated here as the two halves of one scheduling problem that Conductor has to solve jointly, because a decision that is locally optimal for one pool (route to the node with the longest matching prefix) can be globally wrong if that node is already overloaded.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Per-pool optimization objective and constraints in Mooncake's architecture<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Pool</th><th>Objective</th><th>Constraints</th></tr></thead>
+<tbody>
+<tr><td class="row">Prefill</td><td>Maximize KVCache reuse</td><td>TTFT SLO; minimum MFU; KVCache footprint &lt; host DRAM</td></tr>
+<tr><td class="row">Decode</td><td>Maximize throughput (batch size)</td><td>TBT SLO; aggregated KVCache &lt; GPU VRAM</td></tr>
+</tbody>
+</table>
+<p>The rest of this module works through how that joint problem is actually solved: the tiered pool the cache lives in (&#167;2), how blocks are addressed and deduplicated (&#167;3), the four-step workflow a request goes through (&#167;4), Conductor's scheduling algorithm (&#167;5), the multi-node prefill mechanism that keeps the prefill pool elastic under long context (&#167;6), what happens when the cluster is overloaded (&#167;7), the production trace evidence behind the paper's headline numbers (&#167;8), and the Transfer Engine that moves the bytes, plus the two newer repository components built on top of it (&#167;9).</p>
+
+<h2 id="offload-tier-hierarchy">2. The offload-tier hierarchy, concretely</h2>
+<p>Module 1 named the generic tiering hierarchy &#8212; GPU HBM, host DRAM, local SSD, remote storage &#8212; and deferred the actual bandwidth numbers to this module<a class="cite" href="#ref-1">1</a>. Mooncake's own architecture is worth reading precisely here, because it does not draw four cleanly separated tiers with four distinct bandwidth figures; it draws two. Figure 1 of the paper labels the per-instance layer "GPU/VRAM" (the paged KVCache actively participating in a forward pass) and everything below it "CPU/DRAM/SSD" as one box: the "Distributed KVCache Pool"<a class="cite" href="#ref-1">1</a>. Inside that pool, blocks are cached as paged blocks in CPU memory and evicted under one of three interchangeable policies &#8212; LRU, LFU, or a length-aware variant that behaves like LFU but favors blocks occurring later in a request<a class="cite" href="#ref-1">1</a> &#8212; with SSD serving as the overflow tier for whatever does not fit in DRAM. The paper does not separately benchmark DRAM-tier versus SSD-tier bandwidth; both fall inside the same "underutilized CPU, DRAM, and SSD resources of the GPU cluster" that the disaggregated cache harvests<a class="cite" href="#ref-1">1</a>. That is a deliberate architectural choice, not a gap in the paper: from Conductor's point of view, the pool is one logical store with one eviction policy, and the tier boundary inside it (DRAM-resident vs. SSD-resident) is an implementation detail of the storage backend, not something the scheduling algorithm reasons about directly.</p>
+<p>The one tier boundary Mooncake <em>does</em> measure precisely, because it is the one that crosses a physical machine, is the jump from a node's own KVCache pool to another node's &#8212; the "Inter-node KVCache Transfer" arrow in Figure 1<a class="cite" href="#ref-1">1</a>. That transfer is handled by Messenger, a separate GPUDirect-RDMA-based component deployed on every node, running as its own process within each inference instance<a class="cite" href="#ref-1">1</a>. The repository's own benchmark of that hop, run with 40 GB of data (the size of a 128k-token KVCache on a LLaMA3-70B-class model), reports up to 87 GB/s of achieved bandwidth on a 4&#215;200 Gbps RoCE network and up to 190 GB/s on an 8&#215;400 Gbps RoCE network<a class="cite" href="#ref-2">2</a> &#8212; the numbers this module's title promises, and the subject of &#167;9's full treatment. The paper's own testbed used RDMA NICs supporting "up to 800 Gbps of interconnect bandwidth" per node<a class="cite" href="#ref-1">1</a>, roughly 100 GB/s, consistent with the 4-rail figure.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Tiering hierarchy: GPU VRAM paged KVCache, the blended CPU DRAM plus local SSD distributed KVCache pool, and cross-node RDMA transfer</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="30" width="170" height="90" rx="8" class="d-block"/>
+<text x="105" y="60" text-anchor="middle" class="d-text-inv d-bold">GPU HBM/VRAM</text>
+<text x="105" y="78" text-anchor="middle" class="d-small d-text-inv">per-instance paged</text>
+<text x="105" y="94" text-anchor="middle" class="d-small d-text-inv">KVCache, active batch</text>
+<text x="105" y="140" text-anchor="middle" class="d-small d-text-light">fastest, smallest</text>
+<path d="M190,75 L240,75" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="245" y="20" width="220" height="150" rx="8" class="d-panel"/>
+<text x="355" y="45" text-anchor="middle" class="d-bold">Distributed KVCache pool</text>
+<text x="355" y="65" text-anchor="middle" class="d-small d-text-light">CPU DRAM + local SSD</text>
+<text x="355" y="65" text-anchor="middle" class="d-small d-text-light" opacity="0"> </text>
+<rect x="260" y="80" width="190" height="36" rx="6" class="d-outline"/>
+<text x="355" y="102" text-anchor="middle" class="d-mono d-small">LRU / LFU / LengthAware</text>
+<text x="355" y="132" text-anchor="middle" class="d-small d-text-light">one blended pool &#8212; Mooncake</text>
+<text x="355" y="148" text-anchor="middle" class="d-small d-text-light">does not split DRAM/SSD bandwidth</text>
+<path d="M465,95 L515,95" class="d-arrow" marker-end="url(#f2-arr)"/>
+<text x="490" y="80" text-anchor="middle" class="d-mono d-small">Messenger</text>
+<rect x="520" y="30" width="260" height="140" rx="8" class="d-block-accent"/>
+<text x="650" y="58" text-anchor="middle" class="d-text-inv d-bold">Remote node's KVCache pool</text>
+<text x="650" y="80" text-anchor="middle" class="d-text-inv d-mono">87 GB/s</text>
+<text x="650" y="98" text-anchor="middle" class="d-text-inv d-small">4&#215;200 Gbps RoCE</text>
+<text x="650" y="122" text-anchor="middle" class="d-text-inv d-mono">190 GB/s</text>
+<text x="650" y="140" text-anchor="middle" class="d-text-inv d-small">8&#215;400 Gbps RoCE</text>
+<text x="650" y="160" text-anchor="middle" class="d-small d-text-light">largest, slowest (measured)</text>
+</svg>
+</figure>
+<figcaption><b>Figure 2.</b> Mooncake's own architecture draws two boundaries, not four: the per-instance GPU/VRAM tier, a blended CPU-DRAM-plus-SSD "distributed KVCache pool" tier with one shared eviction policy, and cross-node RDMA transfer between pools &#8212; measured at 87 GB/s (4&#215;200 Gbps RoCE) and 190 GB/s (8&#215;400 Gbps RoCE) on a 40 GB payload<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>Module 1's generic four-tier framing (HBM / host DRAM / local SSD / remote) is the right mental model for the cost-capacity trade-off in the abstract. Mooncake's concrete implementation collapses the middle two tiers into one storage engine with one eviction policy, because from the scheduler's perspective what matters is whether a block is local (GPU-resident) or requires a fetch (pool-resident, regardless of whether that fetch hits DRAM or SSD underneath) &#8212; and whether that fetch crosses a node boundary, which is the one hop the paper and repository both benchmark directly.</p></aside>
+
+<h2 id="content-addressed-blocks">3. Content-addressed KVCache blocks</h2>
+<p>Inside the pool, KVCache is stored as paged blocks of 512 tokens each, and every block carries a hash value determined by both its own content and its prefix<a class="cite" href="#ref-1">1</a>. Concretely, for a prompt split into consecutive token blocks a, b, c, &#8230;, the hash of the first block is <code>A = Hash(a)</code>, and every subsequent block's hash folds in the previous block's hash: <code>B = Hash(A+b)</code>, <code>C = Hash(B+c)</code>, and so on<a class="cite" href="#ref-1">1</a>. A request's block-hash chain is then compared, one hash at a time, against a prefill instance's cached keys to find the longest matching prefix; the paper calls this quantity <code>prefix_len</code><a class="cite" href="#ref-1">1</a>.</p>
+<p>The hash-of-hash chaining is the mechanism that makes this a genuinely different structure from the single-engine radix tree Aman already knows from vLLM/SGLang prefix caching: it is not that Mooncake's hashing is more sophisticated, it is that the hash itself is the cross-node addressing key. A local radix tree only needs to answer "does this node have this prefix," because the tree and the KV blocks it points to live in the same process. Mooncake's hash has to be globally comparable across every prefill instance and the shared pool, so that Conductor can ask "which instance, if any, anywhere in the cluster, has the longest matching prefix for this exact hash chain" before a single token of the request has been assigned anywhere<a class="cite" href="#ref-1">1</a>. The open-source request trace released with the paper stores exactly these values &#8212; each record's <code>hash_ids</code> field is the list of block hashes (block size 512) covering the request's input, remapped to globally unique integers for privacy<a class="cite" href="#ref-1">1</a>. Two records sharing the same leading hash IDs are provably sharing the same KVCache for that many blocks; the paper's own example shows two trace entries sharing their first 12 hash IDs, meaning they can share prefix caching for the first 12 &#215; 512 = 6,144 tokens<a class="cite" href="#ref-1">1</a>.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">Content-addressed block hashing: token blocks a through i, hash-of-hash prefix chain, and prefix/incremental/unallocated block classification against a prefill instance's cache</title>
+<rect x="40" y="20" width="720" height="44" rx="6" class="d-outline"/>
+<g class="d-mono d-small">
+<text x="80" y="46" text-anchor="middle">a</text><text x="160" y="46" text-anchor="middle">b</text><text x="240" y="46" text-anchor="middle">c</text><text x="320" y="46" text-anchor="middle">d</text><text x="400" y="46" text-anchor="middle">e</text><text x="480" y="46" text-anchor="middle">f</text><text x="560" y="46" text-anchor="middle">g</text><text x="640" y="46" text-anchor="middle">h</text><text x="720" y="46" text-anchor="middle">i</text>
+</g>
+<line x1="120" y1="20" x2="120" y2="64" class="d-outline"/>
+<line x1="200" y1="20" x2="200" y2="64" class="d-outline"/>
+<line x1="280" y1="20" x2="280" y2="64" class="d-outline"/>
+<line x1="360" y1="20" x2="360" y2="64" class="d-outline"/>
+<line x1="440" y1="20" x2="440" y2="64" class="d-outline"/>
+<line x1="520" y1="20" x2="520" y2="64" class="d-outline"/>
+<line x1="600" y1="20" x2="600" y2="64" class="d-outline"/>
+<line x1="680" y1="20" x2="680" y2="64" class="d-outline"/>
+<text x="400" y="14" text-anchor="middle" class="d-small d-text-light">token blocks, 512 tokens each</text>
+<g class="d-mono d-small d-text-light" text-anchor="middle">
+<text x="80" y="86">A=Hash(a)</text><text x="160" y="86">B=Hash(A+b)</text><text x="240" y="86">C=Hash(B+c)</text><text x="320" y="86">D=Hash(C+d)</text><text x="400" y="86">E=Hash(D+e)</text><text x="480" y="86">F=Hash(E+f)</text>
+</g>
+<g class="d-small" text-anchor="middle" fill="none">
+<text x="80" y="106" class="d-fill-green">match</text><text x="160" y="106" class="d-fill-green">match</text><text x="240" y="106" class="d-fill-green">match</text><text x="320" y="106" class="d-fill-green">match</text><text x="400" y="106" class="d-fill-green">match</text><text x="480" y="106" class="d-fill-red">mismatch</text>
+</g>
+<rect x="40" y="130" width="720" height="120" rx="8" class="d-panel"/>
+<text x="70" y="150" class="d-small d-bold">Prefill instance cache:</text>
+<rect x="60" y="160" width="80" height="34" rx="4" class="d-fill-amber-soft d-stroke-amber"/><text x="100" y="182" text-anchor="middle" class="d-mono d-small">A</text>
+<rect x="145" y="160" width="80" height="34" rx="4" class="d-fill-amber-soft d-stroke-amber"/><text x="185" y="182" text-anchor="middle" class="d-mono d-small">B</text>
+<rect x="230" y="160" width="80" height="34" rx="4" class="d-fill-amber-soft d-stroke-amber"/><text x="270" y="182" text-anchor="middle" class="d-mono d-small">C</text>
+<rect x="315" y="160" width="80" height="34" rx="4" class="d-fill-amber-soft d-stroke-amber"/><text x="355" y="182" text-anchor="middle" class="d-mono d-small">D</text>
+<rect x="400" y="160" width="80" height="34" rx="4" class="d-fill-amber-soft d-stroke-amber"/><text x="440" y="182" text-anchor="middle" class="d-mono d-small">E</text>
+<rect x="485" y="160" width="80" height="34" rx="4" class="d-fill-red-soft d-stroke-red"/><text x="525" y="182" text-anchor="middle" class="d-mono d-small">F</text>
+<rect x="570" y="160" width="80" height="34" rx="4" class="d-fill-red-soft d-stroke-red"/><text x="610" y="182" text-anchor="middle" class="d-mono d-small">G</text>
+<rect x="655" y="160" width="80" height="34" rx="4" class="d-outline d-dashed"/><text x="695" y="182" text-anchor="middle" class="d-mono d-small">H</text>
+<text x="70" y="222" class="d-small"><tspan class="d-fill-amber">&#9632;</tspan> prefix cache blocks (matched, reused)</text>
+<text x="70" y="240" class="d-small"><tspan class="d-fill-red">&#9632;</tspan> incremental cache blocks (newly computed, stored) &#160;&#160;&#160;&#9633; unallocated</text>
+</svg>
+</figure>
+<figcaption><b>Figure 3.</b> A request's token blocks (a&#8211;i) are hashed into a chain; blocks a&#8211;e match an existing prefill instance's cache and are reused as-is, block f is where the chain first diverges, and f onward becomes newly computed "incremental" cache stored back into the pool under its own new hash<a class="cite" href="#ref-1">1</a>.</figcaption>
+
+<h2 id="four-step-workflow">4. The four-step per-request workflow</h2>
+<p>Once tokenizing is finished, Conductor selects a prefill instance (or instance group) and a decode instance and starts a workflow with four steps<a class="cite" href="#ref-1">1</a>.</p>
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 220" role="img" aria-label="Four-step Mooncake request workflow: KVCache reuse, incremental prefill, KVCache transfer, decoding">
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<g data-step="1">
+<rect x="20" y="60" width="170" height="90" rx="8" class="d-block"/>
+<text x="105" y="90" text-anchor="middle" class="d-text-inv d-bold">1. KVCache reuse</text>
+<text x="105" y="112" text-anchor="middle" class="d-small d-text-inv">load matched prefix</text>
+<text x="105" y="128" text-anchor="middle" class="d-small d-text-inv">from remote CPU mem</text>
+<text x="105" y="144" text-anchor="middle" class="d-small d-text-inv">into prefill GPU</text>
+</g>
+<path d="M190,105 L230,105" class="d-arrow" marker-end="url(#f4-arr)"/>
+<g data-step="2">
+<rect x="235" y="60" width="170" height="90" rx="8" class="d-block"/>
+<text x="320" y="90" text-anchor="middle" class="d-text-inv d-bold">2. Incremental prefill</text>
+<text x="320" y="112" text-anchor="middle" class="d-small d-text-inv">compute uncached tail;</text>
+<text x="320" y="128" text-anchor="middle" class="d-small d-text-inv">chunk if &gt; prefill_chunk</text>
+<text x="320" y="144" text-anchor="middle" class="d-small d-text-inv">(typically &gt;1000 tok)</text>
+</g>
+<path d="M405,105 L445,105" class="d-arrow" marker-end="url(#f4-arr)"/>
+<g data-step="3">
+<rect x="450" y="60" width="170" height="90" rx="8" class="d-block-2"/>
+<text x="535" y="90" text-anchor="middle" class="d-text-inv d-bold">3. KVCache transfer</text>
+<text x="535" y="112" text-anchor="middle" class="d-small d-text-inv">Messenger streams new</text>
+<text x="535" y="128" text-anchor="middle" class="d-small d-text-inv">KV layer-by-layer to</text>
+<text x="535" y="144" text-anchor="middle" class="d-small d-text-inv">decode node's CPU DRAM</text>
+</g>
+<path d="M620,105 L660,105" class="d-arrow" marker-end="url(#f4-arr)"/>
+<g data-step="4">
+<rect x="665" y="60" width="115" height="90" rx="8" class="d-block-accent"/>
+<text x="722" y="90" text-anchor="middle" class="d-text-inv d-bold">4. Decoding</text>
+<text x="722" y="112" text-anchor="middle" class="d-small d-text-inv">async load into</text>
+<text x="722" y="128" text-anchor="middle" class="d-small d-text-inv">VRAM, join</text>
+<text x="722" y="144" text-anchor="middle" class="d-small d-text-inv">continuous batch</text>
+</g>
+<g data-step="3">
+<text x="535" y="180" text-anchor="middle" class="d-small d-text-light">overlapped with step 2, not sequential after it</text>
+</g>
+</svg>
+</figure>
+<ol class="steps">
+<li><b>KVCache reuse.</b> The prefill node receives the raw input, the block IDs of the prefix cache it can reuse, and the block IDs allocated for the full request; it loads the prefix cache from remote CPU memory into GPU memory based on those block IDs, skipped entirely if no prefix cache exists<a class="cite" href="#ref-1">1</a>. This selection already balances three objectives &#8212; reusing as much KVCache as possible, balancing load across prefill instances, and meeting the TTFT SLO &#8212; which &#167;5's scheduling algorithm formalizes.</li>
+<li><b>Incremental prefill.</b> The prefill node completes the prefill stage using the reused prefix and stores the newly generated incremental KVCache back into CPU memory. If the number of uncached input tokens exceeds <code>prefill_chunk</code> &#8212; a threshold "typically larger than 1000 tokens," chosen to fully utilize the prefill GPU's computational power &#8212; the stage is split into chunks executed in a pipelined manner across the prefill node group, the mechanism &#167;6 covers in full<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>KVCache transfer.</b> Messenger, deployed as its own process on every node, transfers the cache to the destination decoding node's CPU memory. This step is asynchronous and overlapped with step 2: as each transformer layer's incremental KVCache finishes computing, its store-and-transfer is launched immediately rather than waiting for the whole prefill pass to complete, which is what keeps a long-context request's transfer time from simply adding on top of its compute time<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>Decoding.</b> Once all KVCache has arrived in the decode node's CPU DRAM, the request joins the next continuous-batching iteration. Conductor pre-selects the decode instance based on its current load to avoid violating the TBT SLO, but the local scheduler on that instance double-checks the SLO at admission time, because the anticipated load may have shifted during the prefill stage &#8212; and this double-check can itself reject the request, wasting the prefill compute already spent<a class="cite" href="#ref-1">1</a>. &#167;7 covers how Mooncake tries to avoid paying that cost.</li>
+</ol>
+</div>
+<p>The asynchronous overlap in step 3 is implemented with launch-and-wait semantics: before a layer's attention computation begins, the model waits only for that layer's own asynchronous KVCache load to complete and immediately triggers the next layer's load; after a layer's attention finishes, its KVCache store is launched asynchronously without blocking forward progress, and the prefill instance only waits for all outstanding stores to finish once every layer's computation is done<a class="cite" href="#ref-1">1</a>. Measured against a serialized baseline (compute the full prefill, then store all KVCache), this layer-wise overlap cuts the added latency from storing KVCache dramatically at every tested context length from 8k to 128k tokens &#8212; the paper's own bar chart shows the layer-wise bars pinned near zero added latency across the whole range, while the serialized bars grow from roughly 0.1 s at 8k tokens to nearly 0.9 s at 128k<a class="cite" href="#ref-1">1</a>. The practical consequence the paper draws from this is one worth keeping: because the overlap makes the prefill instance's execution time roughly equal to either the KVCache loading/storing time or the standard prefill time (whichever dominates), Conductor's prefill scheduling can disregard available VRAM headroom entirely and consider only KVCache distribution and available DRAM capacity<a class="cite" href="#ref-1">1</a> &#8212; VRAM pressure, the thing that usually dominates single-engine KV-cache scheduling, stops being the prefill pool's binding constraint.</p>
+
+<h2 id="conductor-scheduling">5. Conductor: the KVCache-centric scheduling algorithm</h2>
+<p>Previous work on LLM-serving schedulers typically load-balances on the number of assigned requests alone. Mooncake's paper is explicit that this is insufficient once KVCache reuse is on the table: the selection of a prefill instance has to weigh "not just load but also the prefix cache hit length and the distribution of reusable KVCache blocks," because there is a real tension between routing to the instance with the longest prefix match (cheapest to compute, but possibly already overloaded) and routing to a different, lightly loaded instance (more balanced, but forces more incremental prefill)<a class="cite" href="#ref-1">1</a>. Algorithm 1 in the paper is Conductor's answer, and it is precise enough to reproduce.</p>
+<pre class="code" data-lang="plaintext" data-title="Algorithm 1 &#8212; KVCache-centric Scheduling (paraphrased from Qin et al., FAST 2025)"><code>Input:  prefill pool P, decoding pool D, request R, cache block size B
+Output: the (prefill, decode) instance pair (p, d) for R
+
+block_keys &lt;- PrefixHash(R.prompt_tokens, B)
+TTFT &lt;- infinity
+p &lt;- None
+best_prefix_len, best_matched_instance &lt;- FindBestPrefixMatch(P, block_keys)
+
+for instance in P:
+    prefix_len &lt;- instance.prefix_len
+    T_queue &lt;- EstimatePrefillQueueTime(instance)
+
+    if best_prefix_len / prefix_len &lt; kvcache_balancing_threshold:
+        # cache-aware prefill scheduling: this instance's own match is
+        # close enough to the cluster-wide best -- do not pay a transfer
+        T_prefill &lt;- EstimatePrefillExecutionTime(len(R.prompt_tokens), prefix_len)
+        if TTFT &gt; T_queue + T_prefill:
+            TTFT &lt;- T_queue + T_prefill
+            p &lt;- instance
+    else:
+        # cache-aware AND balancing: pull the remote best-match cache here
+        transfer_len &lt;- best_prefix_len - prefix_len
+        T_transfer &lt;- EstimateKVCacheTransferTime(instance, best_matched_instance, transfer_len)
+        T_prefill &lt;- EstimatePrefillExecutionTime(len(R.prompt_tokens), best_prefix_len)
+        if TTFT &gt; T_transfer + T_queue + T_prefill:
+            TTFT &lt;- T_transfer + T_queue + T_prefill
+            p &lt;- instance
+
+d, TBT &lt;- SelectDecodingInstance(D)          # load-balancing decoding scheduling
+if TTFT &gt; TTFT_SLO or TBT &gt; TBT_SLO:
+    reject R; return
+
+if best_prefix_len / p.prefix_len &gt; kvcache_balancing_threshold:
+    TransferKVCache(best_matched_instance, p)  # KVCache hot-spot migration
+
+return (p, d)
+</code></pre>
+<p>Three mechanisms are worth pulling out of that loop. First, the block-hash matching itself (<code>PrefixHash</code>, <code>FindBestPrefixMatch</code>) is the same content-addressed chain from &#167;3, compared one block at a time against every prefill instance's cache keys; the paper notes plainly that "similar reuse logic is already implemented in vLLM, but the open-source version of vLLM only supports local KVCache caching"<a class="cite" href="#ref-1">1</a> &#8212; Conductor's contribution is running that same match cluster-wide rather than per-process. Second, TTFT for a candidate instance is not just execution time; it adds the instance's current queueing time, computed by summing the estimated prefill time of every request already queued ahead of it, so a request never gets routed to an instance with the best cache match if that instance is backed up enough to blow the TTFT SLO anyway<a class="cite" href="#ref-1">1</a>. Third, execution-time prediction itself is a learned model: prefill duration is estimated from offline test data as a function of request length and prefix-hit length, and because transformer compute follows a regular pattern, this predictor's error bound stays small given enough offline data &#8212; transfer-time prediction is harder, the paper says, because it depends not just on payload size but on whether the sending node's network path is currently congested<a class="cite" href="#ref-1">1</a>.</p>
+<p>The <code>kvcache_balancing_threshold</code> comparison is the load-vs-locality trade-off made explicit as a single tunable ratio: if the best available prefix match anywhere in the cluster is not meaningfully longer than what a candidate instance already has locally (the ratio stays under threshold), Conductor keeps the request local and skips the transfer; only once the gap becomes large enough does it pay to pull the remote cache across the network<a class="cite" href="#ref-1">1</a>. The same idea appears twice more, once for the decoding side (a separate load-balancing scheduler simply picks the least-loaded decode instance rather than doing any cache matching, because decode's KVCache is already resident wherever the prefill handoff landed it<a class="cite" href="#ref-1">1</a>) and once as a standing background process: <b>cache load balancing and hot-spot migration</b>.</p>
+<h3 id="hot-spot-migration">5.1 Cache load balancing and hot-spot migration</h3>
+<p>Cache popularity in a real MaaS deployment is heavily skewed &#8212; a system prompt is hit by nearly every request, while a cache built from one user's long document may be read once<a class="cite" href="#ref-1">1</a>. A request may not always get routed to the instance with the single longest prefix match, because that instance may already be overloaded; in that case Conductor forwards both the cache's location and the request to an alternative instance, which proactively retrieves and locally stores the remote KVCache, <em>if</em> the estimated additional prefill time this saves is shorter than the transfer time it costs<a class="cite" href="#ref-1">1</a> &#8212; exactly the <code>TransferKVCache</code> call at the bottom of Algorithm 1. The paper considered and rejected a straw-man alternative: collecting global per-block usage statistics and forecasting future demand with a prediction model. Because a MaaS provider's workload is highly dynamic and its user base grows quickly, accurately predicting per-block future usage was judged infeasible; Mooncake instead uses a heuristic-based automated hot-spot migration scheme that replicates hot blocks without requiring precise future-usage predictions<a class="cite" href="#ref-1">1</a>. Both effects &#8212; forwarding a request to a lightly loaded instance below a size-based transfer threshold, and hot-spot replication as a side effect of that forwarding &#8212; reduce prefill time for requests while automatically spreading hot caches across more machines<a class="cite" href="#ref-1">1</a>. In a controlled 8-prefill/8-decode-instance experiment replaying 23,000 real requests, Conductor's combined cache-aware-plus-balancing strategy produced a lower and tighter TTFT distribution than either cache-aware scheduling alone, load-balancing scheduling alone, or random assignment<a class="cite" href="#ref-1">1</a>.</p>
+
+<h2 id="multi-node-prefill">6. Multi-node prefill: why the prefill pool needs its own parallelism</h2>
+<p>Section &#167;5 of the paper opens by asking, directly, whether Mooncake's separate prefill pool is still necessary given chunked prefill &#8212; the same question Module 3 covers in depth from the interference-and-goodput angle. Restated narrowly here: <q>the necessity and best practices for designing a separate and elastic prefill pool remain under debate&#8230; it is worth discussing whether this separation is still necessary with the introduction of chunked prefill</q><a class="cite" href="#ref-1">1</a>. The paper's answer is to keep the disaggregated architecture, for two reasons, and this section is the concrete mechanism behind the first of them: prefill nodes require different cross-node parallelism settings to handle long contexts, a need that has nothing to do with interference and everything to do with how a single long-context prefill gets enough GPUs to hit its TTFT SLO<a class="cite" href="#ref-1">1</a>. (The second reason, VRAM savings, is the direct consequence of the four-step workflow in &#167;4: because a prefill instance never needs to hold a completed request's KVCache once it has been transferred out, its VRAM budget is decoupled from decode's.)</p>
+<p>Context lengths for recent models run from 8k up to 128k and beyond, and for such requests input tokens routinely outnumber output tokens by 10&#8211;100&#215;, which makes optimizing TTFT &#8212; not TBT &#8212; the dominant concern for long-context prefill<a class="cite" href="#ref-1">1</a>. Using more than one 8-GPU node to prefill such a request in parallel is desirable, but the paper rules out two standard options for different reasons. Extending tensor parallelism (TP) across more than one node requires two RDMA-based all-reduce operations per layer, which significantly reduces prefill MFU<a class="cite" href="#ref-1">1</a> &#8212; the cross-node TP tax Module 1 already established structurally (a TP all-reduce crossing the NVLink-to-RDMA boundary pays the bandwidth cliff on every layer, not once per request). Sequence parallelism (SP, e.g. Ring Attention or Striped Attention) partitions the input sequence itself across nodes and needs cross-node communication only once per layer rather than an all-reduce, which cuts network consumption and improves MFU relative to cross-node TP &#8212; but SP still yields worse MFU than single-node TP, and a deployment that tries to run every prefill node in one SP group forces a static parallelism choice that leaves the cluster underutilized whenever request lengths don't need it<a class="cite" href="#ref-1">1</a>. Dynamically resizing the SP group per request (elastic SP) is possible in principle but, the paper notes, requires establishing a global communication group in advance and complicates Conductor's design when cache-reuse utilization and SLO violations also have to factor into that same resizing decision<a class="cite" href="#ref-1">1</a> &#8212; in short, elastic SP trades a scheduling problem Conductor already solves (&#167;5) for a much harder one that couples parallelism topology to cache placement.</p>
+<p>Mooncake's actual choice is <b>chunked pipeline parallelism (CPP)</b>: group every X nodes in the prefill cluster into a pipelined node group, partition a request's input tokens into chunks no longer than <code>prefill_chunk</code> (&#167;4), and process different chunks of the same request simultaneously on different nodes in a pipeline<a class="cite" href="#ref-1">1</a>. This is standard pipeline parallelism applied to a single request's prefill rather than to a training batch, and it offers two benefits the paper is explicit about: cross-node communication is needed only at pipeline-stage boundaries, which overlaps easily with computation and contends far less with the concurrent KVCache transfer traffic (&#167;9) than SP's per-layer communication does; and CPP fits both short and long contexts without the static-partitioning overhead SP's node grouping requires, because a short request that never exceeds one <code>prefill_chunk</code> simply never engages the pipeline<a class="cite" href="#ref-1">1</a>. The paper flags this as, to its knowledge, the first application of pipeline-based prefill acceleration to the inference stage &#8212; the technique itself is borrowed from training systems, where it has been explored before, but long-context inference prefill has only recently emerged as a workload large enough to benefit from it<a class="cite" href="#ref-1">1</a>.</p>
+<p>Combined with the layer-wise streaming from &#167;4 &#8212; which lets a prefill instance's KVCache store-and-transfer run fully overlapped with its own compute &#8212; CPP is what makes "prefill nodes require different cross-node parallelism settings" a structural argument rather than a preference: a decode instance never needs more than one node's worth of parallelism for the model itself (Module 5's wide-EP and Module 3's placement discussions aside), but a prefill instance serving a 128k-token request benefits from spreading that one request's compute across several nodes in a way decode never does. That asymmetry is exactly what a colocated, non-disaggregated engine cannot express: it has one parallelism plan for the whole model, applied uniformly to both phases.</p>
+
+<h2 id="overload-scheduling">7. Overload-oriented scheduling: early rejection</h2>
+<p>Most academic work on LLM serving scheduling assumes every request eventually gets processed and optimizes throughput or latency accordingly. Mooncake's paper explicitly rejects that assumption for a production MaaS provider: cluster capacity grows far more slowly than request volume during rapid user growth, so overload during peak times is routine, and the real question is not "how fast can we serve" but "which requests do we accept at all"<a class="cite" href="#ref-1">1</a>. The paper's stated objective is to maximize overall throughput while meeting SLOs, with one deliberate restriction on what counts: only requests that <em>fully complete</em> execution count toward that throughput measure. A request rejected midway still consumed real prefill compute, and that compute is treated as wasted, not partially credited<a class="cite" href="#ref-1">1</a>. That framing has a direct consequence: since elastically scaling the cluster is typically infeasible on short notice, a request should be rejected as early as possible if it cannot finish under the SLO &#8212; late rejection is strictly worse than early rejection, because it wastes more sunk compute<a class="cite" href="#ref-1">1</a>.</p>
+<p>Because Mooncake's prefill and decode stages run on physically separate instances, their load can be measured directly rather than inferred through the interference a colocated engine would introduce &#8212; system load is defined as SLO satisfaction itself, using the predicted maximum TTFT and TBT for an instance against the SLO thresholds \(l_{ttft}\) and \(l_{tbt}\)<a class="cite" href="#ref-1">1</a>. The naive policy &#8212; reject a request only once both stages have already been attempted and the decode instance's load is found to be too high &#8212; wastes the prefill compute already spent, because there is a time lag between when prefill starts and when the decode-side load is actually assessed<a class="cite" href="#ref-1">1</a>. <b>Early Rejection</b> moves that assessment forward: on arrival, Conductor evaluates whether to accept a request based on the <em>greater</em> of the prefill and decode pools' current load, before committing any prefill compute<a class="cite" href="#ref-1">1</a>.</p>
+<p>Early Rejection on its own introduces a new failure mode: because the decode-load estimate that gates acceptance is itself stale by the time prefill actually finishes, prefill and decode instance loads start oscillating out of phase. The paper's own trace from a 20-machine cluster over 20 minutes shows this directly &#8212; when decode load is momentarily read as low, Conductor admits a burst of requests; those requests complete prefill and land on decode together, spiking decode load; Conductor then rejects a burst of new requests until decode load falls again; and the cycle repeats, with prefill and decode load visibly anti-correlated across the 20-minute window, most pronounced in clusters with fewer prefill machines<a class="cite" href="#ref-1">1</a>. <b>Early Rejection Based on Prediction</b> addresses this by predicting decode load <em>after</em> the prefill stage completes, rather than reading current decode load, before deciding whether to admit a request<a class="cite" href="#ref-1">1</a>. The paper considered request-level prediction (estimate each request's output length in advance, which would make TTFT/TBT prediction far more accurate) but rejected it as impractical &#8212; output-length prediction is either too costly or too inaccurate, especially under the scarce-resource conditions where accurate prediction matters most<a class="cite" href="#ref-1">1</a>. The deployed strategy instead predicts at the system level: assuming a uniform decode time \(t_d\) per request, Conductor adds requests that prefill will finish by time \(t\) into the decoding pool's projected load, removes requests whose decode is projected to finish before \(t\), and averages the resulting TBT ratio across decode instances to forecast load at \(t\)<a class="cite" href="#ref-1">1</a>.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Requests rejected under overload, replaying 23,000 real requests at 2&#215; speed on an 8-prefill/8-decode-instance Mooncake cluster<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Strategy</th><th class="num">Requests rejected</th></tr></thead>
+<tbody>
+<tr><td class="row">Baseline (reject after both stages attempted)</td><td class="num" data-worst>4,183</td></tr>
+<tr><td class="row">Early Rejection</td><td class="num">3,771</td></tr>
+<tr><td class="row">Early Rejection Based on Prediction</td><td class="num" data-best>3,589</td></tr>
+</tbody>
+</table>
+<p>Moving from the baseline to prediction-based early rejection cuts the rejection count by \((4{,}183 - 3{,}589) / 4{,}183 \approx 14.2\%\) at the same 2&#215; overload-replay speed<a class="cite" href="#ref-1">1</a> &#8212; every one of those roughly 600 additional accepted requests is a request that, under the baseline policy, would have consumed prefill compute and then been thrown away after the decode stage rejected it. The mechanism is entirely about avoiding wasted GPU-seconds under overload, not about improving best-case latency; it only matters once the cluster is at or past capacity, which the paper treats as the normal operating condition for a fast-growing MaaS provider rather than an edge case<a class="cite" href="#ref-1">1</a>.</p>
+
+<h2 id="production-evidence">8. Production trace evidence and end-to-end results</h2>
+<p>Mooncake's SLO framing for both simulated and real experiments follows directly from the TTFT/TBT distinction already used throughout &#167;1 and &#167;7: a request is measured against \(\text{TTFT}_{P90}\) and \(\text{TBT}_{P90}\) &#8212; the 90th-percentile latency relative to a single, uncontended baseline request &#8212; and in the paper's own end-to-end experiments these thresholds are fixed at \(\text{TTFT}_{P90} = 10\times\) and \(\text{TBT}_{P90} = 5\times\) the single-request baseline<a class="cite" href="#ref-1">1</a>. Any request that exceeds either threshold counts as an SLO violation and its consumed resources are treated as wasted, consistent with &#167;7's rejection framing.</p>
+<h3 id="trace-statistics">8.1 The Kimi request trace</h3>
+<p>To ground this in real traffic rather than only synthetic benchmarks, the paper open-sources a one-hour sample of Kimi's production request stream: 23,608 entries, each carrying a relative arrival timestamp, an input length, an output length, and the block-hash chain from &#167;3<a class="cite" href="#ref-1">1</a>. The average input length is 7,590 tokens and the average output length is 182 tokens, giving an average input:output ratio of roughly 720 &#8212; a pattern the paper is careful to flag as representative of Kimi's long-context-heavy workload specifically, "not unanimous for all workloads"<a class="cite" href="#ref-1">1</a>.</p>
+<p>Running a simple cache-policy analysis against this trace with a single global cache pool, comparing LRU, LFU, and a length-aware variant across cache capacities from 1,000 to unbounded ("Inf") blocks, the hit ratio rises from about 30% at 1,000 blocks to about 50% at 50,000 blocks, with essentially no further gain beyond that &#8212; LRU performs best on this dataset, which the paper attributes to temporal proximity in how sessions reuse cache<a class="cite" href="#ref-1">1</a>. The paper is explicit that the ~50% ceiling should not be read as a hard limit on KVCache reusability in general: it is a property of this one-hour sample, and "this reusability highly depends on the application scenario and can be as large as 90% for certain scenarios, such as our chat-to-paper service"<a class="cite" href="#ref-1">1</a>. Separately, the block hit-count distribution is heavily skewed &#8212; over 50% of cache blocks in the trace go entirely unused, while a small number are hit tens of thousands of times &#8212; which is the empirical justification for the hot-spot replication scheme in &#167;5.1<a class="cite" href="#ref-1">1</a>.</p>
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 3.</b> Cache hit ratio by policy and capacity, single global cache pool, on the 23,608-request Kimi trace<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Policy</th><th class="num">1,000 blocks</th><th class="num">10,000</th><th class="num">30,000</th><th class="num">50,000</th><th class="num">100,000</th><th class="num">Inf</th></tr></thead>
+<tbody>
+<tr><td class="row">LRUCache</td><td class="num">0.30</td><td class="num">0.40</td><td class="num">0.48</td><td class="num">0.50</td><td class="num" data-best>0.51</td><td class="num" data-best>0.51</td></tr>
+<tr><td class="row">LFUCache</td><td class="num">0.30</td><td class="num">0.35</td><td class="num">0.43</td><td class="num">0.49</td><td class="num">0.51</td><td class="num">0.51</td></tr>
+<tr><td class="row">LengthAwareCache</td><td class="num" data-worst>0.30</td><td class="num" data-worst>0.35</td><td class="num" data-worst>0.42</td><td class="num" data-worst>0.48</td><td class="num">0.50</td><td class="num">0.51</td></tr>
+</tbody>
+</table>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f5t"><title id="f5t">Bar chart of LRUCache hit ratio versus cache capacity in blocks, from Table 3</title>
+<line x1="70" y1="230" x2="760" y2="230" class="d-axis"/>
+<line x1="70" y1="20" x2="70" y2="230" class="d-axis"/>
+<g class="d-grid"><line x1="70" y1="180" x2="760" y2="180"/><line x1="70" y1="130" x2="760" y2="130"/><line x1="70" y1="80" x2="760" y2="80"/><line x1="70" y1="30" x2="760" y2="30"/></g>
+<text x="55" y="235" text-anchor="end" class="d-mono d-small">0%</text>
+<text x="55" y="185" text-anchor="end" class="d-mono d-small">20%</text>
+<text x="55" y="135" text-anchor="end" class="d-mono d-small">40%</text>
+<text x="55" y="85" text-anchor="end" class="d-mono d-small">60%</text>
+<text x="30" y="120" text-anchor="middle" class="d-text-light d-small" transform="rotate(-90 30 120)">LRU cache hit ratio</text>
+<rect x="110" y="155" width="80" height="75" class="d-fill-blue"/><text x="150" y="146" text-anchor="middle" class="d-mono d-small">30%</text>
+<rect x="230" y="130" width="80" height="100" class="d-fill-blue"/><text x="270" y="121" text-anchor="middle" class="d-mono d-small">40%</text>
+<rect x="350" y="110" width="80" height="120" class="d-fill-blue"/><text x="390" y="101" text-anchor="middle" class="d-mono d-small">48%</text>
+<rect x="470" y="105" width="80" height="125" class="d-fill-orange"/><text x="510" y="96" text-anchor="middle" class="d-mono d-small">50%</text>
+<rect x="590" y="102" width="80" height="128" class="d-fill-blue"/><text x="630" y="93" text-anchor="middle" class="d-mono d-small">51%</text>
+<text x="150" y="250" text-anchor="middle" class="d-mono d-small">1,000</text>
+<text x="270" y="250" text-anchor="middle" class="d-mono d-small">10,000</text>
+<text x="390" y="250" text-anchor="middle" class="d-mono d-small">30,000</text>
+<text x="510" y="250" text-anchor="middle" class="d-mono d-small">50,000</text>
+<text x="630" y="250" text-anchor="middle" class="d-mono d-small">100,000</text>
+<text x="400" y="272" text-anchor="middle" class="d-text-light d-small">cache capacity, blocks (512 tokens each)</text>
+</svg>
+</figure>
+<figcaption><b>Figure 4.</b> LRUCache hit ratio against cache capacity on the Kimi trace: 30% at 1,000 blocks, rising to 50% at 50,000 blocks (highlighted), and flattening at 51% beyond that<a class="cite" href="#ref-1">1</a>.</figcaption>
+<p>The arithmetic behind that 30%&#8594;50% jump is worth making concrete. At an average input length of 7,590 tokens per request<a class="cite" href="#ref-1">1</a>, a cache hit ratio of \(h\) means, on average, \(h \times 7{,}590\) input tokens per request are served from the KVCache pool instead of recomputed. Moving from \(h=0.30\) to \(h=0.50\) shifts the average reused portion from \(0.30 \times 7{,}590 \approx 2{,}277\) tokens to \(0.50 \times 7{,}590 \approx 3{,}795\) tokens per request &#8212; roughly 1,518 additional tokens' worth of prefill compute avoided per request, on average, for a 50&#215; increase in cache capacity (1,000 to 50,000 blocks)<a class="cite" href="#ref-1">1</a>. That the ratio saturates near 50% despite another 2&#215; capacity increase to 100,000 blocks is the direct empirical basis for the paper's claim that required capacity should scale with the actual reuse ceiling of the workload, not grow without bound.</p>
+<h3 id="end-to-end-results">8.2 End-to-end throughput and SLO attainment</h3>
+<p>Against a four-instance vLLM baseline (vLLM-[4M]) on the public ArXiv Summarization and L-Eval datasets, a Mooncake cluster split three prefill/one decode instance (Mooncake-[3P+1D]) achieves throughput improvements of 20% and 40% respectively while meeting the same SLOs<a class="cite" href="#ref-1">1</a>; on simulated long-context data (16k&#8211;128k-token prompts), Mooncake's throughput improvement over vLLM ranges from 50% to 525% at matched TTFT/TBT SLOs<a class="cite" href="#ref-1">1</a> &#8212; the 525% figure quoted in the paper's abstract is the upper end of this simulated range, specifically for the longest-context configurations where vLLM's colocated design suffers most from prefill-decode interference. Under real workload replay &#8212; 10 prefill plus 10 decode Mooncake instances against 20 vLLM instances, both handling the same 23,000-request real trace, with a 30-second TTFT cap and a 0.1-second-per-token TBT cap &#8212; nearly 100% of Mooncake's requests meet the TBT SLO, against only 57% for vLLM, while both systems' TTFT distributions are nearly identical<a class="cite" href="#ref-1">1</a>. That gap is entirely a decode-side effect: vLLM's colocated engine lets a large batch or an incoming prefill degrade decode's inter-token latency for requests already in flight, while Mooncake's disaggregated decode pool, isolated from prefill entirely, holds TBT stable regardless of prefill load. The paper's headline production claim &#8212; Mooncake enables Kimi to handle 75% more requests under real workloads while adhering to SLOs<a class="cite" href="#ref-1">1</a> &#8212; follows directly from this TBT gap: at a fixed SLO bar, a system whose TBT is not systematically inflated by colocated prefill traffic can simply admit more concurrent requests before anyone breaches it.</p>
+
+<h2 id="transfer-engine-store-ep">9. Transfer Engine, Mooncake Store, and Mooncake EP/PG</h2>
+<p>Everything in &#167;2&#8211;8 depends on one component actually moving the bytes: the <b>Transfer Engine</b>, described in the current repository as "the core of Mooncake," a high-performance data transfer framework offering a unified interface for batched data movement across storage, network, and accelerator environments<a class="cite" href="#ref-2">2</a>. It supports multiple simultaneous RDMA NIC devices per transfer to aggregate bandwidth, chooses transfer paths topology-aware (accounting for NUMA affinity between source and destination), and retries automatically over alternative paths on a transient network failure<a class="cite" href="#ref-2">2</a> &#8212; the engineering underneath Messenger's role in &#167;2 and &#167;4.</p>
+<p>The 87 GB/s and 190 GB/s figures already used in &#167;2 come from the repository's own benchmark: moving 40 GB of data &#8212; the size of the KVCache a 128k-token request would generate on a LLaMA3-70B-class model &#8212; the Transfer Engine sustains up to 87 GB/s on a 4&#215;200 Gbps RoCE network and up to 190 GB/s on an 8&#215;400 Gbps RoCE network, roughly 2.4&#215; and 4.6&#215; faster than plain TCP on the same links<a class="cite" href="#ref-2">2</a>. Those multipliers imply the TCP baseline the RDMA path is being compared against, without the repository stating it directly:</p>
+$$ \text{TCP}_{4\times200\text{G}} = \frac{87\ \text{GB/s}}{2.4} \approx 36.3\ \text{GB/s} \qquad \text{TCP}_{8\times400\text{G}} = \frac{190\ \text{GB/s}}{4.6} \approx 41.3\ \text{GB/s} $$
+<p>Two things fall out of that arithmetic. First, TCP throughput barely moves between the 4-rail and 8-rail configurations (36.3 to 41.3 GB/s, a 14% gain) even though the underlying link capacity doubled, while RDMA throughput more than doubles (87 to 190 GB/s, a 2.18&#215; gain) &#8212; consistent with TCP's per-connection overhead (kernel copies, protocol processing) becoming the bottleneck well before the wire is saturated, exactly the four-copy tax GPUDirect RDMA exists to remove (Module 1 &#167;3). Second, the RDMA path's multi-rail aggregation is doing real work: going from 4 to 8 rails at the same per-rail rate class should double achievable bandwidth if striping is perfect, and 190/87 &#8776; 2.18&#215; is close to that ideal, meaning the Transfer Engine's multi-NIC aggregation (the first bullet point above) is capturing most of the available headroom rather than leaving it on the table.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f6t"><title id="f6t">Bar chart of Mooncake Transfer Engine bandwidth, RoCE vs. implied TCP baseline, for 40 GB of data on 4x200Gbps and 8x400Gbps networks</title>
+<line x1="70" y1="230" x2="760" y2="230" class="d-axis"/>
+<line x1="70" y1="20" x2="70" y2="230" class="d-axis"/>
+<g class="d-grid"><line x1="70" y1="180" x2="760" y2="180"/><line x1="70" y1="130" x2="760" y2="130"/><line x1="70" y1="80" x2="760" y2="80"/><line x1="70" y1="30" x2="760" y2="30"/></g>
+<text x="55" y="235" text-anchor="end" class="d-mono d-small">0</text>
+<text x="55" y="185" text-anchor="end" class="d-mono d-small">50</text>
+<text x="55" y="135" text-anchor="end" class="d-mono d-small">100</text>
+<text x="55" y="85" text-anchor="end" class="d-mono d-small">150</text>
+<text x="55" y="35" text-anchor="end" class="d-mono d-small">200</text>
+<text x="30" y="120" text-anchor="middle" class="d-text-light d-small" transform="rotate(-90 30 120)">GB/s</text>
+<rect x="140" y="177" width="70" height="53" class="d-fill-cyan"/><text x="175" y="168" text-anchor="middle" class="d-mono d-small">36.3</text>
+<text x="175" y="248" text-anchor="middle" class="d-small">TCP</text>
+<rect x="230" y="140" width="70" height="90" class="d-fill-orange"/><text x="265" y="131" text-anchor="middle" class="d-mono d-small">87</text>
+<text x="265" y="248" text-anchor="middle" class="d-small">RDMA</text>
+<text x="220" y="266" text-anchor="middle" class="d-small d-text-light">4&#215;200 Gbps RoCE</text>
+<rect x="440" y="163" width="70" height="67" class="d-fill-cyan"/><text x="475" y="154" text-anchor="middle" class="d-mono d-small">41.3</text>
+<text x="475" y="248" text-anchor="middle" class="d-small">TCP</text>
+<rect x="530" y="35" width="70" height="195" class="d-fill-orange"/><text x="565" y="26" text-anchor="middle" class="d-mono d-small">190</text>
+<text x="565" y="248" text-anchor="middle" class="d-small">RDMA</text>
+<text x="520" y="266" text-anchor="middle" class="d-small d-text-light">8&#215;400 Gbps RoCE</text>
+</svg>
+</figure>
+<figcaption><b>Figure 5.</b> Transfer Engine bandwidth moving 40 GB of data (the KVCache generated by a 128k-token request on a LLaMA3-70B-class model): RDMA measured directly at 87 GB/s and 190 GB/s; TCP is the implied baseline back-calculated from the stated 2.4&#215;/4.6&#215; speedup factors<a class="cite" href="#ref-2">2</a>.</figcaption>
+<p>The Transfer Engine reaches this bandwidth over a broad protocol set &#8212; TCP, RDMA, AWS EFA, NVMe-oF, NVLink, HIP, Barex, CXL, and Ascend-family transports &#8212; and, when built against the matching accelerator runtime, detects accelerator memory and routes across CUDA, MUSA, HIP, MACA, Cambricon MLU, and Ascend environments<a class="cite" href="#ref-2">2</a>, the multi-vendor breadth that makes it usable outside an all-NVIDIA cluster in a way Module 1's NIXL and DeepEP figures, both Hopper/Blackwell-specific, are not.</p>
+<p>Two components have been built on top of the Transfer Engine since the original paper, and both extend the same KVCache-centric idea past request serving: <b>Mooncake Store</b> and <b>Mooncake EP &amp; Process Group (PG)</b>.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 4.</b> Mooncake's three repository components<a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Component</th><th>Layer</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td class="row">Transfer Engine (TE)</td><td>transport</td><td>Unified batched data movement across storage/network/accelerator, multi-rail aggregation, topology-aware routing, automatic failover</td></tr>
+<tr><td class="row">Mooncake Store</td><td>storage engine</td><td>Distributed KV-cache and model-weight object store built on TE; per-object replica count, placement, soft/hard pin; decouples cache lifetime from engine restarts</td></tr>
+<tr><td class="row">Mooncake EP &amp; PG</td><td>execution</td><td>Fault-tolerant, DeepEP-compatible expert-parallel dispatch/combine with rank-activeness awareness; <code>torch.distributed</code> process-group backend with elastic rank recovery</td></tr>
+</tbody>
+</table>
+<p>Mooncake Store is, in effect, the productized and generalized version of the "Distributed KVCache Pool" box in Figure 1: it adds large-object striping and end-to-end zero-copy transfer to fully exploit TE's aggregated multi-NIC bandwidth, a multi-tier DRAM/SSD/NVMe cache design for capacity beyond what &#167;2's blended pool description covers in the original paper, and &#8212; the part that goes beyond what the FAST'25 paper describes &#8212; programmatic, per-object control over replica count, preferred storage segment, and soft/hard pinning, so a caller can protect a specific KVCache block or model-weight object from eviction rather than relying only on the LRU/LFU/LengthAware policies of &#167;2<a class="cite" href="#ref-2">2</a>. Because storage nodes running Mooncake Store are decoupled from any specific inference engine process, they can be added or removed elastically, and cached data survives engine restarts, upgrades, and Conductor's own scheduling decisions<a class="cite" href="#ref-2">2</a> &#8212; the KVCache pool becomes infrastructure with its own lifecycle, not a side effect of whichever engine process happened to compute it.</p>
+<p>Mooncake EP and PG target a different failure mode entirely: wide expert-parallel MoE inference (Module 5's subject), where a single failed GPU rank can otherwise stall an entire EP group's dispatch/combine. Mooncake EP keeps its dispatch/combine API close to DeepEP's low-latency mode &#8212; deliberately, so an inference engine already integrated with DeepEP does not have to rewrite its MoE communication path &#8212; but adds <code>active_ranks</code> awareness so dispatch can route around a known-failed rank rather than hanging on it, while Mooncake PG registers as a standard <code>torch.distributed</code> process-group backend (supporting ordinary collectives like <code>all_gather</code>) with added primitives for peer-state polling and elastic rank recovery, letting a replacement process rejoin an existing group instead of forcing a full restart of the inference service<a class="cite" href="#ref-2">2</a>.</p>
+<p>Production adoption has moved briskly since the Transfer Engine was first open-sourced in November 2024. vLLM added official Transfer Engine support for disaggregated prefilling in December 2024 and Mooncake Store support as a cluster-level shared KV-cache backend in May 2026<a class="cite" href="#ref-2">2</a>; SGLang added Transfer Engine support for PD disaggregation in April 2025<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-2">2</a> and Mooncake Store as a hierarchical KV-caching backend (extending RadixAttention across device, host, and remote tiers) in September 2025<a class="cite" href="#ref-2">2</a>; LMDeploy adopted Mooncake as a PD-disaggregation backend in June 2025<a class="cite" href="#ref-2">2</a>; and TensorRT-LLM integrated the Transfer Engine for KVCache transfer in disaggregated inference in December 2025<a class="cite" href="#ref-2">2</a>. NIXL itself (Module 8) lists Mooncake's Transfer Engine as a supported backend plugin as of May 2025<a class="cite" href="#ref-2">2</a> &#8212; Mooncake is not only an alternative to NIXL's transport layer, it is also reachable <em>through</em> NIXL, which is one reason vLLM's and SGLang's connector lists (Module 4) name Mooncake and NIXL as siblings rather than strict alternatives.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Module 3 already covers the disagreement over whether a second (decode) pool is worth its operational cost at all, including Mooncake's own &#167;5 answer (kept, for the cross-node prefill parallelism reason worked through in &#167;6, and the VRAM-decoupling reason from &#167;4) &#8212; that discussion is not repeated here. Given that prefill and decode are already disaggregated, this module raises a narrower, distinct question: once KV cache has to cross a node boundary at all, is it worth building a <em>shared, hash-addressed, cluster-wide pool</em> with a dedicated global scheduler (Conductor), or does a simpler point-to-point handoff &#8212; move each request's cache from its prefill instance straight to its assigned decode instance, with no cross-request sharing and no global cache-aware scheduling &#8212; capture most of the benefit at far less engineering cost?</p>
+<div class="positions">
+<article class="position">
+<h4>The shared pool pays for itself</h4>
+<p class="who">Mooncake's own production deployment and evaluation<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a></p>
+<p>Once KVCache exists as a transferable object anyway (forced by disaggregation), making it globally addressable and shared costs comparatively little extra machinery &#8212; the same Messenger/Transfer Engine that moves prefill&#8594;decode handoffs moves cross-request reuse too &#8212; and the measured upside is large: up to 525% higher throughput in simulated long-context scenarios, and 75% more requests served under real production traffic at matched SLOs, driven mostly by the decode-side TBT isolation and the fraction of requests that hit a shared prefix cache anywhere in the cluster rather than only on their own replica<a class="cite" href="#ref-1">1</a>. Production adoption across vLLM, SGLang, LMDeploy, and TensorRT-LLM within roughly a year of the paper's release<a class="cite" href="#ref-2">2</a> is independent evidence that the industry judged the added complexity worth shipping, not just worth publishing.</p>
+<ul class="pros"><li>Directly measured, large end-to-end gains under real production traffic, not just simulation</li><li>The transfer mechanism (Messenger/Transfer Engine) is needed for the mandatory prefill&#8594;decode handoff regardless &#8212; global sharing is an incremental cost on top of infrastructure that already exists</li><li>Widely adopted by independent serving engines within about a year</li></ul>
+<ul class="cons"><li>The 525% figure is the top of a 50&#8211;525% simulated range, concentrated in the longest-context configurations &#8212; not representative of the median workload</li><li>Conductor's cache-aware scheduling, hot-spot migration, and early-rejection-with-prediction subsystems (&#167;5, &#167;7) are all additional engineering surface a point-to-point design would not need</li></ul>
+</article>
+<article class="position">
+<h4>The reuse ceiling is modest and workload-specific; the complexity is real</h4>
+<p class="who">Mooncake's own &#167;4.2 and &#167;9 discussion, and the low-complexity alternative Module 2 already establishes<a class="cite" href="#ref-1">1</a></p>
+<p>On the paper's own 23,608-request production trace, cache hit ratio saturates near 50% even with effectively unlimited cache capacity, and the paper states directly that this reusability "highly depends on the application scenario," reaching 90% only for specific workloads like chat-to-paper<a class="cite" href="#ref-1">1</a>. For the median request in a general-purpose deployment, then, roughly half of prefill compute is never avoided by sharing regardless of pool size &#8212; and capturing even that 50% required a hash-of-hash content-addressing scheme, a learned execution-time predictor, a heuristic hot-spot replication policy tuned by a currently-manual threshold, and a whole overload-oriented early-rejection subsystem built specifically because the shared-scheduling design creates its own load-fluctuation failure mode (&#167;7) that a simpler design would not have introduced in the first place. Module 2's prefix-aware routing achieves a meaningfully similar effect &#8212; steering requests toward wherever their prefix is already cached &#8212; using an in-memory LRU index and, at most, a KVEvent stream, without a separate global storage engine, a content-hash chain, or a dedicated scheduler process.</p>
+<ul class="pros"><li>Grounded in the same paper's own numbers, not a competing claim from elsewhere</li><li>Correctly separates "does cache need to move at all" (forced by disaggregation, not in dispute) from "does it need to move into a globally shared, hash-addressed pool" (the actual design choice under debate)</li><li>Lower operational surface: no global scheduler state, no hot-spot replication tuning, no early-rejection prediction subsystem to build and maintain</li></ul>
+<ul class="cons"><li>Mooncake's own real-workload result (75% more requests) is not explained by cache-hit ratio alone &#8212; a large share comes from decode-pool TBT isolation, which a point-to-point (non-shared) transfer design would preserve just as well, so this position risks over-crediting the sharing layer specifically</li><li>Does not have its own head-to-head production measurement against Mooncake's shared-pool design &#8212; the comparison is inferred from Mooncake's own internal numbers, not a controlled experiment</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Separate two claims Mooncake's own paper does not clearly separate: that KV cache must move across a node boundary once prefill and decode are disaggregated (not in dispute &#8212; &#167;4's four-step workflow is required infrastructure, and most of the 75%-more-requests result plausibly traces to decode-pool TBT isolation, which any disaggregated design gets), and that this cache should additionally be pooled, hash-addressed, and shared cluster-wide for cross-request reuse (the actual point of disagreement). The paper's own data supports the second claim conditionally, not universally: the ~50% hit-ratio ceiling on general Kimi traffic, against a stated 90% ceiling for long-document, high-repeat workloads like chat-to-paper, means the shared-pool machinery earns its complexity precisely for workloads with long, frequently-repeated contexts &#8212; RAG pipelines, agentic tool-use loops, multi-turn chat over a large shared system prompt or document &#8212; and earns it much less for short, largely-unique prompts, where Module 2's routing-only approach is likely to capture most of the achievable benefit at a fraction of the engineering cost. What would settle this cleanly is a controlled comparison Mooncake's own evaluation does not provide: the same production trace, same hardware, same disaggregated prefill/decode split, with cache sharing switched off (point-to-point transfer only, no cross-request pool) versus on &#8212; isolating the sharing layer's marginal contribution from disaggregation's own TBT-isolation effect. Nobody has published that ablation.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The architecture this module describes &#8212; Conductor, the four-step workflow, hash-of-hash block addressing &#8212; is the FAST'25 paper's design and is stable; what is moving fast is the repository built around it. Mooncake Store, open-sourced in March 2025 as "a distributed KVCache based on Transfer Engine," did not exist in the original paper's evaluation and only became a first-class vLLM feature in May 2026<a class="cite" href="#ref-2">2</a> &#8212; the per-object replica/pin/placement controls in &#167;9 are newer than most of the mechanism this module otherwise describes. Mooncake EP and PG are newer still, extending the same transfer infrastructure to fault-tolerant expert-parallel execution (Module 5's territory) rather than request serving, and the repository's own 2026 updates show active work on that front specifically: a declarative data-movement engine for disaggregated serving resilience and a dedicated study of surviving partial rank failures in wide-EP MoE inference are both cited as in-progress or newly published work by the same research group<a class="cite" href="#ref-2">2</a>. The Transfer Engine itself is also being pulled into workloads well outside inference serving &#8212; RDMA-based weight synchronization for reinforcement-learning training loops and speculative-decoding trainer/inference decoupling both now use it as a generic tensor-movement layer<a class="cite" href="#ref-2">2</a> &#8212; which is worth watching because it means the transport layer's roadmap is no longer driven solely by KV-cache-serving requirements. The <code>kvcache_balancing_threshold</code> in Algorithm 1 (&#167;5) is explicitly flagged in the paper itself as manually tuned today, with an adaptive algorithm left as future work<a class="cite" href="#ref-1">1</a> &#8212; expect that knob to become automatic before the overall architecture changes shape.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">paper</span>Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., Xu, X. <em>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</em>. USENIX FAST 2025 (Best Paper Award); arXiv:2407.00079v4. <a href="https://arxiv.org/pdf/2407.00079">https://arxiv.org/pdf/2407.00079</a>. Accessed 2026-09-17. <span class="ref-use">Used for: architecture (&#167;3, Fig. 1), four-step workflow (&#167;3, Fig. 3&#8211;4), content-addressed block hashing, Algorithm 1 (Conductor scheduling, &#167;6), cache load balancing/hot-spot migration (&#167;6.2), chunked pipeline parallelism and layer-wise prefill (&#167;5), overload-oriented early rejection (&#167;7), trace statistics and cache-hit-ratio table (&#167;4, Table 1), SLO definitions (&#167;2), end-to-end evaluation results (&#167;8).</span></li>
+<li id="ref-2"><span class="ref-type">repo</span>Moonshot AI / MADSys contributors. <em>kvcache-ai/Mooncake</em> (README, main branch). 2026. <a href="https://github.com/kvcache-ai/Mooncake/blob/main/README.md">https://github.com/kvcache-ai/Mooncake/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Transfer Engine bandwidth benchmark (87/190 GB/s, 2.4x/4.6x vs. TCP), supported transports, Mooncake Store description and features, Mooncake EP &amp; Process Group description, production-adoption timeline (vLLM, SGLang, LMDeploy, TensorRT-LLM, NIXL backend plugin dates).</span></li>
+<li id="ref-3"><span class="ref-type">official</span>SGLang contributors. <em>PD Disaggregation</em>. SGLang Documentation. <a href="https://docs.sglang.io/advanced_features/pd_disaggregation.html">https://docs.sglang.io/advanced_features/pd_disaggregation.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: confirming Mooncake Transfer Engine as one of SGLang's two supported PD transfer backends (cross-reference to Module 4/12).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

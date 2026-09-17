@@ -1,0 +1,842 @@
+{
+  "version": 1,
+  "id": "multi-node-llm-inference",
+  "title": "Multi-Node LLM Inference: From One Node to N",
+  "shortTitle": "Multi-node Serving",
+  "description": "Scaling LLM inference serving from one 8-GPU node to N nodes: replication and routing, prefill/decode disaggregation, cross-node MoE, multi-node KV management, and the open-source serving stack.",
+  "category": "Computer Science",
+  "kind": "course",
+  "color": "blue",
+  "icon": "Server",
+  "unitLabel": "Module",
+  "status": "published",
+  "sources": "sources.md",
+  "generator": {
+    "skill": "study-course",
+    "request": "Multi-node LLM inference: scaling serving from one 8-GPU node to N nodes (replication, routing, prefill/decode disaggregation, cross-node MoE, and the open-source stack) --category cs --modules 18",
+    "createdAt": "2026-09-17T06:11:21.705Z",
+    "updatedAt": "2026-09-17T10:13:11.070Z",
+    "profile": "learner-profile.md",
+    "pipeline": {
+      "stage": "done",
+      "approved": true,
+      "approvedAt": "2026-09-17T07:42:22.632Z"
+    }
+  },
+  "parts": [
+    {
+      "id": "part-01-multi-node-frame",
+      "number": 1,
+      "title": "The Multi-Node Frame",
+      "shortTitle": "Multi-Node Frame",
+      "description": "Establishes the bandwidth/latency arithmetic and the routing problem that every later part refers back to: what changes, physically and logically, the instant a second node appears.",
+      "modules": [
+        {
+          "status": "published",
+          "format": "html",
+          "id": "01-interconnect-transport",
+          "number": 1,
+          "title": "Interconnect and Transport: The Physical Layer of Multi-Node Serving",
+          "shortTitle": "Interconnect & Transport",
+          "description": "The bandwidth/latency ladder from NVLink inside a node to InfiniBand/RoCE between nodes to the NVL72 fabric, and what GPUDirect RDMA and UCX/NIXL actually move.",
+          "scope": "In: NVLink/NVSwitch topology inside an 8-GPU node (recapped only to establish baseline numbers Aman already knows), the bandwidth cliff crossing into InfiniBand/RoCE between nodes, the GPUDirect RDMA mechanism and its latency floor, UCX and NIXL as the transport abstraction underneath every later stack module, NVL72 as a structurally different regime (a 72-GPU single NVLink domain, not nine racked 8-GPU nodes), and concrete bandwidth/latency figures at every hop with sources so any later KV-transfer or all-to-all cost can be computed from first principles. Out: kernel-level CUDA/NVLink programming (assumed known), single-node TP mechanics (assumed known), DeepEP's full kernel implementation (Module 5). After this module Aman can compute, given a payload size and an interconnect, how long a cross-node operation takes.",
+          "topics": [
+            "NVLink/NVSwitch bandwidth inside one 8-GPU H100/B200 node vs. the bandwidth cliff crossing to inter-node fabric",
+            "InfiniBand NDR/XDR and RoCE: ConnectX-7 400Gb/s specs, RDMA message rate, hardware congestion control",
+            "GPUDirect RDMA mechanism: bypassing host memory, the ~1.7us latency floor, staging-vs-RDMA crossover by message size",
+            "NVL72 as a 72-GPU single NVLink domain: 130 TB/s NVLink bandwidth, 13.4 TB HBM3E, why this is structurally not nine 8-GPU nodes",
+            "UCX as the transport-agnostic layer underneath NIXL, RCCL, and NCCL",
+            "NIXL's abstraction: memory sections, transfer backend interface, metadata handler, and its actively-supported backends (UCX, GDS)",
+            "Real bandwidth numbers at each hop: DeepEP NVLink dispatch (726 GB/s) vs. DeepEP RDMA dispatch (90 GB/s) -- an ~8x cliff at the node boundary",
+            "The HBM -> host -> SSD -> remote tiering hierarchy, previewed here and given full treatment in Module 7",
+            "Worked arithmetic: time to move a fixed-size KV-cache block across NVLink vs. IB vs. RoCE"
+          ],
+          "sourceIds": [
+            "S40",
+            "S41",
+            "S25",
+            "S27",
+            "S42",
+            "S36"
+          ],
+          "estWords": 7000,
+          "figures": 6,
+          "disagreements": [],
+          "prerequisites": [],
+          "file": "01-interconnect-transport.html",
+          "words": 5088,
+          "tables": 2,
+          "citations": 16,
+          "unverified": 1,
+          "readingTime": "25 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "02-replication-routing",
+          "number": 2,
+          "title": "Replication and Routing: KV-Cache-Aware, Prefix-Aware, and SLO-Aware Request Placement",
+          "shortTitle": "Replication & Routing",
+          "description": "Why naive round-robin fails once every replica carries different KV-cache state, and the mechanisms -- approximate hashing vs. precise event-streaming -- routers use to learn and score that state.",
+          "scope": "In: the replication model (N independent TP8 engine copies, each with private KV cache) and why request placement stops being stateless; prefix-cache-aware scoring (block hashing, rolling hash chains, LRU indexes); precise KV-cache indexing via KVEvents emitted over ZeroMQ; session affinity vs. prefix affinity; load- and SLO-aware scoring layered on prefix affinity; the layered filter -> score -> select pipeline as implemented by llm-d's scheduler and the Gateway API Inference Extension's EPP contract; sglang-router and vLLM production-stack's simpler router designs as points of comparison. Out: Kubernetes plumbing (InferencePool CRD, Envoy ext-proc wiring -- Module 10); Dynamo's Router as a named component (Module 9). After this module Aman can explain, mechanism by mechanism, how four different routers decide which replica gets a request and why the decision changes as fleet size grows.",
+          "topics": [
+            "Why replication breaks stateless load balancing: KV cache is per-replica private state, not shared",
+            "Approximate prefix-cache scoring: fixed-size block hashing, rolling hash chains, in-memory LRU index of recently-routed prefixes",
+            "Precise KV-cache indexing: KVEvents over ZeroMQ, a globally consistent view of which token blocks live on which pod, tokenization round-trip cost",
+            "Session affinity vs. prefix affinity: when they agree and when they conflict",
+            "The layered scheduling pipeline: filtering -> scoring (weighted scorer set) -> selection, as a general pattern",
+            "Load/SLO-aware scoring signals layered on prefix-cache scoring: in-flight load, queue depth, decode-stage filtering",
+            "Comparison table: llm-d EPP scorers vs. vLLM production-stack router vs. sglang-router feature sets",
+            "What learning KV state costs: event-streaming overhead, staleness windows, consistency guarantees",
+            "Failure/staleness modes: a stale prefix index after eviction, thundering herd on a newly-warm replica"
+          ],
+          "sourceIds": [
+            "S6",
+            "S8",
+            "S13",
+            "S17",
+            "S9",
+            "S11"
+          ],
+          "estWords": 7500,
+          "figures": 4,
+          "disagreements": [
+            "Approximate vs. precise KV-cache-aware routing"
+          ],
+          "prerequisites": [
+            "Module 1"
+          ],
+          "file": "02-replication-routing.html",
+          "words": 5665,
+          "tables": 4,
+          "citations": 6,
+          "unverified": 0,
+          "readingTime": "30 min"
+        }
+      ]
+    },
+    {
+      "id": "part-02-pd-disaggregation",
+      "number": 2,
+      "title": "Prefill/Decode Disaggregation",
+      "shortTitle": "PD Disaggregation",
+      "description": "The queueing-theoretic case for splitting prefill and decode into separate pools, and the runtime mechanics -- KV transfer, scheduling, failure handling -- that make the split work.",
+      "modules": [
+        {
+          "status": "published",
+          "format": "html",
+          "id": "03-why-disaggregation-pays",
+          "number": 3,
+          "title": "Why Disaggregation Pays: Goodput, Interference, and the Ratio Decision",
+          "shortTitle": "Why Disaggregate",
+          "description": "The queueing-theoretic and empirical case for splitting prefill and decode into separate pools, the interference mechanism that motivates it, and the TCO crossover point where it stops paying.",
+          "scope": "In: the prefill-decode interference mechanism on a colocated engine (compute-bound prefill jobs stalling memory-bound decode steps); goodput as the correct optimization target vs. raw throughput; DistServe's per-GPU goodput result and its placement-algorithm framing (high- vs. low-node-affinity clusters); Splitwise's phase-splitting motivation and its A100-vs-H100 hardware-delta table; Mooncake's own reconsideration of whether disaggregation is still needed given chunked prefill; the InferenceMAX/SemiAnalysis finding that disaggregation's TCO advantage is conditional on the interactivity target, not unconditional; how prefill:decode ratio and pool sizing follow from request-trace shape (ISL/OSL distributions). Out: the KV transfer mechanics and connector implementations (Module 4); any single project's specific PD implementation (Part 5). After this module Aman can state, with numbers, when disaggregation is worth the operational cost and when it is not, for a given interactivity target.",
+          "topics": [
+            "The interference mechanism: why a prefill job stalls decode steps on a colocated engine, and why chunked prefill only mitigates it",
+            "Goodput vs. throughput as the optimization target; SLO-attainment framing (TTFT_P90, TBT_P90/ITL definitions)",
+            "DistServe's per-GPU goodput numbers on A100 (1.6 rps colocated vs. 5.6/10 rps split) and its placement algorithm (high- vs. low-node-affinity)",
+            "Splitwise's A100-vs-H100 hardware-delta table and phase-splitting motivation from production Azure traces (median ISL/OSL by workload)",
+            "Prefill:decode ratio as a function of request shape (ISL:OSL), not a fixed constant -- TensorRT-LLM's 1.4x-6.11x speedup range by workload",
+            "Mooncake's explicit re-examination: does chunked prefill make disaggregation unnecessary, and why they kept it (long-context cross-node parallelism, VRAM savings)",
+            "The TCO crossover: InferenceMAX's ~90 tok/s/user interactivity threshold where GB200 NVL72 disaggregated prefill stops winning over an aggregated 8-GPU B200 server",
+            "Reconciling DistServe's near-unconditional goodput win with InferenceMAX's conditional TCO win (different metrics, different hardware generations)"
+          ],
+          "sourceIds": [
+            "S35",
+            "S36",
+            "S22",
+            "S43",
+            "S20",
+            "S53"
+          ],
+          "estWords": 8000,
+          "figures": 4,
+          "disagreements": [
+            "When does prefill/decode disaggregation actually pay off?",
+            "Is a second (decode) pool worth the operational cost, or does chunked-prefill on a single colocated engine capture most of the benefit?"
+          ],
+          "prerequisites": [
+            "Module 1",
+            "Module 2"
+          ],
+          "file": "03-why-disaggregation-pays.html",
+          "words": 5018,
+          "tables": 3,
+          "citations": 6,
+          "unverified": 0,
+          "readingTime": "25 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "04-kv-transfer-pd-scheduling",
+          "number": 4,
+          "title": "KV Transfer and Scheduling Across the Prefill/Decode Boundary",
+          "shortTitle": "KV Transfer & Scheduling",
+          "description": "The connector abstractions, transfer paths, cross-pool scheduling policies, and failure modes that make disaggregation actually work at runtime.",
+          "scope": "In: the generic connector-abstraction pattern (vLLM's Connector/LookupBuffer/Pipe; TensorRT-LLM's cache-transceiver keyed by disagg_request_id; SGLang's bootstrap handshake); backend-specific synchronous-vs-overlapped transfer behavior (SGLang begins decode during transfer, vLLM/TensorRT-LLM wait for prefill completion); xPyD runtime reconfiguration (Dynamo); heartbeat-based failure detection and bootstrap timeouts; dynamic node joining/leaving as an in-progress, not-GA capability; scheduling policy across two pools (admission, queueing, which prefill worker pairs with which decode worker). Out: the underlying transfer engines as named projects (Mooncake, NIXL -- Modules 7-8); goodput/ratio reasoning (Module 3, already covered). After this module Aman can trace exactly what happens, step by step, from a request landing at a prefill worker to its first decoded token, across any of the three engines.",
+          "topics": [
+            "The connector abstraction pattern: producer/consumer roles, generic pipe/buffer primitives (vLLM Connector/LookupBuffer/Pipe)",
+            "Request-ID-keyed cache transfer: TensorRT-LLM's DisaggregatedParams.disagg_request_id binding context and generation phases",
+            "Synchronous vs. overlapped transfer: SGLang's bootstrap coordination (decode starts during transfer) vs. vLLM/TensorRT-LLM's wait-for-completion default",
+            "Named connectors in vLLM: LMCacheConnectorV1, NixlConnector, MooncakeConnector, MoRIIOConnector, MultiConnector, OffloadingConnector -- what each is for",
+            "Runtime-reconfigurable xPyD: worker registration/deregistration, RuntimeConfig publication, drain-before-remove",
+            "Failure detection: SGLang heartbeat monitoring (5.0s default) and bootstrap handshake timeout (300s default); what happens when a prefill worker dies mid-transfer",
+            "Scheduling across two pools: which prefill worker pairs with which decode instance, and how that pairing is chosen",
+            "Status of dynamic node joining/leaving in TensorRT-LLM (explicitly in progress, not GA)",
+            "Non-blocking KV transfer: how forward passes on the source GPU keep serving other requests during transfer"
+          ],
+          "sourceIds": [
+            "S12",
+            "S2",
+            "S21",
+            "S16"
+          ],
+          "estWords": 7500,
+          "figures": 6,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 3"
+          ],
+          "file": "04-kv-transfer-pd-scheduling.html",
+          "words": 5142,
+          "tables": 6,
+          "citations": 4,
+          "unverified": 0,
+          "readingTime": "30 min"
+        }
+      ]
+    },
+    {
+      "id": "part-03-cross-node-moe",
+      "number": 3,
+      "title": "Cross-Node Mixture-of-Experts",
+      "shortTitle": "Cross-Node MoE",
+      "description": "Wide expert parallelism as an all-to-all problem distinct from dense-model TP/PP, and DeepSeek's own published production deployment as the grounded reference point.",
+      "modules": [
+        {
+          "status": "published",
+          "format": "html",
+          "id": "05-wide-expert-parallelism",
+          "number": 5,
+          "title": "Wide Expert Parallelism: DeepEP, Placement, and Load Balancing",
+          "shortTitle": "Wide EP & DeepEP",
+          "description": "The all-to-all dispatch/combine mechanism that makes cross-node MoE tractable, and the placement/load-balancing algorithms that keep it from bottlenecking on the slowest expert.",
+          "scope": "In: why cross-node MoE parallelism is an all-to-all traffic pattern, not an all-reduce one; DeepEP's two kernel modes (normal: NVLink-to-RDMA-domain forwarding for training/prefill; low-latency: pure RDMA for decode) with FP8-dispatch/BF16-combine precision and measured bandwidth by configuration; EPLB's redundant-expert strategy (duplicate heavy experts, heuristic packing) and its two policies (hierarchical for prefill, global for decode); group-limited expert routing to reduce inter-node traffic; attention-DP + expert-parallel layout as the general pattern (TP=1 attention replicated across DP ranks, MoE sharded across EP ranks), with vLLM's EP_SIZE=TP_SIZE*DP_SIZE arithmetic and SGLang's --enable-dp-attention; what NVL72 changes about the EP domain (a 72-GPU NVLink domain lets EP32 live entirely inside NVLink instead of crossing into RDMA). Out: DeepSeek's specific production numbers and history (Module 6); vLLM/SGLang's full CLI-level deployment guides (Part 5). After this module Aman can reason about EP degree, placement policy, and expected all-to-all bandwidth for a given cluster topology.",
+          "topics": [
+            "Why MoE cross-node parallelism is an all-to-all problem, not an all-reduce problem",
+            "DeepEP normal kernels: NVLink-to-RDMA-domain forwarding, used for training and prefill dispatch/combine",
+            "DeepEP low-latency kernels: pure RDMA, used for decode; FP8 dispatch / BF16 combine",
+            "Measured DeepEP bandwidth by configuration: NVLink EP8 (726/740 GB/s dispatch/combine) vs. RDMA EP8x2 (90/81 GB/s) vs. RDMA EP8x4 (61/61 GB/s)",
+            "EPLB: redundant-experts strategy, heuristic packing for load balance, group-limited routing to keep same-group experts on one node",
+            "Hierarchical (prefill, smaller EP) vs. global (decode, larger EP) load-balancing policy, and why the two stages differ",
+            "Attention-DP + EP layout: TP=1 attention replicated across DP ranks, MoE sharded across EP ranks; EP_SIZE = TP_SIZE x DP_SIZE",
+            "vLLM multi-node DP+EP arithmetic: data-parallel-size, data-parallel-size-local, data-parallel-start-rank across two nodes",
+            "What NVL72 changes: a 72-GPU NVLink domain can hold EP32-EP72 entirely inside NVLink instead of crossing into the RDMA domain",
+            "EPLB memory overhead: ~2.4 GB per redundant expert per EP rank on DeepSeek-V3"
+          ],
+          "sourceIds": [
+            "S27",
+            "S30",
+            "S14",
+            "S16",
+            "S40"
+          ],
+          "estWords": 8500,
+          "figures": 5,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 1"
+          ],
+          "file": "05-wide-expert-parallelism.html",
+          "words": 5765,
+          "tables": 4,
+          "citations": 6,
+          "unverified": 1,
+          "readingTime": "30 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "06-deepseek-inference-system",
+          "number": 6,
+          "title": "DeepSeek's Production Inference System: EP Configurations, Economics, and Reproduction",
+          "shortTitle": "DeepSeek Deployment",
+          "description": "DeepSeek's own published deployment -- two different EP configurations two months apart, microbatch overlap, real cost/profit numbers -- and SGLang's independent 96-GPU reproduction that validates the numbers.",
+          "scope": "In: DeepSeek-V3's December 2024 technical-report deployment (prefill EP32/4 nodes, decode EP320/40 nodes, 32 redundant experts, IBGDA point-to-point for decode all-to-all); the February 2025 Day-6 disclosure's smaller production configuration (decode EP144/18 nodes) with per-node throughput/cost/profit numbers; the two-microbatch overlap technique that hides communication behind computation; the EP320-vs-EP144 discrepancy as an operational evolution, not an error; SGLang's independent reproduction on 96 H100 GPUs matching within 5.6%/6.6% of DeepSeek's own profile, and its resulting $0.20/1M-token cost. Out: DeepEP kernel mechanics (Module 5, already covered); SGLang's general architecture (Module 12). After this module Aman has a concrete, numbers-grounded reference deployment to compare any other wide-EP deployment against.",
+          "topics": [
+            "December 2024 technical-report deployment: prefill EP32 (4 nodes, TP4+SP+DP8, 32 redundant experts), decode EP320 (40 nodes, TP4+SP+DP80, one expert per GPU, IBGDA point-to-point)",
+            "Why decode is memory-bound, not compute-bound, at small per-expert batch size (<=256 tokens), and why only a fraction of SMs go to dispatch+MoE+combine",
+            "February 2025 Day-6 disclosure: decode shrunk to EP144/18 nodes, 2 routed + 1 shared expert per GPU -- the production configuration two months later",
+            "Per-node throughput: ~73.7k tok/s input (prefill, incl. cache hits) and ~14.8k tok/s output (decode) on H800",
+            "Real economics: $87,072/day operational cost vs. $562,027/day theoretical revenue at R1 pricing, 545% cost-profit margin",
+            "Three-tier load balancing in production: prefill load balancer, decode load balancer, expert-parallel load balancer",
+            "Two-microbatch overlap: alternating execution so one microbatch's communication hides behind the other's computation",
+            "SGLang's independent 96-H100 reproduction: EP32 prefill / EP72 decode, per-node throughput within 5.6%/6.6% of DeepSeek's own H800 numbers, $0.20/1M output tokens",
+            "The 20-of-132-SM communication tax on H800 and DeepSeek's hardware-design ask for dedicated communication co-processors"
+          ],
+          "sourceIds": [
+            "S28",
+            "S29",
+            "S18",
+            "S30"
+          ],
+          "estWords": 7000,
+          "figures": 4,
+          "disagreements": [
+            "How large should the cross-node decode expert-parallel degree be for a DeepSeek-class MoE model?"
+          ],
+          "prerequisites": [
+            "Module 5"
+          ],
+          "file": "06-deepseek-inference-system.html",
+          "words": 5190,
+          "tables": 3,
+          "citations": 6,
+          "unverified": 0,
+          "readingTime": "25 min"
+        }
+      ]
+    },
+    {
+      "id": "part-04-multi-node-kv-management",
+      "number": 4,
+      "title": "Multi-Node KV Cache Management",
+      "shortTitle": "KV Cache Management",
+      "description": "Treating KV cache as a first-class, hash-addressed, tiered cluster resource instead of private per-replica state, via Mooncake's architecture and the LMCache/NIXL layer it composes with.",
+      "modules": [
+        {
+          "status": "published",
+          "format": "html",
+          "id": "07-mooncake-tiered-kv",
+          "number": 7,
+          "title": "Prefix Caching and Tiered KV Offload Across Nodes: Mooncake's Architecture",
+          "shortTitle": "Tiered KV & Mooncake",
+          "description": "The KVCache-centric view of a serving cluster -- HBM to host DRAM to SSD to remote, addressed by content hash -- and Mooncake, the paper and system that made this architecture concrete.",
+          "scope": "In: the general offload-tier hierarchy (HBM -> host DRAM -> local SSD -> remote/RDMA-reachable storage) and why it exists; Mooncake's KVCache-centric disaggregated architecture: separate prefill/decode clusters, the Conductor global scheduler, the four-step per-request workflow (KVCache reuse -> incremental prefill -> KVCache transfer -> decode); content-addressed block hashing (512-token blocks, hash-of-hash chaining) and its role in cross-node prefix-cache reuse; the prefill_chunk threshold; Mooncake's production trace statistics and cache-hit-ratio-vs-capacity curve; the Messenger RDMA transfer component; Transfer Engine's measured bandwidth (87/190 GB/s on 4x/8x RoCE) and multi-transport support; Mooncake Store and Mooncake EP/Process Group as the repo's newer components; production adoption across vLLM, SGLang, LMDeploy. Out: LMCache and NIXL as separate projects (Module 8); generic PD scheduling mechanics already covered (Module 4) -- here only Mooncake's own Conductor-specific framing. After this module Aman can explain why a serving cluster benefits from treating KV cache as a first-class, hash-addressed, tiered resource rather than private per-replica state.",
+          "topics": [
+            "The offload-tier hierarchy: HBM -> host DRAM -> local SSD -> remote, and the cost/latency/capacity trade-off at each tier",
+            "Mooncake's KVCache-centric architecture: separated prefill/decode clusters, Conductor as global scheduler dispatching on KVCache distribution and workload",
+            "The four-step per-request workflow: KVCache reuse, incremental prefill, KVCache transfer, decoding",
+            "Content-addressed block hashing: 512-token blocks, hash determined by content + prefix, for cross-request/cross-node dedup",
+            "The prefill_chunk threshold (>1000 tokens) and why it exists (fully utilize GPU compute per chunk)",
+            "Production trace evidence: 23,608-request Kimi trace, avg input:output ratio ~720, cache-hit-ratio rising 30%->50% as capacity grows 1,000->50,000 blocks",
+            "SLO framing used in Mooncake's own evaluation: TTFT_P90 = 10x baseline, TBT_P90 = 5x baseline",
+            "Messenger: the GPUDirect-RDMA-based transfer component underneath KVCache transfer",
+            "Transfer Engine measured bandwidth: 87 GB/s (4x200Gbps RoCE), 190 GB/s (8x400Gbps RoCE), ~2.4x-4.6x faster than TCP; multi-transport support",
+            "Mooncake's own reconsideration of whether disaggregation is still needed post-chunked-prefill, cross-referenced against Module 3"
+          ],
+          "sourceIds": [
+            "S22",
+            "S23",
+            "S16"
+          ],
+          "estWords": 7500,
+          "figures": 6,
+          "disagreements": [
+            "Is a second (decode) pool worth the operational cost, or does chunked-prefill on a single colocated engine capture most of the benefit?"
+          ],
+          "prerequisites": [
+            "Module 4"
+          ],
+          "file": "07-mooncake-tiered-kv.html",
+          "words": 7441,
+          "tables": 4,
+          "citations": 3,
+          "unverified": 0,
+          "readingTime": "40 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "08-lmcache-nixl",
+          "number": 8,
+          "title": "LMCache and NIXL: The Reusable KV Layer and the Transfer-Library Primitive",
+          "shortTitle": "LMCache & NIXL",
+          "description": "LMCache as a pluggable KV-reuse layer that turns transient cache into shared, storage-backed state, and NIXL as the point-to-point transfer primitive that Dynamo, TensorRT-LLM, and SGLang all build their KV movement on.",
+          "scope": "In: LMCache's mechanism (automatic chunked offload at GPU-memory pressure, default 256-token chunks, pluggable backends spanning CPU RAM, local disk, Redis/Valkey, Mooncake Storage, InfiniStore, S3, NIXL, GDS); its vLLM integration via KVTransferConfig (LMCacheConnectorV1, kv_both role) and a measured ~7.43x cache-hit speedup; its integration timeline (vLLM V1 multimodal, Dynamo integration); NIXL's architecture (Memory Sections, Transfer Backend Interface, Metadata Handler), its actively-supported backends (UCX, GDS) and protocols (RoCE, InfiniBand, GPUDirect RDMA, NVMe-oF, TCP, NVLink); NIXL's role as the shared substrate under Dynamo's KV transfer, TensorRT-LLM's default cache-transceiver backend, and SGLang's alternate PD transfer backend; NIXL's fast-moving version history as evidence of how young this layer is. Out: Mooncake (Module 7, already covered as the KV-centric architecture LMCache/NIXL can plug into); Dynamo's own KVBM and Router (Module 9). After this module Aman can place LMCache and NIXL correctly in the stack: one is a reuse/offload policy layer, the other a transport primitive, and most systems compose both.",
+          "topics": [
+            "LMCache's mechanism: automatic chunked KV offload under GPU memory pressure, default 256-token chunks",
+            "LMCache pluggable backends: CPU RAM, local disk, Redis/Valkey, Mooncake Storage, InfiniStore, S3-compatible, NIXL, GDS",
+            "vLLM integration: KVTransferConfig with LMCacheConnectorV1 and kv_role=kv_both; measured ~7.43x second-run speedup",
+            "LMCache as 'AI-native knowledge': reframing KV cache as reusable state rather than transient scratch space",
+            "NIXL's three abstractions: Memory Sections (unify memory/storage types), Transfer Backend Interface, Metadata Handler (agent-to-agent metadata)",
+            "NIXL's actively-supported backends (UCX, GDS) vs. in-development backends (other filesystem/block/object stores)",
+            "NIXL as shared substrate: Dynamo's default KV transfer path, TensorRT-LLM's default cache-transceiver backend, SGLang's alternate PD backend",
+            "NIXL's rapid version churn as evidence of stack immaturity: stride descriptors (44MB->7KB), per-rail EFA flush fix, nixl::trace/NVTX integration",
+            "Where LMCache and NIXL compose: LMCache as a policy/backend-plugin layer sitting atop NIXL or Mooncake as the actual mover"
+          ],
+          "sourceIds": [
+            "S24",
+            "S24b",
+            "S25",
+            "S26",
+            "S12"
+          ],
+          "estWords": 7000,
+          "figures": 3,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 4",
+            "Module 7"
+          ],
+          "file": "08-lmcache-nixl.html",
+          "words": 5134,
+          "tables": 2,
+          "citations": 11,
+          "unverified": 0,
+          "readingTime": "25 min"
+        }
+      ]
+    },
+    {
+      "id": "part-05-open-source-stack",
+      "number": 5,
+      "title": "The Open-Source Serving Stack",
+      "shortTitle": "Open-Source Stack",
+      "description": "Project by project: Dynamo, llm-d, vLLM, SGLang, and TensorRT-LLM/Triton, contrasted mechanism by mechanism against the generic patterns established in Parts 1-4.",
+      "modules": [
+        {
+          "status": "published",
+          "format": "html",
+          "id": "09-nvidia-dynamo",
+          "number": 9,
+          "title": "NVIDIA Dynamo: Router, Planner, KV Block Manager, and Disaggregation Orchestration",
+          "shortTitle": "NVIDIA Dynamo",
+          "description": "Dynamo's architecture as an orchestration layer above vLLM/SGLang/TensorRT-LLM -- KV-aware Router, SLA-driven Planner, the KVBM offload manager -- and its own headline benchmark numbers.",
+          "scope": "In: Dynamo's position as an orchestration layer, not an inference engine (backends: vLLM, SGLang, TensorRT-LLM); named components (Router, Planner, KVBM, ModelExpress, Grove) and what each does; the Planner's four scaling modes (throughput, latency, load, sla) and their composition order; SLA-mode's performance-model mechanism (Rust AIC estimates plus online FPM tuning/regression, bootstrapped from profiler data); default SLA targets (TTFT 500ms, ITL 50ms); ARIMA/Prophet traffic prediction; Prometheus metrics emitted; disaggregated-serving specifics (NIXL-based non-blocking VRAM-to-VRAM transfer, backend-specific sync/overlap behavior already introduced in Module 4, here Dynamo's own implementation); current version (v1.4.2) and release cadence; headline benchmark claims (7x throughput/GPU, 2x TTFT, 750x on GB300) read as vendor-reported. Out: generic PD mechanics (Module 4, cross-referenced not repeated); llm-d (Module 10, a genuinely different design). After this module Aman can describe Dynamo's component architecture precisely enough to deploy or debug it.",
+          "topics": [
+            "Dynamo's position: orchestration layer above inference engines, not a replacement (vLLM/SGLang/TensorRT-LLM backends)",
+            "Named components: Router (KV-aware routing), Planner (SLA-driven autoscaler), KVBM (GPU->CPU->SSD->remote offload), ModelExpress (weight streaming via NIXL/NVLink), Grove (Kubernetes gang-scheduling operator)",
+            "Planner's four scaling modes: throughput, latency, load, sla, and their composition order (load-based adjusts above the throughput-derived floor)",
+            "SLA-mode performance model: Rust engine performance shim, native AIC estimates, online FPM tuning vs. FPM regression fallback, bootstrap data sources",
+            "Default SLA targets (TTFT 500ms, ITL 50ms) and ARIMA/Prophet-based traffic prediction",
+            "Prometheus metrics Dynamo emits: request rate/duration, TTFT, ITL, ISL/OSL, GPU utilization/power",
+            "Disaggregated-serving implementation specifics: NIXL VRAM-to-VRAM non-blocking transfer, backend-specific sync/overlap behavior",
+            "Version and release cadence: v1.4.2 (patch), v1.4.1 (classify/pooling endpoints), v1.5.0-dev (TensorRT-LLM 1.3.0rc25 container) as evidence of pace",
+            "Headline benchmark claims and their caveats: 7x/GPU (DeepSeek R1, GB200), 2x TTFT (KV-aware routing), 750x (DeepSeek-R1, GB300) as vendor-reported, model/hardware-specific"
+          ],
+          "sourceIds": [
+            "S1",
+            "S2",
+            "S3",
+            "S4",
+            "S5"
+          ],
+          "estWords": 8000,
+          "figures": 4,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 4",
+            "Module 2"
+          ],
+          "file": "09-nvidia-dynamo.html",
+          "words": 6849,
+          "tables": 4,
+          "citations": 17,
+          "unverified": 0,
+          "readingTime": "35 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "10-llm-d-epp",
+          "number": 10,
+          "title": "llm-d: The Inference Scheduler, Endpoint Picker, and Kubernetes Gateway API Inference Extension",
+          "shortTitle": "llm-d & EPP",
+          "description": "llm-d's five well-lit paths, its scheduler as the reference implementation of the Gateway API Inference Extension's Endpoint Picker protocol, and the InferencePool CRD every EPP-based router now builds against.",
+          "scope": "In: llm-d's five themes (Intelligent Routing, Advanced KV-Cache Management, Serving Large Models, Operational Excellence, Batch Processing) and its founding organizations/governance (CNCF Sandbox since March 2026); the layered EPP architecture (Routing Layer -> Flow Controller -> Scheduling Layer) as a design pattern now standardized by Kubernetes SIGs; InferencePool's CRD fields (selector, targetPorts, endpointPickerRef) and its GA/optionality history; the data layer's Source -> Extract -> Attribute lifecycle; llm-d's own headline benchmark claims read as self-reported; llm-d's supported engines (vLLM, SGLang). Out: the scoring mechanism internals already covered (Module 2, cross-referenced); Kubernetes deployment topology generally (Module 14). After this module Aman understands llm-d as the reference EPP implementation and can distinguish the Gateway API Inference Extension (the Kubernetes-standard API) from llm-d (one implementation built on it, among others like AIBrix).",
+          "topics": [
+            "llm-d's five well-lit paths: Intelligent Routing, Advanced KV-Cache Management, Serving Large Models, Operational Excellence, Batch Processing",
+            "Governance and founding organizations: Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA; CNCF Sandbox since March 2026",
+            "The layered EPP architecture: Routing Layer (per-model rules, enrichment) -> Flow Controller (priority, fairness, queueing) -> Scheduling Layer (load-balancing on current InferencePool state)",
+            "InferencePool CRD: selector, targetPorts, endpointPickerRef fields; GA since v1.0.0; endpointPickerRef required-then-optional history (v1.5.0)",
+            "HTTPRoute-to-InferencePool relationship: one route, multiple backend pools",
+            "The data layer's Source -> Extract -> Attribute lifecycle feeding scorers, cross-referenced against Module 2's scorer list",
+            "Pluggability as a design principle: adding scorers/filters without core changes",
+            "llm-d's headline self-reported numbers and their scope caveats: 3x throughput/2x TTFT (prefix-cache), 70% higher tok/s (disaggregation), 50k tok/s cluster (16x16 B200), 13.9x (hierarchical KV offload)",
+            "Distinguishing the standard (Gateway API Inference Extension) from one implementation (llm-d) from another (AIBrix, Module 14)"
+          ],
+          "sourceIds": [
+            "S7",
+            "S6",
+            "S9",
+            "S10",
+            "S11"
+          ],
+          "estWords": 7500,
+          "figures": 5,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 2",
+            "Module 9"
+          ],
+          "file": "10-llm-d-epp.html",
+          "words": 5204,
+          "tables": 3,
+          "citations": 15,
+          "unverified": 0,
+          "readingTime": "30 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "11-vllm-multinode",
+          "number": 11,
+          "title": "vLLM Multi-Node: Distributed Serving, Disaggregated Prefill, and the Production Stack",
+          "shortTitle": "vLLM Multi-Node",
+          "description": "How vLLM itself scales past one node -- the KV-connector abstraction that every disaggregation backend plugs into, DP+EP CLI arithmetic, and the reference production-stack deployment.",
+          "scope": "In: vLLM's disaggregated-prefill mechanism as vLLM's own docs frame it (experimental status, the Connector/LookupBuffer/Pipe abstractions -- here vLLM's specific implementation and connector list, cross-referencing Module 4 for the general pattern); the full named-connector list; DP+EP CLI-level configuration (EP_SIZE=TP_SIZE*DP_SIZE, --data-parallel-size/--data-parallel-size-local/--data-parallel-start-rank across nodes); the vLLM production-stack reference architecture (serving engine + request router + Prometheus/Grafana observability) and its router's round-robin/session-ID/service-discovery modes; vLLM's Prometheus metric surface as the substrate other systems' autoscalers consume. Out: the general connector pattern (Module 4); LMCache/NIXL/Mooncake as projects (Modules 7-8, cross-referenced). After this module Aman can configure and reason about a real multi-node vLLM deployment end to end, including which flags produce which topology.",
+          "topics": [
+            "vLLM's disaggregated-prefill status: labeled experimental, three abstractions (Connector, LookupBuffer, Pipe)",
+            "The full named-connector list and what each backs onto: LMCacheConnectorV1, NixlConnector, MooncakeConnector, MoRIIOConnector (ROCm), MultiConnector, OffloadingConnector, FlexKVConnectorV1, PyNcclConnector",
+            "DP+EP CLI arithmetic: EP_SIZE = TP_SIZE x DP_SIZE; --tensor-parallel-size, --data-parallel-size, --data-parallel-size-local, --data-parallel-start-rank",
+            "Two-node worked example: 16 total DP ranks, 8 local per node, start-rank 8 on the second node",
+            "Attention-DP + EP layout in vLLM specifically: TP=1 replicated attention, MoE sharded across the full EP group",
+            "vLLM production-stack architecture: serving engine, request router (round-robin/session-ID/k8s service discovery), observability stack",
+            "vLLM's Prometheus metric surface: named gauges (num_requests_running, kv_cache_usage_perc), histograms (TTFT, ITL, per-token latency, prefill/decode time, KV block lifetime), deprecated v0 metrics",
+            "LWS as the substrate vLLM's own multi-node deployment guides assume, cross-referenced forward to Module 14"
+          ],
+          "sourceIds": [
+            "S12",
+            "S13",
+            "S14",
+            "S15"
+          ],
+          "estWords": 7500,
+          "figures": 4,
+          "disagreements": [
+            "Is a second (decode) pool worth the operational cost, or does chunked-prefill on a single colocated engine capture most of the benefit?"
+          ],
+          "prerequisites": [
+            "Module 4",
+            "Module 5"
+          ],
+          "file": "11-vllm-multinode.html",
+          "words": 5337,
+          "tables": 4,
+          "citations": 7,
+          "unverified": 1,
+          "readingTime": "30 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "12-sglang-router-pd",
+          "number": 12,
+          "title": "SGLang: Router, PD Disaggregation, and Wide-EP Deployment Patterns",
+          "shortTitle": "SGLang Router & PD",
+          "description": "SGLang's two-problem framing for disaggregation, its dual transfer-backend design, and its concrete multi-node DeepSeek-class deployment recipe.",
+          "scope": "In: SGLang's stated motivation for disaggregation (prefill interruption, DP attention imbalance -- a framing distinct from DistServe/Mooncake's interference argument, worth contrasting); the two transfer backends (Mooncake transfer engine with per-GPU IB device mapping, NIXL with UCX default / LIBFABRIC option) and how they're selected; the concrete multi-node DeepSeek deployment pattern (TP=16, DP=8, --enable-dp-attention, --moe-a2a-backend deepep, separate prefill/decode master nodes); heterogeneous-TP with GPU staging buffer (2-5x throughput gain, MLA incompatibility caveat); failure-detection specifics (heartbeat interval, bootstrap timeout defaults); sglang-router as a standalone Rust load balancer and its versioning; the SGL-JAX bridge to TPU previewed (full treatment Module 18). Out: generic connector/failure-mode pattern (Module 4, cross-referenced); wide-EP mechanism internals (Module 5, cross-referenced). After this module Aman can stand up and debug a multi-node SGLang DeepSeek-class deployment and knows exactly which flags control which behavior.",
+          "topics": [
+            "SGLang's disaggregation motivation: prefill interruption vs. DP attention imbalance, a framing distinct from interference-based arguments elsewhere",
+            "Two transfer backends: Mooncake (mooncake-transfer-engine, per-GPU IB device mapping) vs. NIXL (UCX default, LIBFABRIC via env var)",
+            "Multi-node DeepSeek deployment recipe: TP=16, DP=8, --enable-dp-attention, --moe-a2a-backend deepep, separate prefill/decode master nodes",
+            "Heterogeneous TP with GPU staging buffer: 2-5x throughput gain when prefill/decode use different TP sizes; incompatible with MLA models",
+            "Failure detection specifics: SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL (5.0s default), bootstrap handshake timeout (300s default)",
+            "sglang-router: standalone Rust load balancer, PD-aware routing algorithms, versioning (0.3.2)",
+            "Comparing SGLang's framing to DistServe/Mooncake's interference argument (Module 3): same conclusion, different diagnosis",
+            "SGL-JAX as the bridge extending this stack to TPU, previewed here and fully treated in Module 18"
+          ],
+          "sourceIds": [
+            "S16",
+            "S17",
+            "S18",
+            "S19"
+          ],
+          "estWords": 7000,
+          "figures": 6,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 4",
+            "Module 5"
+          ],
+          "file": "12-sglang-router-pd.html",
+          "words": 5391,
+          "tables": 4,
+          "citations": 9,
+          "unverified": 0,
+          "readingTime": "30 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "13-trtllm-triton",
+          "number": 13,
+          "title": "TensorRT-LLM and Triton: Disaggregated Serving on GB200",
+          "shortTitle": "TensorRT-LLM & Triton",
+          "description": "TensorRT-LLM's context/generation server terminology, its cache-transceiver mechanism, and the disaggregation speedup numbers NVIDIA measured across models and GPU counts on GB200.",
+          "scope": "In: TensorRT-LLM's own terminology (context servers = prefill, generation servers = decode); the cache-transceiver mechanism (KvCacheTransceiverV2, default NIXL backend, TRTLLM_NIXL_KVCACHE_BACKEND selecting UCX/LIBFABRIC, transport over RDMA/NVLink); the disagg_request_id binding mechanism (TensorRT-LLM specifics, general pattern already in Module 4); measured speedups across models and configurations on GB200 (DeepSeek R1 with/without MTP, Qwen3, by ISL:OSL ratio, by GPU count 4-32); dynamic node joining/leaving as explicitly in-progress, not-GA; Triton's role as the serving frontend TensorRT-LLM backends into. Out: general PD mechanics (Module 4); wide-EP mechanism (Module 5). After this module Aman can read TensorRT-LLM's disaggregation benchmarks critically, knowing which speedup numbers apply to which workload shape.",
+          "topics": [
+            "Terminology: context servers (prefill) vs. generation servers (decode)",
+            "Cache-transceiver mechanism: KvCacheTransceiverV2, default NIXL backend, TRTLLM_NIXL_KVCACHE_BACKEND (UCX default vs. LIBFABRIC)",
+            "disagg_request_id: why context and generation phases of one request must share a single ID",
+            "Communication protocols supported: MPI, UCX, NIXL, over RDMA/NVLink",
+            "Measured speedups on GB200 by workload: DeepSeek R1 (1.4x-1.8x without MTP, 1.6x-2.5x with MTP), Qwen3 (1.7x-6.11x), by GPU count (4-32 per instance)",
+            "Why speedup varies 1.4x-6.11x by ISL:OSL ratio and model: reading these numbers as workload-shape-dependent, not hardware constants",
+            "Dynamic node joining/leaving: explicitly in progress, being built on top of the existing cache-transceiver mechanism, not yet GA",
+            "Triton as the serving frontend TensorRT-LLM plugs into"
+          ],
+          "sourceIds": [
+            "S20",
+            "S21",
+            "S2"
+          ],
+          "estWords": 6500,
+          "figures": 5,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 4"
+          ],
+          "file": "13-trtllm-triton.html",
+          "words": 5060,
+          "tables": 3,
+          "citations": 9,
+          "unverified": 0,
+          "readingTime": "25 min"
+        }
+      ]
+    },
+    {
+      "id": "part-06-ops-economics-frontier",
+      "number": 6,
+      "title": "Operations, Economics, and the Frontier",
+      "shortTitle": "Ops, Econ & Frontier",
+      "description": "How the fleet is deployed and kept alive, how to size it from published numbers, and what the field has not yet settled.",
+      "modules": [
+        {
+          "status": "published",
+          "format": "html",
+          "id": "14-k8s-deployment-ops",
+          "number": 14,
+          "title": "Kubernetes Deployment Topologies and Operations at Fleet Scale",
+          "shortTitle": "K8s Deployment & Ops",
+          "description": "How a multi-node inference fleet is actually deployed and operated -- LeaderWorkerSet as the multi-host replication primitive, SLO-driven autoscaling, multi-tenant serving, observability, and upgrade/failure handling.",
+          "scope": "In: LeaderWorkerSet (LWS) as the Kubernetes API for deploying a sharded multi-host unit of replication, and its co-design with llm-d; concrete parallelism-to-GPU-count topology examples (KServe's tensorParallelSize x pipelineParallelSize = total GPUs, 16-GPU/2-node worked example); the orchestration layer landscape (Ray Serve LLM's multi-node/multi-model primitives, KServe's multinode ServingRuntime, AIBrix's component set) and where each fits relative to Dynamo/llm-d; multi-model and multi-tenant serving patterns; observability -- what metrics actually matter for a multi-node fleet vs. vanity metrics; upgrade and failure handling (rolling upgrades of stateful multi-host pods, GPU hardware-failure detection, drain-before-remove). Out: the SLO-autoscaling algorithm internals already covered for Dynamo's Planner (Module 9, cross-referenced); capacity-planning arithmetic (Module 15). After this module Aman can specify a concrete Kubernetes topology for an N-node deployment and knows which orchestration layer fits which operational need.",
+          "topics": [
+            "LeaderWorkerSet: deploying a group of pods as one unit of replication for multi-host sharded inference; co-design with llm-d",
+            "KServe's parallelism arithmetic: tensorParallelSize x pipelineParallelSize = total GPUs, worked 16-GPU/2-node example",
+            "Orchestration layer landscape: Ray Serve LLM (multi-node/multi-model, LLMConfig/build_openai_app/serve.run), KServe multinode ServingRuntime, AIBrix (Gateway/Routing, App-Tailored Autoscaler, Distributed KV Cache, GPU Hardware Failure Detection)",
+            "Where each orchestration layer sits relative to Dynamo/llm-d: complementary Kubernetes control-plane vs. inference-specific orchestration",
+            "Multi-model and multi-tenant serving patterns: shared InferencePool across models, LoRA-adapter routing by model name",
+            "Observability that matters: TTFT/ITL percentiles, KV-cache utilization, per-pool queue depth, GPU power/utilization, vs. metrics that don't move the needle",
+            "Upgrade handling: rolling upgrade of stateful multi-host sharded pods, drain-before-remove pattern cross-referenced against Module 4's xPyD",
+            "GPU hardware-failure detection and recovery at fleet scale, using AIBrix's dedicated component as a concrete example"
+          ],
+          "sourceIds": [
+            "S34",
+            "S33",
+            "S32",
+            "S31",
+            "S15"
+          ],
+          "estWords": 7000,
+          "figures": 6,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 9",
+            "Module 10"
+          ],
+          "file": "14-k8s-deployment-ops.html",
+          "words": 6799,
+          "tables": 4,
+          "citations": 13,
+          "unverified": 0,
+          "readingTime": "35 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "15-capacity-economics",
+          "number": 15,
+          "title": "Capacity Planning and Economics: Goodput, Tokens/s/$, and Little's-Law Reasoning at Rack Scale",
+          "shortTitle": "Capacity & Economics",
+          "description": "The arithmetic for sizing a multi-node deployment from published numbers -- goodput under TTFT/ITL SLOs, tokens/s/$ as a function of N, and queueing-theoretic reasoning about when adding nodes stops helping.",
+          "scope": "In: precise metric definitions (TTFT, TPOT/ITL formulas including the N-request averaging subtlety, goodput = %requests meeting all SLOs); the single-node batch-size/latency/throughput baseline planners must know before scaling (14x throughput for 4x latency at batch 64; continuous batching's 10-20x gain; the sublinear GPU-count-to-latency relationship at low batch size); scaling tokens/s/$ with N using DeepSeek's and SGLang's published cost numbers as worked examples; TCO-per-million-tokens as the correct optimization target (InferenceMAX framing, cross-referenced from Module 3) applied as a planning tool; queueing-theoretic capacity reasoning grounded in DistServe's M/D/1 analysis rather than unsourced blog heuristics, explicitly flagging why an unsourced Little's-Law blog claim was excluded from this course. Out: the disaggregation pay-off decision itself (Module 3, already made); per-project economics (Modules 6, 9-13, cross-referenced for worked numbers). After this module Aman can size a deployment -- node count, pool split, expected tokens/s/$ -- from a target SLO and a published per-node throughput number.",
+          "topics": [
+            "Precise metric definitions: TTFT, TPOT (1-request formula and N-request averaging subtlety, Avg TPOT vs. Avg ITL divergence), goodput",
+            "Single-node batch-size/latency/throughput baseline: 4x latency for 14x throughput at batch 64; continuous batching's 10-20x gain over static/dynamic batching",
+            "Why doubling GPU count doesn't halve latency at low batch size (0.7x latency at 4->8 GPUs, Llama2-70B): the capacity-planning trap of assuming linear scaling",
+            "Scaling tokens/s/$ with N: worked economics from DeepSeek's own numbers ($87,072/day cost, 545% margin) and SGLang's reproduction ($0.20/1M output tokens)",
+            "TCO-per-million-tokens as optimization target and the interactivity-dependent crossover, cross-referenced from Module 3's ~90 tok/s/user finding, applied as a sizing decision tool",
+            "Queueing-theoretic capacity reasoning: DistServe's M/D/1 goodput analysis as the grounded alternative to informal Little's-Law heuristics",
+            "Why an unsourced Little's-Law blog claim (30-70% throughput from work-conserving schedulers) was excluded, and what to use instead",
+            "Worked sizing structure: given a target TTFT/ITL SLO and a per-node throughput number, derive required node count and expected cost per million tokens"
+          ],
+          "sourceIds": [
+            "S53",
+            "S52",
+            "S35",
+            "S43",
+            "S29"
+          ],
+          "estWords": 7500,
+          "figures": 6,
+          "disagreements": [
+            "When does prefill/decode disaggregation actually pay off?"
+          ],
+          "prerequisites": [
+            "Module 3",
+            "Module 6"
+          ],
+          "file": "15-capacity-economics.html",
+          "words": 5330,
+          "tables": 2,
+          "citations": 9,
+          "unverified": 0,
+          "readingTime": "30 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "16-research-frontier",
+          "number": 16,
+          "title": "The Research Frontier: Live Migration, Fused Megakernels, and What Is Still Unsettled",
+          "shortTitle": "Research Frontier",
+          "description": "What the open-source stack has not yet productionized -- cross-instance live request migration, kernel-fusion alternatives to orchestration complexity -- and where the field's own published numbers still disagree.",
+          "scope": "In: Llumnix's cross-instance live-migration mechanism (near-zero-downtime, sequence-length-independent; unifying load balancing, de-fragmentation, prioritization, and autoscaling under one 'virtual usage' abstraction) as a capability that is research-proven but not yet part of the mainstream production stack surveyed in Part 5; Stanford Hazy Research/Scaling Intelligence Lab's kernel-fusion line of work as a contrasting research direction -- Tokasaurus (dynamic Hydragen grouping, adaptive CPU/GPU pipelining) and ThunderMLA (fused decode megakernel via a GPU-resident virtual instruction set, 20-35% faster than FlashMLA) built on ThunderKittens, explicitly correcting the 'Thunder Agent' misnomer, which does not name a real project; synthesis of this course's open disagreements as unresolved as of 2026-09-17: the EP320-vs-EP144 DeepSeek discrepancy, TensorRT-LLM's not-yet-GA dynamic node joining/leaving, and the disaggregation-pays-off conditionality. Out: no new mechanism categories -- this module is explicitly synthesis plus two research lines not covered elsewhere. After this module Aman knows what a state-of-the-art multi-node deployment does not yet do, and which of this course's numbers are most likely to be stale within a year.",
+          "topics": [
+            "Llumnix's live migration mechanism: near-zero-downtime, constant-in-sequence-length migration between running instances",
+            "The 'virtual usage' abstraction unifying four rescheduling purposes: load balancing, de-fragmentation, prioritization, autoscaling",
+            "Llumnix's measured gains (15x P99 TTFT, 2x P99 per-token latency vs. INFaaS on 16 GPUs; 36% cost saving) and why this capability is absent from Part 5's production stacks",
+            "Tokasaurus: dynamic Hydragen grouping for shared prefixes, pipeline parallelism for NVLink-less GPUs, async TP for NVLink GPUs -- a throughput-first alternative to disaggregation-first design",
+            "ThunderMLA: the fused 'megakernel' concept -- a GPU-resident virtual instruction set eliminating kernel-launch overhead, 20-35% faster than DeepSeek's own FlashMLA",
+            "ThunderKittens as the underlying tile-kernel DSL that makes megakernel fusion tractable (naming correction: not 'Thunder Agent', which does not exist)",
+            "Open disagreement recap: EP320 (Dec 2024) vs. EP144 (Feb 2025) for DeepSeek decode -- genuine deployment evolution, not error",
+            "Open disagreement recap: TensorRT-LLM's dynamic node joining/leaving explicitly in progress, not GA -- what production readiness would require",
+            "Open disagreement recap: disaggregation's pay-off conditionality -- near-unconditional goodput win (DistServe/Mooncake) vs. interactivity-conditional TCO win (InferenceMAX) -- and why both are correct under their own metric",
+            "What is most likely to be stale within a year: NIXL/Dynamo's monthly-cadence version churn, EP configurations, the TCO crossover point as newer hardware ships"
+          ],
+          "sourceIds": [
+            "S37",
+            "S38",
+            "S39",
+            "S28",
+            "S43"
+          ],
+          "estWords": 6500,
+          "figures": 4,
+          "disagreements": [
+            "How large should the cross-node decode expert-parallel degree be for a DeepSeek-class MoE model?",
+            "When does prefill/decode disaggregation actually pay off?"
+          ],
+          "prerequisites": [
+            "Module 4",
+            "Module 6",
+            "Module 15"
+          ],
+          "file": "16-research-frontier.html",
+          "words": 5439,
+          "tables": 5,
+          "citations": 20,
+          "unverified": 0,
+          "readingTime": "30 min"
+        }
+      ]
+    },
+    {
+      "id": "part-07-contrasting-hardware",
+      "number": 7,
+      "title": "Contrasting Hardware: AMD and TPU",
+      "shortTitle": "Contrasting Hardware",
+      "description": "What transfers from the NVIDIA-centric course and what is a hard substitution, on AMD Instinct and Google TPU.",
+      "modules": [
+        {
+          "status": "published",
+          "format": "html",
+          "id": "17-amd-multinode",
+          "number": 17,
+          "title": "AMD MI300X/MI355X Multi-Node Serving: RCCL, InfiniBand/RoCE, and vLLM-ROCm",
+          "shortTitle": "AMD Multi-Node",
+          "description": "What transfers from the NVIDIA-centric stack to AMD's Instinct platform and what does not -- RCCL's IB/RoCE setup, MI300X/MI355X's interconnect numbers, and vLLM-ROCm's DP+EP results.",
+          "scope": "In: MI300X architecture numbers (192GB HBM3 @ 5.2TB/s, 4th-gen Infinity Fabric 896GB/s/GPU, 8-GPU platform aggregate 1.5TB HBM3 @ 42.4TB/s vs. H100 HGX's 640GB @ 25.6TB/s); MI355X's generational jump (288GB HBM3e @ 8TB/s, 5th-gen Infinity Fabric 538GB/s/chip, RoCEv2 via Pollara 400GbE NIC); RCCL multi-node setup mechanics (required RDMA packages, MASTER_ADDR/NNODES/NODE_RANK, NCCL_SOCKET_IFNAME, NCCL_IB_HCA, NCCL_IB_GID_INDEX=3 for RoCE, automatic RDMA activation on InfiniBand vs. exact-version RoCE library matching); vLLM-ROCm's state (AITER attention backends, MoRIIOConnector as the ROCm-specific disaggregation connector already named in Module 11, DP+EP throughput gains 16-47% over TP at high concurrency, 7,114 TPS DeepSeek-R1 at 1024 concurrent requests); InferenceMAX's MI300X-vs-MI355X per-MW comparison. Out: re-deriving PD/EP/routing mechanisms already covered generically (Modules 2-6) -- here only what is AMD-specific or numerically different. After this module Aman knows exactly which multi-node mechanisms in this course port to AMD unchanged and which are AMD-specific substitutions.",
+          "topics": [
+            "MI300X spec numbers: 192GB HBM3 @ 5.2TB/s, 304 CUs/1,216 Matrix Cores, 4th-gen Infinity Fabric 896GB/s/GPU",
+            "8-GPU MI300X platform vs. 8-GPU H100 HGX: 1.5TB @ 42.4TB/s vs. 640GB @ 25.6TB/s, the memory-capacity case for large MoE inference",
+            "MI355X generational jump: 288GB HBM3e @ 8TB/s, 5th-gen Infinity Fabric 538GB/s/chip (~4.3TB/s aggregate per node), 1,400W TDP/chip",
+            "Multi-node fabric: RoCEv2 Ethernet via Pollara 400GbE NIC as the standard scale-out path, vs. NVIDIA's IB-first default",
+            "RCCL multi-node setup: required RDMA packages, MASTER_ADDR/NNODES/NODE_RANK launch variables, NCCL_SOCKET_IFNAME, NCCL_IB_HCA",
+            "RoCE-specific requirement: NCCL_IB_GID_INDEX=3 and exact RoCE-library-version matching across hosts, vs. InfiniBand's automatic RDMA activation",
+            "vLLM-ROCm's AITER attention backends: 2.7-4.4x TPS over legacy ROCM_ATTN, 1.2-1.5x over TRITON_MLA for MLA models",
+            "DP+EP on ROCm: 16-47% throughput gain over TP at >=512 concurrent requests, 7,114 TPS DeepSeek-R1 at 1024 concurrent requests",
+            "MoRIIOConnector as the ROCm-specific KV-disaggregation connector, cross-referenced against Module 11's connector list",
+            "InferenceMAX's per-provisioned-MW comparison: MI300X 750k tok/s/MW vs. MI355X 2.55M tok/s/MW at 90 tok/s/user interactivity"
+          ],
+          "sourceIds": [
+            "S46",
+            "S47",
+            "S44",
+            "S45",
+            "S43"
+          ],
+          "estWords": 7500,
+          "figures": 7,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 1",
+            "Module 4",
+            "Module 5"
+          ],
+          "file": "17-amd-multinode.html",
+          "words": 5758,
+          "tables": 4,
+          "citations": 15,
+          "unverified": 0,
+          "readingTime": "30 min"
+        },
+        {
+          "status": "published",
+          "format": "html",
+          "id": "18-tpu-multihost",
+          "number": 18,
+          "title": "TPU Multi-Host Serving: ICI, Pathways, and JetStream",
+          "shortTitle": "TPU Multi-Host",
+          "description": "The TPU-native alternative to the GPU stack's node/fabric model -- ICI mesh topology, single-controller Pathways orchestration, and JetStream as the serving engine -- contrasted mechanism by mechanism against Parts 1-6.",
+          "scope": "In: TPU generation specs (v6e: 256-chip pod, 800GBps bidirectional ICI/chip, 32GB HBM/chip @ 1638GBps, 8-chip single-VM inference-optimized slice; TPU7x/Ironwood: 9,216-chip pod, 1,200GBps ICI/chip, 192GB HBM/chip @ ~7.37TB/s) and how ICI's mesh/torus topology differs structurally from NVLink's switched fabric and IB's fat-tree; the single-controller Pathways model (pathways-proxy, pathways-rm, jax-tpu, jetstream-http) as the orchestration analog to Dynamo/llm-d, built on the same LeaderWorkerSet primitive; JetStream as the throughput/memory-optimized serving engine (JAX/MaxText and PyTorch reference implementations); multi-host slice topology examples (v6e-16, disaggregated-mode two-v6e-8 example) and what disaggregation means when the fabric is already a single low-latency mesh; checkpoint-restoration timings as an operational reality GPU-stack modules don't surface; the access-model caveat (Pathways not fully self-serve GA); SGLang's SGL-JAX bridge as the point where the GPU-centric open-source router/PD/wide-EP stack is being ported onto this substrate. Out: re-deriving routing/PD/EP mechanisms already covered -- here only what changes when ICI replaces NVLink/IB and Pathways replaces Dynamo/llm-d. After this module Aman can map every mechanism in this course onto its TPU-side equivalent or absence.",
+          "topics": [
+            "TPU v6e pod spec: 256 chips, 800GBps bidirectional ICI/chip, 32GB HBM/chip @ 1638GBps, 2D torus topology",
+            "TPU7x/Ironwood pod spec: 9,216 chips, 1,200GBps ICI/chip, 192GB HBM/chip @ ~7.37TB/s, two TensorCores + four SparseCores per chip",
+            "ICI mesh/torus topology vs. NVLink's switched fabric and IB's fat-tree: no equivalent bandwidth cliff at the node boundary within a pod",
+            "The 8-chip single-VM inference-optimized slice (v6e-8) as TPU's analog to an 8-GPU node, and where the analogy breaks",
+            "Pathways single-controller architecture: pathways-proxy, pathways-rm (resource manager), jax-tpu engine, jetstream-http, orchestrated via LeaderWorkerSet",
+            "JetStream: throughput/memory-optimized serving engine, JAX/MaxText and PyTorch reference engines",
+            "Multi-host slice examples: v6e-16 aggregate slice vs. disaggregated-mode two-v6e-8-slice configuration, and what disaggregation means on an already-unified mesh",
+            "Operational realities: checkpoint restoration timing (7 min for Llama3.1-405B, 2 min for Llama2-70B) as a cost GPU-stack modules don't surface",
+            "Access model: Pathways requires a Google Cloud account representative, not yet fully self-serve GA",
+            "SGL-JAX as the bridge porting the GPU-centric router/PD/wide-EP stack onto JAX/TPU; RadixArk's planned SGL-torchtpu backend"
+          ],
+          "sourceIds": [
+            "S48",
+            "S49",
+            "S50",
+            "S51",
+            "S19"
+          ],
+          "estWords": 7500,
+          "figures": 4,
+          "disagreements": [],
+          "prerequisites": [
+            "Module 1",
+            "Module 4",
+            "Module 14"
+          ],
+          "file": "18-tpu-multihost.html",
+          "words": 6737,
+          "tables": 2,
+          "citations": 13,
+          "unverified": 0,
+          "readingTime": "35 min"
+        }
+      ]
+    }
+  ],
+  "appendices": [
+    {
+      "id": "bibliography",
+      "letter": "A",
+      "title": "Bibliography",
+      "file": "bibliography.html",
+      "format": "html"
+    }
+  ]
+}

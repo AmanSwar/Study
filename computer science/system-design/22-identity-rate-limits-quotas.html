@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Identity, Rate Limits, and Quotas: API Keys, Orgs, and Token-Bucket Enforcement · System Design</title>
+<meta name="description" content="The org/workspace/key identity hierarchy as OpenAI's and Anthropic's own rate-limit documentation incidentally reveals it, spend limits vs rate limits as distinct mechanisms, fixed-window/sliding-window/token-bucket enforcement applied to LLM API traffic, and BeyondCorp/Zanzibar applied to org-level authorization.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 22</p>
+  <h1>Identity, Rate Limits, and Quotas: API Keys, Orgs, and Token-Bucket Enforcement</h1>
+  <p class="lede">Every request to an inference API carries a bearer key that resolves through an organization/workspace hierarchy to two independent gates — a spend limit measured in dollars per month and a rate limit measured in requests or tokens per minute — and the two gates fail in different, deliberately distinguishable ways. This module reads OpenAI's and Anthropic's own rate-limit documentation for what it reveals about that hierarchy, applies Module 10's fixed-window/sliding-window/token-bucket vocabulary to the specific problem of a request whose true cost is unknown until generation finishes, and applies Module 10's BeyondCorp/Zanzibar vocabulary to org-level authorization on an API platform. After this module you can read either platform's 429 response and say exactly which limit tripped, why, and whether retrying is even possible.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>40 min</b> read</span>
+    <span class="chip"><b>7</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 10</b>, <b>Module 21</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f1t"><title id="f1t">A request resolves through an org/workspace/key identity hierarchy and passes two independent gates before reaching the router</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="90" y="24" text-anchor="middle" class="d-title d-bold">Identity (§1)</text>
+    <rect x="20" y="34" width="140" height="36" rx="8" class="d-block"/><text x="90" y="56" text-anchor="middle" class="d-text-inv d-small d-bold">API key</text>
+    <path d="M90,70 L90,96" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="20" y="96" width="140" height="36" rx="8" class="d-block-2"/><text x="90" y="118" text-anchor="middle" class="d-text-inv d-small d-bold">Workspace / project</text>
+    <path d="M90,132 L90,158" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="20" y="158" width="140" height="36" rx="8" class="d-block-accent"/><text x="90" y="180" text-anchor="middle" class="d-text-inv d-small d-bold">Organization</text>
+
+    <path d="M160,176 L215,176" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <text x="335" y="150" text-anchor="middle" class="d-title d-bold">Two independent gates</text>
+    <rect x="215" y="158" width="240" height="36" rx="8" class="d-surface d-stroke-red"/>
+    <text x="335" y="180" text-anchor="middle" class="d-small d-bold">Spend limit ($/mo, org) — §2</text>
+    <path d="M455,176 L520,176" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="487" y="167" text-anchor="middle" class="d-mono d-small">pass</text>
+    <path d="M335,194 L335,240" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+
+    <rect x="520" y="158" width="240" height="36" rx="8" class="d-block"/>
+    <text x="640" y="180" text-anchor="middle" class="d-text-inv d-small d-bold">Rate limit (RPM/ITPM/OTPM) — §3</text>
+    <path d="M760,176 L780,176" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M640,194 L640,240" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+
+    <text x="335" y="215" text-anchor="middle" class="d-mono d-small d-text-light">fail</text>
+    <text x="640" y="215" text-anchor="middle" class="d-mono d-small d-text-light">fail</text>
+
+    <rect x="185" y="240" width="300" height="46" rx="8" class="d-panel d-outline"/>
+    <text x="335" y="260" text-anchor="middle" class="d-small d-bold">429 rate_limit_error</text>
+    <text x="335" y="277" text-anchor="middle" class="d-small">no retry-after header</text>
+
+    <rect x="490" y="240" width="300" height="46" rx="8" class="d-panel d-outline"/>
+    <text x="640" y="260" text-anchor="middle" class="d-small d-bold">429 rate_limit_error</text>
+    <text x="640" y="277" text-anchor="middle" class="d-small">retry-after header present</text>
+
+    <text x="785" y="176" text-anchor="middle" class="d-small d-bold">→</text>
+    <text x="700" y="130" text-anchor="middle" class="d-small d-text-light">to gateway router</text>
+    <text x="700" y="145" text-anchor="middle" class="d-small d-text-light">(Module 21)</text>
+
+    <text x="400" y="340" text-anchor="middle" class="d-small d-text-light">Both gates return HTTP 429 and the same error.type; only the presence of retry-after and</text>
+    <text x="400" y="358" text-anchor="middle" class="d-small d-text-light">error.details.error_code tells a client which gate it hit<a class="cite" href="#ref-1">1</a>.</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> A request's API key resolves upward through a workspace/project to an organization (§1), then must clear two independently-enforced gates — a monthly spend limit and a per-minute/per-token rate limit — before reaching the router this course covers in Module 21. Both gates fail with HTTP 429, but only one carries a retry-after header<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<h2 id="identity-hierarchy">1. The identity hierarchy incidentally revealed by rate-limit docs</h2>
+<p>Neither OpenAI nor Anthropic has published a document titled "API key architecture" or "how our OAuth/service-account model works." The identity hierarchy each platform actually runs is visible only where a different document — the rate-limit page — has to state it in passing, because a limit is meaningless without saying at what level it is enforced. That is a real gap in what is publicly documented, not a stylistic choice by this module: no primary source in this course's source map describes either platform's identity system as its own subject, and the hierarchy below is reconstructed entirely from what each platform's rate-limit documentation says about where a limit lives.</p>
+
+<h3 id="identity-openai">1.1 OpenAI: organization, project, and cumulative spend</h3>
+<p>OpenAI's rate-limit documentation states its scope directly: "rate limits are defined at the organization level and at the project level, not user level"<a class="cite" href="#ref-2">2</a>. That single sentence fixes two levels of the hierarchy — organization above, project below — and rules out a third: there is no per-human-user rate limit, only per-organization and per-project ones, which means every API key inside a given project shares that project's budget regardless of which individual created the key. OpenAI's six rate-limit dimensions (RPM, RPD, TPM, TPD, IPM, and audio minutes per minute; detailed in §3.3) are each tracked at both levels, and the response headers reflect this explicitly with a parallel project-scoped set — <code>x-ratelimit-limit-tokens</code> alongside <code>x-ratelimit-limit-project-tokens</code><a class="cite" href="#ref-2">2</a> — so a client inspecting a single response can see both its project's remaining budget and (implicitly) that a higher, organization-wide ceiling exists above it.</p>
+<p>The other half of OpenAI's identity-adjacent structure is the usage tier, and it is keyed to a number that has nothing to do with request volume: cumulative dollars paid. An organization starts in the Free tier (available only in allowed geographies) and moves to Tier 1 after paying $5, Tier 2 after $50, Tier 3 after $100, Tier 4 after $250, and Tier 5 after $1,000 — cumulative payment history, not a subscription plan a customer selects<a class="cite" href="#ref-2">2</a>. Each tier carries its own monthly usage cap, independent of the per-minute rate-limit dimensions: $100/month for Free and Tier 1, $500 for Tier 2, $1,000 for Tier 3, $5,000 for Tier 4, and $200,000 for Tier 5<a class="cite" href="#ref-2">2</a>. The mechanism is a graduated trust ladder that an organization climbs automatically by paying more over time, not a plan it negotiates — a shape that makes sense for a platform whose primary abuse vector is a large number of low-trust, low-history signups rather than a small number of enterprise accounts.</p>
+
+<h3 id="identity-anthropic">1.2 Anthropic: organization, workspace, and named plan tiers</h3>
+<p>Anthropic's rate-limit documentation states its hierarchy just as directly, using a different pair of nouns: "the API enforces service-configured limits at the organization level, but you may also set user-configurable limits for your organization's workspaces"<a class="cite" href="#ref-1">1</a>. Organization is the same top level OpenAI uses; workspace replaces OpenAI's project as the second level, and — unlike OpenAI's projects, which the documentation does not describe as independently configurable by the customer — Anthropic states plainly that workspace-level limits are something the organization itself sets, below the org-wide ceiling, specifically "to protect Workspaces in your Organization from potential overuse"<a class="cite" href="#ref-1">1</a> (the mechanics of this are worked through with real numbers in §4). A response header makes the resolution concrete for any given request: <code>anthropic-workspace-id</code> "carries the ID of the Workspace that your API key or access token resolved to"<a class="cite" href="#ref-1">1</a> — direct textual confirmation that an API key is not itself the unit of account; it resolves to a workspace, which resolves to an organization.</p>
+<p>Anthropic's tier structure differs from OpenAI's in kind, not just in name. Where OpenAI's tiers are unlabeled numbers keyed to cumulative payment, Anthropic's are named plans — Start, Build, Scale, and Custom — each carrying an explicit monthly spend cap set by the plan rather than accumulated by history: $500 for Start, $1,000 for Build, $200,000 for Scale, and no cap at all for Custom, where limits are negotiated directly with an account team<a class="cite" href="#ref-1">1</a>. Anthropic's documentation also names a state OpenAI's does not: new organizations, or organizations without much usage history, may start in an Evaluation tier below the standard tiers' published limits, "as part of how Anthropic prevents fraud and abuse," with limits that increase automatically as usage history accumulates<a class="cite" href="#ref-1">1</a> — functionally similar to OpenAI's payment-gated tier ladder, but framed as a probation period rather than a rewards ladder, and applied before an organization is even assigned to Start/Build/Scale rather than as one more rung within that ladder.</p>
+
+<h3 id="identity-gap">1.3 The documented gap, and the one fully-documented reference hierarchy</h3>
+<p>Both platforms' rate-limit pages agree that a two-level customer hierarchy exists (organization above a second unit — project or workspace — below), and both agree that unit-of-account is tracked per key resolving through that hierarchy. Neither page says anything about how a key is issued, rotated, or scoped to a service account; neither describes an OAuth flow, a machine-identity credential, or how a human user's console login relates to the keys that user can mint. That is not an oversight in this module — it is the actual state of what either lab has published, and a reader who needs deeper API-key or service-account mechanics has nowhere in either platform's own documentation to look beyond the rate-limit and API-key-management console pages, which describe the mechanics of creating a key but not the architecture behind it.</p>
+<p>The one identity hierarchy in this space that <em>is</em> fully documented at an architectural level belongs to neither frontier lab but to LiteLLM, the open-source LLM gateway/proxy Module 21 introduces as a reference implementation of the gateway request lifecycle. LiteLLM's own architecture document specifies virtual keys as the unit a client actually holds, and states the rollup explicitly: "spend for that user is tracked... team in the LiteLLM_TeamTable"<a class="cite" href="#ref-3">3</a> — a three-level hierarchy of key, user, and team that a proxy operator configures directly, with "hard limits (tokens, requests, upstream-billing caps), soft limits with alerts, model whitelists, and rate limits" attached at the key level and rolled up at each level above it<a class="cite" href="#ref-3">3</a>. LiteLLM's model is worth holding next to OpenAI's and Anthropic's precisely because it is the mirror image of the gap: it is a fully specified, code-visible hierarchy for a self-hosted gateway sitting in front of either lab's API, built by an operator who needed exactly the identity mechanics neither lab documents for its own hosted product.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> The identity hierarchy each source's rate-limit or architecture documentation states directly, read side by side<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a>.</caption>
+<thead><tr><th>Level</th><th>OpenAI</th><th>Anthropic</th><th>LiteLLM (self-hosted gateway)</th></tr></thead>
+<tbody>
+<tr><td class="row">Top level</td><td>Organization</td><td>Organization</td><td>Team</td></tr>
+<tr><td class="row">Second level</td><td>Project</td><td>Workspace</td><td>User</td></tr>
+<tr><td class="row">Unit a client holds</td><td>API key (per project)</td><td>API key (resolves to a workspace)</td><td>Virtual key</td></tr>
+<tr><td class="row">Tier naming</td><td>Free / Tier 1&ndash;5, keyed to cumulative $ paid</td><td>Evaluation / Start / Build / Scale / Custom, named plans</td><td>operator-defined, no fixed tiers</td></tr>
+<tr><td class="row">Example monthly cap</td><td>$200,000 at Tier 5</td><td>$200,000 at Scale</td><td>configured per key/user/team</td></tr>
+<tr><td class="row">Second-level limit configurability</td><td>not described as customer-configurable</td><td>customer sets workspace limits below org ceiling<a class="cite" href="#ref-1">1</a></td><td>fully configurable per level<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Dedicated architecture document</td><td data-worst>none</td><td data-worst>none</td><td data-best>yes<a class="cite" href="#ref-3">3</a></td></tr>
+</tbody>
+</table>
+<h2 id="spend-vs-rate">2. Spend limits vs rate limits: two mechanisms, two error signatures</h2>
+<p>Anthropic's documentation draws the distinction as cleanly as any source in this course draws any distinction: "spend limits set a maximum monthly cost an organization can incur for API usage. Rate limits set the maximum number of API requests an organization can make over a defined period of time"<a class="cite" href="#ref-1">1</a>. One bounds a dollar total accumulated over a calendar month; the other bounds a rate — requests, tokens, images, or audio-minutes per minute or per day. A caller can be well under its rate limit and still blocked because the org has spent its monthly cap, and can be far from the spend cap while still throttled because it sent 200 requests in the same second a 60 RPM limit allows only one. The two mechanisms answer unrelated questions and are checked independently, which is exactly what Figure 1's two-gate structure shows: passing the spend gate says nothing about the rate gate, and vice versa.</p>
+
+<h3 id="spend-vs-rate-signature">2.1 Why the error has to look different</h3>
+<p>Both failures return the same HTTP status and, on Anthropic's API, literally the same <code>error.type</code> string: <code>rate_limit_error</code><a class="cite" href="#ref-1">1</a>. That shared label is not sloppy naming — a rate limit and an exhausted spend cap are, from the caller's point of view, both instances of "you cannot make this request right now" — but it creates a real problem for any client that wants to react correctly: a client that retries a genuine rate limit after backing off is doing the right thing; a client that retries an exhausted monthly spend cap in a loop will burn every retry for the rest of the calendar month for nothing. Anthropic's documentation resolves the ambiguity with two separate signals rather than a third top-level error type: the <code>retry-after</code> header is present on an ordinary rate limit and absent on the spend-cap response, and the spend-cap response additionally carries <code>error.details.error_code: enforced_spend_limit_reached</code>, which the documentation states exists specifically so a client can "tell this response apart from a rate limit"<a class="cite" href="#ref-1">1</a>. "Retrying, including the SDKs' automatic retries, fails until access resumes" is stated explicitly for the spend-cap case — a caller is told plainly that no amount of backoff helps, only waiting for the next billing month or requesting a higher limit<a class="cite" href="#ref-1">1</a>.</p>
+<p>There is a third distinct signature that is easy to miss, because it looks similar to the other two but is neither: a <em>self-imposed</em> spend limit — one an organization sets below its tier's cap voluntarily, covered in §1.2's mention that Anthropic lets an org "set your own spend limit below your tier's cap" — returns HTTP 400 with <code>error.type: invalid_request_error</code>, not HTTP 429 at all, and a message beginning "You have reached your specified API usage limits"<a class="cite" href="#ref-1">1</a>. The distinction matters operationally: HTTP 400 conventionally means "this specific request is malformed and will never succeed as sent," which is the wrong signal for "your organization is out of self-imposed budget for the month," but Anthropic's documentation is explicit that this is the actual status code returned, and a client that treats every 4xx identically will misclassify a self-imposed budget cap as a request bug rather than a billing state. One further variant sits alongside these three: the Claude Code workspace's limit, when exceeded, can instead return a 429 that does carry a <code>retry-after</code> header even though it is enforcing what is functionally a spend-type limit<a class="cite" href="#ref-1">1</a> — a reminder that the three-signature taxonomy below is what the general Messages API returns, not an inviolable law that every limit type on the platform obeys without exception.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f2t"><title id="f2t">Three error responses that look similar but carry different retry semantics</title>
+    <text x="150" y="24" text-anchor="middle" class="d-title d-bold">Ordinary rate limit</text>
+    <rect x="20" y="34" width="260" height="150" rx="8" class="d-surface d-stroke-cyan"/>
+    <text x="35" y="56" class="d-mono d-small">HTTP 429</text>
+    <text x="35" y="76" class="d-mono d-small">"type": "rate_limit_error"</text>
+    <text x="35" y="96" class="d-mono d-small">retry-after: 12</text>
+    <text x="35" y="116" class="d-mono d-small d-text-light">error_code: (absent)</text>
+    <rect x="35" y="135" width="230" height="34" rx="6" class="d-fill-green-soft d-stroke-green"/>
+    <text x="150" y="157" text-anchor="middle" class="d-small d-bold">retry after waiting</text>
+
+    <text x="410" y="24" text-anchor="middle" class="d-title d-bold">Spend cap reached</text>
+    <rect x="280" y="34" width="260" height="150" rx="8" class="d-surface d-stroke-red"/>
+    <text x="295" y="56" class="d-mono d-small">HTTP 429</text>
+    <text x="295" y="76" class="d-mono d-small">"type": "rate_limit_error"</text>
+    <text x="295" y="96" class="d-mono d-small d-text-light">retry-after: (absent)</text>
+    <text x="295" y="116" class="d-mono d-small">enforced_spend_limit_reached</text>
+    <rect x="295" y="135" width="230" height="34" rx="6" class="d-fill-red-soft d-stroke-red"/>
+    <text x="410" y="157" text-anchor="middle" class="d-small d-bold">retry never succeeds</text>
+
+    <text x="670" y="24" text-anchor="middle" class="d-title d-bold">Self-imposed spend limit</text>
+    <rect x="540" y="34" width="240" height="150" rx="8" class="d-surface d-stroke-amber"/>
+    <text x="555" y="56" class="d-mono d-small">HTTP 400</text>
+    <text x="555" y="76" class="d-mono d-small">"type": "invalid_request</text>
+    <text x="555" y="92" class="d-mono d-small">_error"</text>
+    <text x="555" y="112" class="d-mono d-small d-text-light">retry-after: (absent)</text>
+    <rect x="555" y="130" width="210" height="34" rx="6" class="d-fill-amber-soft d-stroke-amber"/>
+    <text x="660" y="152" text-anchor="middle" class="d-small d-bold">raise the self-limit</text>
+
+    <text x="400" y="220" text-anchor="middle" class="d-small d-text-light">Same HTTP-adjacent shape, three different remedies: wait, request a higher tier, or raise a self-imposed cap.</text>
+    <text x="400" y="240" text-anchor="middle" class="d-small d-text-light">A client that treats all three as one retryable case will loop uselessly against the middle and right cases<a class="cite" href="#ref-1">1</a>.</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Anthropic's three distinct limit-exceeded responses. An ordinary rate limit and an exhausted monthly spend cap both use <code>error.type: rate_limit_error</code> and HTTP 429, distinguished only by the presence of <code>retry-after</code> and the <code>enforced_spend_limit_reached</code> error code; a self-imposed spend limit uses a different status code and error type entirely<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Error-response fields for the three limit-exceeded cases Anthropic's documentation specifies<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Case</th><th>HTTP status</th><th>error.type</th><th>retry-after</th><th>Distinguishing field</th><th>Correct client action</th></tr></thead>
+<tbody>
+<tr><td class="row">Ordinary rate limit</td><td class="num">429</td><td>rate_limit_error</td><td data-best>present</td><td>&mdash;</td><td>back off and retry</td></tr>
+<tr><td class="row">Org spend cap reached</td><td class="num">429</td><td>rate_limit_error</td><td data-worst>absent</td><td>error_code: enforced_spend_limit_reached</td><td>stop retrying; wait for next billing month or request a higher tier</td></tr>
+<tr><td class="row">Self-imposed spend limit</td><td class="num">400</td><td>invalid_request_error</td><td data-worst>absent</td><td>message text ("specified API usage limits")</td><td>raise or remove the self-imposed limit</td></tr>
+</tbody>
+</table>
+
+<p>OpenAI's documentation makes the same rate-limit-vs-abuse distinction in spirit, though from the opposite direction: rather than a separate spend-cap error code, it warns that "unsuccessful requests contribute to your per-minute limit, so continuously resending a request won't work" and instructs clients to "treat this value as a minimum: wait at least that long and add a small random delay"<a class="cite" href="#ref-2">2</a> before retrying — a statement this module returns to in §3.5, because it has direct consequences for retry design that go beyond simply reading a header correctly. OpenAI's documentation states that "OpenAI sets an approved monthly usage limit for each organization" tied to the tier ladder in §1.1, but — unlike Anthropic's explicit <code>enforced_spend_limit_reached</code> error code and no-retry-after signal — it does not state what error a caller actually receives on reaching that monthly cap. That is a second, narrower instance of §1.3's documentation gap: OpenAI's rate-limit page is precise about the six per-minute/per-day dimensions and silent about the error signature for the one limit that is closest in kind to Anthropic's spend cap.</p>
+<h2 id="cost-after-generation">3. Enforcing a limit whose true cost is known only after generation</h2>
+<p>Module 10 §4 established three rate-limiting algorithms — fixed window, sliding window, token bucket — and worked a derivation showing the identical 20-request burst produces three different accept counts (20, 10, and 12 of 20) depending on which algorithm measures it<a class="cite" href="#ref-4">4</a>. That derivation assumed every request costs the same one unit of "rate." An LLM API cannot make that assumption: the quantity that actually matters — tokens generated — is not known when the request arrives, only after the model finishes producing output, and a request that turns out to generate 4,000 output tokens looks, at admission time, identical to one that will generate 40. This section applies Module 10's three algorithms to that harder problem rather than re-deriving them.</p>
+
+<h3 id="cost-fixed-sliding-applied">3.1 Fixed window vs sliding window, applied to an API key's RPM limit</h3>
+<p>Cloudflare's AI Gateway — a product built specifically to sit in front of LLM API traffic rather than a generic web backend — documents exactly the boundary-straddling failure mode Module 10 derived, using the same style of example: with a 10-requests-per-10-minutes limit, "sending 10 requests at 12:09 and 10 requests at 12:11... all 20 requests would be successful" under fixed-window enforcement, because the first batch lands in the window ending at 12:10 and the second in the fresh window that opens immediately after<a class="cite" href="#ref-4">4</a>. Anchored to a sliding window instead, "there would be no more than x requests in the last ten minutes... they would fail in a sliding window strategy since there were more than ten requests in the last ten minutes"<a class="cite" href="#ref-4">4</a> — the second batch is rejected outright because the trailing 10-minute interval already contains the first batch. The mechanism is identical to Module 10's; what is new here is only the object being counted: an API key's RPM allocation rather than a generic backend's admission counter, and Cloudflare's own AI Gateway product is the direct evidence that this exact boundary problem is something LLM-platform operators have had to document and solve, not a hypothetical.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f3t"><title id="f3t">The same 20-request burst against a 10-per-10-minute API key RPM limit, fixed window vs sliding window</title>
+    <text x="20" y="24" class="d-small d-bold">API key RPM limit: 10 requests / 10 minutes — burst of 10 @ minute 9, 10 @ minute 11</text>
+
+    <text x="20" y="60" class="d-small d-text-light">Fixed window (resets on the clock)</text>
+    <line x1="60" y1="80" x2="760" y2="80" class="d-axis"/>
+    <line x1="410" y1="65" x2="410" y2="95" class="d-dashed d-stroke-blue"/>
+    <text x="410" y="105" text-anchor="middle" class="d-mono d-small">t=10 (reset)</text>
+    <rect x="60" y="68" width="350" height="4" class="d-fill-blue-soft"/><rect x="410" y="68" width="350" height="4" class="d-fill-cyan-soft"/>
+    <circle cx="340" cy="80" r="5" class="d-fill-green"/><text x="340" y="47" text-anchor="middle" class="d-mono d-small">10 req @9</text>
+    <circle cx="480" cy="80" r="5" class="d-fill-green"/><text x="480" y="47" text-anchor="middle" class="d-mono d-small">10 req @11</text>
+    <text x="700" y="47" text-anchor="middle" class="d-mono d-small d-bold">20/20 admitted</text>
+
+    <text x="20" y="165" class="d-small d-text-light">Sliding window (trailing 10 minutes, evaluated continuously)</text>
+    <line x1="60" y1="185" x2="760" y2="185" class="d-axis"/>
+    <line x1="410" y1="170" x2="410" y2="200" class="d-dashed d-stroke-blue"/>
+    <path d="M340,173 L480,173" class="d-line d-stroke-amber" style="stroke-width:2"/>
+    <text x="410" y="163" text-anchor="middle" class="d-mono d-small">trailing 10-min window</text>
+    <circle cx="340" cy="185" r="5" class="d-fill-green"/><text x="340" y="217" text-anchor="middle" class="d-mono d-small">10 req @9 — admitted</text>
+    <circle cx="480" cy="185" r="5" class="d-fill-red"/><text x="480" y="217" text-anchor="middle" class="d-mono d-small">10 req @11 — all rejected</text>
+    <text x="700" y="152" text-anchor="middle" class="d-mono d-small d-bold">10/20 admitted</text>
+
+    <text x="400" y="248" text-anchor="middle" class="d-small d-text-light">Mechanism and derivation: Module 10 §4.1&ndash;4.4. Data: Cloudflare AI Gateway's own 10-per-10-minute example<a class="cite" href="#ref-4">4</a>.</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Cloudflare's AI Gateway documents the identical boundary-straddling burst Module 10 derived in general terms, here anchored to an API key's requests-per-minute allocation: a fixed window admits the full 20-request burst, a sliding window rejects the entire second batch<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h3 id="cost-token-bucket-applied">3.2 Token bucket applied: continuous replenishment, and the sub-window smoothing caveat</h3>
+<p>Anthropic's Messages API is the token-bucket case Module 10 §4.3 introduced in general terms<a class="cite" href="#ref-1">1</a>, and its documentation adds a detail Module 10 did not need: the nominal bucket capacity is not always the effective burst capacity a caller can actually extract, because the platform can smooth enforcement to a finer sub-window than the limit's stated unit. Anthropic states this directly: "you might hit rate limits over shorter time intervals. For instance, a rate of 60 requests per minute (RPM) might be enforced as 1 request per second. Short bursts of requests can exceed the limit and trigger rate limit errors"<a class="cite" href="#ref-1">1</a>. Read literally against the pure token-bucket model — capacity 60, refill 1 token/second, starting full — a caller that has been idle should be able to spend all 60 tokens in the first second of a burst; Anthropic's own caveat says that in practice, enforcing "1 request per second" as the effective ceiling means a burst of, say, 20 requests inside one second can trigger a 429 even though the nominal 60-per-minute bucket has plenty of capacity left over the full minute. The nominal number on the rate-limit page (60 RPM) and the number that actually predicts whether a burst succeeds (roughly 1 per second, i.e. a much smaller effective bucket over a much shorter interval) are two different quantities, and only the documentation — not the stated limit — tells you which one governs a specific burst pattern.</p>
+<p>This is the general lesson a token-bucket implementation can hide from a naive reading of its parameters: "continuously replenished... rather than reset at fixed intervals" describes the refill rule<a class="cite" href="#ref-1">1</a>, but says nothing about whether the operator additionally caps how much of that capacity can be spent inside a sub-interval shorter than the nominal window — a second bucket, effectively, nested inside the first, with its own tighter capacity. A caller tuning its request pacing against the published 60 RPM number alone, without accounting for this sub-window smoothing, will see intermittent 429s that a naive token-bucket model says should not happen.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">Fixed-window reset step vs token-bucket continuous refill, same nominal rate</title>
+    <line x1="70" y1="240" x2="760" y2="240" class="d-axis"/>
+    <line x1="70" y1="40" x2="70" y2="240" class="d-axis"/>
+    <text x="40" y="245" text-anchor="end" class="d-small d-text-light">0</text>
+    <text x="40" y="65" text-anchor="end" class="d-small d-text-light">cap</text>
+    <text x="415" y="270" text-anchor="middle" class="d-small d-text-light">time →</text>
+
+    <line x1="70" y1="60" x2="760" y2="60" class="d-grid"/>
+    <polyline points="70,60 300,60 300,240 300,60 530,60 530,240 530,60 760,60" class="d-line d-stroke-blue" style="stroke-width:2"/>
+    <text x="180" y="255" text-anchor="middle" class="d-mono d-small">drains to 0</text>
+    <line x1="300" y1="55" x2="300" y2="245" class="d-dashed d-stroke-blue"/>
+    <text x="300" y="45" text-anchor="middle" class="d-mono d-small">reset</text>
+    <line x1="530" y1="55" x2="530" y2="245" class="d-dashed d-stroke-blue"/>
+    <text x="530" y="45" text-anchor="middle" class="d-mono d-small">reset</text>
+    <text x="700" y="80" text-anchor="middle" class="d-small d-bold">Fixed window</text>
+
+    <polyline points="70,150 220,240 260,225 400,240 440,220 600,240 650,215 760,190" class="d-line d-stroke-orange" style="stroke-width:2"/>
+    <text x="700" y="200" text-anchor="middle" class="d-small d-bold">Token bucket</text>
+    <text x="230" y="255" text-anchor="middle" class="d-mono d-small d-text-light">drain</text>
+    <text x="330" y="230" text-anchor="middle" class="d-mono d-small d-text-light">refill</text>
+
+    <text x="415" y="20" text-anchor="middle" class="d-small d-text-light">Same nominal rate, two shapes: a step function that snaps to full at each reset instant vs a continuous ramp with no reset at all</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> A fixed-window limiter's remaining capacity is a step function — it drains linearly and snaps back to full the instant the window resets. A token bucket's remaining capacity is continuous — it drains on each accepted request and refills gradually at a fixed rate with no reset instant, per Anthropic's own framing of the mechanism<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="cost-per-dimension">3.3 Per-dimension limit sets: six axes vs three</h3>
+<p>Both platforms answer "how much can this key do per minute" with more than one number, because a single combined counter cannot distinguish a caller sending many small requests from one sending few enormous ones. OpenAI enforces six independent dimensions — RPM, RPD, TPM, TPD, IPM, and audio minutes per minute for streaming audio models — and states that whichever one is reached first triggers the 429<a class="cite" href="#ref-2">2</a>. Anthropic enforces three — RPM, ITPM, OTPM — and states the same "any one" logic: "if you exceed any of the rate limits you will get a 429 error describing which rate limit was exceeded"<a class="cite" href="#ref-1">1</a>. The difference is not that OpenAI's platform is more heavily used or Anthropic's less; it is that OpenAI's product surface spans more modalities requiring their own independent ceiling (images, audio) while Anthropic's is scoped to text-in/text-out on the Messages API, and — the detail worth dwelling on — Anthropic further splits tokens into input and output rather than combining them into one TPM figure the way a naive reading of "tokens per minute" would suggest.</p>
+<p>That input/output split matters mechanically, not just cosmetically: input tokens are countable at request time (you can tokenize the prompt before sending it), while output tokens are not known until the model has finished generating them. Anthropic's documentation states this distinction as two different enforcement timings rather than one: ITPM "is estimated at the beginning of each request, and the estimate is adjusted during the request to reflect the actual number of input tokens used," while OTPM "is evaluated in real time as output tokens are produced, counting only the actual tokens generated" — and explicitly, "the <code>max_tokens</code> parameter does not factor into OTPM rate limit calculations, so there is no rate limit downside to setting a higher <code>max_tokens</code> value"<a class="cite" href="#ref-1">1</a>. A combined TPM dimension would have to either estimate the unknown output length pessimistically at admission (over-reserving capacity against requests that turn out short) or under-count it (letting a long generation blow past a limit that was fine at admission time); splitting into ITPM and OTPM sidesteps the estimation problem for outputs entirely by only ever counting what was actually produced, in real time, as it is produced.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Per-dimension rate-limit sets, OpenAI's six vs Anthropic's three<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Dimension</th><th>OpenAI</th><th>Anthropic</th><th>Known at request time?</th></tr></thead>
+<tbody>
+<tr><td class="row">Requests / minute</td><td>RPM</td><td>RPM</td><td>yes</td></tr>
+<tr><td class="row">Requests / day</td><td>RPD</td><td data-worst>not a separate dimension</td><td>yes</td></tr>
+<tr><td class="row">Input tokens / minute</td><td>combined into TPM</td><td>ITPM (cache-excluded, most models)</td><td>yes (tokenizable)</td></tr>
+<tr><td class="row">Output tokens / minute</td><td>combined into TPM</td><td>OTPM (real-time, actual tokens only)</td><td data-worst>no &mdash; known only as generated</td></tr>
+<tr><td class="row">Tokens / day</td><td>TPD</td><td data-worst>not a separate dimension</td><td>&mdash;</td></tr>
+<tr><td class="row">Images / minute</td><td>IPM</td><td data-worst>not a separate dimension</td><td>yes</td></tr>
+<tr><td class="row">Audio minutes / minute</td><td>for streaming audio models</td><td data-worst>not a separate dimension</td><td>partially</td></tr>
+</tbody>
+</table>
+
+<p>Anthropic's own published tables give a concrete sense of how far these three numbers move across tiers for one model family. Claude Sonnet 5's limits scale roughly 2x from Start to Build and roughly another 2x from Build to Scale on every dimension simultaneously<a class="cite" href="#ref-1">1</a> — the tiers are not just a dollar-cap ladder (§1.2) but a matched rate-limit ladder rising alongside it.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 4.</b> Claude Sonnet 5 rate limits by usage tier<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Tier</th><th class="num">RPM</th><th class="num">ITPM</th><th class="num">OTPM</th></tr></thead>
+<tbody>
+<tr><td class="row">Start</td><td class="num">1,000</td><td class="num">2,000,000</td><td class="num">400,000</td></tr>
+<tr><td class="row">Build</td><td class="num">5,000</td><td class="num">5,000,000</td><td class="num">1,000,000</td></tr>
+<tr><td class="row">Scale</td><td class="num" data-best>10,000</td><td class="num" data-best>10,000,000</td><td class="num" data-best>2,000,000</td></tr>
+</tbody>
+</table>
+
+<p>Both platforms also carve out rate limits for specific resources that sit outside the six-vs-three framing entirely, because a resource that isn't a chat completion doesn't fit naturally into RPM/TPM-shaped counters. OpenAI meters vector-store ingestion separately at 300 requests per minute per vector store<a class="cite" href="#ref-2">2</a>, and its Batch API is not rate-limited by RPM/TPM at all but by a queue depth: "Batch API queue limits are calculated based on the total number of input tokens queued for a given model"<a class="cite" href="#ref-2">2</a> — a caller can queue an enormous batch job without touching its interactive RPM/TPM budget, but the aggregate size of everything still waiting to run is its own separate ceiling. Anthropic carves out comparably specific limits for its Message Batches API (a combined RPM plus a cap on batch requests in the processing queue — 200,000 at Start, rising to 500,000 at Scale — plus a 100,000-request-per-batch ceiling at every tier), its Managed Agents endpoints (300 requests per minute to create an agent/session/environment, 1,200 per minute for read operations), and its Files API (a separate per-organization limit shared across upload, list, retrieve, download, and delete)<a class="cite" href="#ref-1">1</a>. The general lesson is that "six dimensions" and "three dimensions" describe only the interactive-completion surface; any resource whose cost shape doesn't match request-count-or-token-count gets its own bespoke limit instead of being forced into the existing six or three, and a platform's true rate-limit surface is the union of all of them, not just the headline table.</p>
+
+<h3 id="cost-cache-aware-itpm">3.4 Cache-aware ITPM: a worked derivation of effective throughput</h3>
+<p>Anthropic excludes most models' <code>cache_read_input_tokens</code> from the ITPM count entirely: "only uncached input tokens count toward your ITPM rate limits"<a class="cite" href="#ref-1">1</a> (prompt caching's own mechanics — breakpoints, TTLs, pricing multipliers — belong to Module 28; this section needs only the rate-limit consequence). That single exclusion turns a fixed ITPM number into a variable effective throughput ceiling that depends on how much of a workload's input is repeated context served from cache. Let \(L\) be the stated ITPM limit and \(h\) the fraction of input tokens served from cache (the cache hit rate). If a caller sends \(X\) total input tokens per minute, a fraction \(h X\) is cache-read (excluded) and the remaining \((1-h)X\) is uncached and counts toward the limit:
+$$ (1-h)X \le L \quad\Rightarrow\quad X \le \frac{L}{1-h} $$
+At \(h = 0\) (no caching), effective throughput equals the stated limit, \(X_{\max} = L\), exactly as a combined, cache-blind TPM dimension would behave. At \(h = 0.8\) and \(L = 2{,}000{,}000\), \(X_{\max} = 2{,}000{,}000 / 0.2 = 10{,}000{,}000\) — Anthropic's own worked example states this exact number: "with a 2,000,000 ITPM limit and an 80% cache hit rate, you could effectively process 10,000,000 total input tokens per minute"<a class="cite" href="#ref-1">1</a>, which is precisely the arithmetic above. The relationship is not linear in \(h\) — it diverges as \(h \to 1\): at a 95% cache hit rate the same 2,000,000 ITPM limit supports 40,000,000 total input tokens per minute, and at 99% it supports 200,000,000. A workload's effective rate-limit ceiling is therefore not a fixed platform number at all once caching is in play; it is a function of that workload's own cache discipline, which is the direct reason Anthropic's documentation recommends monitoring cache hit rate on the usage page specifically "to tune your caching strategy"<a class="cite" href="#ref-1">1</a> rather than treating the published ITPM number as the ceiling to plan against.</p>
+
+<div class="calc">
+<p class="calc-title">Effective ITPM throughput under cache-aware rate limiting</p>
+<div class="calc-row"><label for="c1">ITPM limit (uncached input tokens/min)</label><input type="range" id="c1" name="L" min="100000" max="10000000" step="100000" value="2000000" data-format="si"></div>
+<div class="calc-row"><label for="c2">Cache hit rate</label><input type="range" id="c2" name="h" min="0" max="0.99" step="0.01" value="0.8" data-format="pct"></div>
+<div class="calc-out">
+<div>Effective total input throughput<output data-expr="L / (1 - h)" data-format="si"></output> tokens/min</div>
+</div>
+<p class="calc-note">Formula: \( X_{\max} = L / (1 - h) \), derived above. At the default 2,000,000 ITPM / 80% inputs, this reproduces Anthropic's own stated 10,000,000 tokens/minute example<a class="cite" href="#ref-1">1</a>.</p>
+</div>
+
+<h3 id="cost-failed-requests-count">3.5 Why a failed request still counts against the limit</h3>
+<p>A rate limiter that only decremented its counter on <em>successful</em> requests would be trivially exploitable: a caller denied for exceeding its limit could immediately retry, and because the denied attempt didn't count, the retry would face exactly the same limit state as the original request — an infinite-retry loophole around any cap. Both platforms close this by counting the attempt, not the outcome. OpenAI states it plainly: "unsuccessful requests contribute to your per-minute limit, so continuously resending a request won't work"<a class="cite" href="#ref-2">2</a>. The design consequence is that a client cannot treat a 429 as free to immediately retry — doing so both fails again and burns another unit of whatever budget is already exhausted, which is strictly worse than doing nothing. OpenAI's own guidance follows directly from this: "treat this value as a minimum: wait at least that long and add a small random delay" before retrying<a class="cite" href="#ref-2">2</a> — the exponential-backoff-with-jitter pattern Module 11 covers in general terms for any retried operation, applied here to the specific case where the "operation" is itself the thing consuming the budget being retried against. The same logic underlies OpenAI's traffic-ramping guidance for a caller scaling up from a cold start: once traffic reaches 1,000,000 input TPM, increase it by no more than 50% every 15 minutes<a class="cite" href="#ref-2">2</a> — a deliberately slow ramp precisely because a burst of requests that trips a limit is not merely rejected for free; every rejected request in that burst has already spent capacity that a well-paced ramp would not have wasted.</p>
+
+<h3 id="cost-response-headers">3.6 Response headers: how a client actually inspects its remaining budget</h3>
+<p>A well-behaved client should not have to guess where it stands relative to a limit by counting its own requests — both platforms return the live state on every response, not just on a 429. OpenAI's headers are scoped in a pair per dimension, one for the effective (often project-level) limit and one explicitly project-scoped: <code>x-ratelimit-limit-requests</code>, <code>x-ratelimit-remaining-requests</code>, and <code>x-ratelimit-reset-requests</code>, mirrored for tokens, plus a parallel <code>x-ratelimit-limit-project-tokens</code> set<a class="cite" href="#ref-2">2</a>. Anthropic's headers are scoped per rate-limit type rather than per request/token pair, with a separate triple (limit/remaining/reset) for requests, combined tokens, input tokens, and output tokens, plus a fifth set gated behind Priority Tier access<a class="cite" href="#ref-1">1</a> — and Anthropic states explicitly which limit's numbers you are looking at when more than one could apply: "the <code>anthropic-ratelimit-tokens-*</code> headers display the values for the most restrictive limit currently in effect. For instance, if you have exceeded the Workspace per-minute token limit, the headers will contain the Workspace per-minute token rate limit values"<a class="cite" href="#ref-1">1</a> — a direct answer to the §4 question of whether a request's throttling came from its workspace cap or the org ceiling above it, readable from a single response without querying a console. A separate <code>anthropic-workspace-id</code> header, already introduced in §1.2, resolves which workspace a given key's traffic counted against<a class="cite" href="#ref-1">1</a>. Reading these headers, rather than tracking client-side counters that can drift from the server's true state, is the mechanism both platforms actually expect a production client to use to stay under a limit rather than discover it via a 429.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 5.</b> Rate-limit-status response headers, OpenAI vs Anthropic<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>What it tells you</th><th>OpenAI header</th><th>Anthropic header</th></tr></thead>
+<tbody>
+<tr><td class="row">Request limit / remaining / reset</td><td><code>x-ratelimit-limit-requests</code> / <code>-remaining-requests</code> / <code>-reset-requests</code></td><td><code>anthropic-ratelimit-requests-limit</code> / <code>-remaining</code> / <code>-reset</code></td></tr>
+<tr><td class="row">Token limit / remaining / reset</td><td><code>x-ratelimit-limit-tokens</code> / <code>-remaining-tokens</code> / <code>-reset-tokens</code> (combined)</td><td>separate input and output triples: <code>anthropic-ratelimit-input-tokens-*</code>, <code>anthropic-ratelimit-output-tokens-*</code></td></tr>
+<tr><td class="row">Project/workspace-scoped variant</td><td><code>x-ratelimit-limit-project-tokens</code> and remaining/reset equivalents</td><td>same header names reused; "most restrictive limit currently in effect" rule<a class="cite" href="#ref-1">1</a> disambiguates org vs. workspace</td></tr>
+<tr><td class="row">Which workspace/project a request counted against</td><td data-worst>not exposed as a header</td><td data-best><code>anthropic-workspace-id</code></td></tr>
+<tr><td class="row">Retry timing on an ordinary rate limit</td><td><code>Retry-After</code></td><td><code>retry-after</code> (absent on spend-cap responses, §2.1)</td></tr>
+<tr><td class="row">Premium-tier-only variant</td><td data-worst>none documented</td><td><code>anthropic-priority-input-tokens-*</code> / <code>-output-tokens-*</code> (Priority Tier only)</td></tr>
+</tbody>
+</table>
+
+<h2 id="workspace-org-hierarchy">4. Workspace/org limit hierarchy and over-ceiling allocation</h2>
+<p>§1.2 established that Anthropic lets an organization configure a workspace's limits below the org-wide ceiling. The documentation gives one concrete real number to anchor the pattern: "if your Organization's limit is 40,000 input tokens per minute and 8,000 output tokens per minute, you might limit one Workspace to 30,000 input tokens per minute. This protects other Workspaces from potential overuse and ensures a more equitable distribution of resources across your Organization"<a class="cite" href="#ref-1">1</a>. That single workspace, capped at 30,000 of the org's 40,000 ITPM, still leaves 10,000 ITPM of headroom the org has not pre-allocated to anyone. The interesting design question — and the one the manifest for this module asks directly — is what happens once a second and third workspace are also configured with their own caps, and those caps sum to more than the org's total.</p>
+
+<h3 id="workspace-over-ceiling">4.1 Extending the example past the ceiling</h3>
+<p>Take Anthropic's real numbers as given (org ceiling 40,000 ITPM / 8,000 OTPM; Workspace A capped at 30,000 ITPM) and add two further workspaces, illustratively, to make the over-allocation concrete: Workspace B configured at 25,000 ITPM, and Workspace C configured at 20,000 ITPM. Summed, the three workspace-level caps total 75,000 ITPM — nearly double the organization's 40,000 ITPM ceiling. Anthropic's documentation states directly that this is not an error state and does not need to be prevented at configuration time: "organization-wide limits always apply, even if Workspace limits add up to more"<a class="cite" href="#ref-1">1</a>. The mechanism that makes this safe is headroom sharing, not reservation: a workspace's configured cap is a ceiling on how much of the shared org pool that one workspace may draw at once, not a guaranteed slice carved permanently out of the total. "The remaining unused tokens per minute (or more, if that Workspace doesn't use the limit) are then available for other Workspaces to use"<a class="cite" href="#ref-1">1</a> — so if Workspace A, B, and C are all quiet simultaneously, none of them is blocked by the others' configured caps; if all three try to burst to their individual caps at the same instant, the organization-level enforcement is the one that actually gates total throughput to 40,000 ITPM, admitting requests from whichever workspaces arrive first (or by whatever internal tie-break the platform applies, which the documentation does not specify) until the shared ceiling is reached, independent of any single workspace's own configured number.</p>
+<p>This is the same headroom-sharing shape Module 10 §3.1 described for Borg's best-effort priority tier, where every user's nominally unlimited low-priority quota is still bounded by oversubscribed shared capacity underneath it — except here the outer ceiling is a hard org-wide number rather than Borg's physical cluster capacity, and the workspace caps are a voluntary further restriction an organization applies to itself, not a market-priced purchase. The practical consequence for anyone configuring workspace limits is that summing configured workspace caps and comparing the total to the org ceiling is not a validation step the platform performs or needs to perform — over-provisioning workspace allocations is a deliberate, safe, and in fact ordinary way to set these numbers, because the org-level check is what actually bounds aggregate usage regardless of how generously any individual workspace was configured.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f5t"><title id="f5t">An organization's 40,000 ITPM ceiling with three workspaces whose configured caps sum to 75,000, above the ceiling</title>
+    <defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="260" y="20" width="280" height="56" rx="8" class="d-block-accent"/>
+    <text x="400" y="44" text-anchor="middle" class="d-text-inv d-small d-bold">Organization ceiling</text>
+    <text x="400" y="62" text-anchor="middle" class="d-text-inv d-small">40,000 ITPM / 8,000 OTPM (real)</text>
+
+    <path d="M330,76 L150,120" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <path d="M400,76 L400,120" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <path d="M470,76 L650,120" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+    <rect x="40" y="120" width="220" height="50" rx="8" class="d-block-2"/>
+    <text x="150" y="141" text-anchor="middle" class="d-text-inv d-small d-bold">Workspace A</text>
+    <text x="150" y="159" text-anchor="middle" class="d-text-inv d-small">30,000 ITPM (real)<a class="cite" href="#ref-1">1</a></text>
+
+    <rect x="290" y="120" width="220" height="50" rx="8" class="d-block-2"/>
+    <text x="400" y="141" text-anchor="middle" class="d-text-inv d-small d-bold">Workspace B</text>
+    <text x="400" y="159" text-anchor="middle" class="d-text-inv d-small">25,000 ITPM (illustrative)</text>
+
+    <rect x="540" y="120" width="220" height="50" rx="8" class="d-block-2"/>
+    <text x="650" y="141" text-anchor="middle" class="d-text-inv d-small d-bold">Workspace C</text>
+    <text x="650" y="159" text-anchor="middle" class="d-text-inv d-small">20,000 ITPM (illustrative)</text>
+
+    <path d="M150,170 L150,200" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <path d="M400,170 L400,200" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <path d="M650,170 L650,200" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="90" y="200" width="120" height="34" rx="6" class="d-surface d-stroke-cyan"/><text x="150" y="222" text-anchor="middle" class="d-small">API key(s)</text>
+    <rect x="340" y="200" width="120" height="34" rx="6" class="d-surface d-stroke-cyan"/><text x="400" y="222" text-anchor="middle" class="d-small">API key(s)</text>
+    <rect x="590" y="200" width="120" height="34" rx="6" class="d-surface d-stroke-cyan"/><text x="650" y="222" text-anchor="middle" class="d-small">API key(s)</text>
+
+    <rect x="150" y="260" width="500" height="50" rx="8" class="d-panel d-outline"/>
+    <text x="400" y="280" text-anchor="middle" class="d-small d-bold">Sum of configured workspace caps: 75,000 ITPM &gt; 40,000 org ceiling</text>
+    <text x="400" y="298" text-anchor="middle" class="d-small">Safe by design: unused workspace headroom is shared; the org ceiling always wins<a class="cite" href="#ref-1">1</a></text>
+
+    <text x="400" y="330" text-anchor="middle" class="d-small d-text-light">Workspace A and the org ceiling are Anthropic's own published example; Workspaces B and C extend it illustratively.</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Anthropic's own example (org ceiling 40,000 ITPM/8,000 OTPM; Workspace A capped at 30,000 ITPM) extended with two illustrative further workspaces whose caps sum to 75,000 ITPM, above the org ceiling. This is a deliberately safe configuration, not an error: Anthropic's documentation states the org-wide limit always applies regardless of how workspace caps sum<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<h2 id="zero-trust-zanzibar-applied">5. Zero trust and relationship-based authorization applied to an API platform</h2>
+<p>Everything above assumes a request's API key is genuinely the party it claims to be and asks only how much of the platform that party may use. Module 10 §5&ndash;6 built two mechanisms for the prior question — should this party reach this resource at all, and does it hold the specific permission it is claiming — using BeyondCorp's device/identity trust tiers and Zanzibar's relation-tuple authorization<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-6">6</a>. Neither OpenAI's nor Anthropic's rate-limit documentation states that either mechanism runs inside their platforms, and no source in this course's map claims it does; this section applies Module 10's general vocabulary to the org/workspace/key domain established in §1 rather than reporting an attested feature of either named platform.</p>
+
+<h3 id="zero-trust-applied">5.1 What a bearer key lacks that BeyondCorp's model has</h3>
+<p>A typical inference-API request authenticates on exactly one fact: possession of a bearer token — the API key itself, sent in an HTTP header, checked against a database of valid keys and their associated org/workspace. BeyondCorp's model, applied to the same request, would ask a structurally richer question: not just "is this credential valid" but "what do we currently know about the device and context this credential is being used from, and does that context clear the minimum trust tier this specific resource requires"<a class="cite" href="#ref-5">5</a>. Under BeyondCorp's own framing, a credential presented from a device with a stale security patch, a flagged infection signal, or a known-stolen status would be downgraded or denied even if the credential itself is technically valid<a class="cite" href="#ref-5">5</a> — a second, independent axis of trust layered on top of "is this the right secret."</p>
+<p>A bearer-key-only model has no equivalent second axis: once a key is valid, it carries its full authority from any device, any network, any client software, indefinitely until revoked. This is a real, structural gap relative to BeyondCorp's design, not a minor stylistic difference — the entire point of BeyondCorp's Trust Inferer is that identity alone (a valid credential) is not sufficient for access, because a valid credential can be stolen, and continuously re-evaluated device/context state is what limits the blast radius of that theft<a class="cite" href="#ref-5">5</a>. An inference platform whose only gate is bearer-key possession inherits the older perimeter-style failure mode BeyondCorp was built to retire: a leaked key is exactly as powerful as the legitimate key, usable from anywhere, until someone notices and rotates it. Extending anything like a Trust Inferer to API traffic would mean scoring the calling context — client IP reputation, TLS client-certificate identity, anomalous usage-pattern signals — the same way BeyondCorp scores a corporate laptop's patch level, and gating a resource's minimum required tier against that score rather than against key validity alone. Whether either lab does anything resembling this internally is not stated in any source available to this module, which is why this paragraph is phrased as what the mechanism would add, not what either platform has built.</p>
+
+<h3 id="zanzibar-applied">5.2 Zanzibar's tuple algebra applied to org/team/key permissions</h3>
+<p>Zanzibar's data model represents every permission and every group membership as one uniform relation tuple, \(\langle object \rangle \# \langle relation \rangle @ \langle user \rangle\), composable through usersets so that nested group membership resolves without ever materializing a flat per-user access-control list<a class="cite" href="#ref-6">6</a>. That algebra generalizes cleanly to the org/workspace/key hierarchy §1 established, even though no source states that either lab implements authorization this way. An illustrative (not attested) tuple set for the identity hierarchy in this module reads:</p>
+<pre class="code" data-lang="plaintext" data-title="illustrative relation tuples for an org/workspace/key hierarchy" data-nohl><code>org:acme#admin@user:11
+workspace:prod#owner@org:acme#admin
+key:sk_live_abc#issued_by@workspace:prod#owner
+key:sk_live_abc#can_call@model:sonnet-5
+</code></pre>
+<p>A check for "can user 11 call model sonnet-5 through key sk_live_abc" does not match any single tuple directly, in exactly the shape Module 10 §6.1 worked through for a document-viewer check<a class="cite" href="#ref-6">6</a>: it resolves by walking the chain — user 11 is an org:acme admin; org:acme admins are workspace:prod owners; workspace:prod owners are who key sk_live_abc was issued by; and that key is separately granted <code>can_call</code> on model:sonnet-5. Revoking access at any single link — demoting user 11 from admin, for instance — invalidates every check that depended on that link without touching the other tuples, which is the same audit and revocation property Module 10 attributes to Zanzibar's design generally<a class="cite" href="#ref-6">6</a>. The illustrative label matters here specifically because §1.3 already established that neither platform documents its authorization internals at this level; what is genuinely transferable from Module 10 is the algebra — relations compose, groups nest, and a single revoked tuple cuts every check that chained through it — not a claim about which frontier lab, if any, implements exactly this data model underneath its console's team and permission settings.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Two disagreements from Module 10 sharpen once the request being rate-limited is an LLM generation rather than a generic API call. The first — fixed window vs. sliding window — is the same trade-off Module 10 §4 already worked through in general terms, now anchored to a product built specifically for LLM traffic. The second is new to this domain entirely: an LLM request's true resource cost (output tokens generated) is not known at admission time, and the systems in this course's source map disagree about whether to estimate that cost pessimistically up front or admit optimistically and reconcile afterward.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Fixed window is acceptable for a coarse RPM ceiling</h4>
+    <p class="who">Implicit in Cloudflare's own presentation of fixed window as the plainer of its two documented AI Gateway modes<a class="cite" href="#ref-4">4</a>; consistent with Module 10's general assessment that fixed window survives mainly where O(1) simplicity matters more than boundary-burst risk.</p>
+    <p>A per-key or per-workspace RPM ceiling exists mainly to catch gross misuse — a runaway loop, a misconfigured retry storm — rather than to enforce a precise physical resource constraint. For that purpose, a counter that resets on the clock is cheap to implement across a fleet of gateway replicas and easy for an operator to reason about, and the up-to-2x boundary burst Cloudflare documents<a class="cite" href="#ref-4">4</a> is a rare, bounded annoyance rather than a resource-safety failure.</p>
+    <ul class="pros"><li>trivial to shard across gateway replicas without a shared timestamp log</li><li>predictable, easy to explain to a customer disputing a 429</li></ul>
+    <ul class="cons"><li>a caller that understands the boundary can extract a sustained 2x burst deliberately<a class="cite" href="#ref-4">4</a></li><li>weak as the sole guard against a genuine resource-exhaustion attack on a scarce backend</li></ul>
+  </article>
+  <article class="position">
+    <h4>Sliding window (or an equivalent continuously-evaluated bound) is necessary once tokens, not requests, are the scarce resource</h4>
+    <p class="who">Cloudflare's own sliding-window mode, offered to close exactly this gap<a class="cite" href="#ref-4">4</a>; reinforced by Anthropic's move away from fixed-interval reset toward continuous replenishment for its own production limiter<a class="cite" href="#ref-1">1</a>.</p>
+    <p>GPU capacity backing an LLM API is not elastic on the timescale of a rate-limit window the way a stateless web backend's CPU headroom might be; a 2x admitted burst at a boundary is not merely an inconvenience, it is GPU-seconds actually consumed that a continuously-evaluated bound would have refused. Once the thing being protected is a physically scarce, expensive backend rather than a cheap stateless handler, the boundary-burst gap is a resource-safety problem, not a cosmetic one.</p>
+    <ul class="pros"><li>no boundary at which a caller can extract more than the stated rate<a class="cite" href="#ref-4">4</a></li><li>matches the actual failure mode being protected against (backend saturation, not just abuse-counting)</li></ul>
+    <ul class="cons"><li>exact sliding-window state is proportional to traffic, not O(1) per caller<a class="cite" href="#ref-4">4</a></li><li>Anthropic's own token bucket is not a sliding window either — it is a third option, discussed next, that gets most of the same benefit at O(1) state</li></ul>
+  </article>
+  <article class="position">
+    <h4>Estimate pessimistically at admission, adjust during the request</h4>
+    <p class="who">Anthropic's Messages API: ITPM "is estimated at the beginning of each request, and the estimate is adjusted during the request to reflect the actual number of input tokens used," while OTPM counts only tokens actually generated in real time<a class="cite" href="#ref-1">1</a>.</p>
+    <p>Because the platform controls the model doing the generating, it can meter output as it is produced rather than guessing at admission — there is no window in which a request's true output cost is unknown to the enforcement layer, only a window in which it is not yet finished accumulating. Splitting ITPM (estimable, since the prompt is fully known before generation starts) from OTPM (only knowable in real time) lets each half of the cost be metered by the mechanism actually suited to it, rather than forcing one combined estimate to cover both.</p>
+    <ul class="pros"><li>no separate reconciliation step after the fact — the limit's live state is always the true state</li><li>cache-aware ITPM exclusion (§3.4) composes cleanly with this because uncached input tokens are exactly counted, not estimated</li></ul>
+    <ul class="cons"><li>only works when the enforcement layer is co-located with, or has real-time visibility into, the model doing the generating</li><li>Anthropic's own sub-window smoothing caveat (§3.2) shows the nominal number still under-describes true burst behavior in practice</li></ul>
+  </article>
+  <article class="position">
+    <h4>Admit optimistically against current state, reconcile after the fact</h4>
+    <p class="who">Envoy AI Gateway: "AI Gateway checks if processing this request would exceed the configured token limit. If the limit would be exceeded, the request is rejected... If within the limit, the request is processed and its token usage is counted towards the total"<a class="cite" href="#ref-7">7</a>.</p>
+    <p>A gateway sitting in front of a third-party model provider (rather than operating the model itself, as Anthropic does) cannot always get real-time token counts mid-generation from every backend it might route to — Envoy AI Gateway explicitly supports non-OpenAI-schema backends like AWS Bedrock through response transformers<a class="cite" href="#ref-7">7</a> — so it checks the limit against the best information available at admission time and reconciles the running total only once the response actually returns.</p>
+    <ul class="pros"><li>works uniformly across heterogeneous backends without needing mid-generation visibility into every provider's internals</li><li>simpler mental model: one check at admission, one update on completion, no mid-flight adjustment</li></ul>
+    <ul class="cons"><li>a burst of concurrent requests can each pass the pre-check before any of their usage lands, over-admitting relative to the true limit — the same race-condition shape Module 10 §4.5 describes for any shared counter updated by more than one process</li><li>the gap between admission and reconciliation is exactly proportional to how long a generation takes, so it is worst for the longest, most expensive requests</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>On fixed vs. sliding window, Module 10's general verdict carries over unchanged: sliding window is the only one of the two that actually enforces the stated rate at every instant, and it is worth its higher per-caller state whenever the resource behind the limit is expensive enough that a 2x boundary burst is a real cost rather than a rounding error — which a GPU-backed inference API almost always is. Token bucket, as Anthropic implements it, gets most of sliding window's smoothness at fixed-window's O(1) state cost, which is why it is the more common production choice for LLM APIs specifically rather than either of Module 10's two window strategies in pure form. On estimate-then-adjust vs. admit-then-reconcile, the right choice is determined by where the enforcement point sits relative to the model doing the generating: a lab that operates its own inference stack (Anthropic, OpenAI) has no excuse not to meter output in real time, so estimate-then-adjust dominates there and the residual risk is only the sub-window smoothing gap already covered in §3.2. A gateway that fronts arbitrary third-party backends (Envoy AI Gateway, and by extension any multi-provider router) genuinely cannot always get that real-time signal, so admit-then-reconcile is the pragmatic fallback — but it should be paired with a conservative per-request ceiling (a hard cap on <code>max_tokens</code>, enforced before admission) precisely because the over-admission window is proportional to generation length and otherwise unbounded. What would settle the second disagreement more precisely than either vendor's documentation currently does is a published number: how large is the actual over-admission rate Envoy-style optimistic admission produces under realistic concurrent bursty traffic, measured against Anthropic-style real-time metering on the identical workload. No source in this course's map publishes that comparison.</p></div>
+</section>
+<h2 id="what-is-changing">What is changing</h2>
+<p>Every specific number in this module is a live-documentation snapshot, not a fixed specification, and the surrounding structure is visibly still moving. Anthropic's Evaluation tier and acceleration-limit warning<a class="cite" href="#ref-1">1</a> exist specifically because new-organization fraud patterns keep shifting, which means the thresholds that gate an org out of that tier are the kind of number likely to change without a version bump. Anthropic's fast-mode Priority Tier tokens are explicitly labeled a research preview with their own dedicated headers<a class="cite" href="#ref-1">1</a> — a fourth rate-limit dimension layered on top of the three this module treats as the stable set, and one that may be renamed, merged into OTPM, or dropped before it leaves preview. The model-family bucketing itself is not static: Anthropic's own footnotes describe combined rate-limit buckets shared across specific model version ranges (for instance, several Opus point releases sharing one limit while the newest Opus generation gets its own)<a class="cite" href="#ref-1">1</a>, and that bucketing has visibly been reshuffled before and will be again as new model versions ship and old ones are retired. OpenAI's guidance to increase traffic by no more than 50% every 15 minutes once above 1,000,000 input TPM<a class="cite" href="#ref-2">2</a> is an operational recommendation tied to current capacity-provisioning practice, not a protocol guarantee, and should be expected to move as the underlying serving capacity does. None of this affects the mechanisms this module actually teaches — spend limits vs. rate limits as distinct error signatures, cache-aware ITPM's \(L/(1-h)\) relationship, the org/workspace headroom-sharing model — which are architectural choices unlikely to be reversed even as the specific dollar figures and per-model numbers around them keep shifting.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>Anthropic. <em>Rate limits (Claude API)</em>. platform.claude.com documentation, 2026. <a href="https://platform.claude.com/docs/en/api/rate-limits">https://platform.claude.com/docs/en/api/rate-limits</a>. Accessed 2026-09-17. <span class="ref-use">Used for: organization/workspace hierarchy and response headers (§1.2), spend-limit vs. rate-limit mechanism and error signatures including the three-signature taxonomy (§2), token-bucket definition and sub-window smoothing caveat (§3.2), the three rate-limit dimensions and per-tier RPM/ITPM/OTPM tables for Claude Sonnet 5 (§3.3, Table 4), the Batches/Managed-Agents/Files API resource-specific carve-outs (§3.3), cache-aware ITPM exclusion and the 2M/80%/10M worked example (§3.4), the anthropic-ratelimit-* and anthropic-workspace-id response headers and the "most restrictive limit" disambiguation rule (§3.6, Table 5), the workspace-limit example (40,000/8,000/30,000) and the "org limit always applies" rule (§4.1), and the Evaluation tier, fast-mode Priority Tier headers, and combined-model-bucket footnotes ("What is changing").</span></li>
+<li id="ref-2"><span class="ref-type">official</span>OpenAI. <em>Rate limits (OpenAI API)</em>. developers.openai.com documentation, 2026. <a href="https://developers.openai.com/api/docs/guides/rate-limits">https://developers.openai.com/api/docs/guides/rate-limits</a>. Accessed 2026-09-17. <span class="ref-use">Used for: organization/project scope statement and project-scoped response headers (§1.1), the six rate-limit dimensions and cumulative-payment usage-tier table (§1.1, Table 3), the undocumented monthly-cap error signature (§2.1), the vector-store and Batch API queue-based limits (§3.3), the x-ratelimit-* response headers (§3.6, Table 5), and the unsuccessful-requests-still-count and traffic-ramping guidance (§3.5, "What is changing").</span></li>
+<li id="ref-3"><span class="ref-type">official</span>BerriAI / LiteLLM contributors. <em>Life of a Request (LiteLLM Proxy architecture)</em>. docs.litellm.ai live documentation, 2026. <a href="https://docs.litellm.ai/docs/proxy/architecture">https://docs.litellm.ai/docs/proxy/architecture</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the fully-documented virtual-key/user/team identity hierarchy contrasted against OpenAI's and Anthropic's undocumented internals (§1.3, Table 1).</span></li>
+<li id="ref-4"><span class="ref-type">official</span>Cloudflare. <em>Rate limiting (Cloudflare AI Gateway)</em>. developers.cloudflare.com, 2026. <a href="https://developers.cloudflare.com/ai-gateway/features/rate-limiting/">https://developers.cloudflare.com/ai-gateway/features/rate-limiting/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the fixed-window vs. sliding-window 20-request boundary burst re-anchored to an API key's RPM limit (§3.1, Figure 3) and the fixed-vs-sliding disagreement position ("Where experts disagree").</span></li>
+<li id="ref-5"><span class="ref-type">paper</span>Osborn, Barclay, Justin McWilliams, Betsy Beyer, and Max Saltonstall. <em>BeyondCorp: Design to Deployment at Google</em>. USENIX ;login:, vol. 41, no. 1, Spring 2016, pp. 28-33. <a href="https://research.google.com/pubs/archive/44860.pdf">https://research.google.com/pubs/archive/44860.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the device/identity trust-tier mechanism applied illustratively to bearer-key-only API authentication (§5.1).</span></li>
+<li id="ref-6"><span class="ref-type">paper</span>Pang, Ruoming et al. <em>Zanzibar: Google's Consistent, Global Authorization System</em>. USENIX ATC '19. <a href="https://www.usenix.org/system/files/atc19-pang.pdf">https://www.usenix.org/system/files/atc19-pang.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the relation-tuple algebra applied illustratively to an org/workspace/key permission chain (§5.2).</span></li>
+<li id="ref-7"><span class="ref-type">official</span>Envoy AI Gateway project. <em>Usage-based Rate Limiting</em>. aigateway.envoyproxy.io v0.1 documentation, 2026. <a href="https://aigateway.envoyproxy.io/docs/0.1/capabilities/usage-based-ratelimiting/">https://aigateway.envoyproxy.io/docs/0.1/capabilities/usage-based-ratelimiting/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the admit-optimistically-then-reconcile enforcement design contrasted with Anthropic's estimate-then-adjust approach ("Where experts disagree").</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

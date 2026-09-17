@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stripe: Ledgers, Idempotency Keys, and API Design for Payments · System Design</title>
+<meta name="description" content="How Stripe's Idempotency-Key header, a durable in-flight state, and an immutable double-entry ledger combine to make retries safe for money movement, and why usage-metering visibility splits into a real-time and an asynchronous design.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 18</p>
+  <h1>Stripe: Ledgers, Idempotency Keys, and API Design for Payments</h1>
+  <p class="lede">Module 8 built the general vocabulary: a network only promises at-least-once delivery, and an idempotency key turns that into exactly-once effects by tracking a third state — in-flight — between absent and complete. This module is what that vocabulary looks like once the side effect is money: a durable in-flight state that survives a crash mid-request, an immutable ledger that records enough to make a retry provably safe, an exact backoff-and-jitter schedule a client library runs before retrying, and two competing designs — continuously-tracked balances versus end-of-period aggregation — for making usage visible before it becomes an invoice.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>30 min</b> read</span>
+    <span class="chip"><b>13</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 8</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f1t"><title id="f1t">Two request shapes into a payments platform: a mutating request guarded by an idempotency key writing to a ledger, and a usage-event stream feeding a meter that becomes visible either continuously or only at period end</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="26" text-anchor="middle" class="d-title d-bold">Two request shapes, one safety requirement: a retry must never double-count money</text>
+
+    <!-- top lane: mutating request -->
+    <rect x="20" y="55" width="130" height="56" rx="8" class="d-block-2"/>
+    <text x="85" y="88" text-anchor="middle" class="d-text-inv d-bold">Client</text>
+    <path d="M150,83 L215,83" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="182" y="72" text-anchor="middle" class="d-mono d-small">Idempotency-Key</text>
+    <rect x="215" y="55" width="170" height="56" rx="8" class="d-hl"/>
+    <text x="300" y="78" text-anchor="middle" class="d-text-inv d-bold">API boundary</text>
+    <text x="300" y="96" text-anchor="middle" class="d-text-inv d-small">absent / in-flight / complete</text>
+    <path d="M385,83 L450,83" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="450" y="55" width="170" height="56" rx="8" class="d-block"/>
+    <text x="535" y="78" text-anchor="middle" class="d-text-inv d-bold">Ledger</text>
+    <text x="535" y="96" text-anchor="middle" class="d-text-inv d-small">double-entry, immutable</text>
+    <path d="M620,83 L685,83" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="685" y="55" width="95" height="56" rx="8" class="d-panel"/>
+    <text x="732" y="88" text-anchor="middle" class="d-small">Balance</text>
+    <text x="230" y="130" text-anchor="middle" class="d-small d-text-light">Section 1-3: charges, refunds — a mutating write, guarded by a client-supplied key</text>
+
+    <!-- bottom lane: usage events -->
+    <rect x="20" y="200" width="130" height="56" rx="8" class="d-block-2"/>
+    <text x="85" y="233" text-anchor="middle" class="d-text-inv d-bold">Product</text>
+    <path d="M150,228 L215,228" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="182" y="217" text-anchor="middle" class="d-mono d-small">usage events</text>
+    <rect x="215" y="200" width="170" height="56" rx="8" class="d-fill-cyan-soft d-stroke-cyan"/>
+    <text x="300" y="233" text-anchor="middle" class="d-bold">Meter</text>
+    <path d="M385,220 Q420,190 460,190" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M385,236 Q420,266 460,266" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="460" y="163" width="200" height="46" rx="8" class="d-block-2"/>
+    <text x="560" y="191" text-anchor="middle" class="d-text-inv d-small d-bold">Real-time balance</text>
+    <rect x="460" y="243" width="200" height="46" rx="8" class="d-block-muted"/>
+    <text x="560" y="271" text-anchor="middle" class="d-text-inv d-small d-bold">End-of-period aggregation</text>
+    <path d="M660,186 L710,186" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M660,266 L710,266" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="710" y="163" width="70" height="46" rx="8" class="d-panel"/><text x="745" y="191" text-anchor="middle" class="d-small">visible now</text>
+    <rect x="710" y="243" width="70" height="46" rx="8" class="d-panel"/><text x="745" y="271" text-anchor="middle" class="d-small">visible later</text>
+    <text x="230" y="310" text-anchor="middle" class="d-small d-text-light">Section 5: metered usage — a stream of facts, made visible either as it arrives or only at invoice time</text>
+
+    <line x1="20" y1="340" x2="780" y2="340" class="d-axis d-dashed"/>
+    <text x="400" y="360" text-anchor="middle" class="d-small d-text-light">Both lanes answer the same underlying question: what must be recorded, and when, so that a retry or a late read cannot corrupt the number a customer is billed</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> A payments platform has two request shapes that both have to survive retries and asynchrony without corrupting a monetary total: a mutating write guarded by a client-supplied idempotency key that lands in an immutable ledger<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>, and a stream of usage events that becomes a bill either continuously or only when a period closes<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<h2 id="payments-retry-problem">1. Why a payments API cannot just retry</h2>
+<p>Module 8 derives the underlying fact once and for all: no asynchronous network can tell a client, after a timeout or a reset connection, whether the server executed the request and the acknowledgment was lost, or whether the request never arrived. A client that wants the operation to eventually happen has exactly one option, retry, and exactly one new risk from retrying: the original attempt may have already succeeded, and the retry duplicates it. Module 8 also derives the fix — a client-generated idempotency key, a server-side record of that key's status, and a three-state model (absent, in-flight, complete) that a naive two-state read cannot represent safely. This module does not re-derive either of those; it takes them as given and asks what changes when the side effect the retry might duplicate is a movement of money rather than a generic write.</p>
+<p>Nothing about the mechanism changes. Stripe's mutating endpoints accept an <code>Idempotency-Key</code> header carrying a client-generated identifier, and the server's behavior is exactly the three-state machine Module 8 derives: save the resulting status code and body of the first request made for a given key, "regardless of whether it succeeds or fails," so that "subsequent requests with the same key return the same result, including <code>500</code> errors"<a class="cite" href="#ref-4">4</a>. Stripe recommends a V4 UUID or an equivalently high-entropy random string, caps a key at 255 characters, and — this is the detail that makes the state machine durable rather than merely conceptual — automatically prunes keys once they are "at least 24 hours old," after which a reused key simply starts a new request<a class="cite" href="#ref-4">4</a>. If a client reuses a key with different parameters, the server treats that as a bug and errors rather than silently executing the new parameters or returning the old result<a class="cite" href="#ref-4">4</a>. None of this is specific to payments; it is Module 8's mechanism, instantiated at one HTTP header.</p>
+<p>What is specific to payments is the cost of getting the in-flight case wrong. In a generic API, a duplicated write might create an extra row a cleanup job removes later. In a payments API, the two directions of failure both have a name and a customer-facing consequence: a retry misclassified as absent charges a card twice; a retry misclassified as complete tells a client an operation succeeded before the money has actually moved, and the client may act — ship the order, release the reservation — on a result that does not yet exist<a class="cite" href="#ref-5">5</a>. That asymmetry, not a different mechanism, is why this module spends the next two sections on how the in-flight state is made durable and what a ledger has to record, rather than on the state machine itself.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">First charge request executes and caches its result; a retry with the same Idempotency-Key header returns the cached charge object unchanged</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">POST /v1/charges, Idempotency-Key: KG5LxwFBepaKHyUD</text>
+    <rect x="20" y="55" width="120" height="200" rx="6" class="d-panel"/>
+    <text x="80" y="48" text-anchor="middle" class="d-small d-text-light">Client</text>
+    <rect x="330" y="55" width="140" height="200" rx="6" class="d-panel"/>
+    <text x="400" y="48" text-anchor="middle" class="d-small d-text-light">Stripe API</text>
+    <rect x="640" y="55" width="140" height="200" rx="6" class="d-panel"/>
+    <text x="710" y="48" text-anchor="middle" class="d-small d-text-light">Card network</text>
+
+    <path d="M140,90 L330,90" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+    <text x="235" y="80" text-anchor="middle" class="d-small">request 1 (key K)</text>
+    <path d="M470,100 L640,100" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="555" y="92" text-anchor="middle" class="d-small d-mono">authorize</text>
+    <path d="M640,130 L470,130" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="555" y="122" text-anchor="middle" class="d-small d-mono">approved</text>
+    <rect x="340" y="150" width="120" height="34" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="400" y="171" text-anchor="middle" class="d-small">save result under K</text>
+    <path d="M330,175 L140,175" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+    <text x="235" y="163" text-anchor="middle" class="d-small">charge object ch_1</text>
+
+    <path d="M140,235 L330,235" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+    <text x="235" y="222" text-anchor="middle" class="d-small">retry (same key K)</text>
+    <text x="235" y="250" text-anchor="middle" class="d-small d-text-light">connection reset before response above</text>
+    <path d="M330,270 L140,270" class="d-dashed d-outline" marker-end="url(#f2-arr)"/>
+    <text x="235" y="285" text-anchor="middle" class="d-small d-bold">cached ch_1 returned — no second authorize</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> The retry in the lower lane never reaches the card network: Stripe's server already holds the status code and body it saved for key K on the first attempt, and returns that cached charge object rather than re-executing<a class="cite" href="#ref-4">4</a>. The mechanism is the three-state machine Module 8 derives; this figure is that machine instantiated at one endpoint.</figcaption>
+</figure>
+
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>An <code>Idempotency-Key</code> header only exists because <code>POST</code> is not idempotent by the HTTP specification's own definition — a second, identical <code>POST</code> is a new request as far as HTTP itself is concerned. Stripe's documentation is explicit that the header is scoped accordingly: "all <code>POST</code> requests accept idempotency keys," while "<code>GET</code> and <code>DELETE</code> requests... are idempotent by definition," so sending a key on either "has no effect"<a class="cite" href="#ref-4">4</a>. This is a narrower claim than Module 8's general idempotency-key pattern might suggest at first: the header is not a universal retry-safety wrapper, it is the specific patch for the one HTTP verb payments APIs use for money-moving operations that the protocol itself does not already make safe to repeat.</p></aside>
+
+<h3 id="webhooks-reverse-direction">1.1 The same problem in the other direction: webhooks</h3>
+<p>Section 1's idempotency key protects one direction of traffic: client-to-server requests that mutate state. Stripe's platform has a second, symmetric direction — webhooks, where Stripe itself pushes event notifications to a merchant's server when something changes asynchronously (a dispute opens, a subscription renews, a bank confirms a delayed payment)<a class="cite" href="#ref-6">6</a> — and that direction has exactly the same at-least-once problem, with the roles reversed. Stripe's own documentation states the delivery guarantee plainly: "webhook endpoints might occasionally receive the same event more than once," and the prescribed fix is the receiver-side mirror of Section 1's server-side cache: "guard against duplicated event receipts by logging the event IDs you've processed, and then not processing already-logged events"<a class="cite" href="#ref-6">6</a>. The merchant, not Stripe, now has to build the idempotency layer, because it is the merchant's handler that must not double-fulfil an order or double-apply a subscription renewal on a redelivered event.</p>
+<p>The retry schedule on this side is Stripe's own, not a client library's: "Stripe attempts to deliver events to your destination for up to three days with an exponential backoff in live mode"<a class="cite" href="#ref-6">6</a> if the merchant's endpoint fails to return a <code>2xx</code> status — which is precisely why the documentation warns a handler to "quickly return a successful status code... before any complex logic that might cause a timeout"<a class="cite" href="#ref-6">6</a>, since a slow handler that eventually succeeds after Stripe has already timed out the request triggers a redelivery of an event that was, in fact, processed. Beyond that automatic window, a merchant can manually resend a specific event from the Dashboard "for up to 15 days after the event creation," or via the CLI "for up to 30 days"<a class="cite" href="#ref-6">6</a> — three different retention windows (24 hours for an idempotency key's cached result, 3 days for automatic webhook redelivery, 15-30 days for manual resend) coexisting in the same platform, each sized for a different failure timescale.</p>
+<p>Ordering is where this direction diverges most from Section 1's request/response case. A request and its retry are the same call, so ordering within that pair is trivial. A stream of webhook events is not: "Stripe doesn't guarantee the delivery of events in the order that they're generated"<a class="cite" href="#ref-6">6</a> — creating one subscription can generate a <code>customer.subscription.created</code>, an <code>invoice.created</code>, and an <code>invoice.paid</code> event that arrive in any order, and the documentation's fix is the same identifier-based dedup, generalized: "track event IDs to identify duplicate deliveries instead" of relying on a timestamp, since "distinct events can share a timestamp"<a class="cite" href="#ref-6">6</a>. This is Section 3's business+id identifier and Module 8's offset-based ordering solving two different problems that look similar: Kafka's offset gives a total order within one partition by construction; a webhook event ID gives no ordering guarantee at all, only a guarantee that the same event, redelivered, is recognizable as a duplicate rather than a new fact.</p>
+
+<h2 id="in-flight-as-ledger-state">2. Making "in-flight" a real, durable state</h2>
+<p>Module 8's Figure 5 marks the failure mode precisely: collapse a key's status to two values, and a request that arrives while the first attempt is still executing has no correct place to go — read as absent, it executes concurrently and duplicates the side effect; read as complete, it is served a result that does not exist yet. Stripe's documentation resolves the concurrent case by rejecting it as retryable rather than serving either wrong answer: "if... the request conflicts with another request that's executing concurrently, we don't save the idempotent result... You can retry these requests"<a class="cite" href="#ref-4">4</a>. That resolves what the server tells the client. It says nothing about how the server itself keeps track of "in-flight" durably enough to survive its own process crashing mid-request — and that implementation detail is exactly where a payments system earns or loses its correctness, because the in-flight window is precisely the interval during which a card has been authorized but the result has not yet been recorded anywhere a retry can find it.</p>
+<p>Airbnb's payments engineering team published the clearest public account of how to implement this durably, in a 2019 post describing Orpheus, the idempotency library they built across their payments microservices<a class="cite" href="#ref-5">5</a>. Orpheus splits almost every API request into three phases — Pre-RPC, RPC, Post-RPC — and enforces two rules across them: no network calls in the Pre-RPC or Post-RPC phases, and no database writes in the RPC phase<a class="cite" href="#ref-5">5</a>. Pre-RPC records, in one database transaction, that this idempotency key is now in-flight — durably, before any network call happens. RPC is then free to talk to an external payment processor or bank over the network, because nothing about that phase is allowed to touch the database; a crash during RPC leaves the key visibly in-flight, not silently absent, because Pre-RPC's write already committed. Post-RPC then records, in a second database transaction, the outcome — success or a classified failure — and this is the write that moves the key from in-flight to complete<a class="cite" href="#ref-5">5</a>. Airbnb's stated reason for the strict separation is blunt: "network calls (RPCs) during the Pre and Post-RPC phases are vulnerable and can result in bad things like rapid connection pool exhaustion and performance degradation"<a class="cite" href="#ref-5">5</a> — mixing an unreliable network operation into the same unit of work as a database commit means a slow or hung RPC can now also hold open a database transaction, which is precisely the kind of coupling Module 11's bulkhead-isolation material (Section on thread-pool vs. semaphore isolation) warns against for a different reason.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f3t"><title id="f3t">Pre-RPC, RPC, Post-RPC: the three-phase implementation that makes the in-flight state durable across a process crash</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">One idempotency key, K, across a request lifecycle</text>
+
+    <rect x="20" y="55" width="220" height="90" rx="8" class="d-block"/>
+    <text x="130" y="80" text-anchor="middle" class="d-text-inv d-bold">Pre-RPC</text>
+    <text x="130" y="100" text-anchor="middle" class="d-text-inv d-small">DB txn: write K = in-flight</text>
+    <text x="130" y="117" text-anchor="middle" class="d-text-inv d-small">+ pending ledger row</text>
+    <text x="130" y="134" text-anchor="middle" class="d-text-inv d-small d-bold">no network calls here</text>
+
+    <path d="M240,100 L290,100" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+
+    <rect x="290" y="55" width="220" height="90" rx="8" class="d-hl"/>
+    <text x="400" y="80" text-anchor="middle" class="d-text-inv d-bold">RPC</text>
+    <text x="400" y="100" text-anchor="middle" class="d-text-inv d-small">network call to card network /</text>
+    <text x="400" y="117" text-anchor="middle" class="d-text-inv d-small">acquiring bank</text>
+    <text x="400" y="134" text-anchor="middle" class="d-text-inv d-small d-bold">no database writes here</text>
+
+    <path d="M510,100 L560,100" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+
+    <rect x="560" y="55" width="220" height="90" rx="8" class="d-block"/>
+    <text x="670" y="80" text-anchor="middle" class="d-text-inv d-bold">Post-RPC</text>
+    <text x="670" y="100" text-anchor="middle" class="d-text-inv d-small">DB txn: write K = complete</text>
+    <text x="670" y="117" text-anchor="middle" class="d-text-inv d-small">+ post ledger entry / classify error</text>
+    <text x="670" y="134" text-anchor="middle" class="d-text-inv d-small d-bold">no network calls here</text>
+
+    <path d="M130,145 L130,220" class="d-dashed d-outline"/>
+    <path d="M400,145 L400,220" class="d-dashed d-outline"/>
+    <path d="M670,145 L670,220" class="d-dashed d-outline"/>
+    <rect x="20" y="220" width="220" height="40" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="130" y="245" text-anchor="middle" class="d-small">crash here → K reads in-flight</text>
+    <rect x="290" y="220" width="220" height="40" rx="6" class="d-fill-amber"/>
+    <text x="400" y="245" text-anchor="middle" class="d-text-inv d-small">crash here → K still in-flight, safe: retry re-queries RPC status first</text>
+    <rect x="560" y="220" width="220" height="40" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="670" y="245" text-anchor="middle" class="d-small">crash here → K reads complete</text>
+
+    <text x="400" y="295" text-anchor="middle" class="d-small d-text-light">A crash at any point leaves K in a state a retry can read correctly — because the in-flight write happened before, not after, the network call</text>
+    <text x="400" y="315" text-anchor="middle" class="d-small d-text-light">Airbnb's Orpheus additionally holds a row-level lease with an expiration on K, so a retry against a truly stuck request can proceed once the lease lapses</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Airbnb's Orpheus library separates every idempotent request into Pre-RPC, RPC, and Post-RPC phases and forbids mixing network calls with database writes in the same phase<a class="cite" href="#ref-5">5</a>, which is the concrete implementation of Module 8's "record in-flight before the side effect starts" requirement. A row-level lease with an expiration covers the case where the process holding an in-flight key never comes back at all<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<p>Two further details from the same design are worth carrying forward because Section 3 depends on them. First, Orpheus lets a caller choose between <b>request-level</b> idempotency, where a random key (Airbnb suggests a UUID, matching Stripe's own recommendation) scopes exactly one attempt-chain, and <b>entity-level</b> idempotency, where the key is deterministically derived from a business identifier — their example is the literal string <code>payment-1234-refund</code> — so that every caller asking to refund payment 1234 collides on the same key regardless of whether they generated it independently<a class="cite" href="#ref-5">5</a>. Stripe's documentation only describes the random, caller-chosen form<a class="cite" href="#ref-4">4</a>; Section 3's disagreement over which is better is not academic, it is a live design choice with production consequences on both sides. Second, every in-flight key carries an expiring <b>lease</b> — "a good rule of thumb is to have a higher lease expiration than the RPC timeout"<a class="cite" href="#ref-5">5</a> — which is the same time-bounded-consensus-shortcut idea Module 6 derives for GFS's 60-second chunk lease and Spanner's 10-second leader lease, applied here to a single idempotency key instead of a whole replica or partition: a lease lets the system safely conclude "the original holder is gone" without waiting forever or risking two processes acting on the same key at once.</p>
+
+<h2 id="ledger-design">3. What a payments ledger must record</h2>
+<p>Stripe's own engineering account of its internal ledger system frames the problem it solves as a translation problem before it is a bookkeeping problem: Stripe moves money "through partnerships with local banks and financial networks in 185 countries" using "135 currencies and payment methods"<a class="cite" href="#ref-2">2</a>, and every one of those integrations has its own, incompatible notion of what a successful, failed, or pending operation looks like. Stripe's Ledger exists to translate all of that into one representation before anything gets recorded: "accounts are buckets of money distinguished by their type... and properties," and "events move money between accounts"<a class="cite" href="#ref-2">2</a> — a charge, a refund, a payout are all, underneath, an event moving a specific amount from one named account to another. Stripe's own description of the resulting structure reaches for a physical analogy rather than an accounting term: modeling money movement is "similar to analyzing a flow of water through a network of pipes (processes) ending in reservoirs (balance sheets)"<a class="cite" href="#ref-2">2</a>, but the constraint doing the actual work is the standard double-entry rule underneath that image — every event that debits one account credits another by the same amount, so the books can be checked for balance without trusting any single component's arithmetic.</p>
+<p>Two properties of this design matter specifically because retries and idempotency are the subject of this module. First, the ledger is described as "an immutable and auditable log"<a class="cite" href="#ref-2">2</a> — an event is appended, never edited or deleted, which is the same append-only discipline Module 7 derives for GFS and Module 8 derives for a Kafka partition, applied here to money instead of file chunks or messages: if a mistake needs correcting, a new, compensating event is appended, the original event stays exactly as it was recorded, and the full history remains reconstructable. Second, out-of-order arrival is treated as normal rather than exceptional: "even if they arrive out of order, or are created by different sources, Ledger maintains accurate fund flows through the identifier for <code>business</code> and <code>id</code>"<a class="cite" href="#ref-2">2</a> — the (business, id) pair is functioning exactly as an idempotency key functions in Section 1, except scoped to a ledger event rather than an HTTP request, and the ledger's correctness does not depend on events showing up in the order they were generated. At the scale Stripe discloses, that design choice is load-bearing: the ledger "sees five billion events" a day<a class="cite" href="#ref-2">2</a>, with "99.99% of... dollar volume... fully ingested and verified within four days"<a class="cite" href="#ref-2">2</a> and, as a single stress data point, 300 million transactions totaling $18.6 billion in payment volume over the 2024 Black Friday weekend<a class="cite" href="#ref-2">2</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> What a ledger entry must carry so that an idempotent retry, a late-arriving event, or a replayed webhook cannot silently double-count or lose money<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Field</th><th>Purpose</th><th>What breaks without it</th></tr></thead>
+<tbody>
+<tr><td class="row">Idempotency / dedup identifier (Stripe's <code>business</code> + <code>id</code>)</td><td>Lets the same logical event be posted more than once without being counted twice<a class="cite" href="#ref-2">2</a></td><td>A retried write, or an event replayed after a crash, creates a second ledger row for the same money movement</td></tr>
+<tr><td class="row">Account pair (debit account, credit account)</td><td>Encodes the double-entry constraint directly in the row, not in application logic</td><td>A single-sided write can silently create or destroy money if any downstream step fails partway</td></tr>
+<tr><td class="row">Amount and currency</td><td>The quantity actually moved, in a fixed, checkable unit</td><td>Ambiguous units make the double-entry balance check meaningless</td></tr>
+<tr><td class="row">Append-only, immutable storage</td><td>Corrections are new events, not edits to history<a class="cite" href="#ref-2">2</a></td><td>An edited row destroys the audit trail a dispute or reconciliation depends on</td></tr>
+<tr><td class="row">Source event reference</td><td>Ties the ledger row back to the API request or webhook that caused it</td><td>Reconciliation between the ledger and the systems that triggered it becomes guesswork</td></tr>
+<tr><td class="row">Written to (and read from) the same consistency domain</td><td>A retry check must see the same data the original write committed</td><td>See the replica-lag failure mode below</td></tr>
+</tbody>
+</table>
+
+<p>That last row is not a hypothetical. Airbnb's own account of building Orpheus includes a worked failure mode from getting it wrong: they describe storing idempotency information on a database replica rather than the master, then walking through the sequence where "a client submits a payment request to the service, which ends up being successful downstream, but the client doesn't receive a response due to a network issue," the response is written to the master, and — because of replica lag — "the client could correctly fire an idempotent retry to the service and the response would not be recorded to the replica yet," so "the service could mistakenly execute the payment again, resulting in duplicate payments"<a class="cite" href="#ref-5">5</a>. Airbnb's fix was to read and write idempotency state only against the master database, accepting the latency cost, and to handle the resulting scale problem by sharding that table by idempotency key, which they note "have high cardinality and even distribution, making them effective shard keys"<a class="cite" href="#ref-5">5</a>. This is Module 5's PACELC trade-off (latency versus consistency, absent any partition) showing up at the smallest possible scope — a single lookup table — rather than at the scope of a whole storage system: a replica read is lower latency and, exactly as Module 3 derives for asynchronous replication generally, can be arbitrarily stale, and an idempotency check is one of the few reads in a system where that staleness has a direct dollar cost rather than a UX cost.</p>
+<p>The same post is candid about where deterministic, entity-derived keys change the guarantee Section 1's random-key model provides. A purely random, client-chosen key (Stripe's only documented option<a class="cite" href="#ref-4">4</a>) gives you exactly one thing: this specific attempt-chain is retry-safe. It says nothing about whether two different callers, or two different code paths, might both try to refund the same payment using two different random keys — nothing stops that from happening twice, because the keys are different and the server has no way to know the two requests are, semantically, "the same operation." Airbnb's entity-level alternative — a deterministic key like <code>payment-1234-refund</code><a class="cite" href="#ref-5">5</a> — closes exactly that gap by making the key itself a function of the business fact being asserted, so that any caller, anywhere in the system, who tries to refund payment 1234 collides on the same row regardless of how many independent code paths generate the request. The cost is that the key space is now coupled to the business model — a new kind of operation on an existing entity needs a new, deliberately chosen deterministic key format, not just "generate a UUID and move on."</p>
+
+<h2 id="retry-backoff-jitter">4. Automatic retries: backoff and jitter, with exact numbers</h2>
+<p>Everything in Sections 1-3 makes a retry <i>safe</i>; none of it makes retrying automatic. Stripe's own guidance on when a client should retry at all is narrow and explicit: "watch for <code>429</code> status codes and implement a retry mechanism... follow an exponential backoff schedule to reduce request volume when necessary, and add randomness to the backoff schedule to avoid a thundering herd effect"<a class="cite" href="#ref-7">7</a>. The same page names a second, non-obvious retryable case — an object <code>lock_timeout</code>, returned when "the Stripe API locks objects on some operations so that concurrent workloads don't interfere," and a request's lock acquisition times out because another request or internal process already holds it<a class="cite" href="#ref-7">7</a>. Unlike a rate-limit <code>429</code>, Stripe's own SDKs retry a <code>lock_timeout</code> automatically, and the documentation's example sets this up explicitly: <code>Stripe.max_network_retries = 2</code><a class="cite" href="#ref-7">7</a> — two retries, not an unbounded loop, and the client library, not the caller, decides the timing.</p>
+<p>The timing itself is not left to guesswork; it is a fixed formula in Stripe's own client libraries. The stripe-node source computes a capped exponential delay and then applies jitter in two steps<a class="cite" href="#ref-8">8</a>:</p>
+$$ d_n = \min\!\big(d_0 \cdot 2^{\,n-1},\ d_{\max}\big) $$
+<p>where \(n\) is the retry attempt number, \(d_0\) is <code>initialNetworkRetryDelay</code>, and \(d_{\max}\) is <code>maxNetworkRetryDelay</code>. The library's defaults are \(d_0 = 0.5\) s and \(d_{\max} = 5\) s<a class="cite" href="#ref-8">8</a>. Jitter is then applied by scaling, not by adding noise: <code>sleepSeconds *= 0.5 * (1 + Math.random())</code>, which maps the uniform random draw to the range \([0.5\, d_n,\ d_n]\), and a final floor, <code>sleepSeconds = Math.max(initialNetworkRetryDelay, sleepSeconds)</code>, guarantees the wait never drops below \(d_0\) even after jitter<a class="cite" href="#ref-8">8</a>. Because the floor sits exactly at \(d_0\) and the first attempt's uncapped delay is also \(d_0\), the very first retry has no effective jitter at all — the range \([0.5 d_0, d_0]\) gets clamped back up to exactly \(d_0\) every time. Jitter only starts to matter from the second retry onward, once \(d_n\) has grown past \(d_0\).</p>
+
+<details class="more">
+<summary>Worked schedule for the default constants</summary>
+<p>Substituting \(d_0 = 0.5\) and \(d_{\max} = 5\) into \(d_n = \min(0.5 \cdot 2^{n-1}, 5)\) gives the uncapped and capped delay at each retry, and applying the jitter range \([0.5\,d_n,\, d_n]\) (floored at 0.5) gives the actual wait a client library will sleep before attempt \(n\):</p>
+<table class="tbl">
+<caption><b>Table 2.</b> Stripe client-library retry delay by attempt number, from the default constants in stripe-node's backoff implementation<a class="cite" href="#ref-8">8</a>.</caption>
+<thead><tr><th class="num">Retry n</th><th class="num">Uncapped \(0.5\cdot2^{n-1}\) (s)</th><th class="num">Capped \(d_n\) (s)</th><th>Jittered range (s)</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td class="num">0.5</td><td class="num">0.5</td><td>0.5 (floor clamps the range)</td></tr>
+<tr><td class="num">2</td><td class="num">1.0</td><td class="num">1.0</td><td>0.5 – 1.0</td></tr>
+<tr><td class="num">3</td><td class="num">2.0</td><td class="num">2.0</td><td>1.0 – 2.0</td></tr>
+<tr><td class="num">4</td><td class="num">4.0</td><td class="num">4.0</td><td>2.0 – 4.0</td></tr>
+<tr><td class="num">5</td><td class="num">8.0</td><td class="num" data-worst>5.0</td><td>2.5 – 5.0</td></tr>
+<tr><td class="num">6</td><td class="num">16.0</td><td class="num" data-worst>5.0</td><td>2.5 – 5.0</td></tr>
+</tbody>
+</table>
+<p>From retry 5 onward the uncapped exponential term would exceed \(d_{\max}\), so the delay plateaus at the 5-second cap with a fixed 2.5-5.0 s jitter band — the schedule stops growing, it does not stop having randomness.</p>
+</details>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f4t"><title id="f4t">Client retry timeline: request, timeout, backoff-plus-jitter wait, retry with the same idempotency key</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="40" y1="200" x2="760" y2="200" class="d-axis"/>
+    <text x="400" y="220" text-anchor="middle" class="d-small d-text-light">time</text>
+
+    <rect x="60" y="60" width="90" height="40" rx="6" class="d-block-2"/><text x="105" y="84" text-anchor="middle" class="d-text-inv d-small">attempt 1</text>
+    <path d="M105,100 L105,196" class="d-dashed d-outline"/>
+    <rect x="60" y="115" width="90" height="30" rx="4" class="d-fill-red-soft d-stroke-red"/><text x="105" y="135" text-anchor="middle" class="d-small">timeout / reset</text>
+
+    <path d="M150,80 L230,80" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+    <text x="190" y="68" text-anchor="middle" class="d-mono d-small">wait ~0.5 s</text>
+    <rect x="230" y="60" width="90" height="40" rx="6" class="d-block-2"/><text x="275" y="84" text-anchor="middle" class="d-text-inv d-small">attempt 2</text>
+    <rect x="230" y="115" width="90" height="30" rx="4" class="d-fill-red-soft d-stroke-red"/><text x="275" y="135" text-anchor="middle" class="d-small">timeout again</text>
+
+    <path d="M320,80 L440,80" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+    <text x="380" y="68" text-anchor="middle" class="d-mono d-small">wait 0.5-1.0 s (jittered)</text>
+    <rect x="440" y="60" width="90" height="40" rx="6" class="d-hl"/><text x="485" y="84" text-anchor="middle" class="d-text-inv d-small">attempt 3</text>
+    <rect x="440" y="115" width="90" height="30" rx="4" class="d-fill-blue-soft d-stroke-blue"/><text x="485" y="135" text-anchor="middle" class="d-small">succeeds</text>
+
+    <path d="M105,60 L105,40" class="d-dashed d-outline"/>
+    <path d="M275,60 L275,40" class="d-dashed d-outline"/>
+    <path d="M485,60 L485,40" class="d-dashed d-outline"/>
+    <text x="290" y="30" text-anchor="middle" class="d-mono d-small">Idempotency-Key: K — identical on every attempt</text>
+
+    <text x="485" y="170" text-anchor="middle" class="d-small d-bold">Server has held the cached result under K since attempt 1's actual completion —</text>
+    <text x="485" y="185" text-anchor="middle" class="d-small d-bold">attempt 3 may just be replaying it, not re-executing anything</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> A client's retry loop is independent of what the server did with the first attempt: the client only knows it did not get a response, so it waits a capped-exponential, jittered interval<a class="cite" href="#ref-8">8</a> and retries with the same <code>Idempotency-Key</code>. If attempt 1 actually reached and was processed by the server, attempt 3 gets the cached result from Figure 2, not a fresh execution<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h2 id="metering-realtime-vs-async">5. Two designs for usage visibility: continuous balances vs. end-of-period aggregation</h2>
+<p>Sections 1-4 covered mutating requests — a charge, a refund — where the ledger records a small number of discrete events per customer. Usage-based billing is a different shape of problem: a customer's account accumulates usage continuously (API calls, compute-seconds, tokens), and the question is not "did this one write happen exactly once" but "how far behind is the number we show the customer from the number we will eventually bill them." Stripe's own documentation lays out two designs for this and is explicit about which one it is steering new integrations toward.</p>
+<p>The legacy path, Billing Meters, is architecturally simple: "you send meter events to the Stripe <code>/v1/billing/meter_events</code> endpoint and Stripe aggregates them at the end of the billing period"<a class="cite" href="#ref-3">3</a>. Stripe's documentation states the resulting staleness plainly rather than hiding it: "Stripe processes meter events asynchronously, so aggregated usage in meter event summaries and on upcoming invoices might not immediately reflect recently received meter events"<a class="cite" href="#ref-3">3</a>. The staleness bound here is not a fixed number of seconds; it is bounded by the aggregation cadence, which in the worst case is the length of the billing period itself — a customer's own dashboard, and Stripe's own invoice draft, can both be looking at a number that has not caught up to what actually happened in production a few minutes or hours ago.</p>
+<p>The path Stripe now recommends for new integrations is Metronome, a usage-based billing platform Stripe itself operates, which "tracks running balances and usage totals continuously, so you and your customers can see current usage at any point during the billing period, not just at invoice time"<a class="cite" href="#ref-3">3</a>, and which Stripe's docs describe as "also built for high-volume ingest, making it more suitable for products where customers generate large numbers of events per second or per day"<a class="cite" href="#ref-3">3</a>. Metronome's own documentation describes three separate moments where usage is actually processed rather than just stored: "every time usage is sent, Metronome evaluates customer alerts and thresholds to send webhooks if spending limits are reached or credits are depleted"; usage is recomputed again "whenever the Metronome APIs are called, powering real-time dashboards"; and a final pass happens "at the end of the month or quarter" when an invoice is finalized<a class="cite" href="#ref-9">9</a>. The architectural move that makes this tractable is a deliberate separation between the raw fact and the billable quantity: a <b>usage event</b> is raw activity data sent "in the format that makes sense for your operations, without conforming to rigid predefined structures," and a <b>billable metric</b> is a separate, named transformation that "transform[s] raw usage events into meaningful quantities that appear on an invoice"<a class="cite" href="#ref-9">9</a> — so a pricing change is a change to the metric definition, not a re-instrumentation of the application emitting events. Stripe's own integration guide for combining the two maps its native billing primitives onto Metronome's equivalents: a Stripe <code>Meter</code> corresponds to a Metronome <code>Billable metric</code>, a Stripe <code>CreditGrant</code> to a Metronome <code>Prepaid commit</code>, and a Stripe <code>Credit balance</code> to a Metronome <code>Credit ledger</code><a class="cite" href="#ref-10">10</a> — the same underlying concepts, named differently on either side of the integration.</p>
+<p>The scale this design is built for is not hypothetical. In a customer case study Confluent (Metronome's streaming-infrastructure vendor) published, Metronome's own VP of Engineering, quoted by name, states the platform is "processing over 10,000 invoices per second and streaming billions of events per day with no lost data and extremely low end-to-end latency"<a class="cite" href="#ref-11">11</a>, elsewhere in the same case study rendered as "tens of thousands of invoices processed per second"<a class="cite" href="#ref-11">11</a>. At that ingest rate, an end-of-period aggregation design would need to run its aggregation job often enough to keep dashboards and spend-limit checks meaningfully current — at which point it is, in effect, reimplementing the continuous path anyway, just with an extra layer of batch scheduling on top.</p>
+<p>The clearest case where the two halves of this module meet is a prepaid credit balance with auto-recharge: a customer draws down a balance of purchased credits, and the platform must charge them again once the balance crosses a threshold, without any manual step. Stripe's integration documentation describes exactly this as a supported pattern — "payment-gated commits (including threshold billing and auto-recharge), where a Stripe invoice must be paid before credits are released," with ACH support carrying "a 13-day payment window"<a class="cite" href="#ref-10">10</a> — and this pattern needs both halves of the module simultaneously: it needs Section 5's continuous balance tracking to notice the threshold crossing while it is still true, and Section 1's idempotency-key-guarded charge to collect the recharge payment exactly once even if that request has to be retried. The documentation's own failure path shows what happens when the two halves disagree: "if a payment-gated auto-recharge payment fails, Metronome voids the invoice and disables the contract's auto-recharge," and a human has to "follow up with the customer and manually re-enable the contract"<a class="cite" href="#ref-10">10</a> — a deliberate fallback to a non-retryable, human-in-the-loop state rather than an automatic retry loop, for exactly the reason Section 3's retryable/non-retryable distinction exists: a payment method that has already failed once is not a case where retrying with the same idempotency key is safe to keep doing unattended.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f5t"><title id="f5t">Two visibility curves over one billing period for the same underlying usage stream: continuous tracking versus end-of-period aggregation</title>
+    <defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="70" y1="240" x2="740" y2="240" class="d-axis"/>
+    <line x1="70" y1="240" x2="70" y2="40" class="d-axis"/>
+    <text x="400" y="270" text-anchor="middle" class="d-small d-text-light">time within one billing period</text>
+    <text x="30" y="140" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 30 140)">usage visible to customer</text>
+    <line x1="70" y1="240" x2="740" y2="240" class="d-grid"/>
+    <line x1="70" y1="180" x2="740" y2="180" class="d-grid"/>
+    <line x1="70" y1="120" x2="740" y2="120" class="d-grid"/>
+    <line x1="70" y1="60" x2="740" y2="60" class="d-grid"/>
+
+    <polyline points="70,240 130,225 200,205 280,190 350,165 420,150 500,120 570,105 650,80 740,60" class="d-line d-stroke-blue"/>
+    <text x="620" y="60" text-anchor="start" class="d-small d-bold">Metronome: continuous</text>
+
+    <polyline points="70,240 300,240 300,235 300,235 550,235 550,60 740,60" class="d-line d-stroke-orange d-dashed"/>
+    <text x="560" y="230" text-anchor="start" class="d-small d-bold">Billing Meters: flat until aggregation, then jumps</text>
+
+    <path d="M300,240 L300,235" class="d-dashed d-outline"/>
+    <circle cx="550" cy="235" r="4" class="d-fill-orange"/>
+    <path d="M550,235 L550,60" class="d-arrow-active" marker-end="url(#f5-arr)"/>
+    <text x="555" y="150" text-anchor="start" class="d-small">aggregation run: catches up all at once</text>
+
+    <rect x="290" y="55" width="220" height="34" rx="6" class="d-fill-red-soft d-stroke-red"/>
+    <text x="400" y="76" text-anchor="middle" class="d-small">staleness window: real usage minus what the customer can see</text>
+    <path d="M400,89 L300,235" class="d-dashed d-outline"/>
+    <path d="M400,89 L550,235" class="d-dashed d-outline"/>
+  </svg>
+  <figcaption><b>Figure 5.</b> The same underlying usage stream, shown two ways. Metronome's continuous tracking keeps the visible curve close to the true accumulation at every point<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-9">9</a>; the legacy Billing Meters path holds the visible number flat between aggregation runs and only catches up when Stripe's asynchronous job executes, per Stripe's own documented caveat that summaries "might not immediately reflect recently received meter events"<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Metronome vs. the legacy Billing Meters path, by mechanism<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-10">10</a><a class="cite" href="#ref-9">9</a>.</caption>
+<thead><tr><th>Dimension</th><th>Metronome (real-time)</th><th>Billing Meters (legacy, async)</th></tr></thead>
+<tbody>
+<tr><td class="row">Balance visibility</td><td>Continuous — current at any point in the period<a class="cite" href="#ref-3">3</a></td><td>Only accurate as of the last aggregation run<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Staleness bound</td><td>Bounded by ingest/processing latency</td><td>Bounded by aggregation cadence, up to a full billing period<a class="cite" href="#ref-3">3</a></td></tr>
+<tr><td class="row">Alerting on thresholds</td><td>Evaluated at every event<a class="cite" href="#ref-9">9</a></td><td>Not evaluated until the next aggregation</td></tr>
+<tr><td class="row">Stripe's own recommendation</td><td>Recommended path for new integrations<a class="cite" href="#ref-3">3</a></td><td>Existing/legacy path, still supported</td></tr>
+<tr><td class="row">Fit for high event volume</td><td>Built for it — Stripe names this explicitly<a class="cite" href="#ref-3">3</a>; production case study cites 10,000+ invoices/sec, billions of events/day<a class="cite" href="#ref-11">11</a></td><td>No stated volume target; simpler to operate at low volume</td></tr>
+<tr><td class="row">Event-to-billing-quantity mapping</td><td>Decoupled: raw event vs. billable metric<a class="cite" href="#ref-9">9</a></td><td>Aggregation logic defined per meter, at aggregation time</td></tr>
+</tbody>
+</table>
+
+<p>The choice between the two is not free, and it is not simply "always pick real-time." A continuously-tracked balance requires a streaming ingestion path that stays correct and low-latency under load — infrastructure the async design does not need at all, since a batch job that runs once per period can absorb backpressure that a real-time path cannot. The right question is what the staleness window actually costs: for a spend-capped or credit-metered product, a customer who can burn through their entire remaining balance in the interval between aggregation runs is a real, uncapped financial exposure, not just a stale dashboard — Stripe's own framing, "for products where customers generate large numbers of events per second or per day"<a class="cite" href="#ref-3">3</a>, is precisely naming the case where that exposure compounds fastest. For a low-volume, subscription-adjacent product where usage is measured in the hundreds of calls per billing period and no spend cap depends on real-time enforcement, the staleness window an async aggregation job introduces costs nothing a customer would ever notice, and building or paying for a real-time streaming path buys nothing.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Two design questions run through this module without a single settled answer, and both are visible in the primary sources rather than invented for contrast. The first is how far a single idempotency key can be trusted to make a workflow safe: is one key at one API boundary enough, or does a multi-step money-movement workflow need something closer to a saga? The second is whether usage visibility should default to real-time or asynchronous, now that Stripe itself operates both and states a preference.</p>
+<div class="positions">
+  <article class="position">
+    <h4>A client-supplied idempotency key at the API boundary is enough</h4>
+    <p class="who">Stripe's production design<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a></p>
+    <p>Stripe's entire public idempotency mechanism is one header, one cached result, one endpoint. There is no workflow engine, no DAG, no compensating-transaction machinery visible in the documentation — a client retries a single call with the same key, and the server's cache does the rest. This handles the overwhelming majority of real-world failures, because the overwhelming majority of failures are exactly the case the mechanism targets: a dropped connection or a timeout around one already-idempotent operation.</p>
+    <ul class="pros"><li>Minimal moving parts: no orchestration framework, no DAG runtime, no separate compensation logic to build or maintain</li><li>Proven at Stripe's own scale and across arbitrary third-party client code, without requiring any cooperation from Stripe's internal services beyond the one endpoint</li></ul>
+    <ul class="cons"><li>Only protects the single call it wraps; says nothing about what happens if the failure is between two of the platform's own internal service calls rather than between the client and the API</li><li>Provides no answer for an operation that has already produced an irreversible side effect and now needs to be undone, only for one that has not yet executed at all</li></ul>
+  </article>
+  <article class="position">
+    <h4>Multi-step money movement needs systemic idempotency across a DAG of steps</h4>
+    <p class="who">Airbnb's Orpheus framework and payment-orchestration redesign<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-12">12</a>; the theoretical grounding is Garcia-Molina and Salem's saga model<a class="cite" href="#ref-13">13</a></p>
+    <p>Once a single logical operation (charge the guest, pay the host, reconcile a resolution-center refund) touches more than one internal service, one idempotency key at one boundary does not cover the whole workflow — a crash between step 2 and step 3 of an internal DAG is invisible to whatever key guarded the original client-facing request. Airbnb's answer is to divide "every major workflow... into a directed acyclic graph (DAG) of retryable idempotent steps, each with well-defined behavior," reporting this design has "led to five 9s (99.999%) of consistency for payments" while volume simultaneously doubled<a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-5">5</a>. But Airbnb's own account concedes the limit of pure idempotency: exceptions are explicitly split into "retryable" and "non-retryable," and a non-retryable failure after a partial side effect — a payment already authorized, a step that cannot simply be repeated — is a case idempotent retry cannot resolve on its own<a class="cite" href="#ref-5">5</a>. That is precisely the gap Garcia-Molina and Salem's 1987 saga paper names formally: a long-lived transaction broken into sub-transactions \(T_1,\ldots,T_n\) needs, for each \(T_i\), "a compensating transaction \(C_i\)" that "undoes, from a semantic point of view, any of the actions performed by \(T_i\), but does not necessarily return the database to the state that existed when the execution of \(T_i\) began"<a class="cite" href="#ref-13">13</a> — a mechanism categorically different from "retry this step again," because retrying assumes the step never durably succeeded, and compensation assumes it did.</p>
+    <ul class="pros"><li>Extends retry-safety across an entire internal workflow, not just the one call a client happens to see</li><li>Makes the retryable/non-retryable distinction an explicit, audited property of every step rather than an assumption</li><li>Has a rigorous theoretical grounding (sagas) for the case idempotency alone cannot cover</li></ul>
+    <ul class="cons"><li>Requires building and maintaining a workflow/orchestration layer most teams do not need for a single-endpoint operation</li><li>"Non-retryable" failures still fall back to "requires manual intervention" in Airbnb's own account<a class="cite" href="#ref-5">5</a> — the framework narrows the gap sagas describe, it does not fully automate compensation</li></ul>
+  </article>
+  <article class="position">
+    <h4>Real-time continuous metering should be the default</h4>
+    <p class="who">Stripe's own current guidance, steering new integrations toward Metronome<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-10">10</a></p>
+    <p>Stripe explicitly recommends Metronome for new usage-based billing integrations and names high event volume as the case it is "more suitable" for<a class="cite" href="#ref-3">3</a>. A continuously-tracked balance closes the staleness window that an asynchronous design leaves open by construction, and the production numbers Metronome's own infrastructure vendor discloses — over 10,000 invoices per second, billions of events per day<a class="cite" href="#ref-11">11</a> — show the approach scales past the volume most products will ever reach.</p>
+    <ul class="pros"><li>No staleness window for spend caps, credit thresholds, or fraud-relevant alerts to hide behind<a class="cite" href="#ref-10">10</a></li><li>Decouples raw event instrumentation from billable-metric definition, so pricing changes do not require re-instrumenting the product<a class="cite" href="#ref-10">10</a></li></ul>
+    <ul class="cons"><li>Requires a correct, low-latency streaming ingestion path under load — infrastructure an async batch job does not need at all</li><li>Buys nothing for a product whose usage volume and billing sensitivity never make the staleness window observable</li></ul>
+  </article>
+  <article class="position">
+    <h4>Asynchronous end-of-period aggregation remains the right default for many products</h4>
+    <p class="who">Stripe's continued support of the legacy Billing Meters path<a class="cite" href="#ref-3">3</a></p>
+    <p>Stripe has not removed Billing Meters; it remains supported precisely because most usage-based products do not generate "large numbers of events per second or per day"<a class="cite" href="#ref-3">3</a> and do not gate anything time-critical on the up-to-the-second balance. For that class of product, an aggregation job that runs periodically is simpler to build, has fewer moving parts to keep available, and the staleness it introduces is bounded by a billing period that customers never interact with at second-level resolution anyway.</p>
+    <ul class="pros"><li>No streaming infrastructure to build, operate, or keep available under load</li><li>Aggregation logic is defined once, at aggregation time, independent of how events happen to arrive</li></ul>
+    <ul class="cons"><li>Staleness is bounded only by the aggregation cadence, which in the worst case is the full billing period<a class="cite" href="#ref-3">3</a></li><li>Any feature that depends on real-time enforcement (spend caps, fraud thresholds) cannot be built on top of this path without adding a separate real-time check anyway</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Both contrasts resolve on the same axis: how expensive is staleness or blast radius, not which design is intrinsically better. For idempotency scope, a single client-supplied key is the right and sufficient tool exactly as long as the operation it guards is one call with one side effect at one boundary — which describes most of what a payments API actually does, and is why Stripe's documented mechanism stops there. The moment a logical operation spans multiple internal services with their own independent side effects, Airbnb's own numbers (five nines of consistency at double the volume) show that systemic, DAG-level idempotency is worth the orchestration cost, but even that framework's authors concede it narrows rather than eliminates the need for genuine compensation once a step's effect is irreversible — which is exactly the saga literature's 1987 claim, restated by production experience four decades later. For metering, the deciding variable is what staleness costs: if a customer can exhaust an uncapped exposure inside one aggregation cycle, or a fraud signal needs to fire before the next batch run, real-time tracking is not a luxury, it is the only design that closes that window; if usage is low-volume and nothing time-sensitive depends on the up-to-the-second number, the asynchronous path is simpler and costs nothing observable. What would settle either question further is the same kind of evidence in both cases: a published incident or postmortem showing a specific dollar loss traceable to the staleness window or the idempotency-scope gap, rather than the architectural description alone — Airbnb's replica-lag example in Section 3 is exactly that kind of evidence for idempotency scope, and no comparably specific public postmortem exists yet for the metering trade-off.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">blog</span>Stripe (Brandur Leach et al.). <em>Designing robust and predictable APIs with idempotency</em>. Stripe Engineering Blog, 2017. <a href="https://stripe.com/blog/idempotency">https://stripe.com/blog/idempotency</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Idempotency-Key header origin, cached-result replay on retry, client-library automatic retry with backoff and jitter.</span></li>
+<li id="ref-2"><span class="ref-type">blog</span>Stripe. <em>Ledger: Stripe's system for tracking and validating money movement</em>. stripe.dev Engineering Blog. <a href="https://stripe.dev/blog/ledger-stripe-system-for-tracking-and-validating-money-movement">https://stripe.dev/blog/ledger-stripe-system-for-tracking-and-validating-money-movement</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 135 currencies/185 countries integration problem, accounts-as-buckets and events-move-money model, double-entry "pipes and reservoirs" framing, immutable/auditable log, business+id dedup identifier tolerant of out-of-order arrival, scale figures (5 billion events/day, 99.99% ingested within 4 days, 2024 Black Friday volume).</span></li>
+<li id="ref-3"><span class="ref-type">official</span>Stripe. <em>Usage-based billing</em>. Live documentation. <a href="https://docs.stripe.com/billing/usage-based">https://docs.stripe.com/billing/usage-based</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Metronome continuous running-balance tracking vs. legacy Billing Meters end-of-period aggregation, asynchronous-processing staleness caveat, high-volume-ingest suitability statement.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>Stripe. <em>Idempotent requests</em>. API reference, live documentation. <a href="https://docs.stripe.com/api/idempotent_requests">https://docs.stripe.com/api/idempotent_requests</a>. Accessed 2026-09-17. <span class="ref-use">Used for: caching status code and body including 500 errors, 24-hour key pruning, V4 UUID recommendation and 255-character limit, parameter-mismatch error on key reuse, concurrent in-flight requests rejected as retryable, POST-only applicability.</span></li>
+<li id="ref-5"><span class="ref-type">blog</span>Chew, J., Khisti, N. <em>Avoiding Double Payments in a Distributed Payments System</em>. The Airbnb Tech Blog, 2019-04-16. <a href="https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb">https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Orpheus idempotency library, Pre-RPC/RPC/Post-RPC three-phase structure and the no-network/no-database-write separation rule, request-level vs. entity-level idempotency keys, row-level lease with expiration, master-vs-replica read consistency and the replica-lag double-payment failure mode, retryable/non-retryable exception classification, sharding by idempotency key, five-nines consistency outcome.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>Stripe. <em>Receive Stripe events in your webhook endpoint</em>. Live documentation. <a href="https://docs.stripe.com/webhooks">https://docs.stripe.com/webhooks</a>. Accessed 2026-09-17. <span class="ref-use">Used for: at-least-once webhook delivery and event-ID-based deduplication, automatic redelivery for up to three days with exponential backoff, manual resend windows (15 days Dashboard, 30 days CLI), lack of delivery-order guarantee, quickly-return-2xx guidance.</span></li>
+<li id="ref-7"><span class="ref-type">official</span>Stripe. <em>Rate limits</em>. Live documentation. <a href="https://docs.stripe.com/rate-limits">https://docs.stripe.com/rate-limits</a>. Accessed 2026-09-17. <span class="ref-use">Used for: exponential backoff plus randomness recommendation for 429 errors, object lock_timeout error and automatic SDK retry behavior, max_network_retries=2 Ruby example.</span></li>
+<li id="ref-8"><span class="ref-type">repo</span>Stripe. <em>stripe-node</em> repository, <code>RequestSender.ts</code> and <code>stripe.core.ts</code>. <a href="https://github.com/stripe/stripe-node">https://github.com/stripe/stripe-node</a>. Accessed 2026-09-17. <span class="ref-use">Used for: exact backoff formula (capped exponential delay), jitter scaling formula and floor, default constants initialNetworkRetryDelay=0.5s and maxNetworkRetryDelay=5s.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>Metronome. <em>How Metronome works</em>. Live documentation. <a href="https://docs.metronome.com/guides/get-started/how-metronome-works">https://docs.metronome.com/guides/get-started/how-metronome-works</a>. Accessed 2026-09-17. <span class="ref-use">Used for: three real-time processing touchpoints (alert evaluation at ingestion, on-demand API-triggered computation, billing-period-close finalization), separation of usage events from billable metrics.</span></li>
+<li id="ref-10"><span class="ref-type">official</span>Stripe. <em>How Metronome works with Stripe</em>. Live documentation. <a href="https://docs.stripe.com/billing/how-metronome-works-with-stripe">https://docs.stripe.com/billing/how-metronome-works-with-stripe</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Stripe-to-Metronome concept mapping (Meter/Billable metric, CreditGrant/Prepaid commit, Credit balance/Credit ledger), invoice lifecycle.</span></li>
+<li id="ref-11"><span class="ref-type">blog</span>Confluent. <em>Metronome Powers Real-Time Billing With Confluent Data Streaming Platform</em> (customer case study). <a href="https://www.confluent.io/customers/metronome/">https://www.confluent.io/customers/metronome/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: over 10,000 invoices per second, billions of events streamed per day, low end-to-end latency, quoted directly from Metronome's VP of Engineering.</span></li>
+<li id="ref-12"><span class="ref-type">blog</span>Ross, B. et al. <em>Rebuilding Payment Orchestration at Airbnb</em>. The Airbnb Tech Blog, 2022-02-24. <a href="https://medium.com/airbnb-engineering/rebuilding-payment-orchestration-at-airbnb-341d194a781b">https://medium.com/airbnb-engineering/rebuilding-payment-orchestration-at-airbnb-341d194a781b</a>. Accessed 2026-09-17. <span class="ref-use">Used for: workflows as a DAG of retryable idempotent steps, Kafka at-least-once enhanced to exactly-once via the idempotency framework, data immutability via persistent append-only events and versioning, five-nines consistency at doubled payment volume.</span></li>
+<li id="ref-13"><span class="ref-type">paper</span>Garcia-Molina, H., Salem, K. <em>Sagas</em>. Proceedings of the 1987 ACM SIGMOD International Conference on Management of Data, pp. 249-259. <a href="https://www.cs.princeton.edu/techreports/1987/070.pdf">https://www.cs.princeton.edu/techreports/1987/070.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: saga definition as a long-lived transaction split into interleavable sub-transactions, compensating-transaction \(C_i\) semantics distinct from retry.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

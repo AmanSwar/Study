@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Request Path: DNS, Load Balancers, Reverse Proxies, CDNs, and Edge Networks · System Design</title>
+<meta name="description" content="How a request travels from a client's DNS lookup to an origin server and back — anycast DNS, L4 vs L7 load balancing, reverse proxy responsibilities, tiered CDN caching, and the arithmetic of a hop-by-hop latency budget.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 1</p>
+  <h1>The Request Path: DNS, Load Balancers, Reverse Proxies, CDNs, and Edge Networks</h1>
+  <p class="lede">Every request in every case study and every platform-design module in this course crosses the same handful of hops before it reaches code that does real work: a DNS lookup, an anycast-routed connection, a cache check at the edge, a load-balancing decision, a reverse proxy, and finally the origin. This module derives each hop from its own primary documentation — nginx's load-balancing algorithms, Cloudflare's CDN architecture, AWS's Elastic Load Balancing layer split, the TCP and TLS handshake specifications — so that afterward you can read a load-balancer config or a CDN topology diagram and predict exactly which requests land where, and build a latency budget for any request path this course throws at you.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>12</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f1t"><title id="f1t">Hop-by-hop request path from client to origin, with a latency budget per hop</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    <marker id="f1-arr-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+    <!-- boxes -->
+    <g class="d-mono d-small">
+    <rect x="20" y="150" width="88" height="60" rx="8" class="d-block"/><text x="64" y="176" text-anchor="middle" class="d-text-inv d-bold">Client</text><text x="64" y="192" text-anchor="middle" class="d-text-inv">browser</text>
+    <rect x="132" y="150" width="88" height="60" rx="8" class="d-block-2"/><text x="176" y="176" text-anchor="middle" class="d-text-inv d-bold">DNS</text><text x="176" y="192" text-anchor="middle" class="d-text-inv">resolver</text>
+    <rect x="244" y="150" width="88" height="60" rx="8" class="d-block-2"/><text x="288" y="176" text-anchor="middle" class="d-text-inv d-bold">Anycast</text><text x="288" y="192" text-anchor="middle" class="d-text-inv">edge</text>
+    <rect x="356" y="150" width="88" height="60" rx="8" class="d-block-2"/><text x="400" y="176" text-anchor="middle" class="d-text-inv d-bold">CDN PoP</text><text x="400" y="192" text-anchor="middle" class="d-text-inv">cache</text>
+    <rect x="468" y="150" width="88" height="60" rx="8" class="d-block-accent"/><text x="512" y="176" text-anchor="middle" class="d-text-inv d-bold">LB</text><text x="512" y="192" text-anchor="middle" class="d-text-inv">L4 / L7</text>
+    <rect x="580" y="150" width="88" height="60" rx="8" class="d-block-accent"/><text x="624" y="176" text-anchor="middle" class="d-text-inv d-bold">Reverse</text><text x="624" y="192" text-anchor="middle" class="d-text-inv">proxy</text>
+    <rect x="692" y="150" width="88" height="60" rx="8" class="d-block-muted"/><text x="736" y="176" text-anchor="middle" class="d-bold">Origin</text><text x="736" y="192" text-anchor="middle">app server</text>
+    </g>
+    <!-- arrows -->
+    <path d="M108,180 L132,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M220,180 L244,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M332,180 L356,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M444,180 L468,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M556,180 L580,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M668,180 L692,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <!-- latency labels -->
+    <g class="d-mono d-small d-text-light">
+    <text x="120" y="140" text-anchor="middle">&#8804;10ms</text>
+    <text x="120" y="228" text-anchor="middle">cached lookup</text>
+    <text x="232" y="140" text-anchor="middle">1 RTT</text>
+    <text x="232" y="228" text-anchor="middle">TCP connect</text>
+    <text x="344" y="140" text-anchor="middle">1&#8211;2 RTT</text>
+    <text x="344" y="228" text-anchor="middle">TLS handshake</text>
+    <text x="456" y="140" text-anchor="middle">+1&#8211;2 RTT</text>
+    <text x="456" y="228" text-anchor="middle">on cache miss</text>
+    <text x="568" y="140" text-anchor="middle">&#956;s&#8211;ms</text>
+    <text x="568" y="228" text-anchor="middle">CPU, not RTT</text>
+    <text x="680" y="140" text-anchor="middle">&#956;s&#8211;ms</text>
+    <text x="680" y="228" text-anchor="middle">CPU, not RTT</text>
+    </g>
+    <!-- cache hit shortcut -->
+    <path d="M400,150 Q 232,70 64,150" class="d-arrow-active d-dashed" marker-end="url(#f1-arr-active)" fill="none"/>
+    <text x="232" y="62" text-anchor="middle" class="d-small d-bold">cache hit &#8594; return here, skip LB / proxy / origin</text>
+    <!-- 1 RTT unit note -->
+    <text x="400" y="300" text-anchor="middle" class="d-small d-text-light">1 network RTT &#8776; the distance to reach an edge PoP, &#8804;50ms for 95% of the world's population</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> A request crosses six distinct hops before it reaches application code, and each one is an independent latency and failure domain. The dashed return path shows the shortcut that a cache hit at the CDN PoP takes — it never reaches the load balancer, reverse proxy, or origin at all. The "1 RTT" unit used throughout this module is anchored to Cloudflare's own reach figure: 95% of the world's Internet-connected population is within 50 milliseconds of an edge location<a class="cite" href="#ref-1">1</a>; the DNS figure is Cloudflare's own stated goal for its resolver network<a class="cite" href="#ref-2">2</a>; handshake round-trip counts come from the TCP and TLS 1.3 specifications<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>. Section 7 turns this sketch into an exact table.</figcaption>
+</figure>
+
+<h2 id="hop-model">1. The request as a chain of independent hops</h2>
+<p>Nothing in this module is complicated in isolation: DNS resolves a name to an address, a load balancer picks a backend, a reverse proxy forwards a connection, a cache either has the answer or does not. What makes the request path worth a dedicated module is that these simple operations chain together, and a chain of independent operations has two properties that are easy to underestimate coming from single-node systems work.</p>
+<p>First, every hop is its own failure domain. A DNS resolver, an edge PoP, a load balancer, and a reverse proxy are four different pieces of software running on four different machines (often four different companies' machines), and each one can be slow, overloaded, or down independently of the others. Second, and this is the one that actually bites in production, tail latency compounds across a chain rather than averaging out. If a request has to wait on the slowest of several sequential or fanned-out calls, the end-to-end response time is not the mean of the individual hops — it is dominated by whichever hop happens to be in its own tail on that particular request, and the more hops or parallel calls a request touches, the higher the chance that at least one of them lands in its tail<a class="cite" href="#ref-5">5</a>. A service whose individual hops are each fast at the 99th percentile can still have a visibly slow 99th percentile once six of those hops are stacked in series, because the probability that none of the six is having a bad millisecond is the product of six probabilities close to, but not equal to, one.</p>
+<p>This is also why the request path is a genuinely different kind of engineering problem from the one an ML-serving background trains you for. A KV cache, a batching scheduler, or a collective operation inside a single training job runs under a single administrative domain, with a scheduler that can see the whole system and a network you provisioned and tuned yourself. A DNS resolver you don't operate, an anycast network run by a CDN vendor, and an origin data center you do operate are stitched together by public protocols (DNS, TCP, TLS, HTTP) precisely so that none of the parties needs to trust or even know about the internals of the others. Every mechanism in this module — a load-balancing algorithm, a cache-placement policy, a proxy's buffering behavior — exists to make that stitching predictable despite the fact that no single party controls the whole path.</p>
+<p>The rest of this module walks the chain in Figure 1's order: DNS and anycast routing (Section 2) decide which physical location a request's bytes first arrive at; load balancing (Section 3) decides which backend process within that location handles it; the reverse proxy (Section 4) decides what happens to the connection before a backend ever sees it; the CDN/edge tier (Section 5) decides whether the request needs to leave the edge at all; session affinity (Section 6) is the one policy that couples several of the above decisions together and is worth treating on its own; and Section 7 turns the whole chain into a number.</p>
+
+<h2 id="dns-anycast">2. DNS resolution and anycast routing</h2>
+<p>Before a client can open a connection to anything, a name has to become an address. That step looks trivial and is the reason the rest of the path can behave the way it does: DNS is the only hop in Figure 1 whose answer the client is allowed to cache and reuse across many requests, so it is also the only hop where "fast" mostly means "already answered."</p>
+
+<h3 id="dns-recursive">2.1 Recursive resolution and why caching dominates the cost</h3>
+<p>A client's stub resolver does not usually talk to the authoritative server for a domain directly. It hands the query to a recursive resolver (an ISP's resolver, or a public one such as Cloudflare's 1.1.1.1 or Google's 8.8.8.8), which does the walking on the client's behalf and hands back a single answer. When that resolver already has a cached, unexpired answer for the name, the cost of the whole lookup collapses to one network round trip: "if it can [answer from cache], then the time to answer is only the round-trip time for a packet from the client to the resolver"<a class="cite" href="#ref-2">2</a>. When it does not, the resolver has to walk the delegation chain itself — root server, then top-level-domain server, then the domain's own authoritative server — before it can answer and cache the result for the record's TTL.</p>
+<p>This is why a resolver's own network placement matters as much as its software: a resolver that is itself reachable over an anycast network inherits the same nearest-location routing that Section 2.2 describes for CDN edges, which is precisely why Cloudflare states its explicit goal for 1.1.1.1 as "eventually we want everyone to be within 10 milliseconds of at least one of our locations"<a class="cite" href="#ref-2">2</a> — a target for the client-to-resolver round trip, not for the occasional root/TLD/authoritative walk behind a cache miss. In practice the overwhelming majority of DNS queries for any popular domain are answered from cache somewhere in the resolution chain, because TTLs are chosen to make repeated lookups of the same name cheap; the recursive walk is the exceptional case, not the common one. The number that belongs in a latency budget for DNS, then, is the cached-answer number, and Section 7 uses exactly that figure.</p>
+
+<h3 id="anycast-routing">2.2 Anycast: the same address, answered by whichever location is closest in the network's eyes</h3>
+<p>Once a name resolves to an address, how does that address get a packet to the right physical location out of hundreds of candidates? The mechanism a modern CDN or DNS operator uses is anycast: the identical IP address is announced from every data center in the network, and the Internet's own routing protocol — BGP — decides, for each network the request originates from, which announcement to prefer. Cloudflare's own architecture documentation states the property directly: with anycast, "incoming traffic is routed to the nearest data center with the capacity to process the requests efficiently," and because "multiple nodes have the same IP address, if one node were to fail, requests are simply routed to another node in close proximity" — failover is a side effect of the routing mechanism, not a separate system bolted on afterward<a class="cite" href="#ref-1">1</a>.</p>
+<p>Two things about that mechanism are easy to get wrong from a naive mental model. First, "nearest" means nearest by BGP path selection, which typically reduces to the shortest AS-path (the fewest network-operator hops the announcement crosses), not the shortest physical distance — a request can be routed to a data center in a different city than the geographically closest one if that city's data center has a shorter AS-path from the client's network. Second, anycast is a property of routing to a location, not a property of what happens once the packet arrives there; a single anycast IP can, and typically does, front many physical machines behind a single data center's own internal load balancer (Section 3) — anycast solves "which building," load balancing solves "which machine in that building."</p>
+<p>Cloudflare's documentation contrasts this directly with the alternative most engineers reach for by default — ordinary unicast DNS load balancing, where a domain resolves to different IP addresses depending on which data center's resolver logic answers the query. That approach has two structural weaknesses anycast does not: "clients may be geographically dispersed from the DNS resolver" they happen to use, so the routing decision is made on behalf of the resolver's location, not the client's, and the whole scheme depends on the "client's DNS server instead of client's IP address" as the signal for proximity<a class="cite" href="#ref-1">1</a> — a resolver shared by users on different continents (which public resolvers like 1.1.1.1 and 8.8.8.8 explicitly are) breaks the locality assumption that DNS-based routing depends on. Anycast sidesteps the problem entirely by making the routing decision at the IP layer, on every single packet, using the client's own network path rather than a DNS answer that gets cached and reused by clients the resolver never sees again.</p>
+<p>The practical consequence for the rest of this module: everywhere Figure 1 draws "Anycast edge," read it as "the BGP routing layer delivered this TCP SYN to the nearest capable data center already, before any application-layer decision happened." Everything from Section 3 onward — load balancing, reverse proxying, cache placement — operates <em>inside</em> whichever data center anycast just chose, on traffic that has already been narrowed from "anywhere on the Internet" to "this one facility."</p>
+
+<h2 id="load-balancing">3. Load balancing: layer 4 vs layer 7, and the four algorithms</h2>
+<p>Anycast (Section 2.2) narrows "anywhere on the Internet" down to one data center. A load balancer does the next narrowing: which of the (often hundreds of) backend processes in that data center actually handles this connection. Two questions have to be answered before a load balancer can do anything: how much of the request can it see, and by what rule does it pick a target. The first question is the L4/L7 split; the second is the choice among round robin, least connections, ip-hash, and weighted variants.</p>
+
+<h3 id="l4-vs-l7">3.1 What "layer" buys and costs</h3>
+<p>The terms L4 and L7 refer to the OSI model layers a load balancer operates at, and the distinction is not academic — it determines what information is available to the routing decision and what it costs to get it. AWS states the two positions about as plainly as a vendor ever does about its own two competing products. Its Network Load Balancer "functions at the fourth layer of the Open Systems Interconnection (OSI) model. It can handle millions of requests per second"<a class="cite" href="#ref-6">6</a> — it sees TCP/UDP segments, not HTTP requests, and picks a target using "a flow hash algorithm based on the protocol, source IP address, source port, destination IP address, destination port, and TCP sequence number," so that every packet in one TCP connection is provably routed to the same target for the life of that connection, without the load balancer ever parsing what is inside the segments<a class="cite" href="#ref-6">6</a>. Its Application Load Balancer instead "functions at the application layer, the seventh layer of the Open Systems Interconnection (OSI) model," and evaluates "listener rules in priority order" that can match on the URL path, the HTTP host header, individual HTTP headers, methods, or query parameters before selecting a target<a class="cite" href="#ref-7">7</a> — routing decisions a pure L4 balancer structurally cannot make, because it never terminates or parses the HTTP layer at all.</p>
+<p>That extra visibility is not free. An L7 balancer has to complete the TCP handshake and, for HTTPS, the TLS handshake, then buffer and parse an HTTP request before it can apply a single routing rule — CPU and memory per connection that an L4 balancer never spends, which is exactly why the L4 product is the one advertised for "millions of requests per second" and the L7 product is the one advertised for content-based routing, TLS-termination convenience, and Lambda/container-aware target registration<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a>. Table 1 lays the trade-off out directly; the two are not mutually exclusive; AWS's own NLB documentation notes that a target group's target type can itself be "an Application Load Balancer"<a class="cite" href="#ref-6">6</a> — i.e., L4 in front of L7 is a supported, named pattern, not a workaround, used when an operator wants NLB's static IPs, millions-of-connections throughput, and source-IP preservation as the Internet-facing tier, with an ALB doing content-aware routing one hop behind it.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Layer 4 vs. layer 7 load balancing, as AWS's own two products define the split<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a>; nginx's HTTP load balancer is the L7 case run as software instead of a managed service<a class="cite" href="#ref-8">8</a>.</caption>
+<thead><tr><th>Property</th><th>L4 (e.g. AWS NLB)</th><th>L7 (e.g. AWS ALB, nginx)</th></tr></thead>
+<tbody>
+<tr><td class="row">OSI layer</td><td class="num">4 (TCP/UDP)</td><td class="num">7 (HTTP/HTTPS)</td></tr>
+<tr><td class="row">Routing key</td><td>flow hash: protocol + src/dst IP + src/dst port (+ TCP seq)</td><td>listener rules: path, host header, HTTP headers, method, query string</td></tr>
+<tr><td class="row">Sees TLS/HTTP content</td><td>no (pass-through unless offloaded separately)</td><td>yes (must terminate TLS to read HTTP)</td></tr>
+<tr><td class="row">Stated throughput</td><td data-best>"millions of requests per second"<a class="cite" href="#ref-6">6</a></td><td>bounded by per-connection HTTP parse + TLS cost</td></tr>
+<tr><td class="row">Client IP preservation</td><td data-best>native (no header rewrite needed)</td><td>requires <code>X-Forwarded-For</code> or similar</td></tr>
+<tr><td class="row">Content-based routing</td><td>not possible</td><td data-best>yes (path/host/header rules)</td></tr>
+<tr><td class="row">Can front the other</td><td data-best>yes — NLB target type may be an ALB<a class="cite" href="#ref-6">6</a></td><td>no (L7 cannot sit below L4 in the same chain)</td></tr>
+</tbody>
+</table>
+
+<h3 id="lb-algorithms">3.2 Round robin, least connections, ip-hash, and weighted: mechanism and failure mode</h3>
+<p>Once a balancer has decided what it can see, it still needs a rule for picking among the healthy targets. nginx's own load-balancing documentation is the cleanest primary description of the four algorithms every L7 (and, in spirit, most L4) balancer implements, because nginx ships all four as literal one-line directives rather than as marketing names for proprietary logic.</p>
+<p><strong>Round robin</strong> is nginx's default: requests are distributed to servers in the upstream group in rotation, with no other information used. Its failure mode is that it treats every backend as equally capable of handling the next request, which is wrong whenever backends differ in capacity or whenever request cost varies — a backend that is still finishing a slow request receives the next request anyway, on schedule, regardless of how busy it already is.</p>
+<p><strong>Least connections</strong> (<code>least_conn</code>) fixes exactly that failure mode by routing to whichever healthy backend currently has the fewest open connections: nginx "will try not to overload a busy application server with excessive requests, distributing the new requests to a less busy server instead"<a class="cite" href="#ref-8">8</a>. Its own failure mode shows up when connection count is a poor proxy for actual load — a backend holding many idle long-lived (e.g. WebSocket or SSE) connections looks "busy" by this metric even though it is doing no work, and can be starved of new requests it could easily serve.</p>
+<p><strong>ip_hash</strong> routes by a hash of the client's IP address instead of by backend state at all: nginx hashes "the first three octets of the client IPv4 address, or the entire IPv6 address" and uses that to pick a server, which "ensures that the requests from the same client will always be directed to the same server except when this server is unavailable"<a class="cite" href="#ref-9">9</a>. This is the mechanism behind session affinity (Section 6). Its failure mode is skew: the hash function has no notion of how much traffic any one client generates, so a handful of high-volume clients hashing to the same backend can overload it while others idle, and — this is the operational trap — simply deleting a backend from the pool reshuffles the hash target for many unrelated clients at once; nginx's own fix is that "if one of the servers needs to be temporarily removed, it should be marked with the <code>down</code> parameter in order to preserve the current hashing of client IP addresses"<a class="cite" href="#ref-9">9</a> rather than removed outright. <code>ip_hash</code> also cannot be combined with a <code>backup</code> server<a class="cite" href="#ref-9">9</a>, because a hash-selected backend that fails has nowhere well-defined to fail over to.</p>
+<p>All four algorithms share one more failure mode worth separating out, because it is about detecting a dead backend rather than about picking among live ones: none of them are useful if the balancer keeps sending traffic to a server that is already down. nginx's default answer is passive health checking — "reverse proxy implementation in nginx includes in-band (or passive) server health checks. If the response from a particular server fails with an error, nginx will mark this server as failed, and will try to avoid selecting this server for subsequent inbound requests for a while"<a class="cite" href="#ref-8">8</a>. Two parameters on the <code>server</code> directive control the behavior: <code>max_fails</code> sets how many consecutive failed attempts mark a server down (default 1; 0 disables the check entirely), and <code>fail_timeout</code> sets how long it stays marked down before nginx "will start to gracefully probe the server with the live client's requests" and un-marks it if those probes succeed<a class="cite" href="#ref-8">8</a>. This is passive in the precise sense that the signal is real client traffic failing, not a synthetic probe running on its own schedule — which means the first request to a newly-failed server is guaranteed to fail before the balancer learns anything, a one-request tax every passive scheme pays that a separate active health-check loop (polling a health endpoint independently of real traffic) is designed to avoid.</p>
+<p><strong>Weighted</strong> load balancing is not a fifth algorithm but a modifier on the other three: a <code>weight</code> parameter on a server directive biases round robin (and, since nginx 1.3.1/1.2.2, <code>least_conn</code> and <code>ip_hash</code> too) toward heavier-weighted servers in proportion to their weight<a class="cite" href="#ref-9">9</a>. Figure 2 and Figure 3 make the resulting request assignment and its arithmetic concrete.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f2t"><title id="f2t">The same five-request burst assigned three different ways by round robin, least connections, and ip-hash</title>
+  <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+  <text x="400" y="18" text-anchor="middle" class="d-title d-bold">Burst: requests r1..r5 (r3, r4 from the same client IP; srv2 already has 2 open connections)</text>
+  <!-- requests row -->
+  <g class="d-mono d-small">
+  <rect x="20" y="34" width="50" height="30" rx="6" class="d-block-muted"/><text x="45" y="54" text-anchor="middle">r1</text>
+  <rect x="80" y="34" width="50" height="30" rx="6" class="d-block-muted"/><text x="105" y="54" text-anchor="middle">r2</text>
+  <rect x="140" y="34" width="50" height="30" rx="6" class="d-hl"/><text x="165" y="54" text-anchor="middle">r3</text>
+  <rect x="200" y="34" width="50" height="30" rx="6" class="d-hl"/><text x="225" y="54" text-anchor="middle">r4</text>
+  <rect x="260" y="34" width="50" height="30" rx="6" class="d-block-muted"/><text x="285" y="54" text-anchor="middle">r5</text>
+  </g>
+  <text x="165" y="16" text-anchor="middle" class="d-small d-text-light">same client IP &#8595;</text>
+  <!-- three rows: round robin, least_conn, ip_hash, each mapping to srv1/srv2/srv3 -->
+  <!-- Round robin row -->
+  <text x="20" y="100" class="d-bold d-small">round_robin</text>
+  <g class="d-mono d-small">
+  <rect x="150" y="82" width="60" height="34" rx="6" class="d-block"/><text x="180" y="103" text-anchor="middle" class="d-text-inv">srv1</text>
+  <rect x="220" y="82" width="60" height="34" rx="6" class="d-block"/><text x="250" y="103" text-anchor="middle" class="d-text-inv">srv2</text>
+  <rect x="290" y="82" width="60" height="34" rx="6" class="d-block"/><text x="320" y="103" text-anchor="middle" class="d-text-inv">srv3</text>
+  <rect x="360" y="82" width="60" height="34" rx="6" class="d-block"/><text x="390" y="103" text-anchor="middle" class="d-text-inv">srv1</text>
+  <rect x="430" y="82" width="60" height="34" rx="6" class="d-block"/><text x="460" y="103" text-anchor="middle" class="d-text-inv">srv2</text>
+  </g>
+  <text x="600" y="103" class="d-small d-text-light">r1..r5 rotate srv1,srv2,srv3,srv1,srv2 — ignores that r3/r4 share a client and that srv2 is already loaded</text>
+  <!-- least_conn row -->
+  <text x="20" y="180" class="d-bold d-small">least_conn</text>
+  <g class="d-mono d-small">
+  <rect x="150" y="162" width="60" height="34" rx="6" class="d-block-2"/><text x="180" y="183" text-anchor="middle" class="d-text-inv">srv3</text>
+  <rect x="220" y="162" width="60" height="34" rx="6" class="d-block-2"/><text x="250" y="183" text-anchor="middle" class="d-text-inv">srv1</text>
+  <rect x="290" y="162" width="60" height="34" rx="6" class="d-block-2"/><text x="320" y="183" text-anchor="middle" class="d-text-inv">srv3</text>
+  <rect x="360" y="162" width="60" height="34" rx="6" class="d-block-2"/><text x="390" y="183" text-anchor="middle" class="d-text-inv">srv1</text>
+  <rect x="430" y="162" width="60" height="34" rx="6" class="d-block-2"/><text x="460" y="183" text-anchor="middle" class="d-text-inv">srv3</text>
+  </g>
+  <text x="600" y="183" class="d-small d-text-light">srv2 starts busiest (2 conns) so every request goes to srv1/srv3 until they catch up</text>
+  <!-- ip_hash row -->
+  <text x="20" y="260" class="d-bold d-small">ip_hash</text>
+  <g class="d-mono d-small">
+  <rect x="150" y="242" width="60" height="34" rx="6" class="d-block-accent"/><text x="180" y="263" text-anchor="middle" class="d-text-inv">srv2</text>
+  <rect x="220" y="242" width="60" height="34" rx="6" class="d-block-accent"/><text x="250" y="263" text-anchor="middle" class="d-text-inv">srv1</text>
+  <rect x="290" y="242" width="60" height="34" rx="6" class="d-hl"/><text x="320" y="263" text-anchor="middle">srv3</text>
+  <rect x="360" y="242" width="60" height="34" rx="6" class="d-hl"/><text x="390" y="263" text-anchor="middle">srv3</text>
+  <rect x="430" y="242" width="60" height="34" rx="6" class="d-block-accent"/><text x="460" y="263" text-anchor="middle" class="d-text-inv">srv2</text>
+  </g>
+  <text x="600" y="263" class="d-small d-text-light">r3 and r4 hash to the same client IP and land on the same server (srv3), regardless of srv3's current load</text>
+  <text x="400" y="310" text-anchor="middle" class="d-small">Same five requests, three different assignment rules, three different sets of "hot" servers.</text>
+</svg>
+<figcaption><b>Figure 2.</b> Round robin ignores both client identity and backend load; least connections reacts to backend load but not to client identity; ip-hash guarantees client-to-server stickiness but ignores backend load entirely — a client hashing to an already-hot server stays on it. Mechanism per nginx's own documentation<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-9">9</a>.</figcaption>
+</figure>
+
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 210" role="img" aria-labelledby="f3t"><title id="f3t">Weighted round robin: a weight=3 server receives 3 of every 5 requests</title>
+  <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+  <text x="400" y="18" text-anchor="middle" class="d-title d-bold">upstream { server srv1 weight=3; server srv2; server srv3; }</text>
+  <g class="d-mono d-small">
+  <rect x="40" y="40" width="70" height="30" rx="6" class="d-block-muted"/><text x="75" y="60" text-anchor="middle">r1</text>
+  <rect x="130" y="40" width="70" height="30" rx="6" class="d-block-muted"/><text x="165" y="60" text-anchor="middle">r2</text>
+  <rect x="220" y="40" width="70" height="30" rx="6" class="d-block-muted"/><text x="255" y="60" text-anchor="middle">r3</text>
+  <rect x="310" y="40" width="70" height="30" rx="6" class="d-block-muted"/><text x="345" y="60" text-anchor="middle">r4</text>
+  <rect x="400" y="40" width="70" height="30" rx="6" class="d-block-muted"/><text x="435" y="60" text-anchor="middle">r5</text>
+  </g>
+  <path d="M75,70 L200,130" class="d-arrow" marker-end="url(#f3-arr)"/>
+  <path d="M165,70 L200,130" class="d-arrow" marker-end="url(#f3-arr)"/>
+  <path d="M255,70 L200,130" class="d-arrow" marker-end="url(#f3-arr)"/>
+  <path d="M345,70 L500,130" class="d-arrow" marker-end="url(#f3-arr)"/>
+  <path d="M435,70 L650,130" class="d-arrow" marker-end="url(#f3-arr)"/>
+  <rect x="150" y="130" width="120" height="46" rx="8" class="d-block"/><text x="210" y="150" text-anchor="middle" class="d-text-inv d-bold">srv1</text><text x="210" y="166" text-anchor="middle" class="d-text-inv d-mono d-small">weight=3</text>
+  <rect x="440" y="130" width="120" height="46" rx="8" class="d-block-2"/><text x="500" y="150" text-anchor="middle" class="d-text-inv d-bold">srv2</text><text x="500" y="166" text-anchor="middle" class="d-text-inv d-mono d-small">weight=1</text>
+  <rect x="590" y="130" width="120" height="46" rx="8" class="d-block-2"/><text x="650" y="150" text-anchor="middle" class="d-text-inv d-bold">srv3</text><text x="650" y="166" text-anchor="middle" class="d-text-inv d-mono d-small">weight=1</text>
+  <text x="400" y="200" text-anchor="middle" class="d-small d-text-light">3 of every 5 requests &#8594; srv1; 1 of every 5 &#8594; srv2; 1 of every 5 &#8594; srv3</text>
+</svg>
+<figcaption><b>Figure 3.</b> nginx's own documented example: with <code>server srv1 weight=3</code> alongside two default-weight (<code>weight=1</code>) servers, "every 5 new requests will be distributed across the application instances as the following: 3 requests will be directed to srv1, one request will go to srv2, and another one — to srv3"<a class="cite" href="#ref-8">8</a>. The ratio 3:1:1 sums the weights (5) and gives each server weight/5 of the traffic.</figcaption>
+</figure>
+
+<div class="calc">
+<p class="calc-title">Weighted round robin: share of traffic per server</p>
+<div class="calc-row"><label for="wa">Weight A</label><input type="range" id="wa" name="wa" min="1" max="10" step="1" value="3"></div>
+<div class="calc-row"><label for="wb">Weight B</label><input type="range" id="wb" name="wb" min="1" max="10" step="1" value="1"></div>
+<div class="calc-row"><label for="wc">Weight C</label><input type="range" id="wc" name="wc" min="1" max="10" step="1" value="1"></div>
+<div class="calc-out">
+<div>Share to A<output data-expr="100 * wa / (wa + wb + wc)" data-format="fixed:1"></output><span>%</span></div>
+<div>Share to B<output data-expr="100 * wb / (wa + wb + wc)" data-format="fixed:1"></output><span>%</span></div>
+<div>Share to C<output data-expr="100 * wc / (wa + wb + wc)" data-format="fixed:1"></output><span>%</span></div>
+</div>
+<p class="calc-note">Each server's long-run share of traffic is weight / (sum of weights) — nginx's 3/1/1 example gives 60.0% / 20.0% / 20.0%, matching "3 of every 5"<a class="cite" href="#ref-8">8</a>.</p>
+</div>
+
+<h2 id="reverse-proxy">4. Reverse proxies: TLS termination, buffering, and routing</h2>
+<p>A load balancer answers "which backend"; a reverse proxy is the piece of software that actually sits in front of the backend and mediates the connection — often the same physical process as the L7 load balancer (nginx is both at once), but worth separating conceptually because it has responsibilities that have nothing to do with picking a target.</p>
+<p>The first responsibility is the one most operators reach for a reverse proxy for in the first place: TLS termination. Decrypting HTTPS is CPU work, and centralizing it at one proxy tier means backend application servers never handle certificates, private keys, or the TLS handshake at all — they receive plain HTTP over a trusted internal network. nginx's own configuration model makes the mechanism explicit: an HTTPS server block needs an <code>ssl_certificate</code> directive naming the public certificate — "sent to every client" — and an <code>ssl_certificate_key</code> naming the private key, which "should be stored in a file with restricted access"<a class="cite" href="#ref-11">11</a>. Centralizing termination at one tier means one place to rotate certificates, one place that needs the restricted-access private key, and — the point Section 3.1 already made from the AWS side — backend fleets that never pay the TLS-handshake CPU cost per connection at all.</p>
+<p>The second responsibility is routing in the literal sense nginx uses the word: "when NGINX proxies a request, it: 1. Sends the request to a specified proxy server 2. Fetches the response 3. Sends the response back to the client"<a class="cite" href="#ref-10">10</a>. This sounds identical to what an L7 load balancer already does (Section 3.1), and at small scale it often is the same configuration block; the distinction sharpens once a service has more than one logical backend — a reverse proxy can send <code>/api/*</code> to one upstream group and <code>/static/*</code> to another, terminate TLS once for both, and let each upstream group run its own load-balancing algorithm from Section 3.2 independently.</p>
+<p>The third responsibility is the one that is easiest to underrate: buffering. By default, "NGINX buffers responses from proxied servers. A response is stored in the internal buffers and is not sent to the client until the whole response is received"<a class="cite" href="#ref-10">10</a>. The point of this is to decouple two very different kinds of slowness. A backend generating a response quickly but a client downloading it slowly (a mobile connection, a client on a saturated link) would, without buffering, force the backend's connection-handling thread or worker to stay occupied for as long as the slow client takes to receive the bytes — exactly the resource-exhaustion failure mode Module 11 treats generally as the reason bulkheads and timeouts exist. With buffering, the backend hands its full response to the proxy and moves on immediately; the proxy, not the backend, absorbs the cost of a slow client trickling the response out over a slow link. The same logic runs in reverse for slow uploads, which is why proxies also buffer request bodies before forwarding them.</p>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>All three responsibilities compose at one hop. A single nginx (or equivalent) process in front of an application fleet commonly terminates TLS, applies L7 routing rules, runs a load-balancing algorithm from Section 3.2 per upstream group, and buffers both the request and the response — four distinct jobs, one configuration file, one place in Figure 1's chain.</p></aside>
+
+<h2 id="cdn-edge-topology">5. CDN and edge PoP topology: tiered caching vs. a purpose-built appliance</h2>
+<p>Section 2.2 established that anycast routes a request to the nearest point of presence (PoP); this section is about what that PoP does once the request arrives, and about the two structurally different answers the industry has converged on for "what infrastructure serves this content at all."</p>
+
+<h3 id="tiered-caching">5.1 Tiered caching: edge, regional tier, origin</h3>
+<p>A CDN with hundreds of PoPs has a scaling problem that has nothing to do with any single request's latency: if every PoP independently caches content and independently falls back to the origin on a miss, then a piece of content that is popular globally but cached nowhere yet gets requested from the origin once per PoP — hundreds of redundant origin fetches for the same bytes, all within the content's first few seconds of popularity. Cloudflare's answer is to interpose a second, smaller tier of data centers between the edge PoPs and the origin: "with Tiered Cache, certain data centers are reverse proxies to the origin for other data centers, resulting in more cache hits and faster response times"<a class="cite" href="#ref-1">1</a>. A cache miss at a small edge PoP no longer goes straight to the origin; it goes to a regional tier that is itself shared across many edge PoPs, so the first miss anywhere in a region populates a cache that every other PoP in that region can then hit — the origin sees, at most, one fetch per region rather than one per PoP.</p>
+<p>Cache Reserve extends the same idea one tier further: a persistent object-storage-backed cache layer with a long, explicit retention window, so that even content Cloudflare's normal edge tiers have evicted for being insufficiently "hot" can still be served without going back to the origin — but retention is not the same as permanent freshness. When the TTL on content held in Cache Reserve expires, "the content will need to be revalidated by checking the origin for any updates"<a class="cite" href="#ref-1">1</a> before it can be served again; a long-retention tier still has to answer the same "is this still correct" question every TTL-based cache answers, it just answers it less often. Figure 4 draws the resulting three-tier shape: many edge PoPs, feeding a smaller number of regional tiers, feeding one origin.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f4t"><title id="f4t">Tiered cache topology: many edge PoPs feed a smaller regional tier, which feeds the origin</title>
+  <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+  <text x="400" y="20" text-anchor="middle" class="d-title d-bold">Cloudflare-style tiered cache</text>
+  <!-- edge PoPs row -->
+  <g class="d-mono d-small">
+  <rect x="20" y="40" width="80" height="46" rx="8" class="d-block-2"/><text x="60" y="60" text-anchor="middle" class="d-text-inv">PoP</text><text x="60" y="76" text-anchor="middle" class="d-text-inv">edge 1</text>
+  <rect x="120" y="40" width="80" height="46" rx="8" class="d-block-2"/><text x="160" y="60" text-anchor="middle" class="d-text-inv">PoP</text><text x="160" y="76" text-anchor="middle" class="d-text-inv">edge 2</text>
+  <rect x="220" y="40" width="80" height="46" rx="8" class="d-block-2"/><text x="260" y="60" text-anchor="middle" class="d-text-inv">PoP</text><text x="260" y="76" text-anchor="middle" class="d-text-inv">edge 3</text>
+  <rect x="320" y="40" width="80" height="46" rx="8" class="d-block-2"/><text x="360" y="60" text-anchor="middle" class="d-text-inv">PoP</text><text x="360" y="76" text-anchor="middle" class="d-text-inv">edge 4</text>
+  <rect x="420" y="40" width="80" height="46" rx="8" class="d-block-2"/><text x="460" y="60" text-anchor="middle" class="d-text-inv">PoP</text><text x="460" y="76" text-anchor="middle" class="d-text-inv">edge 5</text>
+  <rect x="520" y="40" width="80" height="46" rx="8" class="d-block-2"/><text x="560" y="60" text-anchor="middle" class="d-text-inv">PoP</text><text x="560" y="76" text-anchor="middle" class="d-text-inv">edge 6</text>
+  </g>
+  <text x="700" y="63" class="d-small d-text-light">hundreds, globally</text>
+  <!-- converging arrows to regional tier -->
+  <path d="M60,86 L220,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+  <path d="M160,86 L230,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+  <path d="M260,86 L250,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+  <path d="M360,86 L470,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+  <path d="M460,86 L490,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+  <path d="M560,86 L510,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+  <!-- regional tier -->
+  <rect x="200" y="150" width="100" height="50" rx="8" class="d-block-accent"/><text x="250" y="171" text-anchor="middle" class="d-text-inv d-bold">Regional</text><text x="250" y="187" text-anchor="middle" class="d-text-inv d-small">tier A</text>
+  <rect x="460" y="150" width="100" height="50" rx="8" class="d-block-accent"/><text x="510" y="171" text-anchor="middle" class="d-text-inv d-bold">Regional</text><text x="510" y="187" text-anchor="middle" class="d-text-inv d-small">tier B</text>
+  <text x="700" y="180" class="d-small d-text-light">far fewer, shared across regions</text>
+  <!-- converge to origin -->
+  <path d="M250,200 L390,250" class="d-arrow" marker-end="url(#f4-arr)"/>
+  <path d="M510,200 L420,250" class="d-arrow" marker-end="url(#f4-arr)"/>
+  <rect x="330" y="250" width="140" height="50" rx="8" class="d-block"/><text x="400" y="271" text-anchor="middle" class="d-text-inv d-bold">Origin</text><text x="400" y="287" text-anchor="middle" class="d-text-inv d-small">one fetch per region, not per PoP</text>
+  <!-- cache reserve aside -->
+  <rect x="600" y="230" width="150" height="70" rx="8" class="d-panel d-dashed"/>
+  <text x="675" y="250" text-anchor="middle" class="d-small d-bold">Cache Reserve</text>
+  <text x="675" y="266" text-anchor="middle" class="d-small d-text-light">long-retention tier;</text>
+  <text x="675" y="280" text-anchor="middle" class="d-small d-text-light">revalidates on TTL</text>
+  <text x="675" y="294" text-anchor="middle" class="d-small d-text-light">expiry, not before</text>
+</svg>
+<figcaption><b>Figure 4.</b> A regional tier absorbs repeated misses from many edge PoPs so the origin sees roughly one fetch per region instead of one per PoP; Cache Reserve adds a further, long-retention tier that still revalidates against the origin once its TTL expires. Topology and Cache Reserve behavior per Cloudflare's own CDN architecture documentation<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="netflix-open-connect">5.2 Netflix Open Connect: the purpose-built alternative</h3>
+<p>Everything in Section 5.1 describes a multi-tenant CDN: many customers' origins, many content types, shared PoPs and shared regional tiers. Netflix's Open Connect takes the opposite structural bet — one tenant, one content type (video), appliances placed directly inside ISP networks or ISP-adjacent exchange points, with every layer of the stack tuned for exactly that workload rather than for generality.</p>
+<p>The tuning shows up as a measured, multi-step throughput progression on a single FreeBSD-based appliance: CPU-limited at 40 Gbps on a single-socket Xeon E5-2697v2, then PCIe-limited once that CPU bottleneck was resolved, then into the 70+ Gbps range on updated hardware, then "well over 90 Gbps for the first time," and finally sustaining "100% TLS traffic comfortably at 90 Gbps" en route to a 100 Gbps target<a class="cite" href="#ref-12">12</a> — a sequence of bottlenecks (CPU, then PCIe bus, then TLS handling) found and removed one at a time on hardware Netflix controls end to end, which a multi-tenant CDN operator generally cannot do for every customer's workload simultaneously.</p>
+<p>The clearest illustration of purpose-built tuning paying off is a result that looks backwards until you see the mechanism: serving entirely from memory dropped throughput, it did not raise it. "The performance actually dropped from being CPU limited at 40 Gbps to being CPU limited at only 22 Gbps" when Netflix tried serving purely from RAM instead of NVMe storage<a class="cite" href="#ref-12">12</a> — the memory-management overhead of the all-memory path cost more CPU than NVMe access did, on this specific hardware and workload. The resolution exploits video's own popularity distribution rather than fighting it: "10-20% of the most popular titles" stay resident in memory, and the long tail is served from NVMe<a class="cite" href="#ref-12">12</a>, a deliberate popularity-tail-aware placement policy that only makes sense because Netflix knows its content's popularity curve in advance and controls the appliance's storage tiers directly — a level of workload-specific tuning a shared regional cache tier serving arbitrary third-party origins has no equivalent lever for.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>Even instrumentation is workload-tuned: Netflix found that "collecting detailed TCP statistics for every TCP connection consumed 5-10% of the CPU," a cost worth paying attention to only because the appliance is already CPU-bound at the limits above, and addressed it "by sampling only a small percentage of connections" rather than instrumenting every one<a class="cite" href="#ref-12">12</a>. A multi-tenant CDN carries this same instrumentation cost across every customer's traffic; Open Connect can decide, for its one workload, that most connections do not need per-connection statistics at all.</p></aside>
+
+<h2 id="session-affinity">6. Session affinity and its cost</h2>
+<p>Section 3.2 already introduced the mechanism — <code>ip_hash</code> pins a client to a server by hashing its address<a class="cite" href="#ref-9">9</a> — but it is worth isolating session affinity as its own design decision, because it is a policy choice about where state lives that happens to be implemented at the load-balancing layer, and it has real costs that a one-line config directive hides.</p>
+<p>The default posture of round robin and least connections is explicitly stateless from the client's point of view: nginx's documentation states plainly that "with round-robin or least-connected load balancing, each subsequent client's request can be potentially distributed to a different server. There is no guarantee that the same client will be always directed to the same server"<a class="cite" href="#ref-8">8</a>. That is a feature, not an oversight — it is exactly what makes a fleet of backends interchangeable: any server can be drained, replaced, or scaled down without any client-visible discontinuity, because no client was ever tied to a specific server in the first place. Rolling deploys, autoscaling, and failure recovery are all cheaper when nothing downstream of the load balancer needs to know which server handled the last request.</p>
+<p>Affinity trades that interchangeability away for a specific reason: "if there is the need to tie a client to a particular application server — in other words, make the client's session 'sticky' or 'persistent'"<a class="cite" href="#ref-8">8</a> — meaning something expensive or hard to externalize is being held in that one server's process memory, and re-fetching or reconstructing it elsewhere on every request would be slower or more complicated than just always routing the client back to where it already lives. A WebSocket or long-poll connection is the clearest case: the connection itself is stateful at the TCP level, so once established, "affinity" is not even optional in the sense that all subsequent messages on that connection physically have to go to whichever server holds the socket — the design question is really about what happens on <em>reconnection</em>, not about the live connection. In-process caches, in-memory session data, or partially-built responses that have not been checkpointed anywhere shared are the cases where affinity is a genuine choice rather than a physical constraint.</p>
+<p>The cost of that choice shows up in exactly the places statelessness was buying safety. Because <code>ip_hash</code> computes its target from a hash of the client address over the current server list, removing a server from that list — rather than marking it <code>down</code> — reshuffles the hash target for clients that had nothing to do with the server being removed<a class="cite" href="#ref-9">9</a>; a routine capacity change becomes an event that silently relocates other clients' state. And because <code>ip_hash</code> is incompatible with a <code>backup</code> server<a class="cite" href="#ref-9">9</a>, there is no clean failover target for a client whose assigned server actually dies — nginx falls back to "another server" on failure, but the guarantee that made affinity useful in the first place (this client always lands here) is exactly what breaks at the moment it would matter most. Module 2 covers the general alternative — externalizing session state into a shared cache so any backend can serve any client — and the trade-off it makes explicit is the one implicit here: a round trip to a shared store on every request, paid continuously, against an occasional expensive relocation, paid only on failure or rebalancing.</p>
+<table class="tbl">
+<caption><b>Table 2.</b> The four nginx load-balancing algorithms: mechanism, what they optimize for, and their characteristic failure mode<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-9">9</a>.</caption>
+<thead><tr><th>Algorithm</th><th>Routes by</th><th>Session affinity</th><th>Characteristic failure mode</th></tr></thead>
+<tbody>
+<tr><td class="row">round_robin (default)</td><td>rotation, no state</td><td>none</td><td>ignores backend load and request cost differences</td></tr>
+<tr><td class="row">least_conn</td><td>fewest active connections (ties broken by weighted round robin)</td><td>none</td><td>connection count is a poor proxy when connections are idle-but-long-lived</td></tr>
+<tr><td class="row">ip_hash</td><td>hash of first 3 octets (IPv4) / full address (IPv6)</td><td data-best>guaranteed (until server list changes)</td><td>hash skew; removing a server (vs. marking it <code>down</code>) reshuffles unrelated clients; no <code>backup</code> support</td></tr>
+<tr><td class="row">weighted (modifier)</td><td>weight / sum(weights) share, layered on any of the above</td><td>inherits from base algorithm</td><td>weights reflect a static estimate of capacity, not live load</td></tr>
+</tbody>
+</table>
+
+<h2 id="latency-budget">7. Building a latency budget end to end</h2>
+<p>Figure 1 sketched the chain; this section prices it, using only the round-trip counts and distance bounds each hop's own specification or documentation states, and being explicit about which numbers are measured facts and which are this module's arithmetic built on top of them.</p>
+<p>Two protocol facts fix the handshake cost before a single application byte moves. Establishing a TCP connection is a three-way exchange — SYN, then SYN-ACK, then ACK — so no data can flow until one full round trip has elapsed<a class="cite" href="#ref-3">3</a>. On top of that, TLS 1.3 needs a further round trip: RFC 8446 describes the standard handshake as a single additional round trip, and states its 0-RTT early-data mode explicitly as "saving a round trip at connection setup for some application data, at the cost of some security properties" relative to that 1-RTT baseline<a class="cite" href="#ref-4">4</a> — meaning the 1-RTT full handshake is itself the improvement 0-RTT is being measured against, and TLS 1.2's handshake, which 1.3 replaced, cost a second round trip that 1.3 removed. A fresh HTTPS connection therefore costs at least two round trips (TCP + TLS 1.3) before the first HTTP request can even be sent, and a third once that request and its response are counted.</p>
+<p>Those round trips need a size, and the only sourced number in this map that stands in for "one round trip to an edge location" is Cloudflare's own reach figure: its network "spans hundreds of cities worldwide, reaching 95% of the world's Internet-connected population within 50 milliseconds"<a class="cite" href="#ref-1">1</a>. Using 50 ms as the round-trip unit is a simplification — it is a 95th-percentile distance bound across a whole global population, not a measured RTT for any specific request — but it is the only concrete, citable number available for "how far away is the nearest PoP," and it is a conservative one to plan against, since it already covers 95% of users. DNS is the one hop that mostly does not pay this cost at all: a cached answer costs only "the round-trip time for a packet from the client to the resolver"<a class="cite" href="#ref-2">2</a>, and Cloudflare's stated goal for its own resolver network is to keep that specific round trip under 10 ms<a class="cite" href="#ref-2">2</a> — a tighter bound than the 50 ms CDN-edge figure because a DNS resolver network can be smaller and more aggressively distributed than a full CDN PoP fleet.</p>
+<p>Table 3 assembles the two cases that bound any request in Figure 1: a warm client hitting a warm cache over a reused connection, and a cold client hitting a cold cache over a fresh connection.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Hop-by-hop latency budget, best case vs. worst case, built from the cited round-trip counts and the 50&#160;ms edge-distance bound<a class="cite" href="#ref-1">1</a>. LB and reverse-proxy hops are CPU-bound processing, not network propagation, so they are not counted in round trips.</caption>
+<thead><tr><th>Hop</th><th>Best case</th><th class="num">Worst case</th><th>Basis</th></tr></thead>
+<tbody>
+<tr><td class="row">DNS lookup</td><td>0 ms — OS/browser cache</td><td class="num">&#8776; 10 ms</td><td>cached answer &#8776; RTT to an anycast resolver location<a class="cite" href="#ref-2">2</a></td></tr>
+<tr><td class="row">TCP handshake</td><td>0 ms — connection reused (keep-alive)</td><td class="num">1 &#215; 50 = 50 ms</td><td>3-way handshake, 1 RTT<a class="cite" href="#ref-3">3</a>, at the 50&#160;ms edge-distance bound<a class="cite" href="#ref-1">1</a></td></tr>
+<tr><td class="row">TLS handshake</td><td>0 ms — session resumption</td><td class="num">1 &#215; 50 = 50 ms</td><td>TLS 1.3 full handshake, 1 RTT<a class="cite" href="#ref-4">4</a></td></tr>
+<tr><td class="row">CDN cache check</td><td>0 ms — part of the request/response RTT below</td><td class="num">+1 &#215; 50 = 50 ms</td><td>miss forwarded to the regional tier<a class="cite" href="#ref-1">1</a>; one extra RTT, distance-dependent</td></tr>
+<tr><td class="row">LB + reverse proxy</td><td>&#956;s&#8211;low ms — CPU only</td><td class="num">&#956;s&#8211;low ms</td><td>processing time, not propagation delay<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-10">10</a></td></tr>
+<tr><td class="row">Request / response</td><td data-best>1 &#215; 50 = 50 ms</td><td class="num">1 &#215; 50 = 50 ms</td><td>final RTT carrying the actual HTTP exchange</td></tr>
+<tr><td class="row"><strong>Total (network-bound)</strong></td><td data-best><strong>&#8776; 50 ms</strong></td><td class="num"><strong>&#8776; 210 ms</strong></td><td>sum of the rows above</td></tr>
+</tbody>
+</table>
+<p>The gap between the two totals — roughly 4x on this arithmetic — is entirely explained by connection and cache reuse, not by anything a load-balancing algorithm or a faster proxy could fix. A warm client with a resumed TLS session and a cache hit pays exactly one round trip, no matter how the LB or reverse proxy tier is configured; a cold client paying for a fresh TCP handshake, a fresh TLS 1.3 handshake, and a cache miss pays for three additional round trips before Section 3's and Section 4's mechanisms even get to make a decision. This is also why HTTP/1.1 keep-alive, TLS session tickets, and high cache-hit ratios are, individually, worth far more to end-to-end latency than tuning which load-balancing algorithm runs behind the proxy — the algorithm changes which backend a request reaches; connection and cache reuse change how many round trips the request pays for at all.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Section 5 described two structurally different answers to "what serves this content at the edge," and the choice between them is a genuine, unresolved engineering trade-off rather than a matter of one side being wrong — Netflix and Cloudflare are both extremely well-resourced operators who looked at the same problem (serve bytes near the client, cheaply, at enormous scale) and built opposite architectures. Neither company has published a normalized per-gigabyte cost comparison, so the disagreement below is read from what each side actually built and argued for, not from a settled number.</p>
+<div class="positions">
+<article class="position">
+<h4>Build a purpose-built, single-tenant appliance</h4>
+<p class="who">Netflix's Open Connect engineering<a class="cite" href="#ref-12">12</a></p>
+<p>If your traffic is enormous, homogeneous (one content type, video), and has a well-understood popularity distribution, then owning the entire hardware and software stack lets you remove bottlenecks a shared multi-tenant platform structurally cannot remove for you: CPU, then PCIe bus, then TLS-handling limits, each found and fixed in sequence en route to 100 Gbps per appliance<a class="cite" href="#ref-12">12</a>. Storage tiering (10-20% of titles in memory, the rest on NVMe) and telemetry sampling are both workload-specific optimizations that only make sense because the operator knows its own content's popularity curve and is willing to tune for exactly that curve and no other<a class="cite" href="#ref-12">12</a>.</p>
+<ul class="pros">
+<li>Per-byte efficiency: every layer, from kernel network-stack tuning to storage placement, is tuned for one known workload.</li>
+<li>ISP placement: appliances embedded inside or adjacent to ISP networks shorten the physical path in a way a generic multi-tenant PoP fleet, sized for arbitrary customers' traffic, does not automatically get.</li>
+<li>No shared-tenant contention for cache capacity, disk I/O, or CPU with unrelated traffic.</li>
+</ul>
+<ul class="cons">
+<li>Requires the traffic volume and homogeneity to justify building and operating hardware at all — the memory-vs-NVMe and telemetry-sampling optimizations only pay for themselves at Netflix's scale.</li>
+<li>No shared regional-tier benefit across tenants; every appliance's cache warms up against Netflix's own traffic alone.</li>
+<li>All of the operational burden (appliance fleet management, ISP relationships, hardware refresh cycles) is now the content operator's job, not a vendor's.</li>
+</ul>
+</article>
+<article class="position">
+<h4>Run on a general-purpose, multi-tenant CDN with tiered caching</h4>
+<p class="who">Cloudflare's CDN reference architecture<a class="cite" href="#ref-1">1</a></p>
+<p>For anyone who is not shipping a single, massive, homogeneous content type, a shared network amortizes the PoP-building problem across every tenant at once, and a regional tiering layer recovers most of the purpose-built appliance's origin-offload benefit without any tenant owning hardware: a miss at one edge PoP is absorbed by a regional tier shared across many PoPs, so the origin sees roughly one fetch per region rather than one per PoP<a class="cite" href="#ref-1">1</a>, and Cache Reserve extends retention further still without a tenant operating any storage at all<a class="cite" href="#ref-1">1</a>.</p>
+<ul class="pros">
+<li>Available immediately to any origin, at any traffic volume, with no hardware to build or operate.</li>
+<li>Cross-tenant economies of scale: PoP and regional-tier capacity is shared across every customer's traffic, not sized for one workload.</li>
+<li>Tiered caching recovers most of the "one fetch per region" benefit that motivated Netflix's own regional exploitation, without a dedicated appliance fleet.</li>
+</ul>
+<ul class="cons">
+<li>Tuning is necessarily generic — a shared platform cannot rebuild its storage tiers, kernel network stack, or telemetry sampling around one tenant's popularity curve the way Open Connect does around Netflix's.</li>
+<li>Cache capacity, disk I/O, and CPU at each PoP are shared with unrelated tenants' traffic, so one tenant's workload cannot claim the whole box the way a single-tenant appliance can.</li>
+<li>Origin-offload still depends on the tiering configuration (Smart/Regional Tiered Cache) being enabled and correctly scoped; it is a feature to configure, not a guaranteed property of using a CDN at all.</li>
+</ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The two positions are not actually competing for the same customer. Below some threshold of traffic volume and content homogeneity, building an appliance fleet is a net loss — you pay the fixed cost of hardware, ISP relationships, and kernel-level tuning for a workload too small or too varied to earn it back, and a multi-tenant CDN's shared regional tier already recovers most of the origin-offload benefit for free. Above that threshold, with traffic dominated by one content type with a knowable popularity distribution — which is precisely Netflix's situation, and precisely why Open Connect exists rather than being a hypothetical — the purpose-built appliance's workload-specific tuning (memory/NVMe tiering by popularity, telemetry sampling, successive CPU/PCIe/TLS bottleneck removal) becomes available in a way no shared platform can offer any single tenant, because a shared platform cannot dedicate its tuning to one tenant's traffic pattern without disadvantaging every other tenant on the same hardware. Neither Netflix nor Cloudflare has published the crossover point in traffic volume or cost per gigabyte at which the trade flips, and that is the concrete number that would let anyone place their own workload on this line rather than reason about it qualitatively.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>Cloudflare. <em>Content Delivery Network (CDN) Reference Architecture</em>. Live documentation, 2026. <a href="https://developers.cloudflare.com/reference-architecture/cdn-reference-architecture">https://developers.cloudflare.com/reference-architecture/cdn-reference-architecture</a>. Accessed 2026-09-17. <span class="ref-use">Used for: anycast vs. DNS-unicast routing, edge-network reach (95% of population within 50ms), Tiered Cache and Cache Reserve mechanics.</span></li>
+<li id="ref-2"><span class="ref-type">blog</span>Cloudflare Blog. <em>Introducing DNS Resolver, 1.1.1.1 (not a joke)</em>. 2018 (live page, accessed 2026). <a href="https://blog.cloudflare.com/dns-resolver-1-1-1-1/">https://blog.cloudflare.com/dns-resolver-1-1-1-1/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: cached DNS answer &#8776; client-resolver RTT; the &lt;10ms anycast-location reach goal for the resolver network.</span></li>
+<li id="ref-3"><span class="ref-type">standard</span>IETF. <em>RFC 9293: Transmission Control Protocol (TCP)</em>. 2022. <a href="https://datatracker.ietf.org/doc/html/rfc9293">https://datatracker.ietf.org/doc/html/rfc9293</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the three-way (SYN/SYN-ACK/ACK) handshake as the 1-RTT cost of establishing a TCP connection.</span></li>
+<li id="ref-4"><span class="ref-type">standard</span>IETF. <em>RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3</em>. 2018. <a href="https://datatracker.ietf.org/doc/html/rfc8446">https://datatracker.ietf.org/doc/html/rfc8446</a>. Accessed 2026-09-17. <span class="ref-use">Used for: TLS 1.3's 1-RTT full handshake and the 0-RTT early-data mode's stated round-trip savings (&#167;1, &#167;1.2).</span></li>
+<li id="ref-5"><span class="ref-type">textbook</span>Kleppmann, M., Riccomini, C. <em>Designing Data-Intensive Applications</em>. 2nd ed., O'Reilly Media, 2026. <a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: tail-latency amplification across chained/fanned-out backend calls (general framing; publisher's table-of-contents page returned HTTP 403 to automated fetch, so no specific chapter number is cited).</span></li>
+<li id="ref-6"><span class="ref-type">official</span>AWS. <em>What is a Network Load Balancer?</em> Elastic Load Balancing User Guide (Network Load Balancers), live documentation, 2026. <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/network/introduction.html">https://docs.aws.amazon.com/elasticloadbalancing/latest/network/introduction.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NLB operating at OSI layer 4, its flow-hash target selection, "millions of requests per second," and support for an Application Load Balancer as a target-group target type.</span></li>
+<li id="ref-7"><span class="ref-type">official</span>AWS. <em>What is an Application Load Balancer?</em> Elastic Load Balancing User Guide (Application Load Balancers), live documentation, 2026. <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html">https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: ALB operating at OSI layer 7 and routing via listener rules on path/host/header/method/query-string content.</span></li>
+<li id="ref-8"><span class="ref-type">official</span>NGINX. <em>Using nginx as HTTP load balancer</em>. nginx.org documentation, 2026. <a href="https://nginx.org/en/docs/http/load_balancing.html">https://nginx.org/en/docs/http/load_balancing.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: round-robin default behavior and lack of session affinity, least_conn mechanism, ip_hash's stickiness guarantee, and the weight=3-of-5 worked example.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>NGINX. <em>Module ngx_http_upstream_module</em>. nginx.org documentation, 2026. <a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html">https://nginx.org/en/docs/http/ngx_http_upstream_module.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: ip_hash's first-three-octets hash key, the <code>down</code> parameter's role in preserving hash distribution, ip_hash's incompatibility with <code>backup</code>, and least_conn's weighted-round-robin tiebreak.</span></li>
+<li id="ref-10"><span class="ref-type">official</span>NGINX (F5). <em>Reverse Proxy</em>. NGINX Admin Guide, docs.nginx.com, 2026. <a href="https://docs.nginx.com/nginx/admin-guide/web-server/reverse-proxy/">https://docs.nginx.com/nginx/admin-guide/web-server/reverse-proxy/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the request/fetch/respond routing description and default response-buffering behavior.</span></li>
+<li id="ref-11"><span class="ref-type">official</span>NGINX (F5). <em>Terminating SSL/HTTPS</em>. NGINX Admin Guide (Security Controls), docs.nginx.com, 2026. <a href="https://docs.nginx.com/nginx/admin-guide/security-controls/terminating-ssl-http/">https://docs.nginx.com/nginx/admin-guide/security-controls/terminating-ssl-http/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the ssl_certificate / ssl_certificate_key TLS-termination configuration model and the public-certificate/private-key distinction.</span></li>
+<li id="ref-12"><span class="ref-type">blog</span>Netflix Technology Blog. <em>Serving 100 Gbps from an Open Connect Appliance</em>. 2017. <a href="https://netflixtechblog.com/serving-100-gbps-from-an-open-connect-appliance-cdb51dda3b99">https://netflixtechblog.com/serving-100-gbps-from-an-open-connect-appliance-cdb51dda3b99</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 40&#8594;100 Gbps throughput progression, the memory-vs-NVMe trade-off (40 Gbps &#8594; 22 Gbps CPU-limited), the 10-20% memory-resident popularity-tail policy, and the TCP-statistics sampling trade-off.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

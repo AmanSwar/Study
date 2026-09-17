@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WhatsApp, Twitter, and Instagram: Messaging and Feed Architectures at Scale · System Design</title>
+<meta name="description" content="WhatsApp's 2-million-connection Erlang server, Twitter's fan-out-on-write timeline, and Instagram's hand-rolled Postgres sharding: three 2012-2013 case studies, each with only one detailed public account and no update since.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 17</p>
+  <h1>WhatsApp, Twitter, and Instagram: Messaging and Feed Architectures at Scale</h1>
+  <p class="lede">Three companies, each solving a different scaling bottleneck, each documented in exactly one detailed public account: WhatsApp pushed a single Erlang server to 2 million concurrent TCP connections in 2012, Twitter described its Redis-cached fan-out-on-write timeline in a 2013 talk, and Instagram published its hand-rolled Postgres sharding and 64-bit ID scheme the same year. After this module you can name the specific mechanism each company chose, do the arithmetic behind each one's headline number, and place all three on the same three-way spectrum of "who decides how data is split" that reappears throughout this course.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>10</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 3, Module 8</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f1t"><title id="f1t">Three companies, three scaling bottlenecks, one dated public record each</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="20" y="30" width="230" height="250" rx="10" class="d-panel"/>
+    <text x="135" y="55" text-anchor="middle" class="d-bold">WhatsApp</text>
+    <text x="135" y="72" text-anchor="middle" class="d-small d-text-light">bottleneck: connection count</text>
+    <line x1="60" y1="100" x2="120" y2="140" class="d-line d-stroke-blue"/>
+    <line x1="80" y1="95" x2="120" y2="140" class="d-line d-stroke-blue"/>
+    <line x1="100" y1="92" x2="120" y2="140" class="d-line d-stroke-blue"/>
+    <line x1="170" y1="95" x2="150" y2="140" class="d-line d-stroke-blue"/>
+    <line x1="190" y1="100" x2="150" y2="140" class="d-line d-stroke-blue"/>
+    <line x1="210" y1="108" x2="150" y2="140" class="d-line d-stroke-blue"/>
+    <rect x="100" y="140" width="70" height="45" rx="6" class="d-block"/>
+    <text x="135" y="166" text-anchor="middle" class="d-text-inv d-small d-bold">1 Erlang node</text>
+    <text x="135" y="210" text-anchor="middle" class="d-mono d-bold">2,000,000+</text>
+    <text x="135" y="226" text-anchor="middle" class="d-small d-text-light">TCP connections<a class="cite" href="#ref-1">1</a></text>
+    <text x="135" y="255" text-anchor="middle" class="d-small">source: company blog, 2012</text>
+
+    <rect x="285" y="30" width="230" height="250" rx="10" class="d-panel"/>
+    <text x="400" y="55" text-anchor="middle" class="d-bold">Twitter</text>
+    <text x="400" y="72" text-anchor="middle" class="d-small d-text-light">bottleneck: read fanout</text>
+    <rect x="365" y="95" width="70" height="35" rx="6" class="d-block-2"/>
+    <text x="400" y="117" text-anchor="middle" class="d-text-inv d-small d-bold">1 tweet</text>
+    <path d="M400,130 L340,155" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M400,130 L400,155" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M400,130 L460,155" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="315" y="155" width="50" height="30" rx="5" class="d-block-muted"/>
+    <rect x="375" y="155" width="50" height="30" rx="5" class="d-block-muted"/>
+    <rect x="435" y="155" width="50" height="30" rx="5" class="d-block-muted"/>
+    <text x="400" y="200" text-anchor="middle" class="d-small d-text-light">N follower timelines</text>
+    <text x="400" y="223" text-anchor="middle" class="d-mono d-bold">300K : 6K</text>
+    <text x="400" y="239" text-anchor="middle" class="d-small d-text-light">read : write QPS<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a></text>
+    <text x="400" y="255" text-anchor="middle" class="d-small">source: talk + analysis, 2013</text>
+
+    <rect x="550" y="30" width="230" height="250" rx="10" class="d-panel"/>
+    <text x="665" y="55" text-anchor="middle" class="d-bold">Instagram</text>
+    <text x="665" y="72" text-anchor="middle" class="d-small d-text-light">bottleneck: write partitioning</text>
+    <g>
+      <rect x="600" y="95" width="28" height="28" class="d-outline"/>
+      <rect x="632" y="95" width="28" height="28" class="d-outline"/>
+      <rect x="664" y="95" width="28" height="28" class="d-outline"/>
+      <rect x="696" y="95" width="28" height="28" class="d-fill-orange-soft d-stroke-orange"/>
+      <rect x="600" y="127" width="28" height="28" class="d-outline"/>
+      <rect x="632" y="127" width="28" height="28" class="d-outline"/>
+      <rect x="664" y="127" width="28" height="28" class="d-outline"/>
+      <rect x="696" y="127" width="28" height="28" class="d-outline"/>
+    </g>
+    <text x="665" y="180" text-anchor="middle" class="d-small d-text-light">logical shards</text>
+    <text x="665" y="213" text-anchor="middle" class="d-mono d-bold">41 + 13 + 10</text>
+    <text x="665" y="229" text-anchor="middle" class="d-small d-text-light">bits: time / shard / seq<a class="cite" href="#ref-4">4</a></text>
+    <text x="665" y="255" text-anchor="middle" class="d-small">source: company blog, 2012</text>
+
+    <rect x="20" y="295" width="760" height="30" rx="6" class="d-fill-amber-soft"/>
+    <text x="400" y="315" text-anchor="middle" class="d-small">All three: one detailed public account, published 2012-2013, no comparably detailed update since</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> Three unrelated systems, each solving a different scaling axis — how many live connections one process can hold, how many copies of one write a read-heavy fanout must produce, and how one write stream is split across machines. Each is documented in a single detailed public account from 2012 or 2013<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>, and none of the three companies has published a comparably detailed architectural update since.</figcaption>
+</figure>
+
+<h2 id="three-thin-case-studies">1. Why three companies share one module</h2>
+<p>Every other case-study module in this course leans on a company that keeps publishing: Google's Spanner and Bigtable papers span 2006-2012 and are still the basis of production systems described in later posts; Netflix's engineering blog produces a steady stream of infrastructure detail; Twitch published a named, current routing architecture in Module 16. WhatsApp, Twitter (as it operated through 2013), and Instagram do not fit that pattern. Each has exactly one moment of genuine public engineering depth, and each moment is over a decade old at this module's as-of date:</p>
+<ul>
+<li>WhatsApp's engineering team posted "1 million is so 2011" on 2012-01-06, reporting a single production server pushed past 2 million concurrent TCP connections<a class="cite" href="#ref-1">1</a>. No comparably detailed WhatsApp infrastructure post has followed.</li>
+<li>Twitter's Raffi Krikorian, then Senior Director of Applications Services, gave "Timelines at Scale" at QCon San Francisco; the talk is dated 2012 on the conference program and was recorded and published by InfoQ on 2013-04-03<a class="cite" href="#ref-2">2</a>. InfoQ's page carries only an abstract, not a transcript, so the specific numbers in this module are corroborated through a third-party analysis, High Scalability, published 2013-07-08, which attributes every figure it quotes to that same talk<a class="cite" href="#ref-3">3</a>. Treat every Twitter number below as one step removed from the primary talk.</li>
+<li>Instagram Engineering published "Sharding &amp; IDs at Instagram" in 2012, describing its Postgres-schema sharding scheme and 64-bit ID generator<a class="cite" href="#ref-4">4</a>. The origin domain now blocks automated fetches; the facts below are cross-checked across two independently hosted, character-for-character reproductions of the same post's code and constants, and that caveat is repeated where it matters (§4).</li>
+</ul>
+<p>None of the three companies' current (2026) production architecture is documented at this depth anywhere in this course's source map. Twitter has since been acquired and renamed; Instagram is now run inside Meta's infrastructure; WhatsApp is run inside Meta's infrastructure as well. Whatever each actually runs today is almost certainly different in specifics — more machines, different storage engines, different languages in places — but no public account at the level of detail these three posts provide has replaced them. This module treats each source as what it is: an accurate description of a real system at a specific point in time, not a claim about what runs in production now. Instagram is widely discussed online as also having run Cassandra for some data types; no source available to this module documents that at any level of mechanism, so this module says only what Instagram's own 2012 post says: Postgres, sharded by schema (§4.3 returns to this explicitly).</p>
+<p>The reason to read all three together despite the thinness is that each demonstrates a different answer to the same underlying question every system in this course eventually faces: where does the deciding logic for "how is load spread across machines" live? WhatsApp's answer is inside a single language runtime's process model. Twitter's answer is a background daemon that pre-computes the answer before anyone asks. Instagram's answer is baked directly into the primary key. Module 3 covered the general replication and partitioning vocabulary (consistent hashing, range vs. hash partitioning, leader-based replication); this module supplies three concrete, load-bearing instances of that vocabulary, then closes by placing Instagram's approach against two systems from elsewhere in this course — Vitess (Module 13) and Spanner (established across Modules 3-5) — that made different choices about the same problem.</p>
+<h2 id="whatsapp-connections">2. WhatsApp: one Erlang node, two million sockets</h2>
+<p>WhatsApp's 2012 post is a follow-up: "a few months ago we published a blog post that talked about our servers doing 1 million tcp connections on a single box," and the new post's point is that the same architecture, on the same class of hardware, now sustains twice that<a class="cite" href="#ref-1">1</a>. The number that matters is not "2 million" as a round headline but the precise reading the team published from the box while it was holding that load, because the precision is what makes the claim checkable and the arithmetic in §2.2 possible.</p>
+
+<h3 id="whatsapp-measurement">2.1 The measurement</h3>
+<p>The server ran FreeBSD 8.2-STABLE (amd64) and Erlang R14B03 (erts-5.8.4), on an Intel Xeon X5675 at 3.07 GHz with 24 CPU cores and 103,062,118,400 bytes of physical memory — 103 GB by a decimal (10<sup>9</sup>) count, 96 GiB by a binary (2<sup>30</sup>) count<a class="cite" href="#ref-1">1</a>. At the moment of measurement, the kernel reported 2,277,845 open sockets<a class="cite" href="#ref-1">1</a> — the source of the "over 2 million" headline. A `top`-style snapshot from the same post gives the full CPU breakdown: 37.9% user, 0.0% nice, 13.6% system, 6.6% interrupt, 41.9% idle<a class="cite" href="#ref-1">1</a> — five categories that sum to exactly 100.0%, with 41.9% of the box's CPU time doing nothing at all while holding 2.28 million live connections. WhatsApp's own framing of the result is that they can do this "with plenty of CPU and memory to spare and do it sustainably"<a class="cite" href="#ref-1">1</a> — the headroom, not just the connection count, is the claim.</p>
+<p>The post also lists the FreeBSD kernel-tuning parameters needed to get there: <code>kern.ipc.maxsockets=2400000</code>, <code>kern.maxfiles=3000000</code>, <code>kern.maxfilesperproc=2700000</code>, and <code>net.inet.tcp.tcbhashsize=524288</code><a class="cite" href="#ref-1">1</a>, alongside TCP host-cache tuning (<code>net.inet.tcp.hostcache.hashsize=4096</code>, <code>net.inet.tcp.hostcache.cachelimit=131072</code>, <code>net.inet.tcp.hostcache.bucketlimit=120</code>)<a class="cite" href="#ref-1">1</a>. None of these are Erlang settings — they are the operating system's own accounting structures for open file descriptors and TCP control blocks, raised well above their stock defaults so the kernel itself does not become the bottleneck before the application does. <code>tcbhashsize</code> in particular sizes the hash table FreeBSD uses to look up a TCP control block by connection tuple; a table sized for a few thousand connections turns every packet's connection lookup into a long chain walk once millions of sockets are open, so this parameter has to move in lockstep with the socket ceiling. The host-cache parameters govern a related structure: FreeBSD's TCP host cache remembers recent round-trip-time and congestion-window estimates per remote peer so a new connection to an already-seen host can start from a better initial estimate than a blind default, and like the TCB hash table, its own hash table and per-bucket limits need raising before the connection count that feeds it grows past what the stock configuration was sized for<a class="cite" href="#ref-1">1</a>.</p>
+<p>The post does not state whether the 2.28 million connections were live production chat traffic or an internal load test standing in for it; it presents the kernel and runtime metrics without characterizing the traffic behind them<a class="cite" href="#ref-1">1</a>. Read the number as "this hardware and this kernel configuration can sustain 2.28 million simultaneous open TCP connections with headroom to spare," not as a claim about concurrent active WhatsApp users on one box.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f2t"><title id="f2t">WhatsApp single-server topology: one Erlang/BEAM node terminating 2.28 million TCP connections, with hardware spec and CPU utilization breakdown</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <text x="20" y="24" class="d-small d-text-light">clients (illustrative sample of 2,277,845 open sockets<a class="cite" href="#ref-1">1</a>)</text>
+    <g class="d-stroke-blue">
+      <line x1="20" y1="40" x2="330" y2="150" class="d-line"/>
+      <line x1="60" y1="40" x2="330" y2="155" class="d-line"/>
+      <line x1="100" y1="40" x2="330" y2="160" class="d-line"/>
+      <line x1="140" y1="40" x2="330" y2="165" class="d-line"/>
+      <line x1="180" y1="40" x2="330" y2="170" class="d-line"/>
+      <line x1="220" y1="40" x2="330" y2="175" class="d-line"/>
+      <line x1="260" y1="40" x2="330" y2="180" class="d-line"/>
+      <line x1="300" y1="40" x2="330" y2="185" class="d-line"/>
+      <line x1="20" y1="80" x2="330" y2="195" class="d-line"/>
+      <line x1="60" y1="90" x2="330" y2="200" class="d-line"/>
+      <line x1="100" y1="100" x2="330" y2="205" class="d-line"/>
+      <line x1="140" y1="110" x2="330" y2="210" class="d-line"/>
+    </g>
+
+    <rect x="330" y="120" width="200" height="140" rx="10" class="d-block"/>
+    <text x="430" y="155" text-anchor="middle" class="d-text-inv d-bold">Erlang / BEAM node</text>
+    <text x="430" y="175" text-anchor="middle" class="d-text-inv d-small">R14B03, smp:24:24</text>
+    <text x="430" y="195" text-anchor="middle" class="d-mono d-text-inv d-bold">2,277,845</text>
+    <text x="430" y="212" text-anchor="middle" class="d-text-inv d-small">open TCP sockets<a class="cite" href="#ref-1">1</a></text>
+    <text x="430" y="230" text-anchor="middle" class="d-text-inv d-small">1 process per socket (&#167;2.2)</text>
+    <text x="430" y="248" text-anchor="middle" class="d-text-inv d-small">FreeBSD 8.2-STABLE amd64</text>
+
+    <rect x="560" y="120" width="220" height="140" rx="10" class="d-panel"/>
+    <text x="670" y="140" text-anchor="middle" class="d-bold d-small">hardware<a class="cite" href="#ref-1">1</a></text>
+    <text x="670" y="160" text-anchor="middle" class="d-small">Xeon X5675 @ 3.07 GHz</text>
+    <text x="670" y="177" text-anchor="middle" class="d-small">24 CPU cores</text>
+    <text x="670" y="194" text-anchor="middle" class="d-small">103 GB RAM (96 GiB)</text>
+    <text x="670" y="215" text-anchor="middle" class="d-small d-text-light">kernel: maxsockets=2.4M<a class="cite" href="#ref-1">1</a></text>
+    <text x="670" y="232" text-anchor="middle" class="d-small d-text-light">tcbhashsize=524,288<a class="cite" href="#ref-1">1</a></text>
+    <text x="670" y="249" text-anchor="middle" class="d-small d-text-light">maxfiles=3,000,000<a class="cite" href="#ref-1">1</a></text>
+
+    <text x="30" y="300" class="d-small d-bold">CPU utilization at 2,277,845 connections<a class="cite" href="#ref-1">1</a></text>
+    <rect x="30" y="315" width="303.2" height="24" class="d-fill-blue"/>
+    <rect x="333.2" y="315" width="0" height="24" class="d-fill-cyan"/>
+    <rect x="333.2" y="315" width="108.8" height="24" class="d-fill-orange"/>
+    <rect x="442" y="315" width="52.8" height="24" class="d-fill-amber"/>
+    <rect x="494.8" y="315" width="335.2" height="24" class="d-outline"/>
+    <text x="140" y="332" text-anchor="middle" class="d-text-inv d-small">user 37.9%</text>
+    <text x="390" y="332" text-anchor="middle" class="d-text-inv d-small">sys 13.6%</text>
+    <text x="465" y="332" text-anchor="middle" class="d-small">int 6.6%</text>
+    <text x="660" y="332" text-anchor="middle" class="d-small">idle 41.9%</text>
+    <text x="30" y="365" class="d-small d-text-light">nice: 0.0% (omitted, zero width) &#8212; five categories sum to 100.0%<a class="cite" href="#ref-1">1</a></text>
+  </svg>
+  <figcaption><b>Figure 2.</b> One Erlang node terminates 2,277,845 TCP connections on a single 24-core, 103 GB server, with 41.9% of CPU time still idle — WhatsApp's own point being headroom, not just the raw connection count<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="whatsapp-erlang-processes">2.2 Why Erlang's process model makes the arithmetic work</h3>
+<p>Holding 2.28 million live TCP connections on one machine is a question about where the per-connection state lives, and Erlang's answer is to give every connection its own preemptively scheduled, garbage-collected process, managed entirely by the BEAM virtual machine rather than by the operating system. This is not the same object as an OS thread: Erlang's official documentation states that a newly spawned process starts at 327 words of memory, of which 233 words back the process's own heap and stack<a class="cite" href="#ref-5">5</a>. On a 64-bit build, a word is 8 bytes, so 327 words is 2,616 bytes — under 2.6 KB for everything the runtime needs to track one process's execution state before it does any work<a class="cite" href="#ref-5">5</a>. Erlang's documentation is explicit that this default is deliberately conservative "to support Erlang systems with hundreds of thousands or even millions of processes"<a class="cite" href="#ref-5">5</a> — the same order of magnitude as WhatsApp's connection count, and not a coincidence: a one-process-per-connection design is only viable at this scale because the per-process floor is measured in kilobytes, not megabytes.</p>
+<p>The arithmetic behind WhatsApp's headroom follows directly from that floor. At 2,277,845 connections and 2,616 bytes of minimum process memory each:</p>
+$$ 2{,}277{,}845 \times 2{,}616\ \text{bytes} \approx 5.96\ \text{GB} $$
+<p>against 103 GB of physical memory<a class="cite" href="#ref-1">1</a> — under 6% of the box's RAM spent on the theoretical minimum footprint of every connection's process state, before counting the message queue, socket buffers, and any per-user session data each process actually holds. That gap is consistent with, though not identical to, the 41.9% idle CPU and the "plenty of... memory to spare" the post reports<a class="cite" href="#ref-1">1</a>: a process model whose baseline unit costs kilobytes leaves most of a 103 GB machine for actual work rather than for the bookkeeping of staying connected. An OS-thread-per-connection design on the same hardware would not have this headroom. Linux's own thread-creation documentation states that a new thread's default stack size is set by the process's <code>RLIMIT_STACK</code> soft limit at the time the program started, falling back to a fixed 2 MB per-architecture default on most architectures if that limit is "unlimited"<a class="cite" href="#ref-6">6</a> — and a typical Linux distribution's default soft <code>RLIMIT_STACK</code> is itself commonly set to 8 MB (8,192 KB)<a class="cite" href="#ref-6">6</a>. Either figure, 2 MB or 8 MB per thread, is three to four orders of magnitude above Erlang's roughly 2.6 KB process floor computed above, which is the concrete reason thread-per-connection servers hit practical ceilings in the tens of thousands of connections while a one-process-per-connection Erlang node reaches millions on the same class of hardware: 2.28 million threads at even the smaller 2 MB default would need 4.56 TB of stack space alone, dwarfing the box's entire 103 GB of RAM<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-6">6</a>, while 2.28 million Erlang processes need under 6 GB, as computed above.</p>
+<p>The other half of the design is preemption: the BEAM scheduler is what lets 24 physical cores serve 2.28 million logically concurrent processes at all, by time-slicing each core's attention across many more runnable processes than there are cores to run them on, so that one connection's handler blocking or looping cannot starve the other 2.28 million indefinitely. Module 6 covers the general vocabulary of preemptive scheduling and fairness this section leans on informally; the point specific to this module is only that the unit being scheduled (a process) and the unit whose memory floor was just computed (also a process) are the same object — Erlang's concurrency primitive is simultaneously the scheduling unit and the connection-state container, which is what lets one design decision (make processes cheap) pay off on both axes (memory <em>and</em> fair scheduling) at once.</p>
+
+<h3 id="whatsapp-vs-kafka">2.3 Contrast: state in the process vs. state at the edge</h3>
+<p>WhatsApp's design keeps each connection's session state inside a live, addressable Erlang process for as long as the socket is open: the process <em>is</em> the connection, and the server holds 2.28 million of them simultaneously in memory, one per open socket<a class="cite" href="#ref-1">1</a>. Module 8 covers Kafka's architecture in full; the relevant contrast here is only the placement of state. Kafka's broker is deliberately stateless with respect to any individual reader: "the information about how much each consumer has consumed is not maintained by the broker, but by the consumer itself"<a class="cite" href="#ref-7">7</a>, and a consumer can disconnect, restart, and resume days later by presenting its own last-read offset — the broker does not need to have kept anything about that consumer while it was away. Kafka's brokers scale the number of independent readers without a floor proportional to connection count, because the state a WhatsApp-style connection process would hold (where is this reader up to?) is pushed out to the client instead of held in server memory for the connection's lifetime.</p>
+<p>These are not competing solutions to the same problem — WhatsApp is terminating live, bidirectional, low-latency chat sessions that must be addressable at any instant, and a Kafka-style client-tracked-offset design would not deliver a chat message to a currently open socket any faster than the socket's own process already does. The general point worth keeping past this module is that "how many connections can one machine hold" and "how many independent readers can one machine serve" are different questions with different answers depending entirely on where the per-connection or per-reader bookkeeping lives: inside a lightweight in-process actor (WhatsApp), or pushed to the far side of the wire and re-presented on every request (Kafka).</p>
+<p>The same state-placement choice shows up again in what each design keeps warm across a restart. A WhatsApp-style Erlang process's state lives inside that process's own heap; kill and restart the node, and every one of its 2.28 million processes — and the session state each was holding — is gone, which is why systems built this way lean on the client reconnecting and re-authenticating rather than on the server preserving anything across the crash. Kafka inverts this by design: rather than build an application-level cache for its log segments, "we rely on the underlying file system page cache," specifically so that "a restarted broker keeps a warm cache" rather than starting cold<a class="cite" href="#ref-7">7</a>. Because the data a Kafka broker serves lives in ordinary files rather than in any single process's private heap, the operating system keeps recently touched pages resident independently of whether the broker process itself is still running — a second, related consequence of keeping the broker stateless with respect to any individual connection: the broker's own restart does not have to mean discarding what was cached.</p>
+
+<h2 id="twitter-fanout">3. Twitter: fan-out-on-write and the 50-to-1 read/write economy</h2>
+<p>At the time of Krikorian's talk, Twitter served roughly 150 million worldwide active users, took in tweets at a daily average of about 5,000/sec (peaking past 12,000/sec during major live events), and answered 300,000 queries per second for home timelines<a class="cite" href="#ref-3">3</a>. The core design decision the talk describes is <em>when</em> to pay the cost of computing "what does this specific user's home timeline look like right now" — at write time, once, when a followed account tweets, or at read time, every time a follower opens the app.</p>
+
+<h3 id="twitter-fanout-daemon">3.1 The write path: a daemon that pre-computes every follower's timeline</h3>
+<p>Twitter's answer is fan-out-on-write. A tweet's arrival triggers a fanout daemon that looks up the tweet's author's followers and writes the tweet into each of those followers' cached timelines — before any follower has asked for anything<a class="cite" href="#ref-3">3</a>. Two named systems sit underneath this: Flock maintains the follower and following lists (the social graph the daemon queries), and Gizzard sits in front of the disk-backed MySQL storage behind Flock, abstracting away SQL transactions and providing global replication across it<a class="cite" href="#ref-3">3</a>. The daemon does not write one follower at a time — it pipelines the writes in batches of 4,000 destinations at once<a class="cite" href="#ref-3">3</a>, and what it writes into each follower's timeline is small and fixed-width: the tweet's own ID, the ID of the tweet's author, and 4 bytes of flag bits marking whether the tweet is a retweet, a reply, or another special case<a class="cite" href="#ref-3">3</a> — not the tweet's text, which is fetched separately (by Tweetypie, the tweet-object service<a class="cite" href="#ref-3">3</a>) only when a client actually renders the timeline.</p>
+<p>Where the daemon writes to is a Redis cluster: each user's home timeline is a Redis list capped at a maximum of 800 entries, replicated three times across three different machines, including across datacenters<a class="cite" href="#ref-3">3</a>. Only users active within the preceding 30 days are kept resident in this way — "every active user is stored in RAM to keep latencies down"<a class="cite" href="#ref-3">3</a> — and the cluster holding all of them runs to a couple of terabytes of RAM in aggregate<a class="cite" href="#ref-3">3</a>. A home-timeline read, in the common case, is then a single fetch from an in-memory list rather than a live join across the follower's entire following set: the read path is deliberately made as cheap as possible by having already done the expensive part (finding every follower) at write time.</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 260" role="img" aria-label="Twitter fan-out-on-write sequence from tweet arrival to follower timeline update">
+      <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f3-arr-d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+
+      <rect x="20" y="90" width="120" height="60" rx="8" class="d-block-muted"/>
+      <text x="80" y="115" text-anchor="middle" class="d-bold d-small">Author</text>
+      <text x="80" y="132" text-anchor="middle" class="d-small d-text-light">tweets</text>
+
+      <g data-step="1">
+        <path d="M140,120 L220,120" class="d-arrow-active" marker-end="url(#f3-arr-d)"/>
+        <rect x="220" y="90" width="130" height="60" rx="8" class="d-block-accent"/>
+        <text x="285" y="115" text-anchor="middle" class="d-text-inv d-bold d-small">Fanout daemon</text>
+        <text x="285" y="132" text-anchor="middle" class="d-text-inv d-small">wakes on write</text>
+      </g>
+
+      <g data-step="2">
+        <path d="M285,90 L285,55 Q285,40 320,40 L410,40" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="410" y="10" width="140" height="55" rx="8" class="d-block-2"/>
+        <text x="480" y="32" text-anchor="middle" class="d-text-inv d-bold d-small">Flock</text>
+        <text x="480" y="48" text-anchor="middle" class="d-text-inv d-small">follower list lookup</text>
+        <path d="M410,45 L360,45 Q350,45 350,60 L350,90" class="d-arrow" marker-end="url(#f3-arr)"/>
+      </g>
+
+      <g data-step="3">
+        <path d="M350,150 L350,175" class="d-arrow-active" marker-end="url(#f3-arr-d)"/>
+        <rect x="230" y="175" width="240" height="45" rx="8" class="d-panel"/>
+        <text x="350" y="193" text-anchor="middle" class="d-bold d-small">Pipelined writes, 4,000 destinations/batch<a class="cite" href="#ref-3">3</a></text>
+        <text x="350" y="209" text-anchor="middle" class="d-small d-text-light">payload: tweet ID + author ID + 4-byte flags<a class="cite" href="#ref-3">3</a></text>
+      </g>
+
+      <g data-step="4">
+        <path d="M470,197 L560,150" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <path d="M470,197 L560,197" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <path d="M470,197 L560,240" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="560" y="120" width="180" height="45" rx="6" class="d-block"/>
+        <text x="650" y="147" text-anchor="middle" class="d-text-inv d-small">Follower A timeline</text>
+        <rect x="560" y="175" width="180" height="45" rx="6" class="d-block"/>
+        <text x="650" y="202" text-anchor="middle" class="d-text-inv d-small">Follower B timeline</text>
+        <rect x="560" y="220" width="180" height="35" rx="6" class="d-block"/>
+        <text x="650" y="242" text-anchor="middle" class="d-text-inv d-small">... N followers</text>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Tweet arrives.</b> The write triggers the fanout daemon<a class="cite" href="#ref-3">3</a>.</li>
+    <li><b>Daemon queries Flock</b> for the author's current follower list<a class="cite" href="#ref-3">3</a>.</li>
+    <li><b>Daemon pipelines writes</b> to Redis in batches of 4,000 destinations, each write carrying only the tweet ID, author ID, and 4 bytes of flags<a class="cite" href="#ref-3">3</a>.</li>
+    <li><b>Every follower's 800-entry, 3x-replicated Redis timeline</b> now contains the new tweet ID, targeted to complete in under 5 seconds<a class="cite" href="#ref-3">3</a>.</li>
+  </ol>
+</div>
+<figure class="fig fig-plain"><figcaption><b>Figure 3.</b> The write path pre-computes every follower's timeline update before any follower asks for anything; Twitter's stated target for the whole sequence is under 5 seconds, against a naive worst case of up to 5 minutes for an account with 31 million followers<a class="cite" href="#ref-3">3</a>.</figcaption></figure>
+
+<h3 id="twitter-read-write-asymmetry">3.2 Why the asymmetry makes fan-out-on-write pay off</h3>
+<p>Krikorian's talk gives the specific traffic split that justifies paying the fanout cost at write time: 300,000 requests per second are spent reading timelines, and only 6,000 requests per second are spent on writes<a class="cite" href="#ref-3">3</a>. That is a ratio of exactly:</p>
+$$ \frac{300{,}000}{6{,}000} = 50 $$
+<p>fifty read requests for every one write request. This ratio is the entire argument for fan-out-on-write: any cost paid once per write is amortized across fifty times as many reads as there are writes to pay for it. A design that instead computed each timeline at read time — fetching the follower's full following list and merging the N most recent tweets from each on every request — would put the expensive part of the work (finding and merging every source) on the side of the ratio that receives fifty times the traffic. Fan-out-on-write does the reverse: it puts the one genuinely expensive operation (finding every follower, which can number in the millions for a large account) on the side of the ratio that only has to happen 6,000 times a second, and turns every one of the 300,000-per-second reads into the cheapest possible operation, a fetch of an already-assembled, bounded-size (800-entry) list from RAM<a class="cite" href="#ref-3">3</a>.</p>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>The general pattern is broader than timelines: whenever one side of a read/write ratio is fixed and the other is large, the expensive step belongs on the side with fewer occurrences, even if that makes each occurrence of the expensive step itself more work (fanning out to millions of followers instead of merging a handful of followees). Paying a bounded number of expensive operations once and serving many cheap reads against the result is the same trade a materialized view, a precomputed index, or a cache makes; fan-out-on-write is that trade applied to "what does this specific user's feed look like," with the multiplier (300,000:6,000, per <a class="cite" href="#ref-3">3</a>) large enough that the trade is not close.</p></aside>
+<p>The talk's own numbers leave one thing unreconciled that neither source available here resolves: tweet-ingest rate is reported separately as roughly 5,000/sec average, 7,000/sec peak, and over 12,000/sec during large events<a class="cite" href="#ref-3">3</a>, which does not equal the 6,000/sec "writes" figure the read/write ratio uses. The two are plausibly measuring different points in the same pipeline — raw tweets arriving versus write-side requests against the timeline-serving tier, which is not necessarily one write per tweet if, for instance, retweets or other write-triggering events are counted separately from original tweets — but the talk as transcribed does not say so explicitly, and no primary transcript is available to check<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>. Treat "6,000/sec writes" as the figure Twitter's own talk paired directly with "300,000/sec reads" for the 50:1 ratio, and the 5,000-12,000/sec tweet-ingest figures as a related but distinct measurement of a different point in the system.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f4t"><title id="f4t">Twitter read versus write QPS: 300,000 timeline reads per second against 6,000 writes per second</title>
+    <line x1="90" y1="30" x2="90" y2="220" class="d-axis"/>
+    <line x1="90" y1="220" x2="740" y2="220" class="d-axis"/>
+    <text x="20" y="35" class="d-small d-text-light">QPS</text>
+    <line x1="90" y1="180" x2="740" y2="180" class="d-grid"/>
+    <line x1="90" y1="140" x2="740" y2="140" class="d-grid"/>
+    <line x1="90" y1="100" x2="740" y2="100" class="d-grid"/>
+    <line x1="90" y1="60" x2="740" y2="60" class="d-grid"/>
+    <text x="80" y="224" text-anchor="end" class="d-small d-text-light">0</text>
+    <text x="80" y="184" text-anchor="end" class="d-small d-text-light">60K</text>
+    <text x="80" y="144" text-anchor="end" class="d-small d-text-light">120K</text>
+    <text x="80" y="104" text-anchor="end" class="d-small d-text-light">180K</text>
+    <text x="80" y="64" text-anchor="end" class="d-small d-text-light">240K</text>
+    <text x="80" y="34" text-anchor="end" class="d-small d-text-light">300K</text>
+
+    <rect x="220" y="24" width="140" height="196" class="d-fill-blue"/>
+    <text x="290" y="14" text-anchor="middle" class="d-mono d-bold">300,000</text>
+    <text x="290" y="245" text-anchor="middle" class="d-small">timeline reads/sec<a class="cite" href="#ref-3">3</a></text>
+
+    <rect x="480" y="216" width="140" height="4" class="d-fill-orange"/>
+    <text x="550" y="204" text-anchor="middle" class="d-mono d-bold">6,000</text>
+    <text x="550" y="245" text-anchor="middle" class="d-small">writes/sec<a class="cite" href="#ref-3">3</a></text>
+
+    <rect x="90" y="24" width="650" height="1" class="d-outline d-dashed"/>
+    <text x="400" y="55" text-anchor="middle" class="d-bold d-small">ratio: 50 reads for every 1 write</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Twitter's home-timeline read traffic outweighs write traffic by 50:1 (300,000 vs. 6,000 requests per second)<a class="cite" href="#ref-3">3</a> — the reason it is worth paying the fanout cost once, at write time, rather than on every read.</figcaption>
+</figure>
+
+<h3 id="twitter-celebrity-hybrid">3.3 The exception: merging at read time for the highest-follower accounts</h3>
+<p>Fan-out-on-write has a worst case that scales with follower count, not with traffic: Krikorian's talk gives the concrete example that it can take up to 5 minutes for a tweet to flow from a 31-million-follower account to all of its followers under the naive version of the fanout, against a target of under 5 seconds<a class="cite" href="#ref-3">3</a>. Writing one tweet ID into 31 million Redis lists is a real, non-trivial amount of work no matter how well pipelined, and unlike the read path, that cost cannot be amortized across other requests — it has to complete once per tweet, in full, regardless of how many followers there are.</p>
+<p>Twitter's documented response is a hybrid: for its highest-follower accounts, the system stops fanning out at write time altogether and instead merges that account's tweets into a follower's timeline at read time, alongside the pre-computed fanned-out portion of the timeline<a class="cite" href="#ref-3">3</a>. This is fan-out-on-read applied narrowly, only to the small set of accounts whose follower count makes the write-time cost disproportionate, while every other account still uses fan-out-on-write. The stated effect is to balance the read and write paths and save "10s of percents of computational resources"<a class="cite" href="#ref-3">3</a> — a materially cheaper system than either pure strategy applied uniformly. The general lesson is that fan-out-on-write and fan-out-on-read are not mutually exclusive architectural commitments; the choice can be, and in Twitter's own account was, made per account based on which side of the write-cost-vs-read-cost trade a given account's follower count puts it on.</p>
+
+<h3 id="twitter-gizzard-flock">3.4 Gizzard, Flock, and an eventual-consistency resemblance to Dynamo</h3>
+<p>Gizzard's stated job is to abstract away SQL transactions and provide global replication over the disk-backed MySQL shards underneath Flock<a class="cite" href="#ref-3">3</a>. No source in this course's map documents Gizzard's internal replication protocol at the level of detail Dynamo's own paper documents its algorithms (Module 3, §3.2-3.3, covers Dynamo's consistent hashing and vector clocks in full), so this section states only what is actually known and where the resemblance is real versus asserted. What is known: Gizzard replicates a follower/following graph globally, across datacenters, on top of a storage engine (MySQL) that does not itself support that kind of geographic replication<a class="cite" href="#ref-3">3</a> — the same problem Dynamo's paper frames as its starting point, an "always writeable" store that replicates across failure domains and reconciles afterward rather than blocking a write on a synchronous cross-region round trip<a class="cite" href="#ref-8">8</a>. Both systems are solving "keep writing during a replica or region failure, and let replicas catch up asynchronously" rather than "block until every replica agrees," which is the shared design lineage the resemblance is actually about.</p>
+<p>What is not known from any source available here: whether Gizzard uses vector clocks, read-repair, Merkle-tree anti-entropy, or any of the other specific mechanisms Dynamo's paper documents<a class="cite" href="#ref-8">8</a> for reconciling concurrent writes to the same record. Treat "Gizzard resembles Dynamo" as a statement about shared design philosophy — asynchronous, multi-region replication over an always-writeable store — and not as a claim that Gizzard implements Dynamo's specific algorithm.</p>
+<p>The fanout daemon, Flock, and Gizzard sit inside a larger named constellation of services the talk describes without going into each one's internals: Timeline, Tweet, User, and Social-Graph services divide the object model along those lines; Gizmoduck serves user objects and Tweetypie serves tweet objects, which is where the actual tweet text a rendered timeline needs is fetched from once the Redis-cached list of IDs (§3.1) has been read; Early Bird is a modified version of the Lucene search library used for Twitter's own search; and Zipkin, explicitly modeled on Google's Dapper paper, provides distributed tracing across this whole service graph<a class="cite" href="#ref-3">3</a>. None of these are documented at the mechanism level this module has given the fanout daemon and the Redis timeline cache — they are named, not explained — but the names are worth having, because "Tweetypie" and "Gizmoduck" recur in later, better-documented accounts of Twitter/X's architecture that this module's source map does not include.</p>
+
+<h2 id="instagram-sharding">4. Instagram: several thousand logical shards over a Postgres schema</h2>
+<p>Instagram's problem is different in kind from WhatsApp's or Twitter's: not how many live connections one process can hold, and not when to pay a fanout cost, but how to keep inserting rows once no single database server can hold the whole table, while still being able to generate a globally unique, roughly time-sortable primary key for every new row without any server having to ask another server "what's the next ID." Instagram's 2012 post covers both halves of that problem together, because they are the same problem: partitioning the data and generating IDs that already encode which partition a row lives in<a class="cite" href="#ref-4">4</a>.</p>
+
+<h3 id="instagram-logical-physical">4.1 Logical shards, mapped onto far fewer physical servers</h3>
+<p>Instagram's account states that the team considered NoSQL alternatives but chose to keep PostgreSQL and shard the data themselves, splitting it across "several thousand" logical shards that are mapped, in code, onto a much smaller number of physical database servers<a class="cite" href="#ref-4">4</a>. The mechanism for this mapping is Postgres's own schema feature: each logical shard is implemented as one Postgres schema, and every sharded table — the post's own example is "likes on our photos" — exists once inside each schema<a class="cite" href="#ref-4">4</a>. A single physical Postgres server hosts many schemas (many logical shards) at once; growing the fleet means moving whole schemas onto new physical servers, not re-partitioning any individual table's rows.</p>
+<p>The reason this beats a naive auto-incrementing primary key is direct: a single `SERIAL` column only produces a globally unique, strictly increasing sequence when there is exactly one database inserting into that table. The moment rows for the same logical table are being inserted into several thousand independent schemas at once, each schema's own sequence starts again from wherever it left off, and two different shards will mint the same integer for two different rows. Decoupling "which shard is this row in" from "which physical server currently hosts that shard" is what lets Instagram move a logical shard between physical machines as load grows, without having to renumber or re-key any row that shard already contains — the exact separation-of-concerns Module 3 introduced for GFS's chunks and Bigtable's tablets, applied here to a stock relational engine rather than a purpose-built distributed store.</p>
+<p>Which logical shard a given row lands in is decided by a plain modulo over the user ID: the post's own worked example takes user ID 31,341 and computes shard ID as \(31{,}341 \bmod 2{,}000 = 1{,}341\)<a class="cite" href="#ref-4">4</a>. This is hash partitioning in Module 3's vocabulary, with the hash function reduced to the simplest one that works — the identity function, then modulo — rather than a cryptographic or otherwise well-mixed hash; it inherits the same property Module 3's consistent-hashing treatment cares about, that partitioning is a deterministic function of a key rather than a lookup, at the cost of the same property consistent hashing exists to fix: changing the shard count (2,000 in the example) changes almost every user's assigned shard, rather than reassigning only the minimal set consistent hashing's virtual nodes achieve. Sharding by user ID, specifically, also has a consequence that follows directly from the scheme even though the post does not spell it out: any table whose rows are assigned to a shard using that same user's ID keeps all of that user's rows in one logical shard together, so a query scoped to one user's own data never has to fan out across shards to answer it. The post does not state whether every sharded table (its own example is photo likes) uses the photo owner's user ID, the acting user's ID, or some other key for this same modulo — only that the mechanism for computing a shard ID, once a sharding key is chosen, is the one shown above.</p>
+
+<h3 id="instagram-id-anatomy">4.2 The 64-bit ID: anatomy and a worked example</h3>
+<p>Instagram generates every row's primary key with a PL/pgSQL function running inside the owning shard, so no cross-shard coordination is needed to mint an ID<a class="cite" href="#ref-4">4</a>. The resulting 64-bit integer packs three fields, most-significant first:</p>
+<ul>
+<li><b>41 bits</b> — milliseconds elapsed since a custom epoch, not the Unix epoch<a class="cite" href="#ref-4">4</a>.</li>
+<li><b>13 bits</b> — the logical shard ID that generated this row<a class="cite" href="#ref-4">4</a>.</li>
+<li><b>10 bits</b> — a per-shard sequence number, taken modulo 1,024 from a Postgres sequence local to that shard<a class="cite" href="#ref-4">4</a>.</li>
+</ul>
+<p>The generating function shifts and OR's these three fields together: the millisecond delta is shifted left by 23 bits (making room for the 13+10 bits below it), then OR'd with the shard ID shifted left by 10 bits, then OR'd with the raw sequence value<a class="cite" href="#ref-4">4</a>. Instagram's own origin domain now blocks automated fetches, so the exact function body below is cross-checked against two independently hosted, character-for-character-identical reproductions of the same post, both showing the same custom epoch constant and the same bit-shift structure<a class="cite" href="#ref-4">4</a>:</p>
+
+<pre class="code" data-lang="sql" data-title="next_id() inside shard schema insta5 (structure per Instagram's 2012 post)"><code>CREATE OR REPLACE FUNCTION insta5.next_id(OUT result bigint) AS $$
+DECLARE
+    our_epoch bigint := 1314220021721;  -- custom epoch, ms since Unix epoch
+    seq_id bigint;
+    now_millis bigint;
+    shard_id int := 5;                  -- this shard's 13-bit ID
+BEGIN
+    SELECT nextval('insta5.table_id_seq') % 1024 INTO seq_id;
+    SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) INTO now_millis;
+    result := (now_millis - our_epoch) &lt;&lt; 23;
+    result := result | (shard_id &lt;&lt; 10);
+    result := result | (seq_id);
+END;
+$$ LANGUAGE PLPGSQL;</code></pre>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f5t"><title id="f5t">Instagram's 64-bit ID: 41 bits of time, 13 bits of shard ID, 10 bits of sequence, with a worked example</title>
+    <text x="20" y="30" class="d-bold d-small">64-bit ID layout, most-significant bit at left<a class="cite" href="#ref-4">4</a></text>
+    <rect x="20" y="45" width="410" height="50" class="d-fill-blue"/>
+    <text x="225" y="65" text-anchor="middle" class="d-text-inv d-bold">41 bits</text>
+    <text x="225" y="83" text-anchor="middle" class="d-text-inv d-small">ms since custom epoch</text>
+    <rect x="430" y="45" width="130" height="50" class="d-fill-orange"/>
+    <text x="495" y="65" text-anchor="middle" class="d-text-inv d-bold">13 bits</text>
+    <text x="495" y="83" text-anchor="middle" class="d-text-inv d-small">shard ID</text>
+    <rect x="560" y="45" width="100" height="50" class="d-fill-cyan"/>
+    <text x="610" y="65" text-anchor="middle" class="d-text-inv d-bold">10 bits</text>
+    <text x="610" y="83" text-anchor="middle" class="d-text-inv d-small">sequence</text>
+    <text x="225" y="112" text-anchor="middle" class="d-small d-text-light">bit 63 ... bit 23</text>
+    <text x="495" y="112" text-anchor="middle" class="d-small d-text-light">bit 22 ... bit 10</text>
+    <text x="610" y="112" text-anchor="middle" class="d-small d-text-light">bit 9 ... bit 0</text>
+
+    <rect x="20" y="140" width="640" height="145" rx="8" class="d-panel"/>
+    <text x="40" y="165" class="d-bold d-small">Worked example</text>
+    <text x="40" y="188" class="d-mono d-small">epoch = 1,314,220,021,721 ms &#8594; 2011-08-24T21:07:01.721Z<a class="cite" href="#ref-4">4</a></text>
+    <text x="40" y="208" class="d-mono d-small">now &#8722; epoch = 5,000 ms   shard_id = 5   seq_id = 12</text>
+    <text x="40" y="230" class="d-mono d-small">result = (5000 &lt;&lt; 23) | (5 &lt;&lt; 10) | 12</text>
+    <text x="40" y="250" class="d-mono d-small">        = 41,943,040,000 | 5,120 | 12</text>
+    <text x="40" y="270" class="d-mono d-bold">result = 41,943,045,132</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Instagram's 64-bit ID reserves 41 bits for a millisecond timestamp against a custom epoch, 13 bits for the generating shard's ID, and 10 bits for a per-shard sequence<a class="cite" href="#ref-4">4</a>. The worked example (delta = 5,000 ms, shard 5, sequence 12) applies the documented shift-and-OR formula by hand; the epoch constant and formula structure are Instagram's own, the specific delta/shard/sequence values here are illustrative.</figcaption>
+</figure>
+
+<p>The bit widths are not arbitrary, and they cross-check against the "several thousand" figure the post states in prose. Forty-one bits of milliseconds gives:</p>
+$$ 2^{41}\ \text{ms} = 2{,}199{,}023{,}255{,}552\ \text{ms} \approx 69.7\ \text{years} $$
+<p>of headroom from the custom epoch before the time field overflows — comfortably past any realistic system lifetime, which is presumably why the post chose a custom 2011 epoch rather than the 1970 Unix epoch: every bit of the 41 spent on years before 2011 is a bit not available for years after it. Thirteen bits of shard ID gives a ceiling of \(2^{13} = 8{,}192\) distinct shard IDs — comfortably above the "several thousand" logical shards the post describes using<a class="cite" href="#ref-4">4</a>, which is the point of choosing 13 rather than, say, 10 or 16: enough headroom to grow the logical shard count without a second migration, without wasting bits that could extend the time field's or the sequence field's range instead. Ten bits of sequence gives \(2^{10} = 1{,}024\) IDs a single shard can mint within the same millisecond before it has to wait for the clock to advance — the ceiling on how many rows one shard's `next_id()` function can generate per millisecond, independent of every other shard, since each shard runs its own sequence and its own copy of the function.</p>
+<p>That per-shard ceiling is also a per-shard risk: the sequence field is generated by <code>nextval(...) % 1024</code>, a plain modulo with no check against the millisecond boundary<a class="cite" href="#ref-4">4</a>, so a shard that is asked to insert more than 1,024 rows inside the same millisecond wraps the sequence back to 0 and mints a colliding ID rather than raising an error or blocking. The scheme's actual safety margin is therefore not "1,024 IDs per shard per millisecond" as an abstract ceiling but "however far below 1,024 a single shard's real write rate stays," which is a property of the sharding scheme's fan-out (how evenly several thousand logical shards divide the total write load) rather than of the ID format itself.</p>
+<p>Multiplying the per-shard ceiling by shard count gives a sense of how much headroom the design carries in aggregate, in the same spirit as WhatsApp's idle-CPU headroom (§2.1): at the "2,000 logical shards" scale the post's own worked example uses, 1,024 IDs/ms/shard across 2,000 shards is a theoretical aggregate ceiling of</p>
+$$ 2{,}000 \times 1{,}024 \times 1{,}000\ \text{ms/s} = 2{,}048{,}000{,}000\ \text{IDs/sec} $$
+<p>— on the order of two billion inserts per second if every shard were simultaneously saturated, a number with no realistic relationship to Instagram's actual 2012 write volume (which this module's sources do not state) but a useful sense check: the bit widths were chosen with room to spare, the same posture every headline number in this module turns out to have once its arithmetic is done by hand.</p>
+
+<aside class="callout callout-note"><span class="callout-title">Not covered: Cassandra</span><p>Instagram is widely described, particularly in system-design-interview material rather than in a citable Instagram engineering account, as having also run Cassandra for some data (for example, high-write-volume denormalized feed data). No source available to this module documents that at any level of mechanism — the only primary account in this module's source map is the Postgres-schema sharding scheme and 64-bit ID generator above<a class="cite" href="#ref-4">4</a>. This is exactly the kind of gap this module is written to be honest about rather than paper over: a claim repeated often enough in secondary retellings starts to feel documented, when what is actually documented, in Instagram's own words, is the scheme this section describes and nothing about Cassandra. This module describes that scheme and stops there.</p></aside>
+
+<h2 id="sharding-philosophies">5. Three philosophies for who owns the shard map</h2>
+<p>Instagram's scheme, Vitess (Module 13's subject), and Spanner (established across Modules 3-5) all answer the same question — once a dataset outgrows one machine, what decides which machine owns which row, and what happens when that decision has to change — with three structurally different answers about where that decision lives.</p>
+<p>Instagram's answer lives in application code and the primary key itself: a client that already has a row's ID can extract the 13-bit shard field directly (§4.2) and go straight to the owning schema, with no separate lookup service consulted on the read path at all<a class="cite" href="#ref-4">4</a>. Vitess's answer is a proxy tier that stands between the application and an unmodified MySQL fleet: VTGate accepts ordinary MySQL-protocol connections and itself resolves which shard a query belongs to, consulting a topology service (etcd, ZooKeeper, or Consul) that tracks the current shard map, while VTTablet runs alongside each MySQL instance managing that instance's own queries, connections, and replication<a class="cite" href="#ref-9">9</a> — Module 13 covers VTGate's Vindex-based routing and the topology service's replication in full; the point here is only that the application never sees a shard ID, because VTGate resolves it on every query. Spanner's answer removes the decision from both the application and any middleware operator: data is organized into directories, contiguous key ranges that are the unit of geographic placement, and the system itself can move a typical 50MB directory between Paxos groups in a few seconds<a class="cite" href="#ref-10">10</a> as load or a placement policy requires, with each of a zone's hundred-to-several-thousand spanservers hosting 100 to 1,000 tablets, each tablet backed by its own Paxos state machine with long-lived, time-based leader leases<a class="cite" href="#ref-10">10</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f6t"><title id="f6t">Three sharding philosophies: Instagram's ID-encoded routing, Vitess's VTGate proxy, and Spanner's automatic directory movement</title>
+    <defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    <marker id="f6-arr-d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+    <rect x="10" y="20" width="250" height="260" rx="10" class="d-outline d-dashed"/>
+    <text x="135" y="42" text-anchor="middle" class="d-bold d-small">Instagram: routing in the key</text>
+    <rect x="40" y="60" width="90" height="40" rx="6" class="d-block-muted"/>
+    <text x="85" y="84" text-anchor="middle" class="d-small d-bold">App</text>
+    <path d="M130,80 L170,80" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <text x="150" y="70" text-anchor="middle" class="d-mono d-small">id &gt;&gt; 10</text>
+    <rect x="170" y="60" width="70" height="40" rx="6" class="d-block-2"/>
+    <text x="205" y="84" text-anchor="middle" class="d-text-inv d-small">shard #</text>
+    <rect x="40" y="130" width="200" height="35" rx="5" class="d-outline"/>
+    <text x="140" y="152" text-anchor="middle" class="d-small">schema per logical shard</text>
+    <rect x="40" y="175" width="200" height="35" rx="5" class="d-outline"/>
+    <text x="140" y="197" text-anchor="middle" class="d-small">Postgres server(s)</text>
+    <path d="M205,100 L140,130" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <text x="135" y="240" text-anchor="middle" class="d-small d-text-light">no proxy, no lookup service<a class="cite" href="#ref-4">4</a></text>
+
+    <rect x="275" y="20" width="250" height="260" rx="10" class="d-outline d-dashed"/>
+    <text x="400" y="42" text-anchor="middle" class="d-bold d-small">Vitess: routing in a proxy</text>
+    <rect x="305" y="60" width="90" height="40" rx="6" class="d-block-muted"/>
+    <text x="350" y="84" text-anchor="middle" class="d-small d-bold">App</text>
+    <path d="M395,80 L435,80" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <text x="415" y="70" text-anchor="middle" class="d-small">MySQL proto</text>
+    <rect x="435" y="60" width="70" height="40" rx="6" class="d-block-accent"/>
+    <text x="470" y="84" text-anchor="middle" class="d-text-inv d-small">VTGate</text>
+    <path d="M470,100 L470,130" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <rect x="305" y="130" width="230" height="35" rx="5" class="d-panel"/>
+    <text x="420" y="152" text-anchor="middle" class="d-small">topology service (etcd/ZK/Consul)<a class="cite" href="#ref-9">9</a></text>
+    <rect x="305" y="175" width="100" height="35" rx="5" class="d-outline"/>
+    <text x="355" y="197" text-anchor="middle" class="d-small">VTTablet+MySQL</text>
+    <rect x="415" y="175" width="120" height="35" rx="5" class="d-outline"/>
+    <text x="475" y="197" text-anchor="middle" class="d-small">VTTablet+MySQL</text>
+    <path d="M420,165 L355,175" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <path d="M420,165 L475,175" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <text x="400" y="240" text-anchor="middle" class="d-small d-text-light">app never sees a shard ID<a class="cite" href="#ref-9">9</a></text>
+
+    <rect x="540" y="20" width="250" height="260" rx="10" class="d-outline d-dashed"/>
+    <text x="665" y="42" text-anchor="middle" class="d-bold d-small">Spanner: routing moves itself</text>
+    <rect x="570" y="60" width="90" height="40" rx="6" class="d-block-muted"/>
+    <text x="615" y="84" text-anchor="middle" class="d-small d-bold">Client lib</text>
+    <path d="M660,80 L700,80" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <rect x="700" y="60" width="70" height="40" rx="6" class="d-block"/>
+    <text x="735" y="84" text-anchor="middle" class="d-text-inv d-small">spanserver</text>
+    <rect x="580" y="130" width="90" height="35" rx="5" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="625" y="152" text-anchor="middle" class="d-small">directory A</text>
+    <rect x="680" y="130" width="90" height="35" rx="5" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="725" y="152" text-anchor="middle" class="d-small">directory B</text>
+    <path d="M625,165 Q655,190 680,165" class="d-arrow-active" marker-end="url(#f6-arr-d)"/>
+    <text x="655" y="200" text-anchor="middle" class="d-mono d-small">moves in seconds<a class="cite" href="#ref-10">10</a></text>
+    <text x="665" y="240" text-anchor="middle" class="d-small d-text-light">Paxos group per tablet<a class="cite" href="#ref-10">10</a></text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Three places to put the sharding decision: baked into the primary key and read directly by application code (Instagram<a class="cite" href="#ref-4">4</a>), resolved on every query by a proxy consulting a topology service (Vitess<a class="cite" href="#ref-9">9</a>, detailed in Module 13), or moved automatically by the storage engine itself between Paxos-replicated groups (Spanner<a class="cite" href="#ref-10">10</a>, established in Modules 3-5).</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Three sharding philosophies compared on who decides, how resharding happens, and what it costs<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-10">10</a>.</caption>
+<thead><tr><th>Property</th><th>Instagram (Postgres schemas)</th><th>Vitess (VTGate/VTTablet)</th><th>Spanner (Paxos directories)</th></tr></thead>
+<tbody>
+<tr><td class="row">Who resolves the shard</td><td>Application code, from bits in the ID</td><td>VTGate proxy, per query</td><td>The storage engine itself</td></tr>
+<tr><td class="row">Storage engine</td><td>Unmodified PostgreSQL</td><td>Unmodified MySQL</td><td>Purpose-built (Spanner)</td></tr>
+<tr><td class="row">Unit of resharding</td><td>A whole logical shard (schema)</td><td>A whole keyspace shard</td><td>A ~50MB directory<a class="cite" href="#ref-10">10</a></td></tr>
+<tr><td class="row">Resharding trigger</td><td>Manual operator migration</td><td>Operator-initiated, app-transparent</td><td>Automatic, load- or policy-driven</td></tr>
+<tr><td class="row">Extra runtime component</td><td>None</td><td>VTGate fleet + topology service<a class="cite" href="#ref-9">9</a></td><td>None (built into spanserver)</td></tr>
+<tr><td class="row">Cross-shard transactions</td><td>Not supported by this scheme</td><td>Supported, at a stated cost (Module 13)</td><td>Externally consistent, via 2PC over Paxos<a class="cite" href="#ref-10">10</a></td></tr>
+<tr><td class="row">Documented production run</td><td>Instagram, 2012 account<a class="cite" href="#ref-4">4</a></td><td>100% of YouTube's DB traffic, 5+ years<a class="cite" href="#ref-9">9</a></td><td>Google-internal + Cloud Spanner<a class="cite" href="#ref-10">10</a></td></tr>
+</tbody>
+</table>
+
+<p>A related but separate question — not who decides how data is split, but who is trusted to mint a durable identifier and how a system stays correct when that identifier's minting is retried — recurs in Module 18's treatment of Stripe's idempotency keys. Instagram's ID scheme (§4.2) solves "generate a unique key with no cross-shard coordination"; Stripe's idempotency key solves a different problem with a similarly load-bearing identifier: making a client-generated key the basis for detecting and safely no-op'ing a retried request. The mechanisms differ, but both are answers to the same underlying question this course keeps returning to — what has to be true about an identifier for a distributed system to trust it.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Table 1 laid out three positions side by side; the actual disagreement is about which one is the right default once a relational workload has outgrown a single machine, and the three systems in this module make three different bets. None of the sources below frame the comparison as a live debate between named people — each is one company or project explaining the choice it made — but the underlying trade-off is the same one Module 3's Dynamo-vs-Bigtable material and Module 13's Vitess-vs-Spanner disagreement both already surface: is the sharding decision cheapest to make in application code, in a middleware layer, or inside the storage engine itself?</p>
+<div class="positions">
+  <article class="position">
+    <h4>Hand-roll it: encode the shard in the key, keep the database engine untouched</h4>
+    <p class="who">Instagram's own account of its 2012 architecture<a class="cite" href="#ref-4">4</a></p>
+    <p>Instagram considered NoSQL and rejected it, choosing instead to shard an unmodified PostgreSQL fleet using the database's own schema feature and an ID scheme that encodes the shard directly in every primary key<a class="cite" href="#ref-4">4</a>. No proxy, no topology service, and no new runtime component sits between the application and the database; a client with a row's ID already knows which shard to query.</p>
+    <ul class="pros">
+      <li>Zero new infrastructure: no proxy fleet, no topology service to keep consistent, nothing new that can fail.</li>
+      <li>Read latency for by-ID lookups is minimal — the shard is a bit-shift away, not a network round trip to a router.</li>
+      <li>A small team can implement and fully understand the entire mechanism (§4.1-4.2 is close to the whole of it).</li>
+    </ul>
+    <ul class="cons">
+      <li>Every piece of application code that queries by anything other than ID has to be sharding-aware from day one.</li>
+      <li>Moving a logical shard to new hardware, or changing the bit widths once chosen, is a manual, whole-schema migration with no documented automatic mechanism<a class="cite" href="#ref-4">4</a>.</li>
+      <li>No cross-shard transactions: the scheme says nothing about atomically updating rows that live in two different logical shards.</li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Put a proxy in front: keep the engine, add a routing tier the app never sees</h4>
+    <p class="who">Vitess's documented architecture and its five-plus years as 100% of YouTube's database traffic<a class="cite" href="#ref-9">9</a> (mechanism detail in Module 13)</p>
+    <p>Keep MySQL exactly as it is and add VTGate, a proxy that speaks the unmodified MySQL wire protocol and resolves shard routing on every query by consulting a topology service, while VTTablet manages each shard's own connections and replication<a class="cite" href="#ref-9">9</a>. The sharding decision moves out of application code and into infrastructure that many applications can share.</p>
+    <ul class="pros">
+      <li>Application code is sharding-agnostic; the same query pattern that worked on one shard keeps working after a resharding operation.</li>
+      <li>One deployment of the pattern serves an entire organization's many services, not just one team's schema.</li>
+      <li>Documented to run transparently under YouTube's full database traffic for over five years<a class="cite" href="#ref-9">9</a>, and adopted since by other operators (Slack, Square, JD.com, per Module 13's sourcing).</li>
+    </ul>
+    <ul class="cons">
+      <li>A whole new tier (VTGate fleet plus a topology service) is now a load-bearing part of every query's path and its own operational surface.</li>
+      <li>Every MySQL connection VTTablet manages still carries MySQL's own 256KB-to-almost-3MB per-connection memory overhead<a class="cite" href="#ref-9">9</a> — Vitess controls this cost, it does not eliminate the underlying constraint.</li>
+      <li>Cross-shard transactions are supported but not free (Module 13 gives the specific cost).</li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Replace the engine: let the storage layer reshard itself automatically</h4>
+    <p class="who">Spanner's own design, established in Modules 3-5<a class="cite" href="#ref-10">10</a></p>
+    <p>Spanner shards data across many Paxos state machines and moves the unit of placement — a directory, typically around 50MB — between Paxos groups automatically, in a few seconds, as load or an explicit placement policy dictates<a class="cite" href="#ref-10">10</a>. Neither the application nor an operator decides when a directory moves; the system does.</p>
+    <ul class="pros">
+      <li>Resharding is not a scheduled migration or an operator-run script — it is a normal, automatic, seconds-scale operation<a class="cite" href="#ref-10">10</a>.</li>
+      <li>Cross-directory transactions get the same external-consistency guarantee as single-directory ones, via 2PC over Paxos and TrueTime (Module 5), with no separate proxy tier to reason about.</li>
+      <li>No MySQL/Postgres-style per-connection memory tax, because the engine was built for this from the start rather than adapted to it.</li>
+    </ul>
+    <ul class="cons">
+      <li>Requires abandoning whatever relational engine (and its tooling, staff expertise, and existing schema) an application already runs — a much larger commitment than adding a proxy in front of the existing one.</li>
+      <li>Externally consistent commits pay TrueTime's clock-uncertainty cost on every cross-group transaction, a latency tax neither of the other two designs incurs in the same form.</li>
+      <li>Only available as Google's own operated system or as the managed Cloud Spanner product — not something most teams stand up themselves the way they can install Vitess or write Instagram's PL/pgSQL function.</li>
+    </ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Which of the three wins depends almost entirely on what already exists and how often the application needs a transaction that spans more than one shard. Instagram's approach is close to strictly right for a small team, a schema that is already ID-centric, and a workload where cross-shard transactions are rare or unnecessary — it is the cheapest possible answer precisely because it adds nothing, and Instagram's own 2012 account describes a team that had already rejected a heavier NoSQL migration for this reason<a class="cite" href="#ref-4">4</a>. It stops being the right answer the moment enough different services need to query the sharded data by something other than ID, because every one of those call sites now has to carry sharding logic by hand. Vitess's proxy tier is the right answer once that condition is met but the organization is still unwilling or unable to migrate off its existing relational engine — YouTube's actual 2010 position, and the reason Vitess exists at all: it buys transparency for the application at the cost of running an extra, shared piece of infrastructure, which is a good trade exactly when many teams would otherwise duplicate Instagram-style sharding logic independently. Spanner's automatic directories win only when the application's correctness requirements genuinely need cross-shard transactions with external consistency and the organization can accept both a storage-engine migration and TrueTime's per-transaction latency cost — a bet that pays off at Google's scale and for Cloud Spanner customers who need exactly that guarantee, and does not pay off for a workload, like Instagram's photo-and-like counters, that never needed cross-shard atomicity in the first place. No source in this module's map publishes a head-to-head benchmark of the three approaches on identical workloads; that comparison — same schema, same query mix, same failure injection, run against a hand-rolled scheme, a Vitess deployment, and a Spanner-class system — is the evidence that would actually settle which one is fastest rather than merely which one is architecturally cleanest for a given starting position.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">blog</span>WhatsApp (Rick Reed). <em>1 million is so 2011</em>. WhatsApp Engineering blog, 2012-01-06. <a href="https://blog.whatsapp.com/1-million-is-so-2011">https://blog.whatsapp.com/1-million-is-so-2011</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 2,277,845-open-socket figure, the full CPU utilization breakdown (37.9% user / 0.0% nice / 13.6% system / 6.6% interrupt / 41.9% idle), hardware spec (Xeon X5675, 24 cores, 103,062,118,400 bytes RAM), FreeBSD/Erlang version, and the kernel-tuning sysctl values (maxsockets, maxfiles, maxfilesperproc, tcbhashsize, hostcache parameters).</span></li>
+<li id="ref-2"><span class="ref-type">talk</span>Krikorian, Raffi. <em>Timelines at Scale</em>. QCon San Francisco 2012, recorded/published by InfoQ 2013-04-03. <a href="https://www.infoq.com/presentations/Twitter-Timeline-Scalability">https://www.infoq.com/presentations/Twitter-Timeline-Scalability</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the talk's existence, subject, speaker, and date, as the primary source that ref-3 (High Scalability) transcribes and attributes numbers to.</span></li>
+<li id="ref-3"><span class="ref-type">analysis</span>Hoff, Todd. <em>The Architecture Twitter Uses to Deal with 150M Active Users, 300K QPS, a 22 MB/S Firehose, and Send Tweets in Under 5 Seconds</em>. High Scalability, 2013-07-08. <a href="https://highscalability.com/the-architecture-twitter-uses-to-deal-with-150m-active-users/">https://highscalability.com/the-architecture-twitter-uses-to-deal-with-150m-active-users/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 150M active users, 300K QPS reads vs. 6,000/sec writes, tweet-ingest rates, the 800-entry/3x-replicated Redis timeline, the fanout daemon's 4,000-destination pipelined batches and per-entry byte layout, the 5-minute-worst-case/5-second-target figures, the celebrity read-time-merge hybrid and its "10s of percents" savings claim, and the Gizzard/Flock/Tweetypie system names — all attributed by the article to Krikorian's talk (ref-2).</span></li>
+<li id="ref-4"><span class="ref-type">blog</span>Instagram Engineering. <em>Sharding &amp; IDs at Instagram</em>. instagram-engineering.com, 2012. <a href="https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c">https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c</a>. Accessed 2026-09-17. <span class="ref-use">Used for: several-thousand-logical-shards-over-fewer-physical-servers claim, the Postgres-schema-per-shard mechanism, the 41/13/10-bit ID layout, the custom epoch constant (1,314,220,021,721 ms) and the PL/pgSQL next_id() function's shift-and-OR structure. The origin domain blocks automated fetches; content is cross-checked across two independently hosted, character-for-character reproductions of the same post.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>Ericsson AB / Erlang OTP team. <em>Processes</em>. Erlang System Documentation, erlang.org. <a href="https://www.erlang.org/doc/system/eff_guide_processes.html">https://www.erlang.org/doc/system/eff_guide_processes.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 327-word (2,616-byte on 64-bit) newly spawned process memory floor, the 233-word default heap/stack allocation, and the stated design intent to support hundreds of thousands to millions of processes.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>Kerrisk, Michael. <em>pthread_create(3) — Linux manual page</em>. man7.org, Linux man-pages project. <a href="https://man7.org/linux/man-pages/man3/pthread_create.3.html">https://man7.org/linux/man-pages/man3/pthread_create.3.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the RLIMIT_STACK-governed default thread stack size (2 MB per-architecture default when RLIMIT_STACK is "unlimited"; commonly 8 MB / 8,192 KB under a typical Linux distribution's soft ulimit), contrasted with Erlang's per-process memory floor (&#167;2.2).</span></li>
+<li id="ref-7"><span class="ref-type">paper</span>Kreps, Jay, Narkhede, Neha, Rao, Jun. <em>Kafka: a Distributed Messaging System for Log Processing</em>. NetDB '11 workshop, 2011. <a href="https://notes.stephenholiday.com/Kafka.pdf">https://notes.stephenholiday.com/Kafka.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the stateless-broker/consumer-tracked-offset design and the page-cache/warm-restart property (&#167;2.3), contrasted with WhatsApp's stateful per-connection process model; full Kafka mechanics are Module 8's subject, not re-derived here.</span></li>
+<li id="ref-8"><span class="ref-type">paper</span>DeCandia, Giuseppe, Hastorun, Deniz, Jampani, Madan, et al. <em>Dynamo: Amazon's Highly Available Key-value Store</em>. SOSP '07, 2007. <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the "always writeable," asynchronously-reconciled design philosophy cited as the shared lineage with Gizzard's global-replication role (&#167;3.4); full Dynamo mechanics (consistent hashing, vector clocks) are Module 3's subject.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>Vitess contributors. <em>What is Vitess?</em> Vitess (CNCF graduated project) documentation, 2026. <a href="https://vitess.io/docs/overview/whatisvitess/">https://vitess.io/docs/overview/whatisvitess/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: VTGate/VTTablet roles, the topology-service description, YouTube's 5+-year, 100%-of-traffic production run, and the 256KB-to-almost-3MB per-MySQL-connection memory overhead figure, in Table 1 and &#167;5's comparison; full VTGate/Vindex routing mechanics are Module 13's subject.</span></li>
+<li id="ref-10"><span class="ref-type">paper</span>Corbett, James C., Dean, Jeffrey, Epstein, Michael, et al. <em>Spanner: Google's Globally-Distributed Database</em>. OSDI '12, 2012. <a href="https://research.google.com/archive/spanner-osdi2012.pdf">https://research.google.com/archive/spanner-osdi2012.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: sharding data across Paxos state machines (&#167;1), the 100-to-several-thousand-spanservers-per-zone and 100-to-1000-tablets-per-spanserver figures, 10-second default Paxos leader leases, and the 50MB-directory-moves-in-a-few-seconds figure (&#167;2.1-2.2), used here only for the &#167;5/disagree comparison; full TrueTime and transaction mechanics are established across Modules 3-5.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

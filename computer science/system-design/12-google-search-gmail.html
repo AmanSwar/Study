@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Google Search and Gmail: Crawl to Index to Serve, and the GFS/Bigtable/Spanner Lineage · System Design</title>
+<meta name="description" content="Google's own three-stage description of Search (crawl, index, serve) read against the storage systems -- GFS, Bigtable, Megastore, Spanner -- Google has separately disclosed as underlying it and Gmail, plus the shift from batch MapReduce indexing to incremental Percolator/Caffeine processing.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 12</p>
+  <h1>Google Search and Gmail: Crawl to Index to Serve, and the GFS/Bigtable/Spanner Lineage</h1>
+  <p class="lede">This is the first case study in the course: it takes the storage, consensus, and consistency mechanisms from Part A and shows what they actually hold up. Google's own three-stage account of Search — crawl, index, serve — is read against the primary papers that disclose the machinery underneath it: the 1998 prototype's architecture, the 2003 cluster paper, the 2010 shift from batch to incremental indexing, and the GFS→Bigtable→Megastore→Spanner storage lineage that both Search and Gmail sit on. Where Google has not published something — Gmail's internal architecture, current ranking signals — this module says so instead of filling the gap.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>40 min</b> read</span>
+    <span class="chip"><b>10</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Modules 3, 5, 6, 7</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">Google's three-stage Search pipeline: crawling, indexing with a not-guaranteed branch, and serving</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    <marker id="f1-arr-d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+
+    <rect x="20" y="60" width="170" height="80" rx="8" class="d-block"/>
+    <text x="105" y="88" text-anchor="middle" class="d-text-inv d-bold">1. Crawling</text>
+    <text x="105" y="106" text-anchor="middle" class="d-text-inv d-small">discover URLs, fetch,</text>
+    <text x="105" y="121" text-anchor="middle" class="d-text-inv d-small">render JS in Chrome</text>
+
+    <path d="M190,100 L250,100" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="250" y="60" width="170" height="80" rx="8" class="d-block-2"/>
+    <text x="335" y="88" text-anchor="middle" class="d-text-inv d-bold">2. Indexing</text>
+    <text x="335" y="106" text-anchor="middle" class="d-text-inv d-small">analyze content,</text>
+    <text x="335" y="121" text-anchor="middle" class="d-text-inv d-small">store in the index</text>
+
+    <path d="M420,100 L480,100" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="480" y="60" width="170" height="80" rx="8" class="d-block-accent"/>
+    <text x="565" y="88" text-anchor="middle" class="d-text-inv d-bold">3. Serving</text>
+    <text x="565" y="106" text-anchor="middle" class="d-text-inv d-small">rank hundreds of factors,</text>
+    <text x="565" y="121" text-anchor="middle" class="d-text-inv d-small">return results to a query</text>
+
+    <path d="M335,140 L335,190 Q335,210 300,210 L190,210" class="d-arrow-active d-dashed" marker-end="url(#f1-arr-d)"/>
+    <rect x="20" y="188" width="170" height="46" rx="8" class="d-block-muted"/>
+    <text x="105" y="207" text-anchor="middle" class="d-bold d-small">Not indexed</text>
+    <text x="105" y="222" text-anchor="middle" class="d-small d-text-light">crawled, never added</text>
+
+    <text x="330" y="175" text-anchor="middle" class="d-small d-bold">indexing is not guaranteed</text>
+
+    <rect x="480" y="188" width="290" height="46" rx="8" class="d-panel"/>
+    <text x="625" y="207" text-anchor="middle" class="d-small d-bold">Index: 100s of billions of pages,</text>
+    <text x="625" y="222" text-anchor="middle" class="d-small">over 100,000,000 GB (&#8776; 100 PB)</text>
+
+    <rect x="20" y="260" width="750" height="60" rx="8" class="d-outline d-dashed"/>
+    <text x="395" y="284" text-anchor="middle" class="d-small">Ranking relevancy: hundreds of factors, undisclosed in detail &mdash; Google states it does not accept payment to rank pages higher</text>
+    <text x="395" y="302" text-anchor="middle" class="d-small d-text-light">(out of scope for this module: current ranking-signal internals are not published by Google)</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The three stages of Google Search exactly as Google's own developer documentation frames them, with the branch it states explicitly: not every crawled page is indexed<a class="cite" href="#ref-1">1</a>. The rest of this module opens each stage against the primary systems papers Google has separately published.</figcaption>
+</figure>
+
+<h2 id="pipeline-officially">1. The pipeline, in Google's own words</h2>
+<p>Google's developer documentation states the shape of Search plainly: "Google Search works in three stages... Crawling: Google downloads text, images, and videos from pages it found on the internet with automated programs called crawlers... Indexing: Google analyzes the text, images, and video files on the page, and stores the information in the Google index... Serving search results: When a user searches on Google, Google returns information that's relevant to the user's query"<a class="cite" href="#ref-1">1</a>. That is the entire official architecture description — three verbs, no internals. This module's job is to attach the systems underneath each verb, using what Google has separately published as engineering papers rather than as marketing copy.</p>
+<p>Two scale numbers anchor the rest of the module. First, index size: "the Google Search index covers hundreds of billions of webpages and is over 100,000,000 gigabytes in size"<a class="cite" href="#ref-1">1</a>. Converting units makes the number legible: <span class="d-mono">100,000,000 GB ÷ 1,000,000 GB/PB = 100 PB</span> — the disclosed index is described as being over 100 petabytes, not gigabytes or terabytes, and covering hundreds of billions of individual pages. Second, rendering: crawling in 2026 is not a text fetch. "During the crawling process, Google renders the page and runs any JavaScript it finds using a recent version of Chrome, similar to how your browser renders pages you visit"<a class="cite" href="#ref-1">1</a> — a full browser engine executes the page's script before any text reaches the indexer, which is why a page whose content is generated client-side by JavaScript can still be indexed at all.</p>
+<p>The branch drawn in Figure 1 is stated as directly as the pipeline itself: "indexing isn't guaranteed; not every page that Google processes will be indexed"<a class="cite" href="#ref-1">1</a>. A page can be successfully crawled — fetched, rendered, parsed — and still never appear in the index. Google does not enumerate every reason in the developer documentation, and this module does not speculate about the missing cases beyond what is stated.</p>
+<p>Ranking is the one stage this module deliberately does not open further. Google states that "relevancy is determined by hundreds of factors" and, separately, that "Google doesn't accept payment to rank pages higher, and ranking is done programmatically"<a class="cite" href="#ref-1">1</a> — a factor count and a policy statement, not a specification. This is the manifest boundary for this module: ranking-algorithm internals are not disclosed by Google beyond such statements, and the rest of this module does not attempt to reconstruct them. What Search's 1998 prototype disclosed about its own ranking signal — PageRank — is covered in §2.2 as a historical, publicly specified mechanism, distinct from whatever the hundreds of factors are today.</p>
+
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>Every remaining section pairs one clause of Figure 1 with a primary engineering paper: crawling and indexing with the 1998 prototype paper (§2) and the 2010 Percolator/Caffeine paper (§5), serving with the 2003 cluster-architecture paper (§3), scale evolution with a 2009 Google keynote (§4), and the storage substrate underneath all three stages with GFS, Bigtable, Megastore, and Spanner (§6–§8).</p></aside>
+
+<h2 id="prototype-architecture">2. Crawling and indexing at prototype scale: the 1998 paper</h2>
+<p>Google's developer documentation describes crawling and indexing as they exist today, without internals. Sergey Brin and Larry Page's 1998 paper describes the same two stages as they existed in the original prototype, with the internals in full — a documented, if not current, block diagram of what "crawl" and "index" actually meant in code<a class="cite" href="#ref-2">2</a>. The prototype indexed 24 million pages<a class="cite" href="#ref-2">2</a>, roughly nine orders of magnitude smaller than today's disclosed index<a class="cite" href="#ref-1">1</a>, but the architecture it discloses is the direct ancestor of the pipeline in Figure 1, and it is the only point in this module's source set where crawling and indexing are described down to the level of named processes and data structures.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 440" role="img" aria-labelledby="f2t"><title id="f2t">Brin and Page's 1998 Google architecture: URL server, crawlers, store server, repository, indexer, barrels, sorter, lexicon, and searcher</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="20" y="20" width="110" height="46" rx="8" class="d-block"/><text x="75" y="47" text-anchor="middle" class="d-text-inv d-small d-bold">URL server</text>
+    <path d="M130,43 L190,43" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="190" y="20" width="100" height="46" rx="8" class="d-block"/><text x="240" y="47" text-anchor="middle" class="d-text-inv d-small d-bold">Crawlers</text>
+    <path d="M290,43 L350,43" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="350" y="20" width="120" height="46" rx="8" class="d-block"/><text x="410" y="47" text-anchor="middle" class="d-text-inv d-small d-bold">Store server</text>
+    <path d="M470,43 L530,43" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="530" y="10" width="130" height="66" rx="8" class="d-block-2"/><text x="595" y="38" text-anchor="middle" class="d-text-inv d-small d-bold">Repository</text><text x="595" y="55" text-anchor="middle" class="d-text-inv d-small">compressed HTML,</text><text x="595" y="68" text-anchor="middle" class="d-text-inv d-small">53.5 GB @ 24M pages</text>
+
+    <path d="M595,76 L595,110" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="500" y="110" width="190" height="46" rx="8" class="d-block-2"/><text x="595" y="132" text-anchor="middle" class="d-text-inv d-small d-bold">Indexer</text><text x="595" y="147" text-anchor="middle" class="d-text-inv d-small">reads, parses, emits hits</text>
+
+    <path d="M500,133 L400,133" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="230" y="110" width="170" height="46" rx="8" class="d-block-accent"/><text x="315" y="132" text-anchor="middle" class="d-text-inv d-small d-bold">Anchors file</text><text x="315" y="147" text-anchor="middle" class="d-text-inv d-small">link src/dest + text</text>
+
+    <path d="M315,156 L315,190" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="230" y="190" width="170" height="46" rx="8" class="d-block-accent"/><text x="315" y="212" text-anchor="middle" class="d-text-inv d-small d-bold">URL resolver</text><text x="315" y="227" text-anchor="middle" class="d-text-inv d-small">rel &rarr; abs URLs &rarr; docIDs</text>
+
+    <path d="M315,236 L315,270" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="230" y="270" width="170" height="46" rx="8" class="d-block-accent"/><text x="315" y="292" text-anchor="middle" class="d-text-inv d-small d-bold">Links database</text><text x="315" y="307" text-anchor="middle" class="d-text-inv d-small">3.9 GB, docID pairs</text>
+
+    <path d="M315,316 L315,350" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="230" y="350" width="170" height="46" rx="8" class="d-fill-amber-soft d-stroke-amber"/><text x="315" y="372" text-anchor="middle" class="d-bold d-small">PageRank</text><text x="315" y="387" text-anchor="middle" class="d-small">iterative eigenvector calc</text>
+
+    <path d="M595,156 L595,190" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="500" y="190" width="190" height="46" rx="8" class="d-block-2"/><text x="595" y="212" text-anchor="middle" class="d-text-inv d-small d-bold">Barrels (64)</text><text x="595" y="227" text-anchor="middle" class="d-text-inv d-small">partially-sorted forward index</text>
+
+    <path d="M595,236 L595,270" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="500" y="270" width="190" height="46" rx="8" class="d-block-2"/><text x="595" y="292" text-anchor="middle" class="d-text-inv d-small d-bold">Sorter</text><text x="595" y="307" text-anchor="middle" class="d-text-inv d-small">re-sorts barrels by wordID</text>
+
+    <path d="M595,316 L595,350" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="500" y="350" width="90" height="46" rx="8" class="d-block-muted"/><text x="545" y="372" text-anchor="middle" class="d-small d-bold">Lexicon</text><text x="545" y="387" text-anchor="middle" class="d-small">293 MB</text>
+
+    <path d="M590,373 L650,373" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M400,373 L500,373" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="650" y="350" width="120" height="46" rx="8" class="d-block-accent"/><text x="710" y="372" text-anchor="middle" class="d-text-inv d-small d-bold">Searcher</text><text x="710" y="387" text-anchor="middle" class="d-text-inv d-small">query &rarr; ranked docIDs</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> The 1998 Google prototype's own architecture diagram, redrawn: URL server feeds distributed crawlers, which write through a store server into a compressed repository; the indexer reads the repository and both emits partially-sorted "barrels" (the forward index) and extracts an anchors file that the URL resolver and links database turn into PageRank's input graph; the sorter re-sorts the barrels into an inverted index the searcher answers queries from<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<h3 id="prototype-mechanism">2.1 What each box actually does</h3>
+<p>"In Google, the Web crawling (downloading of Web pages) is done by several distributed crawlers... There is a URLserver that sends lists of URLs to be fetched to the crawlers. The Web pages that are fetched are then sent to the storeserver. The storeserver then compresses and stores the Web pages into a repository"<a class="cite" href="#ref-2">2</a>. Every fetched page gets an integer identifier the moment it is first referenced: "every Web page has an associated ID number called a docID which is assigned whenever a new URL is parsed out of a Web page"<a class="cite" href="#ref-2">2</a> — assignment happens at link-discovery time, not at crawl time, which is why the URL resolver later has to reconcile docIDs assigned before a page was ever fetched.</p>
+<p>The indexer does two jobs from one pass over the repository: "the indexing function is performed by the indexer and the sorter. The indexer... reads the repository, uncompresses the documents, and parses them. Each document is converted into a set of word occurrences called hits... The indexer distributes these hits into a set of 'barrels', creating a partially sorted forward index"<a class="cite" href="#ref-2">2</a>, and separately, "it parses out all the links in every Web page and stores important information about them in an anchors file. This file contains enough information to determine where each link points from and to, and the text of the link"<a class="cite" href="#ref-2">2</a>. The forward index (barrels, keyed roughly by document) and the link graph (anchors file) are produced by the same pass but consumed by two different downstream systems: barrels feed the sorter toward a queryable inverted index, and the anchors file feeds the URL resolver and links database toward PageRank.</p>
+<p>The last step converts the forward index into something a query can actually use: "the sorter takes the barrels... and resorts them by wordID to generate the inverted index... The searcher is run by a Web server and uses the lexicon built by DumpLexicon together with the inverted index and the PageRanks to answer queries"<a class="cite" href="#ref-2">2</a>. A forward index (document → words) and an inverted index (word → documents) are not the same structure, and the gap between them is exactly the sorter's job — this is the same forward/inverted distinction that shows up in any full-text search engine, and the 1998 paper is unusually explicit about which stage produces which one.</p>
+
+<h3 id="prototype-storage">2.2 Storage stats, and PageRank as the one disclosed ranking signal</h3>
+<p>The paper reports its own resource footprint at 24 million pages in a single table, reproduced in Table 1.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Storage statistics for the 1998 Google prototype at 24 million fetched pages<a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Data structure</th><th class="num">Size</th></tr></thead>
+<tbody>
+<tr><td class="row">Total size of fetched pages</td><td class="num">147.8 GB</td></tr>
+<tr><td class="row">Compressed repository</td><td class="num">53.5 GB</td></tr>
+<tr><td class="row">Short inverted index</td><td class="num">4.1 GB</td></tr>
+<tr><td class="row">Full inverted index</td><td class="num">37.2 GB</td></tr>
+<tr><td class="row">Lexicon</td><td class="num">293 MB</td></tr>
+<tr><td class="row">Links database</td><td class="num">3.9 GB</td></tr>
+<tr><td class="row">Total without repository</td><td class="num">55.2 GB</td></tr>
+<tr><td class="row">Total with repository</td><td class="num" data-best>108.7 GB</td></tr>
+</tbody>
+</table>
+
+<p>Two things are worth noticing in that table. First, the compressed repository (53.5 GB) is smaller than the raw fetched pages (147.8 GB) but is still the single largest structure — "the raw HTML repository uses roughly half of the necessary storage"<a class="cite" href="#ref-2">2</a>. Second, Google kept two separate inverted-index barrels rather than one: "we chose a compromise between these options, keeping two sets of inverted barrels — one set for hit lists which include title or anchor hits and another set for all hit lists. This way, we check the first set of barrels first and if there are not enough matches within those barrels we check the larger ones"<a class="cite" href="#ref-2">2</a> — a cheap, high-precision index consulted first, falling back to an expensive, complete one only when the cheap one doesn't return enough matches. That two-tier read pattern is a caching decision made inside the index format itself, not at a separate cache layer.</p>
+<p>PageRank is the one ranking mechanism this era of Google disclosed in full, and it is worth stating precisely because it is not what "hundreds of undisclosed factors" in §1 refers to today. The paper gives the recurrence directly: assume page <em>A</em> has pages <em>T1...Tn</em> pointing to it, a damping factor <em>d</em> (the paper sets <em>d = 0.85</em>), and <em>C(A)</em> as the number of outbound links on page <em>A</em>; then</p>
+$$ PR(A) = (1-d) + d\left(\frac{PR(T_1)}{C(T_1)} + \cdots + \frac{PR(T_n)}{C(T_n)}\right) $$
+<p>which "can be calculated using a simple iterative algorithm, and corresponds to the principal eigenvector of the normalized link matrix of the Web... a PageRank for 26 million Web pages can be computed in a few hours on a medium size workstation"<a class="cite" href="#ref-2">2</a>. The intuitive reading the paper gives is a random-surfer model: "PageRank can be thought of as a model of user behavior. We assume there is a 'random surfer' who is given a Web page at random and keeps clicking on links, never hitting back... The probability that the random surfer visits a page is its PageRank"<a class="cite" href="#ref-2">2</a>, with the damping factor <em>d</em> as the probability the surfer gets bored and jumps to a random page instead of following a link. PageRank was one input among several even in 1998 — the paper also used anchor text and word-proximity information alongside it<a class="cite" href="#ref-2">2</a> — and it is not a claim about what any of the "hundreds of factors" Google cites today are. It is included here because it is the only ranking mechanism in this module's source set that is a fully specified formula rather than a policy statement.</p>
+
+<h3 id="prototype-crawl-rate">2.3 Worked derivation: how fast the 1998 crawler actually ran</h3>
+<p>The paper states its own crawl-completion numbers in two different units, which makes them a useful cross-check rather than a single opaque figure: "in total it took roughly 9 days to download the 26 million pages (including errors). However, once the system was running smoothly, it ran much faster, downloading the last 11 million pages in just 63 hours, averaging just over 4 million pages per day or 48.5 pages per second"<a class="cite" href="#ref-2">2</a>. Checking that arithmetic directly:</p>
+$$ \frac{11 \times 10^{6}\ \text{pages}}{63\ \text{hours} \times 3600\ \text{s/hour}} = \frac{11{,}000{,}000}{226{,}800\ \text{s}} \approx 48.5\ \text{pages/s} $$
+<p>which matches the paper's own stated figure exactly, and scaling that rate up to a full day, <span class="d-mono">48.5 pages/s &times; 86,400 s/day &approx; 4.19 million pages/day</span>, matches "just over 4 million pages per day" as well. This single-machine-era rate was achieved with a small, explicitly stated degree of parallelism: "each crawler keeps roughly 300 connections open at once... At peak speeds, the system can crawl over 100 web pages per second using four crawlers"<a class="cite" href="#ref-2">2</a> — 300 concurrent connections per crawler because "a major performance stress is DNS lookup," and four crawler processes because that was sufficient concurrency to exceed 100 pages/s in aggregate<a class="cite" href="#ref-2">2</a>. The paper's own closing estimate on where this scales is a useful sanity check against the growth numbers in §4: "we expect to be able to build an index of a substantial portion of the Web — 24 million pages, in less than one week. We expect to be able to build an index of 100 million pages in less than a month"<a class="cite" href="#ref-2">2</a>.</p>
+
+<h2 id="cluster-serving">3. Serving at cluster scale: the 2003 architecture</h2>
+<p>The 1998 prototype ran on a handful of donated workstations<a class="cite" href="#ref-2">2</a>. Five years later, Barroso, Dean, and Hölzle published the architecture that replaced it: "Google's architecture features clusters of more than 15,000 commodity-class PCs with fault-tolerant software"<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>. The stage this paper documents is exactly the "serving" box in Figure 1, and it opens it with a control-flow diagram of one query's path through a cluster.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f3t"><title id="f3t">Google's 2003 query-serving path: a Google Web Server coordinating spell checker, ad server, index servers, and document servers, each sharded and replicated</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <text x="400" y="25" text-anchor="middle" class="d-small d-text-light">query (after DNS-based geographic load balancing to a cluster)</text>
+    <path d="M400,32 L400,60" class="d-arrow" marker-end="url(#f3-arr)"/>
+
+    <rect x="310" y="60" width="180" height="50" rx="8" class="d-block"/><text x="400" y="83" text-anchor="middle" class="d-text-inv d-bold d-small">Google Web Server</text><text x="400" y="98" text-anchor="middle" class="d-text-inv d-small">coordinates the query</text>
+
+    <path d="M310,75 L220,75" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <rect x="80" y="55" width="140" height="40" rx="8" class="d-block-muted"/><text x="150" y="79" text-anchor="middle" class="d-bold d-small">Spell checker</text>
+
+    <path d="M490,75 L580,75" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <rect x="580" y="55" width="140" height="40" rx="8" class="d-block-muted"/><text x="650" y="79" text-anchor="middle" class="d-bold d-small">Ad server</text>
+
+    <path d="M370,110 L230,180" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M430,110 L570,180" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <text x="280" y="150" class="d-small">docids scored</text>
+    <text x="560" y="150" class="d-small">title + snippet</text>
+
+    <rect x="60" y="180" width="380" height="34" rx="6" class="d-label-bg"/>
+    <text x="250" y="202" text-anchor="middle" class="d-small d-bold">Index servers &mdash; sharded by docID, replicated</text>
+    <rect x="60" y="224" width="80" height="46" rx="6" class="d-block-2"/><text x="100" y="250" text-anchor="middle" class="d-text-inv d-small">shard 0</text>
+    <rect x="150" y="224" width="80" height="46" rx="6" class="d-block-2"/><text x="190" y="250" text-anchor="middle" class="d-text-inv d-small">shard 1</text>
+    <rect x="240" y="224" width="80" height="46" rx="6" class="d-block-2"/><text x="280" y="250" text-anchor="middle" class="d-text-inv d-small">shard 2</text>
+    <rect x="330" y="224" width="80" height="46" rx="6" class="d-block-2"/><text x="370" y="250" text-anchor="middle" class="d-text-inv d-small">shard N</text>
+    <rect x="60" y="278" width="80" height="34" rx="6" class="d-block-muted d-dashed"/><text x="100" y="300" text-anchor="middle" class="d-small d-text-light">replica</text>
+    <rect x="150" y="278" width="80" height="34" rx="6" class="d-block-muted d-dashed"/><text x="190" y="300" text-anchor="middle" class="d-small d-text-light">replica</text>
+    <rect x="240" y="278" width="80" height="34" rx="6" class="d-block-muted d-dashed"/><text x="280" y="300" text-anchor="middle" class="d-small d-text-light">replica</text>
+    <rect x="330" y="278" width="80" height="34" rx="6" class="d-block-muted d-dashed"/><text x="370" y="300" text-anchor="middle" class="d-small d-text-light">replica</text>
+
+    <rect x="480" y="180" width="260" height="34" rx="6" class="d-label-bg"/>
+    <text x="610" y="202" text-anchor="middle" class="d-small d-bold">Document servers &mdash; sharded, replicated</text>
+    <rect x="480" y="224" width="80" height="46" rx="6" class="d-block-accent"/><text x="520" y="250" text-anchor="middle" class="d-text-inv d-small">shard 0</text>
+    <rect x="570" y="224" width="80" height="46" rx="6" class="d-block-accent"/><text x="610" y="250" text-anchor="middle" class="d-text-inv d-small">shard 1</text>
+    <rect x="660" y="224" width="80" height="46" rx="6" class="d-block-accent"/><text x="700" y="250" text-anchor="middle" class="d-text-inv d-small">shard M</text>
+
+    <rect x="60" y="335" width="700" height="34" rx="6" class="d-panel"/>
+    <text x="410" y="357" text-anchor="middle" class="d-small">Phase 1 (index servers): intersect hit lists, score, rank &rarr; ordered docids. Phase 2 (doc servers): docid &rarr; title, URL, snippet.</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The 2003 Google Web Server coordinates two independent, sharded, replicated server pools — index servers producing ranked document IDs, and document servers turning those IDs into titles and snippets — plus a spell checker and ad server on the same request<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<h3 id="cluster-two-phase">3.1 Two phases, both embarrassingly shardable</h3>
+<p>The paper decomposes query execution into exactly two phases, matching the two server pools in Figure 3: "in the first phase, the index servers consult an inverted index that maps each query word to a matching list of documents (the hit list). The index servers then determine a set of relevant documents by intersecting the hit lists of the individual query words, and they compute a relevance score for each document"<a class="cite" href="#ref-3">3</a>. The second phase is a separate lookup against separate machines: "the final result of this first phase of query execution is an ordered list of document identifiers (docids)... [the second phase] involves taking this list of docids and computing the actual title and uniform resource locator of these documents, along with a query-specific document summary. Document servers (docservers) handle this job"<a class="cite" href="#ref-3">3</a>.</p>
+<p>Both pools use the identical sharding-and-replication pattern independently: "the search is highly parallelizable by dividing the index into pieces (index shards)... A pool of machines serves requests for each shard... Each request chooses a machine within a pool using an intermediate load balancer"<a class="cite" href="#ref-3">3</a>, and document serving repeats the pattern by "randomly distributing documents into smaller shards, having multiple server replicas responsible for handling each shard, and routing requests through a load balancer"<a class="cite" href="#ref-3">3</a>. Replication here is deliberately dual-purpose — the same replicas that provide throughput also provide fault tolerance for free: "because we already replicate services across multiple machines to obtain sufficient capacity, this type of fault tolerance almost comes for free"<a class="cite" href="#ref-3">3</a>. When one replica of a shard fails, "the load balancer will avoid using it for queries... During the downtime, the system capacity is reduced in proportion to the total fraction of capacity that this machine represented. However, service remains uninterrupted, and all parts of the index remain available"<a class="cite" href="#ref-3">3</a> — a graceful capacity degradation, not an outage, because the index shard the failed machine held is still served by its other replicas.</p>
+<p>Read-mostly access is the property that makes this whole design tractable without invoking general-purpose database consistency machinery: "most accesses to the index and other data structures involved in answering a query are read-only: updates are relatively infrequent, and we can often perform them safely by diverting queries away from a service replica during an update. This principle sidesteps many of the consistency issues that typically arise in using a general-purpose database"<a class="cite" href="#ref-3">3</a>. The consistency model this section describes for search's own read path is not the linearizable, transactional model Module 5 covers for Spanner — it is a much weaker, deliberately chosen one that is sufficient only because writes are rare and can be scheduled around reads.</p>
+
+<h3 id="cluster-cost">3.2 Why 15,000 cheap PCs instead of fewer expensive servers</h3>
+<p>The paper's cost argument is stated as an explicit comparison, not a general preference, and it is worth reproducing in a table because the two configurations it compares cost almost the same amount of money for very different resources.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Two roughly comparable-generation server configurations Google's 2003 paper prices against each other<a class="cite" href="#ref-3">3</a>.</caption>
+<thead><tr><th>Configuration</th><th class="num">Price (2002)</th><th class="num">CPUs</th><th class="num">RAM</th><th class="num">Disk</th></tr></thead>
+<tbody>
+<tr><td class="row">Rack of 88 commodity 2-way PCs</td><td class="num" data-best>$278,000</td><td class="num" data-best>176</td><td class="num">176 GB</td><td class="num">7 TB</td></tr>
+<tr><td class="row">One 8-way high-end server</td><td class="num" data-worst>$758,000</td><td class="num" data-worst>8</td><td class="num" data-best>64 GB</td><td class="num" data-best>8 TB</td></tr>
+</tbody>
+</table>
+
+<p>The paper's own reading of that table: "the multiprocessor server is about three times more expensive but has 22 times fewer CPUs, three times less RAM, and slightly more disk space. Much of the cost difference derives from the much higher interconnect bandwidth and reliability of a high-end server, but again, Google's highly redundant architecture does not rely on either of these attributes"<a class="cite" href="#ref-3">3</a>. Search's own workload is what makes that trade acceptable: "because individual shards don't need to communicate with each other, the resulting speedup is nearly linear. In other words, the CPU speed of the individual index servers does not directly influence the search's overall performance, because we can increase the number of shards to accommodate slower CPUs, and vice versa"<a class="cite" href="#ref-3">3</a>. A workload that needs high single-node interconnect bandwidth and low cross-node communication latency (a distributed join, a tightly-coupled simulation) would not make this trade — the entire argument depends on shards being independent, which is a property of the search workload, not a property of clusters in general. The paper is explicit about the resulting design principle: "price/performance beats peak performance. We purchase the CPU generation that currently gives the best performance per unit price, not the CPUs that give the best absolute performance"<a class="cite" href="#ref-3">3</a>.</p>
+
+<h2 id="scaling-1999-2009">4. Ten years of scaling, and the index-partitioning choice</h2>
+<p>Jeff Dean's WSDM 2009 keynote, "Challenges in Building Large-Scale Information Retrieval Systems," gives a single slide's worth of numbers that quantify a decade of growth on top of the 2003 architecture — a rare case of a Google engineer stating before/after magnitudes directly rather than only a snapshot<a class="cite" href="#ref-4">4</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Google Search parameters, 1999 vs. 2009, as stated in Jeff Dean's WSDM 2009 keynote<a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Parameter</th><th>1999</th><th>2009</th><th class="num">Change</th></tr></thead>
+<tbody>
+<tr><td class="row">Documents indexed</td><td>~70 million</td><td>many billion</td><td class="num" data-worst>~100&times;</td></tr>
+<tr><td class="row">Queries processed / day</td><td>&mdash;</td><td>&mdash;</td><td class="num" data-worst>~1,000&times;</td></tr>
+<tr><td class="row">Per-document info kept in index</td><td>&mdash;</td><td>&mdash;</td><td class="num">~3&times;</td></tr>
+<tr><td class="row">Index update latency</td><td>months</td><td>minutes</td><td class="num" data-best>~10,000&times;</td></tr>
+<tr><td class="row">Average query latency</td><td>&lt;1 s</td><td>&lt;0.2 s</td><td class="num" data-best>~5&times;</td></tr>
+<tr><td class="row">Combined: more machines &times; faster machines</td><td colspan="2"></td><td class="num">~1,000&times;</td></tr>
+</tbody>
+</table>
+
+<p>The keynote's own framing of that table is a warning against static designs: "parameters change over time, often by many orders of magnitude. Right design at X may be very wrong at 10X or 100X... design for ~10X growth, but plan to rewrite before ~100X"<a class="cite" href="#ref-4">4</a>, and it reports that Google's search systems underwent "7 significant revisions in last 10 years... often rolled out without users realizing we've made major changes"<a class="cite" href="#ref-4">4</a>. The 10,000&times; improvement in update latency — months to minutes — is the single number in this table that §5 exists to explain: no amount of buying faster machines under the 2003 architecture's batch update process gets you from months to minutes; that required a different algorithm, not a bigger cluster.</p>
+
+<h3 id="index-partitioning-choice">4.1 By-document vs. by-term index sharding</h3>
+<p>The 2003 paper states that Google shards its inverted index "by dividing the index into pieces (index shards), each having a randomly chosen subset of documents from the full index"<a class="cite" href="#ref-3">3</a> — sharding by document — without spelling out the alternative it rejected. The 2009 keynote states both options and the trade-off explicitly. Sharding by document means "each shard has index for subset of docs," with the query fanning out to every shard and each shard doing its own disk seeks; sharding by term means "shard has subset of words for all docs," with a query for <em>K</em> words touching at most <em>K</em> shards but requiring the results for each word, potentially scattered across shards, to be gathered into one place before they can be intersected<a class="cite" href="#ref-4">4</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 4.</b> Index partitioning by document vs. by term, and why Google's serving environment favors the former<a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Property</th><th>By document</th><th>By term</th></tr></thead>
+<tbody>
+<tr><td class="row">Disk seeks for a <em>K</em>-word query on <em>N</em> shards</td><td class="num" data-worst>O(K &middot; N)</td><td class="num" data-best>O(K)</td></tr>
+<tr><td class="row">Shards touched per query</td><td data-worst>all N</td><td data-best>at most K</td></tr>
+<tr><td class="row">Network bandwidth needed</td><td data-best>low</td><td data-worst>high &mdash; per-doc data for each matching word must be collected in one place</td></tr>
+<tr><td class="row">Per-document info</td><td data-best>easy to keep additional metadata</td><td data-worst>harder</td></tr>
+<tr><td class="row">Query independence across shards</td><td data-best>each shard processes independently</td><td data-worst>needs cross-shard gather</td></tr>
+</tbody>
+</table>
+
+<p>The keynote's own conclusion, stated as a single line: "in our computing environment, by doc makes more sense"<a class="cite" href="#ref-4">4</a>. The reasoning is a direct match to the cost argument in §3.2 — Google's clusters are built from many cheap, high-count, comparatively bandwidth-constrained commodity machines rather than few machines on a fast interconnect<a class="cite" href="#ref-3">3</a>, and by-term sharding is exactly the strategy that shifts cost onto network bandwidth to save disk seeks. By-doc sharding costs a bounded number of disk seeks per shard per query, which the 2003 architecture already amortizes across thousands of cheap machines<a class="cite" href="#ref-3">3</a>; by-term sharding would have shifted that cost onto the network, which is the resource Google's own commodity-cluster design intentionally under-provisions relative to CPU and disk count.</p>
+
+<h3 id="batch-index-updates">4.2 How index updates worked before incremental processing</h3>
+<p>The same keynote describes, for the 1998–1999 era specifically, the batch mechanism the 2003 architecture inherited and that the 10,000&times; latency improvement in Table 3 eventually replaced: "1998–1999: index updates (~once per month): wait until traffic is low, take some replicas offline, copy new index to these replicas, start new frontends pointing at updated index and serve some traffic from there"<a class="cite" href="#ref-4">4</a>. The mechanism used the physical geometry of a spinning disk as a performance trick during the swap: "index server disk: outer part of disk gives higher disk bandwidth... copy new index to inner half of disk (while still serving old index)... restart to use new index... wipe old index... re-copy new index to faster [outer] half of disk"<a class="cite" href="#ref-4">4</a> — the new index is staged on the slower inner tracks first so the old index keeps serving from the fast outer tracks throughout the copy, then swapped to the fast tracks only once it is verified and the old copy is gone. This is a real, once-a-month, multi-step operational procedure, not a background process — and it is the direct target of the "months to minutes" line in Table 3.</p>
+
+<h2 id="batch-to-incremental">5. From batch MapReduce to incremental processing: Percolator and Caffeine</h2>
+<p>Daniel Peng and Frank Dabek's 2010 OSDI paper describes exactly the system that produced the 10,000&times; index-update-latency improvement in Table 3, and it states the batch predecessor's cost in the same breath as introducing its replacement: "in our previous system, each day we crawled several billion documents and fed them along with a repository of existing documents through a series of 100 MapReduces... though not all 100 MapReduces were on the critical path for every document, the organization of the system as a series of MapReduces meant that each document spent 2-3 days being indexed before it could be returned as a search result"<a class="cite" href="#ref-5">5</a>. A hundred sequential-ish batch jobs, each waiting on the slowest straggler in the previous stage, is precisely the kind of design the 2009 keynote warned would become "very wrong" once update latency needed to move from months to minutes<a class="cite" href="#ref-4">4</a> — and a monthly full-index rebuild (§4.2) is not even a candidate for a 2–3 day figure; the 100-MapReduce pipeline described here is an intermediate architecture between the 1999 monthly rebuild and the system this section describes replacing it.</p>
+<p>The replacement, internally named Caffeine, is built directly on top of the storage layers §6 covers next: "Percolator is built on top of the Bigtable distributed storage system... A running Bigtable consists of a collection of tablet servers... A tablet is stored as a collection of read-only files in the Google SSTable format. SSTables are stored in GFS; Bigtable relies on GFS to preserve data in the event of disk loss"<a class="cite" href="#ref-5">5</a>. Percolator adds exactly two things Bigtable does not natively provide: "the challenge, then, in implementing Percolator is providing the features that Bigtable does not: multirow transactions and the observer framework"<a class="cite" href="#ref-5">5</a> — cross-row ACID transactions with snapshot isolation, and a trigger mechanism ("observers") that lets a write to one column kick off the next stage of processing automatically.</p>
+
+<h3 id="percolator-mechanism">5.1 Transactions on Bigtable, and notifications instead of MapReduce stages</h3>
+<p>Percolator's transactions run at snapshot isolation, coordinated by a single small service: "the timestamp oracle is a server that hands out timestamps in strictly increasing order... Batching increases the scalability of the oracle... Our oracle serves around 2 million timestamps per second from a single machine"<a class="cite" href="#ref-5">5</a>. Every transaction reads at a start timestamp and commits at a later commit timestamp, and the paper is explicit that this buys efficient reads at the cost of write-skew exposure it does not try to prevent: "snapshot isolation does not provide serializability... The main advantage of snapshot isolation over a serializable protocol is more efficient reads. Because any timestamp represents a consistent snapshot, reading a cell requires only performing a Bigtable lookup at the given timestamp; acquiring locks is not necessary"<a class="cite" href="#ref-5">5</a>.</p>
+<p>The mechanism that replaces "the next MapReduce stage" is a table-level trigger: "in Percolator, the user writes code ('observers') to be triggered by changes to the table, and we link all the observers into a binary running alongside every tablet server. Each observer registers a function and a set of columns with Percolator, and Percolator invokes the function after data is written to one of those columns in any row"<a class="cite" href="#ref-5">5</a>. Chaining stages together is then just one observer's transaction writing to a column another observer watches: "Percolator applications are structured as a series of observers; each observer completes a task and creates more work for 'downstream' observers by writing to the table. An external process triggers the first observer in the chain by writing initial data into the table. In our indexing system, a MapReduce loads crawled documents into Percolator by running loader transactions, which trigger the document processor transaction to index the document"<a class="cite" href="#ref-5">5</a>. The paper reports this collapses the pipeline dramatically in observer count alone: "the Google indexing system has roughly 10 observers"<a class="cite" href="#ref-5">5</a> — 10 chained transactional steps in place of 100 MapReduce jobs.</p>
+
+<h3 id="percolator-tradeoffs">5.2 What incremental processing actually bought, and what it cost</h3>
+<p>The paper's own headline result is stated in two different units that agree with each other: "the median document moves through Caffeine over 100x faster than the previous system... the average age of a document appearing in a search result dropped by nearly 50 percent (the age of a search result includes delays other than indexing such as the time between a document being changed and being crawled)"<a class="cite" href="#ref-5">5</a>. The two numbers measure different things — 100&times; is the median per-document indexing latency improvement; the roughly 50% figure is the average freshness improvement across all documents in a live search result, which also includes crawl-scheduling delay that Percolator does not touch — and the paper is careful to distinguish them rather than conflate a median-latency win with an average-freshness win.</p>
+<p>This did not come free. The paper reports the resource cost directly rather than only the latency win: "compared to the system it replaced, Caffeine uses roughly twice as many resources to process the crawl rate. However, the radically-lower latency of the new system also enables us to remove the rigid distinctions between large, slow-to-update indexes and smaller, more rapidly updated indexes. Because Percolator frees us from needing to process the repository each time we index documents, we can also make it larger: Caffeine's document collection is currently 3x larger than the previous system's"<a class="cite" href="#ref-5">5</a>. And the trade is not universal — the paper is explicit that Percolator loses to a MapReduce-based pipeline at high enough crawl rates, because random Bigtable lookups per document are more expensive per byte than streaming the whole repository through disk: "at the cross-over point the total cost of the lookups required to cluster the new documents under Percolator equals the cost to stream the documents and the repository through MapReduce. At crawl rates higher than that, one is better off using MapReduce"<a class="cite" href="#ref-5">5</a>, measured in the paper's own synthetic benchmark at roughly a 40% crawl rate per hour<a class="cite" href="#ref-5">5</a> — far above the single-digit hourly crawl rates the paper says real systems actually operate at.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 5.</b> Batch (100-MapReduce) indexing vs. incremental Percolator/Caffeine indexing, by the numbers Google published<a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Property</th><th>Batch (pre-2010)</th><th>Incremental (Caffeine)</th></tr></thead>
+<tbody>
+<tr><td class="row">Per-document indexing latency</td><td class="num" data-worst>2&ndash;3 days</td><td class="num" data-best>&asymp;100&times; faster (median)</td></tr>
+<tr><td class="row">Average document age in results</td><td>baseline</td><td class="num" data-best>&asymp;50% lower</td></tr>
+<tr><td class="row">Pipeline stages</td><td class="num" data-worst>100 MapReduces</td><td class="num" data-best>&asymp;10 observers</td></tr>
+<tr><td class="row">Resources to process a fixed crawl rate</td><td class="num" data-best>1&times;</td><td class="num" data-worst>&asymp;2&times;</td></tr>
+<tr><td class="row">Document collection size</td><td class="num">1&times;</td><td class="num" data-best>3&times; larger</td></tr>
+<tr><td class="row">Wins below crawl rate</td><td data-best>&gt;~40% of repository/hour</td><td data-best>&lt;~40% of repository/hour</td></tr>
+</tbody>
+</table>
+
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>The 100&times; latency win and the 2&times; resource cost are the same design decision seen from two sides. MapReduce amortizes cost by streaming the entire repository through disk once per batch, whether or not most documents changed; Percolator pays for a targeted, random Bigtable lookup per changed document instead, which is more expensive per document processed but does not scale with total repository size. At single-digit hourly crawl rates that trade is a clear win; the crossover in §5.2 marks where it stops being one<a class="cite" href="#ref-5">5</a>.</p></aside>
+
+<h2 id="storage-lineage">6. The storage lineage underneath both stages: GFS, Bigtable, Megastore, Spanner</h2>
+<p>Section 5 already named the two layers Percolator sits on — Bigtable and GFS. This section is about how those two layers, plus the two that came after them, form a single lineage that both Search and Gmail sit on, each layer built explicitly to fix a limitation of the one before it. Module 7 covers GFS's own mechanics (single-master metadata, 64MB chunks, atomic record append) and Module 3/4/6 cover Bigtable's and Spanner's replication, transaction, and consensus mechanics in depth; this section does not re-derive any of that. It only places the four systems on one timeline and states, from each paper directly, who used each one and why the next layer had to exist.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f4t"><title id="f4t">Storage lineage timeline: GFS 2003, Bigtable 2006, Megastore, Spanner 2012, with each layer's documented consumers</title>
+    <line x1="60" y1="120" x2="740" y2="120" class="d-axis"/>
+    <circle cx="140" cy="120" r="5" class="d-fill-blue"/>
+    <circle cx="340" cy="120" r="5" class="d-fill-blue"/>
+    <circle cx="480" cy="120" r="5" class="d-fill-blue"/>
+    <circle cx="680" cy="120" r="5" class="d-hl"/>
+
+    <text x="140" y="140" text-anchor="middle" class="d-mono d-small">2003</text>
+    <text x="340" y="140" text-anchor="middle" class="d-mono d-small">2006</text>
+    <text x="480" y="140" text-anchor="middle" class="d-mono d-small">~2008</text>
+    <text x="680" y="140" text-anchor="middle" class="d-mono d-small">2012</text>
+
+    <rect x="60" y="40" width="160" height="60" rx="8" class="d-block"/><text x="140" y="63" text-anchor="middle" class="d-text-inv d-bold d-small">GFS</text><text x="140" y="80" text-anchor="middle" class="d-text-inv d-small">file layer</text><text x="140" y="94" text-anchor="middle" class="d-text-inv d-small">SOSP '03</text>
+    <path d="M140,100 L140,115" class="d-arrow"/>
+
+    <rect x="260" y="40" width="160" height="60" rx="8" class="d-block-2"/><text x="340" y="63" text-anchor="middle" class="d-text-inv d-bold d-small">Bigtable</text><text x="340" y="80" text-anchor="middle" class="d-text-inv d-small">structured store on GFS</text><text x="340" y="94" text-anchor="middle" class="d-text-inv d-small">OSDI '06</text>
+    <path d="M340,100 L340,115" class="d-arrow"/>
+
+    <rect x="400" y="40" width="160" height="60" rx="8" class="d-block-accent"/><text x="480" y="63" text-anchor="middle" class="d-text-inv d-bold d-small">Megastore</text><text x="480" y="80" text-anchor="middle" class="d-text-inv d-small">on Bigtable, 300+ apps</text><text x="480" y="94" text-anchor="middle" class="d-text-inv d-small">described in Spanner §2.3</text>
+    <path d="M480,100 L480,115" class="d-arrow"/>
+
+    <rect x="600" y="40" width="160" height="60" rx="8" class="d-fill-amber-soft d-stroke-amber"/><text x="680" y="63" text-anchor="middle" class="d-bold d-small">Spanner</text><text x="680" y="80" text-anchor="middle" class="d-small">Paxos + TrueTime</text><text x="680" y="94" text-anchor="middle" class="d-small">OSDI '12</text>
+    <path d="M680,100 L680,115" class="d-arrow"/>
+
+    <rect x="40" y="170" width="200" height="50" rx="6" class="d-panel"/><text x="140" y="190" text-anchor="middle" class="d-small d-bold">Consumers:</text><text x="140" y="206" text-anchor="middle" class="d-small">every layer above it</text>
+
+    <rect x="250" y="170" width="200" height="60" rx="6" class="d-panel"/><text x="350" y="190" text-anchor="middle" class="d-small d-bold">Consumers:</text><text x="350" y="205" text-anchor="middle" class="d-small">web indexing, Percolator,</text><text x="350" y="220" text-anchor="middle" class="d-small">Google Finance, Earth</text>
+
+    <rect x="460" y="170" width="260" height="70" rx="6" class="d-panel"/><text x="590" y="190" text-anchor="middle" class="d-small d-bold">Consumers (300+ apps):</text><text x="590" y="205" text-anchor="middle" class="d-small">Gmail, Picasa, Calendar,</text><text x="590" y="220" text-anchor="middle" class="d-small">Android Market, AppEngine</text><text x="590" y="234" text-anchor="middle" class="d-small d-text-light">&mdash; despite lower performance</text>
+
+    <text x="400" y="270" text-anchor="middle" class="d-small d-text-light">Each layer's own paper states why the next one had to exist: no cross-row transactions (Bigtable) &rarr; simpler but slower model (Megastore) &rarr; externally-consistent transactions at global scale (Spanner)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> The storage lineage from GFS through Spanner, with each layer's documented consumers from its own or a successor's paper<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-8">8</a>. Megastore's publication and internal rollout predate Spanner's 2012 paper; it is placed on the timeline by the period its 300+ applications were live, as described retrospectively in Spanner's own related-work section.</figcaption>
+</figure>
+
+<h3 id="gfs-bigtable-layer">6.1 GFS as the file layer, Bigtable as the structured layer on top of it</h3>
+<p>Bigtable's own abstract states its position in the stack and one of its uses directly: "many projects at Google store data in Bigtable, including web indexing, Google Earth, and Google Finance"<a class="cite" href="#ref-7">7</a> — web indexing named explicitly, in the paper's own first paragraph, as one of Bigtable's demanding workloads. The paper's worked example of its data model is, not coincidentally, a table of crawled web pages: "let us call this particular table the Webtable. In Webtable, we would use URLs as row keys, various aspects of web pages as column names, and store the contents of the web pages in the <code>contents:</code> column"<a class="cite" href="#ref-7">7</a>, with an <code>anchor:</code> column family whose "qualifier is the name of the referring site; the cell contents is the link text"<a class="cite" href="#ref-7">7</a> — the same anchor-text-as-a-ranking-input idea Brin and Page's 1998 anchors file captured (§2.1), now expressed as Bigtable columns instead of a flat file.</p>
+<p>Bigtable's own persistence guarantee depends entirely on the file layer underneath it: "a tablet is stored as a collection of read-only files in the Google SSTable format. SSTables are stored in GFS; Bigtable relies on GFS to preserve data in the event of disk loss"<a class="cite" href="#ref-7">7</a> — Bigtable does not replicate bytes itself; it delegates that job to GFS's own chunk replication (Module 3, Module 7) and adds structured indexing, column families, and row-range sharding (tablets) on top. This is the general pattern the rest of the lineage repeats: each new layer adds exactly one capability the layer below lacks, and delegates everything else downward.</p>
+
+<h3 id="four-layer-comparison">6.2 What each layer added, and what it still didn't provide</h3>
+<table class="tbl tbl-dense">
+<caption><b>Table 6.</b> The four storage layers in Search and Gmail's lineage, and the one capability each added over the layer beneath it<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-8">8</a>.</caption>
+<thead><tr><th>Layer</th><th>Unit of data</th><th>What it added</th><th>What it still lacked</th></tr></thead>
+<tbody>
+<tr><td class="row">GFS</td><td>64 MB chunks, replicated 3&times;<a class="cite" href="#ref-6">6</a></td><td>fault-tolerant bytes at cluster scale via a single in-memory-metadata master<a class="cite" href="#ref-6">6</a></td><td>no structure, no indexing, no transactions</td></tr>
+<tr><td class="row">Bigtable</td><td>rows in a tablet (~100&ndash;200 MB), on GFS SSTables<a class="cite" href="#ref-7">7</a></td><td>sparse sorted multi-dimensional map, column families, single-row atomic read-modify-write<a class="cite" href="#ref-7">7</a></td><td>"does not currently support general transactions across row keys"<a class="cite" href="#ref-7">7</a></td></tr>
+<tr><td class="row">Megastore</td><td>entity groups, on Bigtable</td><td>a simpler data model for interactive applications, used by 300+ Google apps<a class="cite" href="#ref-8">8</a></td><td>"despite its relatively low performance"<a class="cite" href="#ref-8">8</a></td></tr>
+<tr><td class="row">Spanner</td><td>directories over Paxos-replicated tablets<a class="cite" href="#ref-8">8</a></td><td>externally-consistent cross-row, cross-datacenter transactions via TrueTime<a class="cite" href="#ref-8">8</a></td><td>higher write latency than Bigtable's single-row path (2PC + clock-uncertainty wait)</td></tr>
+</tbody>
+</table>
+
+<p>Spanner's own paper states the motivating gap directly: "at least 300 applications within Google use Megastore (despite its relatively low performance) because its data model is simpler to manage... than Bigtable's, and because of its support for synchronous replication across datacenters"<a class="cite" href="#ref-8">8</a>. Megastore already chose synchronous cross-datacenter replication over Bigtable's eventually-consistent replication — the performance cost the quote refers to is largely that synchronization cost, paid in exchange for a simpler-to-reason-about consistency model than raw Bigtable's per-row-only guarantees. Spanner's contribution was making that trade-off unnecessary: general-purpose, externally-consistent transactions across rows, tables, and datacenters, "shard[ing] data across many sets of Paxos state machines in datacenters spread all over the world"<a class="cite" href="#ref-8">8</a>, with the TrueTime API bounding clock uncertainty to "generally less than 10ms" using GPS and atomic clock references<a class="cite" href="#ref-8">8</a> — the mechanism Module 5 covers as the answer to the consistency/latency trade-off, and Module 6 covers as an application of Paxos consensus.</p>
+
+<h2 id="megastore-fanout">7. Megastore's 300+ applications, and what Google has not published about Gmail</h2>
+<p>Spanner's paper names Megastore's consumers directly, and this is the single most concrete, citable fact this module has about Gmail's storage: "examples of well-known Google applications that use Megastore are Gmail, Picasa, Calendar, Android Market, and AppEngine"<a class="cite" href="#ref-8">8</a>, out of "at least 300 applications within Google" that used it despite its cost<a class="cite" href="#ref-8">8</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f5t"><title id="f5t">Megastore's fan-out: 300+ Google applications on one storage layer, with Gmail, Picasa, Calendar, Android Market, and AppEngine named</title>
+    <rect x="300" y="20" width="200" height="56" rx="8" class="d-block-2"/><text x="400" y="43" text-anchor="middle" class="d-text-inv d-bold">Megastore</text><text x="400" y="60" text-anchor="middle" class="d-text-inv d-small">on Bigtable, sync cross-DC</text>
+
+    <path d="M340,76 L160,140" class="d-arrow"/>
+    <path d="M370,76 L280,140" class="d-arrow"/>
+    <path d="M400,76 L400,140" class="d-arrow"/>
+    <path d="M430,76 L520,140" class="d-arrow"/>
+    <path d="M460,76 L640,140" class="d-arrow"/>
+
+    <rect x="80" y="140" width="160" height="46" rx="8" class="d-hl"/><text x="160" y="167" text-anchor="middle" class="d-bold">Gmail</text>
+    <rect x="260" y="140" width="120" height="46" rx="8" class="d-block-accent"/><text x="320" y="167" text-anchor="middle" class="d-text-inv d-bold">Picasa</text>
+    <rect x="400" y="140" width="120" height="46" rx="8" class="d-block-accent"/><text x="460" y="167" text-anchor="middle" class="d-text-inv d-bold">Calendar</text>
+    <rect x="540" y="140" width="150" height="46" rx="8" class="d-block-accent"/><text x="615" y="167" text-anchor="middle" class="d-text-inv d-bold">Android Market</text>
+
+    <rect x="300" y="200" width="200" height="46" rx="8" class="d-block-accent"/><text x="400" y="227" text-anchor="middle" class="d-text-inv d-bold">AppEngine</text>
+    <path d="M400,200 L400,186" class="d-arrow"/>
+
+    <rect x="80" y="255" width="620" height="34" rx="6" class="d-outline d-dashed"/>
+    <text x="390" y="277" text-anchor="middle" class="d-small">+ &ge;295 more named-but-unlisted applications<a class="cite" href="#ref-8">8</a></text>
+  </svg>
+  <figcaption><b>Figure 5.</b> At least 300 Google applications ran on Megastore; Spanner's own paper names five of them by name, Gmail included<a class="cite" href="#ref-8">8</a>. This is the extent of what this module's sources say about Gmail's storage layer.</figcaption>
+</figure>
+
+<h3 id="gmail-undocumented">7.1 Why this module stops here for Gmail</h3>
+<p>The single quoted sentence above is the entirety of what a Google-authored primary source in this module's research says about Gmail's storage architecture: that it was, at some point, one of at least 300 applications using Megastore. No paper in this module's source set describes Gmail's schema, its message-storage format, its search-indexing mechanism for a user's own mailbox, its spam-filtering pipeline, its attachment-storage path, or whether and how it migrated off Megastore onto Spanner or another system since 2012. The manifest for this module is explicit about why: Gmail has no dedicated Google-published architecture account, unlike Search, GFS, Bigtable, Spanner, or Borg, each of which has at least one full engineering paper devoted to it.</p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Everything this module says about Gmail comes from exactly two citable facts: it appears in Spanner's list of Megastore consumers<a class="cite" href="#ref-8">8</a>, and it appears in Borg's own list of latency-sensitive production services (§8)<a class="cite" href="#ref-9">9</a>. Any more specific claim about Gmail's internal architecture — its data model, its consistency guarantees, its current storage backend — would be reconstruction from general knowledge of similar systems, not a documented fact, and this module does not make that substitution. If Gmail's architecture is what you need in more depth than "it is a Megastore and Borg consumer," no source available to this course provides it.</p></aside>
+<p>The Borg paper's mention (§8) is one datapoint later than the Spanner paper's: Borg's 2015 paper lists Gmail as a current example of a latency-sensitive production service, three years after Spanner's 2012 paper described Megastore's 300+-application fan-out<a class="cite" href="#ref-9">9</a>. That is consistent with Gmail having existed on Borg-scheduled infrastructure across both eras, but it is not a claim that Gmail's storage layer specifically was still Megastore in 2015 rather than Spanner or Bigtable directly — the Borg paper does not name Gmail's storage backend at all, only its compute scheduling.</p>
+
+<h2 id="borg-substrate">8. Borg: the compute substrate scheduling both workloads</h2>
+<p>Every server in Figures 1–5 — crawler, indexer, index server, docserver, Percolator worker, Bigtable tablet server, Spanner spanserver — runs as a job on Borg, Google's own cluster manager and the direct design ancestor of Kubernetes<a class="cite" href="#ref-9">9</a>. Borg's own paper names both of this module's case-study workloads in one sentence: "long-running services should never go down, and their latency should be low... Such services are used for end-user-facing products such as Gmail, Google Docs, and web search, and for internal infrastructure services (e.g., BigTable)"<a class="cite" href="#ref-9">9</a> — Gmail and web search named side by side as examples of the same job category, "prod" (production, latency-sensitive), distinguished from the batch category covering the crawling and indexing jobs in §2 and §5.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f6t"><title id="f6t">A Borg cell scheduling a Search-serving prod job and a Gmail-class prod job side by side, both drawing from the same quota-checked resource pool</title>
+    <rect x="40" y="30" width="720" height="250" rx="10" class="d-outline d-dashed"/>
+    <text x="60" y="20" class="d-small d-bold">Borg cell &mdash; median ~10,000 machines<a class="cite" href="#ref-9">9</a></text>
+
+    <rect x="70" y="55" width="320" height="100" rx="8" class="d-block"/>
+    <text x="230" y="78" text-anchor="middle" class="d-text-inv d-bold">Job: web-search-index-serve</text>
+    <text x="230" y="96" text-anchor="middle" class="d-text-inv d-small">alloc class: prod</text>
+    <text x="230" y="111" text-anchor="middle" class="d-text-inv d-small">tasks: index-server-shard-0..N</text>
+    <text x="230" y="126" text-anchor="middle" class="d-text-inv d-small">BNS name written to Chubby</text>
+    <text x="230" y="141" text-anchor="middle" class="d-text-inv d-small">quota checked at submission</text>
+
+    <rect x="410" y="55" width="320" height="100" rx="8" class="d-block-accent"/>
+    <text x="570" y="78" text-anchor="middle" class="d-text-inv d-bold">Job: gmail-frontend</text>
+    <text x="570" y="96" text-anchor="middle" class="d-text-inv d-small">alloc class: prod</text>
+    <text x="570" y="111" text-anchor="middle" class="d-text-inv d-small">tasks: mail-serve-0..M</text>
+    <text x="570" y="126" text-anchor="middle" class="d-text-inv d-small">BNS name written to Chubby</text>
+    <text x="570" y="141" text-anchor="middle" class="d-text-inv d-small">quota checked at submission</text>
+
+    <rect x="70" y="180" width="660" height="34" rx="6" class="d-panel"/>
+    <text x="400" y="202" text-anchor="middle" class="d-small">Both are &ldquo;prod&rdquo;: ~70% of a representative cell's allocated CPU, ~60% of CPU used, ~85% of memory used<a class="cite" href="#ref-9">9</a></text>
+
+    <rect x="70" y="225" width="320" height="40" rx="8" class="d-block-muted"/><text x="230" y="248" text-anchor="middle" class="d-small">Batch jobs: crawling, MapReduce/Percolator (§2, §5) share the same machines, lower priority</text>
+
+    <rect x="410" y="225" width="320" height="40" rx="8" class="d-block-muted"/><text x="570" y="248" text-anchor="middle" class="d-small">Preempted on SIGTERM ~80% of the time before SIGKILL<a class="cite" href="#ref-9">9</a></text>
+  </svg>
+  <figcaption><b>Figure 6.</b> A Borg cell scheduling a Search-serving job and a Gmail-class job as two independent "prod" jobs sharing one cell's admission-control quota and physical machines with lower-priority batch work<a class="cite" href="#ref-9">9</a>. Job and task names are illustrative of Borg's naming scheme, not literal published identifiers — Borg's paper does not disclose Google's actual internal job names.</figcaption>
+</figure>
+
+<h3 id="borg-mechanics">8.1 What "scheduled on the same cell" actually means</h3>
+<p>A cell is Borg's unit of a managed cluster: "Borg cells run hundreds of thousands of jobs, from many thousands of different applications, across a number of clusters each with up to tens of thousands of machines... our median cell size is about 10k machines"<a class="cite" href="#ref-9">9</a>. Search and Gmail, as prod jobs, are two of "hundreds of thousands" of jobs a single cell might be running concurrently, competing for the same machines' CPU and memory as batch work, but with a resource-allocation guarantee batch work does not get: "prod jobs are allocated about 70% of the total CPU resources and represent about 60% of the total CPU usage; they are allocated about 55% of the total memory and represent about 85% of the total memory usage"<a class="cite" href="#ref-9">9</a> — prod jobs are allocated more CPU than they typically use (headroom for latency spikes), while batch jobs opportunistically consume the difference.</p>
+<p>Admission itself is quota-gated before scheduling ever runs: "quota-checking is part of admission control, not scheduling: jobs with insufficient quota are immediately rejected upon submission"<a class="cite" href="#ref-9">9</a> — a Search-serving job and a Gmail job each hold a separate quota grant, checked once at submission time, independent of whatever the scheduler later decides about machine placement. And every task, regardless of which product it belongs to, gets the same discovery mechanism: "Borg creates a stable 'Borg name service' (BNS) name for each task that includes the cell name, job name, and task number. Borg writes the task's hostname and port into a consistent, highly-available file in Chubby with this name"<a class="cite" href="#ref-9">9</a> — the same Chubby lock service Bigtable uses for master election (Module 6) doubles as the address book every other service on the cell uses to find a Search index-server shard or a Gmail frontend task. This is the concrete, cited answer to "what does it mean for Search and Gmail to run on the same infrastructure": they are two named jobs, admitted against two quota grants, competing for CPU and memory headroom on the same 10,000-machine cell, discoverable through the same lock service — and nothing about that shared substrate implies anything about whether they share a storage layer, which §7 already stated is undocumented for Gmail beyond its historical Megastore membership.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Module 6 introduces this disagreement in the abstract: is Raft's understandability advantage over Paxos decisive in practice? This module is where it has to be tested against a concrete case, because two of the systems this module has just walked through — Bigtable's Chubby lock service and Spanner's spanservers — are Google's own production answer, and neither uses Raft.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Understandability should decide the winner</h4>
+    <p class="who">Ongaro and Ousterhout, Raft's designers<a class="cite" href="#ref-10">10</a></p>
+    <p>Raft was built specifically to be easier to reason about and implement correctly than Paxos, and its own user study measured that difference directly: "a user study with 43 students at two universities shows that Raft is significantly easier to understand than Paxos: after learning both algorithms, 33 of these students were able to answer questions about Raft better than questions about Paxos"<a class="cite" href="#ref-10">10</a>. The argument is that an algorithm's safety proof is only as good as an implementer's ability to reproduce it correctly under deadline pressure, and Paxos's single-decree formulation famously leaves practitioners to invent their own multi-decree, membership-change, and leader-election extensions — exactly the parts Raft specifies as one coherent design instead of "a series of independent sub-protocols."</p>
+    <ul class="pros"><li>A measured, replicated (43-subject) result, not an assertion — rare for a claim about implementation difficulty</li><li>Directly targets the failure mode that causes real outages: a subtly wrong from-scratch Paxos implementation, not a correctly-implemented one</li></ul>
+    <ul class="cons"><li>The study measures comprehension by students learning both algorithms for the first time in an afternoon, not the reliability of a production implementation built and hardened over a decade</li><li>Says nothing about whether an already-correct, already-battle-tested Paxos implementation should be thrown away</li></ul>
+  </article>
+  <article class="position">
+    <h4>Operational maturity of an existing implementation dominates</h4>
+    <p class="who">Google's own production choices, as documented in the Bigtable and Spanner papers<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-8">8</a></p>
+    <p>Bigtable's master election runs on Chubby, and "Chubby uses the Paxos [9, 23] algorithm to keep its replicas consistent in the face of failure"<a class="cite" href="#ref-7">7</a>. Spanner, published six years after Chubby was already in wide production use and two years after Raft's own extended paper, still chose Paxos for its spanservers: "it is a database that shards data across many sets of Paxos state machines"<a class="cite" href="#ref-8">8</a>, with "long-lived leaders with time-based leader leases, whose length defaults to 10 seconds"<a class="cite" href="#ref-8">8</a>. Bigtable's own measured Chubby-outage cost — averaging 0.0047% of server-hours across 14 clusters, worst single cluster 0.0326%<a class="cite" href="#ref-3">3</a> — is a number that only exists because the implementation has already been run, measured, and incrementally fixed for years; a from-scratch rewrite in a more understandable algorithm forfeits that accumulated operational knowledge and restarts the reliability curve from zero.</p>
+    <ul class="pros"><li>A hardened implementation's failure modes are known, monitored, and already mitigated; a rewrite's are not, regardless of the new algorithm's textbook clarity</li><li>Google shipped Spanner in 2012 with full knowledge that Raft's extended paper (2014, but circulating from 2013) existed in the same research community and still chose Paxos</li></ul>
+    <ul class="cons"><li>This is a survivorship argument, not a counter-claim about understandability — it says switching costs were high, not that Paxos is easier to get right the first time</li><li>Neither paper states that Google evaluated Raft and rejected it; the absence of a migration is consistent with "never considered" as much as with "considered and rejected"</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>These two positions are not actually in conflict once "decisive" is read as a question about when in a system's life the understandability advantage is realized. For a team choosing a consensus algorithm today, before any implementation exists, Raft's decomposition and the 43-student result are a real, measured argument for lower defect risk during initial implementation — this is the moment the advantage is decisive, and it is why nearly every consensus library built after 2014 (etcd, CockroachDB's Raft-based ranges, Consul) chose Raft over rolling a new Paxos variant. For a team that already has a hardened, measured, decade-old Paxos implementation underneath a production system as consequential as Bigtable's master election or Spanner's replication — Google's actual position in 2012 — the calculus is different: the cost being compared is not "Raft vs. Paxos in the abstract" but "a rewrite of a working system vs. its current failure rate," and Bigtable's own 0.0047% number<a class="cite" href="#ref-3">3</a> shows that failure rate was already very low. What would settle this for a specific team is neither paper's argument but a direct cost estimate: the defect rate of new Paxos implementations built without Raft's decomposition, compared against the migration cost and interim-outage risk of replacing an already-hardened Paxos deployment — a comparison neither the Raft paper nor Google's papers attempt, because each is answering a different question at a different point in a system's lifecycle.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>Google Search Central. <em>In-Depth Guide to How Google Search Works.</em> Live documentation, 2026. <a href="https://developers.google.com/search/docs/fundamentals/how-search-works">https://developers.google.com/search/docs/fundamentals/how-search-works</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the three-stage crawl/index/serve description, index scale (hundreds of billions of pages, over 100,000,000 GB), headless-Chrome JS rendering, ranking-factor and no-pay-to-rank statements, indexing-not-guaranteed statement.</span></li>
+<li id="ref-2"><span class="ref-type">paper</span>Brin, S. &amp; Page, L. <em>The Anatomy of a Large-Scale Hypertextual Web Search Engine.</em> Computer Networks and ISDN Systems, vol. 30, 1998, pp. 107-117. <a href="http://infolab.stanford.edu/pub/papers/google.pdf">http://infolab.stanford.edu/pub/papers/google.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 1998 prototype's system architecture (§4.1), storage statistics (Table 1), the PageRank formula and random-surfer model (§2.1), and the crawl-rate arithmetic (§4.3, §4.4).</span></li>
+<li id="ref-3"><span class="ref-type">paper</span>Barroso, L.A., Dean, J. &amp; Hölzle, U. <em>Web Search for a Planet: The Google Cluster Architecture.</em> IEEE Micro, vol. 23, no. 2, March-April 2003, pp. 22-28. <a href="https://barroso.org/publications/ieeemicro_google.pdf">https://barroso.org/publications/ieeemicro_google.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 2003 query-serving architecture (GWS, index servers, docservers), index sharding and replication for throughput/fault tolerance, the commodity-PC vs. high-end-server cost/performance comparison, and Bigtable's measured Chubby-outage percentage cited in the disagreement section.</span></li>
+<li id="ref-4"><span class="ref-type">talk</span>Dean, J. <em>Challenges in Building Large-Scale Information Retrieval Systems.</em> WSDM 2009 keynote. <a href="https://research.google.com/people/jeff/WSDM09-keynote.pdf">https://research.google.com/people/jeff/WSDM09-keynote.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 1999-vs-2009 growth table (Table 3), the by-document vs. by-term index-partitioning trade-off (Table 4), and the 1998-99 monthly batch index-update mechanism (§4.2).</span></li>
+<li id="ref-5"><span class="ref-type">paper</span>Peng, D. &amp; Dabek, F. <em>Large-scale Incremental Processing Using Distributed Transactions and Notifications.</em> OSDI 2010. <a href="https://www.usenix.org/legacy/event/osdi10/tech/full_papers/Peng.pdf">https://www.usenix.org/legacy/event/osdi10/tech/full_papers/Peng.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the batch (100-MapReduce) indexing system's 2-3 day latency, Percolator's architecture on Bigtable/GFS, the timestamp oracle, snapshot isolation, the observer/notification mechanism, and Caffeine's measured latency, freshness, resource, and index-size figures (Table 5).</span></li>
+<li id="ref-6"><span class="ref-type">paper</span>Ghemawat, S., Gobioff, H. &amp; Leung, S-T. <em>The Google File System.</em> SOSP 2003. <a href="https://research.google.com/archive/gfs-sosp2003.pdf">https://research.google.com/archive/gfs-sosp2003.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: GFS's place at the base of the storage lineage (Table 6); detailed GFS mechanics are covered in Module 7 rather than repeated here.</span></li>
+<li id="ref-7"><span class="ref-type">paper</span>Chang, F. et al. <em>Bigtable: A Distributed Storage System for Structured Data.</em> OSDI 2006. <a href="https://www.usenix.org/legacy/event/osdi06/tech/chang/chang.pdf">https://www.usenix.org/legacy/event/osdi06/tech/chang/chang.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Bigtable's web-indexing use (abstract), the Webtable example, Bigtable's dependence on GFS/SSTables, the lack of cross-row transactions, and Chubby's use of Paxos, cited in the disagreement section.</span></li>
+<li id="ref-8"><span class="ref-type">paper</span>Corbett, J.C. et al. <em>Spanner: Google's Globally-Distributed Database.</em> OSDI 2012. <a href="https://research.google.com/archive/spanner-osdi2012.pdf">https://research.google.com/archive/spanner-osdi2012.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Megastore's 300+ application fan-out naming Gmail, Picasa, Calendar, Android Market, and AppEngine (§7); Spanner's Paxos spanservers, leader leases, and TrueTime; and the Paxos-in-production position in the disagreement section.</span></li>
+<li id="ref-9"><span class="ref-type">paper</span>Verma, A., Pedrosa, L., Korupolu, M., Oppenheimer, D., Tune, E. &amp; Wilkes, J. <em>Large-scale cluster management at Google with Borg.</em> EuroSys 2015. <a href="https://research.google.com/pubs/archive/43438.pdf">https://research.google.com/pubs/archive/43438.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Borg cell size, Gmail and web search named as prod workloads, prod CPU/memory allocation-vs-usage figures, quota-at-admission-control, and the BNS naming mechanism (§8).</span></li>
+<li id="ref-10"><span class="ref-type">paper</span>Ongaro, D. &amp; Ousterhout, J. <em>In Search of an Understandable Consensus Algorithm (Extended Version).</em> 2014. <a href="https://raft.github.io/raft.pdf">https://raft.github.io/raft.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 43-student understandability user study, cited only in the disagreement section.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

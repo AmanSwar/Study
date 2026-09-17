@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM Multi-Node: Distributed Serving, Disaggregated Prefill, and the Production Stack · Multi-Node LLM Inference: From One Node to N</title>
+<meta name="description" content="vLLM's own multi-node story: the KVTransferConfig connector surface, DP+EP CLI arithmetic across nodes, how prefill/decode pools compose with expert parallelism, and the production-stack reference deployment.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 11</p>
+<h1>vLLM Multi-Node: Distributed Serving, Disaggregated Prefill, and the Production Stack</h1>
+<p class="lede">vLLM's own account of scaling past one node: the <code>KVTransferConfig</code> surface that every disaggregation connector plugs into, the CLI flags that turn a data-parallel-size number into a running multi-node cluster, and the reference router-plus-observability stack the project ships for production. After this module you can read a vLLM multi-node deployment's flags and configs and know exactly what topology they produce.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>30 min</b> read</span>
+<span class="chip"><b>7</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 4</b>, <b>Module 5</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 400" role="img" aria-labelledby="f1t"><title id="f1t">vLLM multi-node deployment: router, prefill pool, decode pool, connector, observability</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="20" width="140" height="50" rx="8" class="d-block-accent"/>
+<text x="90" y="40" text-anchor="middle" class="d-text-inv d-bold">client</text>
+<text x="90" y="58" text-anchor="middle" class="d-text-inv d-small">HTTP request</text>
+<path d="M160,45 L210,45" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="210" y="15" width="150" height="60" rx="8" class="d-block"/>
+<text x="285" y="38" text-anchor="middle" class="d-text-inv d-bold">router</text>
+<text x="285" y="56" text-anchor="middle" class="d-text-inv d-small">production-stack (&#167;4)</text>
+
+<path d="M285,75 L285,105 L120,105 L120,130" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M285,75 L285,105 L560,105 L560,130" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="20" y="130" width="200" height="130" rx="8" class="d-panel"/>
+<text x="120" y="150" text-anchor="middle" class="d-bold d-small">prefill pool</text>
+<rect x="35" y="162" width="80" height="42" rx="6" class="d-block-2"/>
+<text x="75" y="180" text-anchor="middle" class="d-text-inv d-small">node 1</text>
+<text x="75" y="196" text-anchor="middle" class="d-text-inv d-small">DP+EP</text>
+<rect x="125" y="162" width="80" height="42" rx="6" class="d-block-2"/>
+<text x="165" y="180" text-anchor="middle" class="d-text-inv d-small">node 2</text>
+<text x="165" y="196" text-anchor="middle" class="d-text-inv d-small">DP+EP</text>
+<text x="120" y="225" text-anchor="middle" class="d-small d-text-light">kv_role: kv_producer</text>
+<text x="120" y="242" text-anchor="middle" class="d-mono d-small">NixlConnector / Mooncake / LMCache</text>
+
+<rect x="580" y="130" width="200" height="130" rx="8" class="d-panel"/>
+<text x="680" y="150" text-anchor="middle" class="d-bold d-small">decode pool</text>
+<rect x="595" y="162" width="80" height="42" rx="6" class="d-block-2"/>
+<text x="635" y="180" text-anchor="middle" class="d-text-inv d-small">node 1</text>
+<text x="635" y="196" text-anchor="middle" class="d-text-inv d-small">DP+EP</text>
+<rect x="685" y="162" width="80" height="42" rx="6" class="d-block-2"/>
+<text x="725" y="180" text-anchor="middle" class="d-text-inv d-small">node 2</text>
+<text x="725" y="196" text-anchor="middle" class="d-text-inv d-small">DP+EP</text>
+<text x="680" y="225" text-anchor="middle" class="d-small d-text-light">kv_role: kv_consumer</text>
+<text x="680" y="242" text-anchor="middle" class="d-mono d-small">same connector family</text>
+
+<path d="M220,195 L580,195" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+<text x="400" y="185" text-anchor="middle" class="d-mono d-small">KV transfer &#8212; &#167;1, &#167;3</text>
+
+<rect x="270" y="300" width="260" height="70" rx="8" class="d-outline d-dashed"/>
+<text x="400" y="320" text-anchor="middle" class="d-small">Prometheus scrapes both pools &#8212; &#167;5</text>
+<text x="400" y="338" text-anchor="middle" class="d-mono d-small">kv_cache_usage_perc, TTFT, ITL histograms</text>
+<path d="M120,260 L340,300" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M680,260 L460,300" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<text x="400" y="392" text-anchor="middle" class="d-small d-text-light">Each pool's internal DP+EP layout follows Module 5's EP_SIZE = TP_SIZE &#215; DP_SIZE arithmetic; this module covers what wraps around it.</text>
+</svg>
+<figcaption><b>Figure 1.</b> The shape this module fills in: a router in front of two independently-scaled pools, each internally a multi-node DP+EP vLLM deployment, joined by a KV connector, both observed through one Prometheus surface<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<h2 id="vllm-disagg-status">1. vLLM's disaggregated prefill: status and the KVTransferConfig surface</h2>
+<p>Module 4 already built the abstraction vLLM disaggregation runs on &#8212; a <code>Connector</code> that lets a kv-consumer worker pull KV caches from a kv-producer, a <code>LookupBuffer</code> with <code>insert</code>/<code>drop_select</code>, and a <code>Pipe</code> that moves tensors &#8212; and its table of eight named connectors (<code>ExampleConnector</code>, <code>LMCacheConnectorV1</code>, <code>NixlConnector</code>, <code>MooncakeConnector</code>, <code>MoRIIOConnector</code>, <code>MultiConnector</code>, <code>OffloadingConnector</code>, <code>FlexKVConnectorV1</code>) and what transport each backs onto. That does not repeat here. What matters for a multi-node vLLM deployment is the surface you actually configure: a single JSON blob, <code>--kv-transfer-config</code>, passed to every <code>vllm serve</code> invocation<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="kv-transfer-config">1.1 The KVTransferConfig JSON schema</h3>
+<p>vLLM's own documentation gives three worked configurations, one per connector family. All three share the same top-level fields &#8212; <code>kv_connector</code> (which class implements the connector), <code>kv_role</code> (whether this instance produces KV, consumes it, or both), and <code>kv_connector_extra_config</code> (a connector-specific nested object) &#8212; with an optional <code>kv_buffer_device</code> when the connector needs to know which memory tier to stage through<a class="cite" href="#ref-1">1</a>:</p>
+
+<pre class="code" data-lang="bash" data-title="NixlConnector &#8212; direct NIXL transfer, UCX and GDS backends"><code>--kv-transfer-config '{
+  "kv_connector": "NixlConnector",
+  "kv_role": "kv_both",
+  "kv_buffer_device": "cuda",
+  "kv_connector_extra_config": {"backends": ["UCX", "GDS"]}
+}'</code></pre>
+
+<pre class="code" data-lang="bash" data-title="MultiConnector &#8212; chain several connectors behind one instance"><code>--kv-transfer-config '{
+  "kv_connector": "MultiConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {"connectors": ["..."]}
+}'</code></pre>
+
+<pre class="code" data-lang="bash" data-title="OffloadingConnector &#8212; spill KV to host RAM under pressure"><code>--kv-transfer-config '{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {"block_size": 64, "cpu_bytes_to_use": 1000000000}
+}'</code></pre>
+
+<p>The <code>kv_connector_extra_config</code> object is where each connector's own tuning surface lives, and the three examples above show how differently that surface is shaped. NIXL's <code>backends</code> list is an ordered preference &#8212; <code>["UCX", "GDS"]</code> tells the connector to prefer UCX for host/device transfer and fall back to GPUDirect Storage, the same two actively-supported NIXL backends Module 8 covers at the transport-library level<a class="cite" href="#ref-1">1</a>. <code>OffloadingConnector</code>'s <code>block_size</code> and <code>cpu_bytes_to_use</code> fields are a capacity budget, not a transport choice: 64 tokens per block and a fixed byte ceiling for how much host RAM the offload path is allowed to claim, the same knob Module 8 covers on LMCache's side of the offload story but set here at the raw-connector level rather than through LMCache's policy layer. <code>MultiConnector</code>'s <code>connectors</code> field is the odd one out structurally &#8212; it does not configure a transport at all, it nests other connectors' own configuration objects inside it, which is what lets one engine run, for example, an <code>OffloadingConnector</code> for local CPU spillover and a <code>NixlConnector</code> for cross-pool transfer at the same time, each keyed by its own role.</p>
+
+<p><code>kv_role</code> is the field that turns a generic connector into a disaggregation half: <code>kv_producer</code> on a prefill instance means "compute KV, then hand it off and drop it"; <code>kv_consumer</code> on a decode instance means "pull KV before generating"; <code>kv_both</code> is what a single colocated engine or an offloading-only setup uses, since it is neither strictly producing for, nor strictly consuming from, a remote peer<a class="cite" href="#ref-1">1</a>. Setting <code>kv_role</code> is the whole difference, at the configuration level, between "this engine offloads its own KV cache to CPU RAM for later reuse" (<code>OffloadingConnector</code>, <code>kv_both</code>) and "this engine is one half of a disaggregated pair" (<code>NixlConnector</code>, <code>kv_producer</code> paired with a second instance running <code>kv_consumer</code>). Section 3 uses exactly this distinction to compose prefill and decode pools.</p>
+
+<h3 id="connector-roster">1.2 The connector roster: nine, not eight</h3>
+<p>vLLM's disaggregated-prefill documentation states, as of the version checked for this module, that it "now supports 9 types of connectors"<a class="cite" href="#ref-1">1</a>. Module 4's table, built from the same documentation, enumerated eight; the ninth is <code>PyNcclConnector</code>, named in vLLM's own connector listing alongside the eight already covered<a class="cite" href="#ref-1">1</a>. The documentation does not give <code>PyNcclConnector</code> the same one-line gloss it gives the others, so treat its presence as confirmed and its mechanism as <mark class="unverified" title="vLLM's disagg-prefill docs list PyNcclConnector by name in the connector roster but do not describe its transport or intended use case in the fetched text; no other primary source in this course's source map elaborates on it">unverified beyond the name</mark> &#8212; a small, telling data point on its own about how fast this part of the stack is still moving (more in "What is changing").</p>
+
+<p>Table 1 restates the roster with a practical lens: not "what does each back onto" (Module 4's framing) but "which one do you reach for, and why."</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> vLLM's KV-connector roster and the deployment situation each fits<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Connector</th><th>Use it when&#8230;</th><th>kv_role typically set to</th></tr></thead>
+<tbody>
+<tr><td class="row">NixlConnector</td><td>standing up disaggregated prefill/decode with the lowest-friction, project-maintained transport</td><td>kv_producer / kv_consumer</td></tr>
+<tr><td class="row">MooncakeConnector</td><td>the cluster already runs Mooncake's transfer engine and store (Module 7)</td><td>kv_producer / kv_consumer</td></tr>
+<tr><td class="row">LMCacheConnectorV1</td><td>you want KV reuse/offload policy (chunking, tiered backends) on top of NIXL, not just raw transfer (Module 8)</td><td>kv_both, or kv_producer/kv_consumer when composed with disaggregation</td></tr>
+<tr><td class="row">OffloadingConnector</td><td>a single colocated engine needs CPU-RAM spillover, no second pool involved</td><td>kv_both</td></tr>
+<tr><td class="row">MultiConnector</td><td>you need more than one of the above active at once (e.g. NIXL for cross-pool transfer plus CPU offload for local spillover)</td><td>kv_both, delegating internally</td></tr>
+<tr><td class="row">MoRIIOConnector</td><td>the cluster is ROCm, not CUDA &#8212; the AMD-side disaggregation path</td><td>kv_producer / kv_consumer</td></tr>
+<tr><td class="row">FlexKVConnectorV1</td><td>KV needs to live behind a distributed, multi-level cache store rather than a point-to-point transfer</td><td>kv_producer / kv_consumer</td></tr>
+<tr><td class="row">PyNcclConnector</td><td>named in the current roster; mechanism not documented in the source checked</td><td>&#8212;</td></tr>
+<tr><td class="row">ExampleConnector</td><td>reading or extending the interface itself, not production traffic</td><td>&#8212;</td></tr>
+</tbody>
+</table>
+
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>All nine sit behind the same <code>--kv-transfer-config</code> flag and the same <code>Connector</code>/<code>LookupBuffer</code>/<code>Pipe</code> trio Module 4 describes. Nothing about the connector you pick changes the scheduling or the request lifecycle across the prefill/decode boundary &#8212; that mechanism, and its per-project variants (TensorRT-LLM's cache-transceiver, SGLang's bootstrap handshake), is Module 4's and, for SGLang specifically, Module 12's territory.</p></aside>
+
+<p>Two entries in Table 1 are worth a second look because they sit a level above the others: <code>MultiConnector</code> and <code>FlexKVConnectorV1</code> are not point-to-point transports in the way <code>NixlConnector</code> or <code>MooncakeConnector</code> are, they are composition and indirection layers built on top of the same interface. <code>FlexKVConnectorV1</code> backs onto a distributed, multi-level KV store rather than a direct producer-consumer link<a class="cite" href="#ref-1">1</a> &#8212; conceptually closer to LMCache's tiered-backend model (Module 8) than to a raw transfer connector, though it is vLLM's own connector implementation rather than a wrapper around LMCache's. Which of <code>LMCacheConnectorV1</code> and <code>FlexKVConnectorV1</code> a deployment reaches for is mostly a question of which reuse/store ecosystem it has already standardized on; both solve the same underlying problem of KV living somewhere other than a single engine's HBM.</p>
+
+<h2 id="dp-ep-multinode">2. DP+EP across nodes: from the formula to a running cluster</h2>
+<p>Module 5 already derived the arithmetic (EP_SIZE = TP_SIZE &#215; DP_SIZE), worked the TP=2/DP=4/8-GPU single-node layout, and walked vLLM's own two-node example &#8212; <code>--data-parallel-size 16</code>, <code>--data-parallel-size-local 8</code>, <code>--data-parallel-start-rank 8</code> on the second node &#8212; down to the rank numbers<a class="cite" href="#ref-2">2</a>. That arithmetic does not need repeating. What Module 5 left aside is what those same two <code>vllm serve</code> invocations need beyond the DP/EP ranks to actually find each other, agree on a network endpoint, and decide which process talks to clients: the process- and network-level flags. That is this section's job.</p>
+
+<h3 id="node-flags">2.1 The flags that turn a rank layout into a cluster</h3>
+<p>vLLM's expert-parallel deployment guide's own two-node example carries four flags that Module 5's arithmetic discussion did not need to unpack<a class="cite" href="#ref-2">2</a>:</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Process- and network-level flags in vLLM's two-node DP+EP example, beyond the rank arithmetic Module 5 already covers<a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Flag</th><th>Set on</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td class="row"><code>--data-parallel-address</code></td><td>both nodes, same value</td><td>IP of the primary node; every node dials this address to join the DP group</td></tr>
+<tr><td class="row"><code>--data-parallel-rpc-port</code></td><td>both nodes, same value</td><td>RPC port for inter-node coordination; any port reachable from every node</td></tr>
+<tr><td class="row"><code>--api-server-count</code></td><td>primary node only</td><td>number of API-server processes fronting the primary node for client-request load handling</td></tr>
+<tr><td class="row"><code>--headless</code></td><td>secondary nodes only</td><td>no API server on this process &#8212; it runs worker ranks only and accepts no client traffic</td></tr>
+</tbody>
+</table>
+
+<p>Put together with Module 5's rank arithmetic, the full picture for the two-node, DP=16, TP=1, EP=16 example is: node 1 opens an RPC listener on <code>--data-parallel-rpc-port</code>, runs 8 API-server processes (<code>--api-server-count=8</code>) to absorb client concurrency, and hosts local DP ranks 0&#8211;7; node 2 dials node 1's address and port, contributes local ranks 0&#8211;7 which become global ranks 8&#8211;15 via <code>--data-parallel-start-rank 8</code>, and runs <code>--headless</code> so it never accepts a client connection directly<a class="cite" href="#ref-2">2</a>. Only one node in the pair is ever a client-facing endpoint; every other node is a worker that the primary coordinates over the RPC port. This is the same shape Section 4's production-stack router sits in front of &#8212; the router never needs to know a decode pool spans two nodes and one of them is headless; it only sees the primary node's API-server endpoint.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 280" role="img" aria-labelledby="f2t"><title id="f2t">Two-node DP+EP process and network topology: primary node with API servers and RPC listener, headless secondary node</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="40" y="30" width="320" height="180" rx="8" class="d-panel"/>
+<text x="200" y="52" text-anchor="middle" class="d-bold d-small">node 1 &#8212; primary</text>
+<rect x="60" y="65" width="120" height="40" rx="6" class="d-block"/>
+<text x="120" y="89" text-anchor="middle" class="d-text-inv d-small">8&#215; API server</text>
+<rect x="200" y="65" width="140" height="40" rx="6" class="d-block"/>
+<text x="270" y="83" text-anchor="middle" class="d-text-inv d-small">RPC listener</text>
+<text x="270" y="98" text-anchor="middle" class="d-text-inv d-small d-mono">:13345</text>
+<rect x="60" y="120" width="280" height="70" rx="6" class="d-block-2"/>
+<text x="200" y="142" text-anchor="middle" class="d-text-inv d-small">local DP ranks 0&#8211;7</text>
+<text x="200" y="160" text-anchor="middle" class="d-text-inv d-small d-mono">--data-parallel-start-rank 0 (default)</text>
+<text x="200" y="177" text-anchor="middle" class="d-text-inv d-small">EP group spans both nodes (&#167;2.1)</text>
+
+<rect x="440" y="30" width="320" height="180" rx="8" class="d-panel"/>
+<text x="600" y="52" text-anchor="middle" class="d-bold d-small">node 2 &#8212; headless</text>
+<rect x="460" y="65" width="280" height="40" rx="6" class="d-block-muted"/>
+<text x="600" y="89" text-anchor="middle" class="d-text-inv d-small">no API server (--headless)</text>
+<rect x="460" y="120" width="280" height="70" rx="6" class="d-block-2"/>
+<text x="600" y="142" text-anchor="middle" class="d-text-inv d-small">local DP ranks 0&#8211;7</text>
+<text x="600" y="160" text-anchor="middle" class="d-text-inv d-small d-mono">--data-parallel-start-rank 8</text>
+<text x="600" y="177" text-anchor="middle" class="d-text-inv d-small">&#8594; global ranks 8&#8211;15</text>
+
+<path d="M360,90 L440,90" class="d-arrow" marker-end="url(#f2-arr)"/>
+<text x="400" y="80" text-anchor="middle" class="d-mono d-small">dials</text>
+
+<rect x="20" y="220" width="200" height="40" rx="6" class="d-outline"/>
+<text x="120" y="245" text-anchor="middle" class="d-mono d-small">--data-parallel-address 192.168.1.100</text>
+
+<text x="400" y="250" text-anchor="middle" class="d-small d-text-light">Only node 1 is ever client-facing; node 2 is a pure worker discovered over the RPC port.</text>
+</svg>
+<figcaption><b>Figure 2.</b> The process and network layer wrapped around Module 5's rank arithmetic for the same two-node, DP=16 example: node 2 dials node 1's <code>--data-parallel-address</code>/<code>--data-parallel-rpc-port</code>, and only node 1 runs an API server<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<p>The documentation does not give a closed-form rule for more than two nodes, but the two-node example generalizes directly: for node <em>i</em> of <em>N</em> uniform nodes, each hosting <code>data-parallel-size-local</code> ranks, the start rank is the cumulative local size of every earlier node &#8212; "equal to the cumulative local DP size of previous nodes," in the documentation's own words<a class="cite" href="#ref-2">2</a>:</p>
+
+$$ \text{start-rank}(i) = \sum_{j=0}^{i-1} \text{data-parallel-size-local}(j) $$
+
+<p>For the uniform case every node runs, this collapses to <code>start-rank(i) = i &#215; data-parallel-size-local</code>, and the global size is <code>data-parallel-size = N &#215; data-parallel-size-local</code>. Only node 0 carries <code>--api-server-count</code> and omits <code>--headless</code>; every other node carries <code>--headless</code> and its own start-rank.</p>
+
+<div class="calc">
+<p class="calc-title">N-node DP+EP sizing (uniform nodes, from vLLM's flags<a class="cite" href="#ref-2">2</a>)</p>
+<div class="calc-row"><label for="c1">Nodes (N)</label><input type="range" id="c1" name="N" min="1" max="16" step="1" value="2"></div>
+<div class="calc-row"><label for="c2">DP ranks per node (data-parallel-size-local)</label><input type="range" id="c2" name="dpl" min="1" max="8" step="1" value="8"></div>
+<div class="calc-row"><label for="c3">Tensor-parallel size (TP)</label><input type="range" id="c3" name="tp" min="1" max="8" step="1" value="1"></div>
+<div class="calc-out">
+<div>Total DP ranks (--data-parallel-size)<output data-expr="N * dpl" data-format="int"></output></div>
+<div>EP_SIZE (Module 5: TP &#215; DP)<output data-expr="tp * N * dpl" data-format="int"></output></div>
+<div>Total GPUs<output data-expr="tp * N * dpl" data-format="int"></output></div>
+<div>Last node's start-rank<output data-expr="(N-1) * dpl" data-format="int"></output></div>
+</div>
+<p class="calc-note">GPU count assumes one GPU per (TP-rank &#215; DP-rank) slot, the layout vLLM's expert-parallel guide uses throughout<a class="cite" href="#ref-2">2</a>. At the default TP=1, EP_SIZE equals total DP ranks, matching the DeepSeek-V3 two-node example (N=2, dpl=8 &#8594; DP=16, EP=16).</p>
+</div>
+
+<p>Push the same arithmetic past two nodes and the pattern that matters is which node carries which start-rank, not just the totals. Take four nodes, each with <code>--data-parallel-size-local 4</code> and <code>--tensor-parallel-size 1</code>: the global <code>--data-parallel-size</code> is <em>4 &#215; 4 = 16</em>, matching the calculator's default DP total but now spread over twice as many, smaller nodes. Node 0 (the only non-headless one) still takes the default start-rank of 0; nodes 1, 2, and 3 take start-ranks 4, 8, and 12 respectively &#8212; each one <code>data-parallel-size-local</code> higher than the previous node's, exactly as the cumulative-sum formula requires. EP_SIZE is unchanged at 16 (TP=1 &#215; DP=16), so four smaller nodes and two larger ones produce an identical EP group size and an identical MoE shard width; the only thing that differs is how many separate RPC-connected processes the primary node's rank-0 process has to track, and how much per-node blast radius a single node failure has &#8212; a quarter of the DP group instead of half.</p>
+
+<h3 id="single-vs-multi-node">2.2 What actually changes crossing from one node to two</h3>
+<p>vLLM's single-node H200 example for the same DeepSeek-V3 model is four flags: <code>--tensor-parallel-size 1 --data-parallel-size 8 --enable-expert-parallel</code>, nothing else<a class="cite" href="#ref-2">2</a>. No address, no RPC port, no headless flag, no start-rank &#8212; because a single process owns every rank and there is no second process to coordinate with. The two-node version does not change the parallelism strategy at all (still TP=1, still attention-DP + full-width EP); it only adds the four coordination flags from Table 2 and splits <code>--data-parallel-size 8</code> into <code>--data-parallel-size 16</code> spread across two <code>--data-parallel-size-local 8</code> processes. The mental model worth keeping: going multi-node in vLLM's DP+EP path is not a different parallelism scheme, it is the same scheme plus a discovery/coordination layer bolted on at the process level.</p>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>The EPLB rebalancer's own configuration surface has grown past the two knobs Module 5 covers (<code>window_size</code>, <code>step_interval</code>). The current <code>--eplb-config</code> JSON also exposes <code>num_redundant_experts</code> (additional global experts per EP rank beyond an equal split, default 0), <code>use_async</code> (non-blocking rebalancing, default enabled), and <code>log_balancedness</code> (emit load metrics, default off)<a class="cite" href="#ref-2">2</a>. None of these change the placement algorithm Module 5 describes; they are operational knobs for how aggressively and how visibly it runs.</p></aside>
+
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Every one of Table 2's shared flags &#8212; <code>--data-parallel-address</code>, <code>--data-parallel-rpc-port</code>, <code>--data-parallel-size</code> &#8212; has to match, byte-for-byte, across every node in the group; only <code>--data-parallel-start-rank</code> and <code>--headless</code> are deliberately per-node<a class="cite" href="#ref-2">2</a>. Because the documented mechanism is a secondary node dialing the primary's address and port to join the group<a class="cite" href="#ref-2">2</a>, a stale address left over from a previous cluster or a mistyped port is, by that mechanism, a connectivity failure on the secondary rather than a validation error the primary can catch before accepting traffic &#8212; reasoning from how the join works, since vLLM's docs do not spell out the exact failure behavior for a misconfigured pair.</p></aside>
+
+<h2 id="pd-plus-dpep">3. Composing disaggregation with DP+EP: two independently-scaled clusters</h2>
+<p>Sections 1 and 2 are separable knobs &#8212; which connector moves KV, and how many nodes and ranks a pool spans &#8212; and vLLM lets you turn both at once. A DeepSeek-class deployment with disaggregated prefill and decode is, mechanically, two separate multi-node DP+EP clusters (each sized by Section 2's arithmetic, independently) joined by one <code>kv_producer</code>/<code>kv_consumer</code> connector pair from Section 1. Nothing in vLLM's own configuration surface treats "disaggregated deployment" as a single object with one set of flags; a prefill pool and a decode pool are two entirely independent invocations of everything covered so far, and the only place they are coupled is the connector metadata each one's <code>--kv-transfer-config</code> points at. That has a direct operational consequence: the prefill pool can be resized, restarted, or moved to different hardware without touching the decode pool's DP+EP flags at all, and vice versa, as long as the connector's endpoint metadata stays reachable &#8212; the same independent-scaling property Module 3's goodput argument for disaggregation assumes at the architectural level, here visible at the level of two <code>vllm serve</code> command lines that share nothing but a connector role.</p>
+
+<h3 id="kv-role">3.1 kv_producer meets kv_consumer</h3>
+<p>The prefill pool's engines start with <code>kv_role: kv_producer</code> in their <code>--kv-transfer-config</code>; the decode pool's engines start with <code>kv_role: kv_consumer</code><a class="cite" href="#ref-1">1</a>. Both point at the same connector class &#8212; typically <code>NixlConnector</code> for a fresh disaggregation setup, or <code>MooncakeConnector</code> if the cluster already runs Mooncake's transfer engine (Module 7) &#8212; so the wire format and metadata handshake match on both sides. Nothing forces the two pools to share a parallelism configuration: the prefill pool can run a smaller EP degree tuned for its compute-bound, larger-batch workload while the decode pool runs a wider EP degree tuned for its memory-bound, latency-sensitive workload, exactly the hierarchical-vs-global EPLB policy split Module 5 covers for placement, applied here at the level of two entirely separate vLLM clusters rather than one.</p>
+
+<p>This is also where the KVTransferConfig fields interact with the DP+EP flags rather than sitting beside them: each pool independently sets its own <code>--data-parallel-size</code>, <code>--data-parallel-size-local</code>, and <code>--data-parallel-start-rank</code> family (Section 2), and independently sets its own <code>--kv-transfer-config</code> (Section 1) with the role appropriate to its position in the pipeline. A concrete four-node layout &#8212; two nodes of prefill, two nodes of decode &#8212; runs four separate <code>vllm serve</code> processes, each with two independent flag families that never need to agree with each other except on the connector's own metadata protocol:</p>
+
+<pre class="code" data-lang="bash" data-title="Prefill pool node 1 of 2 &#8212; smaller EP, kv_producer"><code>vllm serve deepseek-ai/DeepSeek-V3-0324 \
+    --tensor-parallel-size 1 --enable-expert-parallel \
+    --data-parallel-size 8 --data-parallel-size-local 4 \
+    --data-parallel-address 10.0.0.10 --data-parallel-rpc-port 13345 \
+    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'</code></pre>
+
+<pre class="code" data-lang="bash" data-title="Decode pool node 1 of 2 &#8212; wider EP, kv_consumer"><code>vllm serve deepseek-ai/DeepSeek-V3-0324 \
+    --tensor-parallel-size 1 --enable-expert-parallel \
+    --data-parallel-size 16 --data-parallel-size-local 8 \
+    --data-parallel-address 10.0.1.10 --data-parallel-rpc-port 13345 \
+    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'</code></pre>
+
+<p>The two DP totals here &#8212; 8 for prefill, 16 for decode, each on its own independent two-node group with its own <code>--data-parallel-address</code> &#8212; are a synthesis of Sections 1 and 2's flags, built to illustrate the composition rather than quoted from a single documented example; the individual flags and their semantics are each sourced above. The asymmetry (EP=8 for the compute-bound, larger-batch prefill pool; EP=16 for the memory-bound, latency-sensitive decode pool) mirrors the hierarchical-vs-global EPLB placement split Module 5 covers: a narrower EP group with more group-local traffic for prefill, a wider one that spreads load further for decode.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f3t"><title id="f3t">Disaggregated prefill and decode as two independently-sized DP+EP clusters joined by one connector pair</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="30" y="30" width="300" height="150" rx="8" class="d-panel"/>
+<text x="180" y="52" text-anchor="middle" class="d-bold d-small">prefill pool &#8212; 2 nodes</text>
+<rect x="50" y="65" width="120" height="45" rx="6" class="d-block-2"/>
+<text x="110" y="85" text-anchor="middle" class="d-text-inv d-small">node 1</text>
+<text x="110" y="101" text-anchor="middle" class="d-text-inv d-small">DP-local 4</text>
+<rect x="190" y="65" width="120" height="45" rx="6" class="d-block-2"/>
+<text x="250" y="85" text-anchor="middle" class="d-text-inv d-small">node 2</text>
+<text x="250" y="101" text-anchor="middle" class="d-text-inv d-small">DP-local 4</text>
+<text x="180" y="130" text-anchor="middle" class="d-small">DP=8, EP=8 (TP=1)</text>
+<text x="180" y="150" text-anchor="middle" class="d-mono d-small">kv_role: kv_producer</text>
+<text x="180" y="167" text-anchor="middle" class="d-small d-text-light">smaller EP &#8212; hierarchical policy</text>
+
+<rect x="470" y="30" width="300" height="150" rx="8" class="d-panel"/>
+<text x="620" y="52" text-anchor="middle" class="d-bold d-small">decode pool &#8212; 2 nodes</text>
+<rect x="490" y="65" width="120" height="45" rx="6" class="d-block-2"/>
+<text x="550" y="85" text-anchor="middle" class="d-text-inv d-small">node 1</text>
+<text x="550" y="101" text-anchor="middle" class="d-text-inv d-small">DP-local 8</text>
+<rect x="630" y="65" width="120" height="45" rx="6" class="d-block-2"/>
+<text x="690" y="85" text-anchor="middle" class="d-text-inv d-small">node 2</text>
+<text x="690" y="101" text-anchor="middle" class="d-text-inv d-small">DP-local 8</text>
+<text x="620" y="130" text-anchor="middle" class="d-small">DP=16, EP=16 (TP=1)</text>
+<text x="620" y="150" text-anchor="middle" class="d-mono d-small">kv_role: kv_consumer</text>
+<text x="620" y="167" text-anchor="middle" class="d-small d-text-light">wider EP &#8212; global policy</text>
+
+<path d="M330,105 L470,105" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+<text x="400" y="95" text-anchor="middle" class="d-mono d-small">NixlConnector</text>
+
+<text x="400" y="220" text-anchor="middle" class="d-small d-text-light">Each pool's DP+EP sizing follows &#167;2 independently; only kv_role and the shared connector class link them.</text>
+</svg>
+<figcaption><b>Figure 3.</b> Four physical nodes split into two independently-sized DP+EP clusters &#8212; a narrower EP group for prefill, a wider one for decode &#8212; joined by a single <code>NixlConnector</code> kv_producer/kv_consumer pair<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<h3 id="production-readiness">3.2 What is production-ready and what is not</h3>
+<p>vLLM's documentation is direct about where this stands. The disaggregated-prefill feature as a whole carries an explicit banner: "this feature is experimental and subject to change"<a class="cite" href="#ref-1">1</a>, and the docs state plainly that disaggregation "does not improve throughput"<a class="cite" href="#ref-1">1</a> &#8212; consistent with Module 3's framing that the payoff is goodput under an SLO, not raw tokens/second. DP+EP for MoE models sits on firmer ground: it is the documented, default path for serving large MoE models like DeepSeek-V3 across one or many nodes, with a stable CLI surface (<code>--tensor-parallel-size</code>, <code>--data-parallel-size</code>, <code>--enable-expert-parallel</code>) that the expert-parallel deployment guide treats as production guidance, not an experimental preview<a class="cite" href="#ref-2">2</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Production-readiness signals vLLM's own documentation gives for each piece of the multi-node stack, as of the version checked<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Component</th><th>Status per vLLM's own docs</th></tr></thead>
+<tbody>
+<tr><td class="row">Continuous batching, chunked prefill (single engine)</td><td>default production path</td></tr>
+<tr><td class="row">DP+EP for MoE, single or multi-node</td><td>documented deployment guide, stable CLI surface</td></tr>
+<tr><td class="row">EPLB rebalancing</td><td>documented, configurable, default off (<code>num_redundant_experts=0</code>)</td></tr>
+<tr><td class="row">Disaggregated prefill (any connector)</td><td>explicitly labeled experimental, subject to change</td></tr>
+<tr><td class="row">PyNcclConnector</td><td>named in the roster; not documented in the text this module drew from</td></tr>
+</tbody>
+</table>
+
+<p>The practical reading: a team standing up a first multi-node vLLM deployment gets a stable, documented path to DP+EP for a wide MoE model with no experimental-status caveat attached. The same team adding disaggregated prefill on top is opting into a feature vLLM's own maintainers have not yet called stable &#8212; not a reason to avoid it, since Module 3's goodput numbers and Module 6's DeepSeek production numbers both come from disaggregated deployments, but a reason to expect connector-level API churn (Section 1.2's <code>PyNcclConnector</code> appearing without documentation is one symptom of that churn) and to budget engineering time for it accordingly.</p>
+
+<h2 id="production-stack">4. The vLLM production-stack reference deployment</h2>
+<p>Everything above configures individual <code>vllm serve</code> processes. <code>vllm-project/production-stack</code>, released by the vLLM project itself on 2026-01-22<a class="cite" href="#ref-3">3</a>, is the reference answer to the next question: how do those processes become a deployment a client actually talks to. Its own framing is "scale from a single vLLM instance to a distributed vLLM deployment without changing any application code"<a class="cite" href="#ref-3">3</a> &#8212; the stack sits entirely outside the model-serving path.</p>
+
+<h3 id="stack-components">4.1 Three components</h3>
+<p>The stack has three parts<a class="cite" href="#ref-3">3</a>:</p>
+<ul>
+<li><b>Serving engine.</b> The vLLM engines running the actual model(s) &#8212; any of the topologies from Sections 1&#8211;3, one pool or several.</li>
+<li><b>Request router.</b> Sits in front of the serving engines and "directs requests to appropriate backends based on routing keys or session IDs to maximize KV cache reuse"<a class="cite" href="#ref-3">3</a>.</li>
+<li><b>Observability stack.</b> Prometheus scrapes the metrics surface (Section 5), Grafana renders it<a class="cite" href="#ref-3">3</a>.</li>
+</ul>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">vLLM production-stack architecture: router, serving-engine pods, Prometheus/Grafana</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="110" width="130" height="60" rx="8" class="d-block-accent"/>
+<text x="85" y="135" text-anchor="middle" class="d-text-inv d-bold">client</text>
+<text x="85" y="153" text-anchor="middle" class="d-text-inv d-small">OpenAI API</text>
+<path d="M150,140 L200,140" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+<rect x="200" y="100" width="160" height="80" rx="8" class="d-block"/>
+<text x="280" y="125" text-anchor="middle" class="d-text-inv d-bold">router</text>
+<text x="280" y="145" text-anchor="middle" class="d-text-inv d-small">round-robin</text>
+<text x="280" y="161" text-anchor="middle" class="d-text-inv d-small">session-ID</text>
+<text x="280" y="177" text-anchor="middle" class="d-text-inv d-small">prefix-aware (WIP)</text>
+
+<path d="M360,130 L420,80" class="d-arrow" marker-end="url(#f4-arr)"/>
+<path d="M360,140 L420,140" class="d-arrow" marker-end="url(#f4-arr)"/>
+<path d="M360,150 L420,200" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+<rect x="420" y="50" width="150" height="50" rx="6" class="d-block-2"/>
+<text x="495" y="80" text-anchor="middle" class="d-text-inv d-small">serving engine pod 1</text>
+<rect x="420" y="115" width="150" height="50" rx="6" class="d-block-2"/>
+<text x="495" y="145" text-anchor="middle" class="d-text-inv d-small">serving engine pod 2</text>
+<rect x="420" y="180" width="150" height="50" rx="6" class="d-block-2"/>
+<text x="495" y="210" text-anchor="middle" class="d-text-inv d-small">serving engine pod N</text>
+
+<path d="M570,75 L640,140" class="d-arrow d-dashed" marker-end="url(#f4-arr)"/>
+<path d="M570,140 L640,140" class="d-arrow d-dashed" marker-end="url(#f4-arr)"/>
+<path d="M570,205 L640,140" class="d-arrow d-dashed" marker-end="url(#f4-arr)"/>
+
+<rect x="640" y="105" width="140" height="70" rx="8" class="d-panel"/>
+<text x="710" y="130" text-anchor="middle" class="d-small d-bold">Prometheus</text>
+<text x="710" y="150" text-anchor="middle" class="d-small">+ Grafana</text>
+<text x="710" y="166" text-anchor="middle" class="d-small d-text-light">&#167;5 metrics</text>
+
+<text x="400" y="260" text-anchor="middle" class="d-small d-text-light">Deployed as a Helm chart on Kubernetes; each pod's own topology follows &#167;1&#8211;3.</text>
+</svg>
+<figcaption><b>Figure 4.</b> The vLLM production-stack's three components: a router with three selectable routing modes in front of N serving-engine pods, all scraped by one Prometheus/Grafana pair<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<h3 id="router-modes">4.2 Router modes</h3>
+<p>The router documents three routing behaviors: round-robin, session-ID-based routing, and prefix-aware routing, the last explicitly marked work-in-progress<a class="cite" href="#ref-3">3</a>. Round-robin and session-ID routing are the two production-ready modes; prefix-aware routing &#8212; the KV-cache-overlap-aware scoring Module 2 covers in depth for llm-d's scheduler &#8212; is on the production-stack's own roadmap as a future capability, alongside a documented but not-yet-implemented "KV-cache-aware routing algorithm" and improved fault tolerance<a class="cite" href="#ref-3">3</a>. In addition to these routing behaviors, the router supports automatic Kubernetes service discovery, so serving-engine pods can be added or removed from a Deployment without a router restart or manual endpoint list<a class="cite" href="#ref-3">3</a>. Autoscaling driven by vLLM-specific metrics (Section 5's surface) is also roadmap, not shipped<a class="cite" href="#ref-3">3</a>.</p>
+
+<p>Read against Module 2's router taxonomy, the production-stack router sits at the simpler end: it is the "approximate, cheap, no synchronous global state" style of routing taken to its simplest case &#8212; round-robin is not even prefix-aware &#8212; rather than the KVEvents-driven precise indexing llm-d's EPP implements. That is a deliberate scope difference, not an oversight: production-stack is vLLM's own minimal reference deployment, meant to demonstrate the serving-engine/router/observability shape work out of the box, not to compete with llm-d or Dynamo's routing sophistication.</p>
+
+<p>Session-ID routing is the mode that matters most in practice among the two shipped today, because it is the cheapest way to get most of prefix-cache reuse's benefit without building a KV-index at all: pinning every request that carries the same session identifier to the same backend pod means a multi-turn conversation's growing prompt keeps landing on the one engine that already has its prefix cached, at the cost of no longer load-balancing within a session. Round-robin gives up that property entirely in exchange for perfectly even load distribution across the pool &#8212; the right default for single-turn, cache-indifferent traffic, and the wrong one for a chat workload with long multi-turn sessions.</p>
+
+<h3 id="helm-k8s">4.3 Kubernetes deployment shape</h3>
+<p>Production-stack ships as a Helm chart, configured through a <code>values.yaml</code> that declares the serving-engine replica set(s), router, and observability components together<a class="cite" href="#ref-3">3</a>; its own tutorial set includes a worked example for enabling LMCache-backed KV offload (Module 8) directly from the chart<a class="cite" href="#ref-3">3</a>. What the chart does not itself provide is the multi-host sharding primitive a single logical replica needs when Section 2's DP+EP layout, or a plain tensor-parallel shard, spans more than one physical node: that is LeaderWorkerSet (LWS), the Kubernetes SIG API "for deploying a group of pods as a unit of replication," co-designed alongside llm-d specifically to address "multi-host inference workloads where the LLM will be sharded and run across multiple devices on multiple nodes"<a class="cite" href="#ref-4">4</a>. vLLM's own multi-node deployment guides assume an LWS-shaped substrate underneath a production-stack-style router; the full mechanism &#8212; leader/worker pod roles, rolling upgrades of a sharded unit, drain-before-remove &#8212; is Module 14's subject. Concretely, a two-node DP+EP pool from Section 2 (one primary, one headless) is a natural fit for one LWS "replica": the leader pod runs the primary node's flags and carries the API server, the worker pod runs the headless secondary's flags, and LWS is what keeps the pair scheduled, restarted, and drained together as a unit rather than as two independent Kubernetes pods that happen to reference each other's IP addresses.</p>
+
+<h3 id="stack-vs-orchestrators">4.4 Where production-stack sits relative to Dynamo and llm-d</h3>
+<p>Production-stack, Dynamo (Module 9), and llm-d (Module 10) all put a router in front of a fleet of vLLM engines, and it is worth being precise about why a deployment would pick one over another rather than treating them as interchangeable. Production-stack's own documented feature set stops at round-robin, session-ID routing, and Kubernetes service discovery, with prefix-aware and KV-cache-aware routing still on its roadmap and autoscaling not yet implemented<a class="cite" href="#ref-3">3</a>. Dynamo's Router does KV-aware routing today and ships an SLA-driven Planner that actively resizes prefill and decode pools against TTFT/ITL targets. llm-d's scheduler implements the same KV-cache-aware scoring behind the standardized Gateway API Inference Extension contract, with both approximate block-hash and precise KVEvents-based indexing modes. None of that makes production-stack the wrong choice: it is vLLM's own minimal, dependency-light reference implementation of "router in front of engines, metrics out the back," useful precisely because it does not require adopting Dynamo's or llm-d's broader component set to get a working multi-engine deployment off the ground. A team that later needs KV-cache-aware routing or SLA-driven autoscaling is not extending production-stack to get it; it is swapping the router layer for Dynamo's or llm-d's, while the serving-engine flags from Sections 1&#8211;3 stay the same either way.</p>
+
+<h2 id="prometheus-metrics">5. vLLM's Prometheus metric surface</h2>
+<p>Everything upstream &#8212; the production-stack's roadmapped autoscaling, Module 9's Dynamo Planner, Module 2's load-aware scorers &#8212; ultimately reads the same substrate: the Prometheus metrics vLLM's v1 engine emits per instance<a class="cite" href="#ref-5">5</a>. vLLM does not group these formally in its documentation, but they split cleanly into three practical buckets: gauges, counters, and histograms.</p>
+
+<table class="tbl tbl-dense">
+<caption><b>Table 4.</b> vLLM v1 Prometheus metrics by type, with the ones an SLO dashboard or autoscaler actually reads called out<a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Type</th><th>Metric</th><th>What it reads</th></tr></thead>
+<tbody>
+<tr><td class="row">Gauge</td><td><code>vllm:num_requests_running</code></td><td>currently-executing requests &#8212; direct load signal</td></tr>
+<tr><td class="row">Gauge</td><td><code>vllm:kv_cache_usage_perc</code></td><td>fraction of used KV cache blocks, 0&#8211;1 &#8212; the headroom signal every scheduler and autoscaler cares about</td></tr>
+<tr><td class="row">Gauge</td><td><code>vllm:lora_requests_info</code></td><td>per-adapter LoRA request counts</td></tr>
+<tr><td class="row">Gauge</td><td><code>vllm:cache_config_info</code></td><td>static cache configuration, for dashboards not alerts</td></tr>
+<tr><td class="row">Counter</td><td><code>vllm:prompt_tokens_total</code> / <code>vllm:generation_tokens_total</code></td><td>cumulative tokens processed &#8212; the raw input to tokens/s/$ arithmetic (Module 15)</td></tr>
+<tr><td class="row">Counter</td><td><code>vllm:prefix_cache_queries</code> / <code>vllm:prefix_cache_hits</code></td><td>prefix-cache hit rate, comparable to Mooncake's own hit-ratio curve (Module 7)</td></tr>
+<tr><td class="row">Counter</td><td><code>vllm:request_success_total</code></td><td>finished requests, broken down by completion reason</td></tr>
+<tr><td class="row">Histogram</td><td><code>vllm:time_to_first_token_seconds</code></td><td>TTFT distribution &#8212; the metric Section 4.2's SLO framing and Module 9's Planner default (500&#8201;ms) target directly</td></tr>
+<tr><td class="row">Histogram</td><td><code>vllm:inter_token_latency_seconds</code></td><td>time between streamed tokens &#8212; ITL, the Planner's other default target (50&#8201;ms)</td></tr>
+<tr><td class="row">Histogram</td><td><code>vllm:request_time_per_output_token_seconds</code></td><td>per-request TPOT, the Module 15 formula applied at the metric level</td></tr>
+<tr><td class="row">Histogram</td><td><code>vllm:e2e_request_latency_seconds</code></td><td>full request duration, prefill through last token</td></tr>
+<tr><td class="row">Histogram</td><td><code>vllm:request_prefill_time_seconds</code> / <code>vllm:request_decode_time_seconds</code></td><td>phase split &#8212; directly useful for sizing a disaggregated prefill:decode ratio (Module 3)</td></tr>
+<tr><td class="row">Histogram</td><td><code>vllm:kv_block_lifetime_seconds</code>, <code>kv_block_idle_before_evict_seconds</code>, <code>kv_block_reuse_gap_seconds</code></td><td>KV block-level churn &#8212; how long blocks live, sit idle, and get reused before eviction</td></tr>
+</tbody>
+</table>
+
+<p>Two things are worth reading past the raw list. First, <code>kv_cache_usage_perc</code> and <code>num_requests_running</code> are the two gauges that actually gate operational decisions &#8212; a router or autoscaler with access only to these two can implement most of the load-aware scoring Module 2 describes without needing the KVEvents stream llm-d's precise indexing subscribes to. Second, vLLM's own design documentation explicitly flags several v0-era metrics as deprecated or dead weight in v1: <code>vllm:num_requests_swapped</code> and <code>vllm:cpu_cache_usage_perc</code> belonged to a CPU-swapping mode v1 removed; <code>vllm:time_in_queue_requests</code> duplicates queue-time information now carried elsewhere and is marked for deprecation; <code>vllm:tokens_total</code> was never actually implemented despite being named; <code>vllm:avg_prompt_throughput_toks_per_s</code> is deprecated with no direct v1 replacement<a class="cite" href="#ref-5">5</a>. A dashboard built against an older vLLM metrics reference will alert on gauges that no longer move.</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>None of these metrics are connector-aware. A pool running <code>OffloadingConnector</code> and one running <code>NixlConnector</code> in a disaggregated pair expose the identical metric names<a class="cite" href="#ref-5">5</a>; distinguishing "this pool is prefill" from "this pool is decode" for dashboarding purposes is a label you attach at the Prometheus scrape-config or Kubernetes-service level (Section 4.3's Helm values, or Module 14's topology), not something the metric surface itself encodes.</p></aside>
+
+<p>Building a minimal SLO dashboard for a two-pool disaggregated deployment from this surface takes four series, all sourced from Table 4: <code>vllm:time_to_first_token_seconds</code> scraped from the prefill pool's endpoints, since TTFT is set almost entirely by prefill queueing and compute time; <code>vllm:inter_token_latency_seconds</code> scraped from the decode pool, since ITL is a decode-loop property; <code>vllm:kv_cache_usage_perc</code> on both pools, as the earliest warning signal before either one starts queueing; and <code>vllm:request_prefill_time_seconds</code> / <code>vllm:request_decode_time_seconds</code> together, to see the phase split directly rather than infer it from the end-to-end histogram. Everything else in Table 4 &#8212; the LoRA gauge, the static cache-config gauge, the block-lifetime histograms &#8212; is diagnostic detail for debugging a specific incident, not something worth an alert threshold on its own.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Module 3 already covers the goodput-theoretic case for disaggregation in general. The narrower question this module's sources put in direct tension is whether vLLM's <em>own</em> implementation choices endorse that case as a default, or treat it as a specialized add-on most deployments should skip.</p>
+<div class="positions">
+<article class="position">
+<h4>Disaggregation is close to necessary once interference is counted</h4>
+<p class="who">DistServe (OSDI 2024)<a class="cite" href="#ref-6">6</a>; Mooncake (FAST 2025)<a class="cite" href="#ref-7">7</a></p>
+<p>DistServe measures colocated per-GPU goodput on a single A100 at roughly 1.6 requests/second against 5.6 rps prefill-only and 10 rps decode-only when the phases are separated<a class="cite" href="#ref-6">6</a> &#8212; a >3x goodput gap attributed directly to prefill-decode interference on one engine. Mooncake's authors explicitly revisited whether chunked prefill made this unnecessary and decided against it, keeping their disaggregated architecture for cross-node long-context parallelism and VRAM savings even after chunked prefill became standard<a class="cite" href="#ref-7">7</a>. Under this view, a colocated engine is a compromise a serious deployment eventually moves past.</p>
+<ul class="pros"><li>Grounded in controlled, measured goodput numbers on real hardware, not vendor claims</li><li>Mooncake's reconsideration is evidence the conclusion survived a later technology change (chunked prefill), not just an artifact of when the paper was written</li></ul>
+<ul class="cons"><li>Both results come from systems built specifically to prove disaggregation works well; neither measures the operational cost of running two pools instead of one</li><li>DistServe's numbers are from A100-era hardware and a 13B model &#8212; Module 3 covers how the crossover shifts on newer hardware</li></ul>
+</article>
+<article class="position">
+<h4>vLLM's own default path is still one colocated engine</h4>
+<p class="who">vLLM's disaggregated-prefill documentation<a class="cite" href="#ref-1">1</a></p>
+<p>vLLM ships continuous batching and chunked prefill as the default, unqualified production path. Disaggregated prefill is offered as an opt-in feature explicitly labeled experimental, and the documentation itself says the feature "does not improve throughput"<a class="cite" href="#ref-1">1</a> &#8212; language a project does not attach to something it wants as the default recommendation. Nine named connectors exist, one of them (<code>PyNcclConnector</code>) not even documented in prose, which reads as a surface still being actively reshaped rather than settled.</p>
+<ul class="pros"><li>Reflects what the maintainers of the most widely deployed open-source engine are actually willing to call stable, today</li><li>Correctly separates "does this help goodput under an SLO" from "is this safe to run in production without deep familiarity with its failure modes"</li></ul>
+<ul class="cons"><li>Documentation status is a maturity signal, not a technical argument against the mechanism &#8212; it says nothing about whether disaggregation pays off, only whether vLLM's implementation of it is battle-tested</li><li>Module 6's DeepSeek numbers and Module 3's TCO crossover both come from disaggregated production systems, so "experimental" clearly has not stopped large-scale real deployment elsewhere</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>These are not actually competing claims about the same question. DistServe and Mooncake answer "does the mechanism pay off" and vLLM's docs answer "is this specific implementation safe to run without deep operational familiarity" &#8212; Module 3's interactivity-dependent TCO crossover already establishes that the first answer is conditional, not universal, so the two positions are compatible: disaggregation pays off above a workload-shape-dependent bar, and vLLM's own connector layer is young enough that adopting it below that bar, or without the SLO pressure to justify the added complexity, is not yet obviously worth it. The evidence that would sharpen this further is a change-log-level maturity signal from vLLM itself &#8212; the disaggregated-prefill feature losing its experimental label, or the connector roster stabilizing for several releases in a row &#8212; neither of which had happened as of the version checked for this module (package 0.29.0, 2026-09-09<a class="cite" href="#ref-1">1</a>).</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The connector roster grew from the eight Module 4 catalogued to nine in the same documentation pass, with the ninth (<code>PyNcclConnector</code>) named but not yet described in prose<a class="cite" href="#ref-1">1</a> &#8212; treat the exact count and the exact set of names as likely to move within the year. The production-stack router's prefix-aware mode is explicitly work-in-progress, and KV-cache-aware routing and autoscaling are both roadmap items rather than shipped behavior<a class="cite" href="#ref-3">3</a>; a deployment that needs those today has to reach for llm-d (Module 10) or Dynamo (Module 9) instead of production-stack. EPLB's configuration surface has already grown past the two parameters Module 5 documents<a class="cite" href="#ref-2">2</a>, which is itself a signal that the MoE deployment path, despite being the more "stable" of the two features compared in this module's disagreement section, is still under active development. vLLM's own package versioning &#8212; 0.29.0 as of 2026-09-09<a class="cite" href="#ref-1">1</a> &#8212; moves on a roughly monthly cadence, so any specific flag name or default value here should be re-checked against the installed version before being relied on operationally.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>vLLM contributors. <em>Disaggregated Prefilling</em>. vLLM Documentation, docs.vllm.ai/en/latest/features/disagg_prefill/, package v0.29.0 (2026-09-09). <a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">https://docs.vllm.ai/en/latest/features/disagg_prefill/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: KVTransferConfig JSON schema and field-level examples (NixlConnector, MultiConnector, OffloadingConnector), kv_role semantics (kv_producer/kv_consumer/kv_both), the 9-connector roster including PyNcclConnector, the experimental-status banner and "does not improve throughput" statement.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>vLLM Project. <em>Expert Parallel Deployment</em>. vLLM Documentation, docs.vllm.ai/en/latest/serving/expert_parallel_deployment/. <a href="https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/">https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: two-node DP+EP flag semantics (--data-parallel-address, --data-parallel-rpc-port, --api-server-count, --headless), single-node vs. two-node example contrast, start-rank generalization to N nodes, EPLB extra configuration fields (num_redundant_experts, use_async, log_balancedness).</span></li>
+<li id="ref-3"><span class="ref-type">repo</span>vLLM Project contributors. <em>vllm-project/production-stack</em> (README). Released 2026-01-22. <a href="https://github.com/vllm-project/production-stack">https://github.com/vllm-project/production-stack</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the three-component architecture (serving engine, router, observability), router modes (round-robin, session-ID, prefix-aware WIP, Kubernetes service discovery), Helm chart / values.yaml deployment shape, LMCache-offload tutorial, roadmap items (KV-cache-aware routing, autoscaling).</span></li>
+<li id="ref-4"><span class="ref-type">repo</span>Kubernetes SIG contributors. <em>kubernetes-sigs/lws</em> (LeaderWorkerSet README). Main branch. <a href="https://github.com/kubernetes-sigs/lws/blob/main/README.md">https://github.com/kubernetes-sigs/lws/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: LWS as the multi-host sharded-replica substrate under vLLM's multi-node deployment guides, co-design with llm-d.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>vLLM contributors. <em>Metrics</em>. vLLM Design Documentation, docs.vllm.ai/en/latest/design/metrics/ (v1 engine). <a href="https://docs.vllm.ai/en/latest/design/metrics/">https://docs.vllm.ai/en/latest/design/metrics/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: full gauge/counter/histogram metric names and descriptions, deprecated v0 metrics list.</span></li>
+<li id="ref-6"><span class="ref-type">paper</span>Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X., Zhang, H. <em>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</em>. USENIX OSDI 2024. arXiv:2401.09670v3 (2024-06-06). <a href="https://arxiv.org/pdf/2401.09670">https://arxiv.org/pdf/2401.09670</a>. Accessed 2026-09-17. <span class="ref-use">Used for: per-GPU goodput numbers (1.6 rps colocated vs. 5.6/10 rps prefill/decode split on A100).</span></li>
+<li id="ref-7"><span class="ref-type">paper</span>Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., Xu, X. <em>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</em>. USENIX FAST 2025 (Best Paper). arXiv:2407.00079v4 (2025-09-03). <a href="https://arxiv.org/pdf/2407.00079">https://arxiv.org/pdf/2407.00079</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the authors' explicit reconsideration of disaggregation's necessity after chunked prefill, and their reasons for keeping it (§5).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

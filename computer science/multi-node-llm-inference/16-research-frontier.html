@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Research Frontier: Live Migration, Fused Megakernels, and What Is Still Unsettled · Multi-Node LLM Inference: From One Node to N</title>
+<meta name="description" content="Llumnix's cross-instance live migration as a planned rebalancing move distinct from failure recovery, Hazy Research's actual kernel-fusion line of work (Tokasaurus, ThunderMLA, ThunderKittens — correcting the 'Thunder Agent' misnomer), and a synthesis of this course's open disagreements as of 2026-09-17.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 16</p>
+<h1>The Research Frontier: Live Migration, Fused Megakernels, and What Is Still Unsettled</h1>
+<p class="lede">Parts 1-5 covered a production stack: routers, connectors, wide-EP, tiered KV caches, Kubernetes topologies. Two capabilities sit just outside that stack — cross-instance live request migration and fused-megakernel decode — and one name commonly attached to the second line of work does not exist. This module corrects that name, explains the two real research directions it should point to, and closes the course by recapping, module by module, the disagreements this course has flagged but not resolved.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>35 min</b> read</span>
+<span class="chip"><b>20</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 4</b>, <b>Module 6</b>, <b>Module 15</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">Two research frontiers sit above and below the production stack surveyed in Parts 1-5: cluster-level live migration above, GPU-kernel-level fusion below.</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="40" y="16" width="200" height="34" rx="6" class="d-outline d-dashed"/>
+<text x="140" y="37" text-anchor="middle" class="d-text-light d-small">macro: cluster scheduling</text>
+
+<rect x="180" y="70" width="440" height="80" rx="8" class="d-block-muted"/>
+<text x="400" y="98" text-anchor="middle" class="d-bold d-text-inv">Live migration (Llumnix, OSDI 2024)</text>
+<text x="400" y="120" text-anchor="middle" class="d-text-inv d-small">moves a running request between instances mid-decode</text>
+<text x="400" y="138" text-anchor="middle" class="d-text-inv d-small">not implemented by Dynamo, llm-d, vLLM, SGLang, or TensorRT-LLM (&#167;1)</text>
+
+<path d="M400,150 L400,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="140" y="182" width="520" height="90" rx="8" class="d-surface d-stroke-blue"/>
+<text x="400" y="205" text-anchor="middle" class="d-bold">The production stack (Parts 1-5)</text>
+<text x="400" y="226" text-anchor="middle" class="d-small d-text-light">Routers &#183; connectors &#183; wide EP &#183; tiered KV &#183; K8s topologies</text>
+<text x="400" y="245" text-anchor="middle" class="d-small d-text-light">Modules 1&#8211;14, referenced not re-explained</text>
+<text x="400" y="262" text-anchor="middle" class="d-small d-text-light">reconfigures by adding/draining workers, not by moving a live request</text>
+
+<path d="M400,272 L400,296" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="180" y="298" width="440" height="34" rx="6" class="d-block-2"/>
+<text x="400" y="319" text-anchor="middle" class="d-text-inv d-small">micro: fused decode megakernel (ThunderMLA, on ThunderKittens) &#8212; &#167;2</text>
+
+<rect x="640" y="16" width="140" height="34" rx="6" class="d-outline d-dashed"/>
+<text x="710" y="37" text-anchor="middle" class="d-text-light d-small">micro: GPU kernel</text>
+</svg>
+<figcaption><b>Figure 1.</b> Two research directions frame this module: one above the production stack (Llumnix's cross-instance live migration, a cluster-scheduling capability<a class="cite" href="#ref-1">1</a>), one below it (ThunderMLA's fused decode megakernel, a kernel-fusion capability built on ThunderKittens<a class="cite" href="#ref-2">2</a>). Neither is part of the routers, connectors, or orchestration layers covered in Modules 1&#8211;14.</figcaption>
+</figure>
+
+<h2 id="llumnix-live-migration">1. Live migration: Llumnix's virtual-usage abstraction</h2>
+<p>Llumnix is a scheduling layer, published at OSDI 2024 by Alibaba Group, implemented on top of vLLM as its backend inference engine<a class="cite" href="#ref-1">1</a>. Its premise: once a fleet has more than one instance, the request-to-instance assignment made at admission time is not the only scheduling decision worth making. A request already running on instance A can be moved, mid-decode, to instance B, and Llumnix's contribution is making that move cheap enough — near-zero downtime, independent of how long the sequence already is — that it becomes worth doing routinely rather than only as a last resort<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="migration-vs-failure-recovery">1.1 A different move than failure recovery</h3>
+<p>Module 4 §7 covered what happens when a prefill or decode worker dies, hangs, or becomes unreachable mid-transfer: SGLang's decode-side heartbeat (5.0 s interval, 2 consecutive misses to declare a partner offline, 300 s bootstrap and waiting timeouts)<a class="cite" href="#ref-3">3</a>, TensorRT-LLM's startup-time coordinator-reachability check with bounded retry<a class="cite" href="#ref-4">4</a>, and Dynamo's worker-lifecycle registration and deregistration<a class="cite" href="#ref-5">5</a>. All three of those are <em>reactive</em>: something has already gone wrong, and the mechanism exists to detect that and stop routing new work to the failed component. None of the three engines documents what happens to a specific in-flight request's state when its partner dies mid-transfer — Module 4 flagged that gap explicitly and left it open.</p>
+<p>Llumnix's live migration is not a response to that gap. It is a <em>planned</em>, healthy-instance-to-healthy-instance move, triggered by the scheduler's own policy rather than by any failure signal, for four distinct purposes the paper unifies under one abstraction<a class="cite" href="#ref-1">1</a>:</p>
+<ul>
+<li><b>Load balancing</b> — reduce preemptions and cross-request interference on an overloaded instance by moving some of its running requests elsewhere.</li>
+<li><b>De-fragmentation</b> — a cluster can have enough total free memory to admit a queuing request while no single instance has enough contiguous free memory, because load balancing itself spreads free space thin across instances; migration consolidates it.</li>
+<li><b>Prioritization</b> — give a high-priority request dedicated headroom on its current instance by migrating normal-priority requests away from it, without reserving a machine statically.</li>
+<li><b>Auto-scaling</b> — drain a terminating instance by migrating its remaining requests out, or saturate a newly launched instance by migrating requests in.</li>
+</ul>
+<p>All four are absent from the production stack surveyed in Modules 9-13. Dynamo's Planner scales prefill and decode <em>replica counts</em> against latency targets, not individual requests<a class="cite" href="#ref-6">6</a>; llm-d's Endpoint Picker filters and scores <em>which pod a new request goes to</em> at admission time; and every engine's xPyD reconfiguration adds or drains <em>whole workers</em><a class="cite" href="#ref-5">5</a> — none of them relocate one already-admitted, already-decoding request's state from one running instance to another. TensorRT-LLM's own documentation is explicit about how far the closest production-stack feature is from that: dynamic node joining and leaving for a disaggregated deployment is described as "being built on top of" the existing cache-transceiver mechanism, in progress rather than generally available<a class="cite" href="#ref-4">4</a> — and even once it ships, worker-level join/leave is still not per-request migration.</p>
+
+<h3 id="virtual-usage">1.2 One rule, four purposes: virtual usage</h3>
+<p>The mechanism that unifies all four scenarios is a single scheduling policy — load balancing on a metric Llumnix calls <em>virtual usage</em> — rather than four separate policies. The insight: de-fragmentation, prioritization, and auto-scaling can each be expressed as "make an instance's load balancer think it is more loaded than it physically is," which then triggers the same load-balancing migration machinery<a class="cite" href="#ref-1">1</a>. Concretely, virtual usage of a request equals its physical memory usage, plus a priority-dependent headroom term, plus (for a queuing head-of-line request) its projected memory demand, or infinity for a synthetic request artificially injected to drain a terminating instance<a class="cite" href="#ref-1">1</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Llumnix's virtual-usage rule feeds a single load-balancing policy that produces four different rescheduling behaviors depending on which term dominates.</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="230" y="20" width="340" height="70" rx="8" class="d-hl"/>
+<text x="400" y="46" text-anchor="middle" class="d-bold">virtual usage = physical usage</text>
+<text x="400" y="64" text-anchor="middle" class="d-mono d-small">+ headroom(priority) + demand(queuing) + &#8734;(fake)</text>
+<text x="400" y="80" text-anchor="middle" class="d-small d-text-light">one load-balancing policy on this one number</text>
+
+<path d="M310,90 C260,130 200,150 150,175" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M370,90 C340,130 300,150 260,175" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M430,90 C460,130 500,150 540,175" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M490,90 C540,130 600,150 650,175" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+<rect x="60" y="178" width="180" height="60" rx="8" class="d-block"/>
+<text x="150" y="202" text-anchor="middle" class="d-text-inv d-bold d-small">Load balancing</text>
+<text x="150" y="220" text-anchor="middle" class="d-text-inv d-small">physical usage dominates</text>
+
+<rect x="260" y="178" width="180" height="60" rx="8" class="d-block-2"/>
+<text x="350" y="202" text-anchor="middle" class="d-text-inv d-bold d-small">De-fragmentation</text>
+<text x="350" y="220" text-anchor="middle" class="d-text-inv d-small">queuing demand term</text>
+
+<rect x="460" y="178" width="180" height="60" rx="8" class="d-block-accent"/>
+<text x="550" y="202" text-anchor="middle" class="d-text-inv d-bold d-small">Prioritization</text>
+<text x="550" y="220" text-anchor="middle" class="d-text-inv d-small">headroom term</text>
+
+<rect x="560" y="178" width="180" height="60" rx="8" class="d-block-muted" transform="translate(40,0)"/>
+<text x="700" y="202" text-anchor="middle" class="d-text-inv d-bold d-small">Auto-scaling</text>
+<text x="700" y="220" text-anchor="middle" class="d-text-inv d-small">infinity term (fake request)</text>
+
+<text x="400" y="270" text-anchor="middle" class="d-small d-text-light">freeness F = (M &#8722; &#931;V) / B decides who migrates where, every round</text>
+</svg>
+<figcaption><b>Figure 2.</b> Llumnix's <code>CalcVirtualUsage</code> rule adds a headroom, demand, or infinity term to physical memory usage depending on the scenario, then a single load-balancing policy on the resulting "freeness" metric produces load balancing, de-fragmentation, prioritization, and auto-scaling as special cases of the same mechanism<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>The scheduler tracks a per-instance <em>freeness</em> metric \( F = (M - \sum V) / B \), where \(M\) is total instance memory, \(\sum V\) the sum of virtual usages of its requests, and \(B\) the batch size — dividing by batch size converts free memory into "how many more decode iterations this instance's current batch can run before it needs more space." Every scheduling round, Llumnix pairs the instances with the lowest and highest freeness and migrates requests from the low-freeness (overloaded, virtually or physically) instance to the high-freeness one, preferring lower-priority, shorter-sequence requests first<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="migration-mechanism">1.3 The mechanism: pipelined copy plus a handshake</h3>
+<p>Migrating a request naively — stop it, copy its entire KV cache, resume it on the destination — would stall the request for the time it takes to move however much state it has accumulated, and that time grows with sequence length. Llumnix instead exploits one property of autoregressive KV cache: it is append-only. Once a block of KV cache is written for a given iteration, it never changes in later iterations<a class="cite" href="#ref-1">1</a>. That means the already-generated portion of the cache can be copied to the destination instance <em>while the source instance keeps computing new tokens</em>, and only the last few blocks — generated after the previous copy round started — remain to be moved once computation actually has to pause.</p>
+
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 260" role="img" aria-label="Llumnix's multi-stage live-migration protocol, overlapping KV-cache copy with ongoing decode computation on the source instance">
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<g data-step="1">
+<rect x="20" y="20" width="200" height="60" rx="8" class="d-block"/>
+<text x="120" y="45" text-anchor="middle" class="d-text-inv d-bold d-small">Source instance</text>
+<text x="120" y="63" text-anchor="middle" class="d-text-inv d-small">pre-allocates request</text>
+<rect x="580" y="20" width="200" height="60" rx="8" class="d-block-2"/>
+<text x="680" y="45" text-anchor="middle" class="d-text-inv d-bold d-small">Destination instance</text>
+<text x="680" y="63" text-anchor="middle" class="d-text-inv d-small">reserves blocks or aborts</text>
+<path d="M220,50 L580,50" class="d-arrow d-dashed" marker-end="url(#f3-arr)"/>
+<text x="400" y="40" text-anchor="middle" class="d-mono d-small">handshake: PRE-ALLOC / ALLOC / ABORT</text>
+</g>
+
+<g data-step="2">
+<rect x="20" y="100" width="180" height="50" rx="6" class="d-panel"/>
+<text x="110" y="122" text-anchor="middle" class="d-small">Stage 0: copy completed blocks</text>
+<text x="110" y="140" text-anchor="middle" class="d-small d-text-light">while decoding continues</text>
+<path d="M200,125 L580,125" class="d-arrow" marker-end="url(#f3-arr)"/>
+</g>
+
+<g data-step="3">
+<rect x="230" y="100" width="180" height="50" rx="6" class="d-panel"/>
+<text x="320" y="122" text-anchor="middle" class="d-small">Stage 1..N-1: copy the</text>
+<text x="320" y="140" text-anchor="middle" class="d-small d-text-light">few blocks made since last copy</text>
+</g>
+
+<g data-step="4">
+<rect x="440" y="100" width="180" height="50" rx="6" class="d-hl"/>
+<text x="530" y="122" text-anchor="middle" class="d-small d-bold">Stage N: drain the batch,</text>
+<text x="530" y="140" text-anchor="middle" class="d-small">copy the last iteration's blocks</text>
+</g>
+
+<g data-step="5">
+<rect x="600" y="180" width="180" height="50" rx="6" class="d-block-2"/>
+<text x="690" y="202" text-anchor="middle" class="d-text-inv d-small d-bold">COMMIT</text>
+<text x="690" y="220" text-anchor="middle" class="d-text-inv d-small">decode resumes on destination</text>
+<path d="M530,150 L690,180" class="d-arrow" marker-end="url(#f3-arr)"/>
+</g>
+</svg>
+</figure>
+<ol class="steps">
+<li><b>Handshake.</b> Before each stage, the source issues a pre-allocation request naming the block count it will send; the destination reserves that space and replies ALLOC, or replies ABORT if it cannot, which cancels the migration cleanly and releases any state already staged<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>Stage 0.</b> The source begins copying the KV blocks generated by all completed iterations so far. Because those blocks are append-only and will not be rewritten, this copy runs concurrently with the source continuing to decode new tokens for this and every other request in its batch.</li>
+<li><b>Stages 1..N-1.</b> Each subsequent stage copies only the small number of new blocks produced since the previous stage's copy started. Because copying is faster than decoding, this catch-up set stays small, and the loop converges — Llumnix reports this pipelined portion of the transfer overlaps decoding almost entirely<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>Stage N.</b> Once the remaining uncopied set is small enough, the source suspends computation for this one request only, draining it out of its running batch, copies the last iteration's blocks, and this is the <em>only</em> stage that actually stalls the request — one iteration's worth of blocks, regardless of total sequence length<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>Commit.</b> The source releases its local blocks and signals the destination to resume decoding the request from its new location. If either side fails mid-protocol, the handshake's per-stage checks abort the migration and roll back cleanly rather than corrupting request state<a class="cite" href="#ref-1">1</a>.</li>
+</ol>
+</div>
+
+<p>The paper is explicit that naive alternatives — recomputing the prefix from scratch on the destination, or copying the whole cache in one stop-the-world transfer — introduce stalls and downtime "reaching over 50&#215; of the decoding cost," a cost that scales with sequence length, precisely the property the staged protocol eliminates<a class="cite" href="#ref-1">1</a>.</p>
+
+<p>Even Llumnix's own planned-migration mechanism has a reactive failure path layered underneath it, which is worth noting precisely because it shows the two categories are not mutually exclusive. The global scheduler itself can fail: Llumnix falls back to a scheduler-bypassing mode where request frontends dispatch directly to instances by simple rule, migration disabled, until the scheduler recovers. An instance — or its co-located local scheduler and migration coordinator — can also fail outright: every request running on it is aborted, including a request mid-migration whose source instance died, unless its destination was healthy enough to have already committed the transfer; Llumnix relies on Ray to automatically restart the failed actor, after which the service returns to normal scheduling<a class="cite" href="#ref-1">1</a>. So the planned/reactive distinction in Table 2 holds at the level of *why* a rescheduling decision is made, not as a claim that a migration-capable system needs no failure handling at all — it needs both, and Llumnix's own design keeps them as separate mechanisms rather than one subsuming the other.</p>
+
+<details class="more">
+<summary>Worked derivation: how much state actually has to move</summary>
+<p>Llumnix's own implementation notes give the numbers needed to see why a stop-the-world copy would be expensive enough to motivate staging in the first place. For a 16-bit LLaMA-7B model, one KV-cache block holds the key or value tensor for 16 tokens in one layer, and is fused into a 128 KB contiguous buffer before transfer<a class="cite" href="#ref-1">1</a>. A 1,024-token sequence over the model's 32 layers therefore has, per layer, \(1024 / 16 = 64\) key blocks and 64 value blocks — 128 blocks per layer — and across 32 layers:</p>
+$$ N_{\text{blocks}} = \frac{1024}{16} \times 2 \times 32 = 4{,}096 \text{ blocks} $$
+<p>matching the paper's own "1k tokens translates to 4k such blocks (32 layers)"<a class="cite" href="#ref-1">1</a>. At 128 KB per block, the total KV-cache footprint for this one request is</p>
+$$ 4{,}096 \times 128\text{ KB} = 524{,}288\text{ KB} = 512\text{ MB} $$
+<p>Copying 512 MB in one stop-the-world transfer would hold the GPU's decode loop for this request idle for the full transfer duration, and that duration grows linearly with sequence length — a 4,096-token request would need to move 2 GB before it could resume. The staged protocol sidesteps this by moving the bulk of that 512 MB during Stage 0, concurrently with ongoing decode, so only the last iteration's handful of newly appended blocks — not the full 4,096 — are on the critical path in Stage N. That is the concrete mechanism behind the paper's claim of downtime "constant to sequence lengths"<a class="cite" href="#ref-1">1</a>: the quantity that scales with \(L\) is moved off the blocking path, and only an \(O(1)\) slice remains on it.</p>
+</details>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Llumnix vs. INFaaS++ on a 16-GPU LLaMA-7B/30B cluster under realistic traces<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Metric</th><th class="num">Llumnix vs. INFaaS++</th><th>Mechanism</th></tr></thead>
+<tbody>
+<tr><td class="row">P99 first-token latency</td><td class="num" data-best>up to 15&#215; better</td><td>de-fragmentation reduces queuing delay</td></tr>
+<tr><td class="row">P99 per-token generation latency</td><td class="num" data-best>up to 2&#215; better</td><td>load balancing reduces preemptions</td></tr>
+<tr><td class="row">High-priority request speedup</td><td class="num" data-best>1.5&#215;</td><td>prioritization headroom via virtual usage</td></tr>
+<tr><td class="row">Cost saving at similar tail latency</td><td class="num" data-best>up to 36%</td><td>tighter auto-scaling via migration-assisted draining</td></tr>
+</tbody>
+</table>
+
+<table class="tbl tbl-dense">
+<caption><b>Table 2.</b> Module 4's failure handling and Llumnix's rescheduling are different mechanisms solving different problems, not two versions of the same thing<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Property</th><th>Module 4: partner-death detection</th><th>Llumnix: live migration</th></tr></thead>
+<tbody>
+<tr><td class="row">Trigger</td><td>a heartbeat or timeout expires; something is already wrong</td><td>a scheduling round; the virtual-usage policy decides to act</td></tr>
+<tr><td class="row">State of both endpoints</td><td>one endpoint is dead, hung, or unreachable</td><td>both endpoints are healthy and serving</td></tr>
+<tr><td class="row">What moves</td><td>routing decisions for <em>future</em> requests, away from the failed worker</td><td>one already-admitted request's live KV-cache state</td></tr>
+<tr><td class="row">Documented per-request outcome</td><td>not specified by any of the three engines' own docs (Module 4 §7)</td><td>resume on destination after Stage N, near-zero downtime</td></tr>
+<tr><td class="row">In the Part 5 production stack?</td><td>yes &#8212; SGLang, TensorRT-LLM, Dynamo all document some form of it</td><td>no &#8212; not implemented by any of the five engines covered in Modules 9&#8211;13</td></tr>
+</tbody>
+</table>
+
+<h2 id="hazy-research">2. The actual Hazy Research work: Tokasaurus, ThunderMLA, ThunderKittens</h2>
+<p>Before naming any project, a direct correction: <b>there is no Stanford or Hazy Research project called "Thunder Agent."</b> That name does not appear in Hazy Research's or the (Hazy-Research-adjacent) Scaling Intelligence Lab's published blogs, papers, or repositories<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-8">8</a>. If that name has come up elsewhere as the label for Stanford's multi-GPU serving or kernel-fusion work, it is a misremembering of one or more of three real, separately named projects: <b>Tokasaurus</b>, a throughput-first inference engine; <b>ThunderMLA</b>, a fused decode megakernel; and <b>ThunderKittens</b>, the tile-programming library both of the above (and much else at Hazy Research) are built on. The rest of this section describes what each of those three actually is.</p>
+
+<h3 id="thunderkittens">2.1 ThunderKittens: the tile-kernel DSL underneath both</h3>
+<p>ThunderKittens is a framework, maintained by graduate students at Stanford's Hazy Research Lab, for writing high-performance CUDA kernels; its own repository describes it as providing "tile primitives for speedy kernels," built around three stated principles — simplicity, extensibility, speed<a class="cite" href="#ref-8">8</a>. It operates at the warp and warpgroup level, giving kernel authors register tiles, shared-memory tiles, and register vectors as primitives, with a minimum tile size of 16&#215;16 values, and abstracts over tensor-core dispatch, shared-memory bank conflicts, asynchronous load/store scheduling, and distributed shared memory across thread blocks<a class="cite" href="#ref-8">8</a>. It is the library that ThunderMLA's megakernel is written in (§2.3) — the "interpreter template" ThunderMLA describes is implemented as a ThunderKittens construct<a class="cite" href="#ref-2">2</a> — and is used well beyond that one kernel: production users cited by the project include Together AI, Jump Trading, and Cursor, and its kernels cover FlashAttention-3-style attention, GEMM, and linear-attention architectures<a class="cite" href="#ref-8">8</a>. As of the version visible at the time of writing, ThunderKittens 2.0 (released 2026-01-11) added Blackwell GPU support and MXFP8/NVFP4 precision, requiring CUDA 12.8 or later<a class="cite" href="#ref-8">8</a>.</p>
+
+<h3 id="tokasaurus">2.2 Tokasaurus: a throughput-first engine, not a latency-first one</h3>
+<p>Tokasaurus is an inference engine built by Stanford's Scaling Intelligence Lab, explicitly optimized for "throughput-intensive workloads"<a class="cite" href="#ref-7">7</a> — the total time and cost to process a large batch of sequences, rather than any single request's latency. That framing puts it in a different design space than every engine covered in Modules 9-13, all of which are built to serve interactive, per-request-latency-sensitive traffic. Two mechanisms carry the throughput claim:</p>
+<ul>
+<li><b>Dynamic Hydragen grouping.</b> Before every forward pass, Tokasaurus runs a greedy depth-first search over the current batch to find the longest shared prefixes across requests, then groups requests on a shared prefix to run Hydragen-style attention against it once rather than redundantly per request<a class="cite" href="#ref-7">7</a>. This is a batch-time, algorithmic answer to the same prefix-reuse problem Module 2's router-side prefix-cache scoring and Module 7's hash-addressed KV pool solve at the routing and storage layers respectively — Tokasaurus instead exploits shared prefixes inside a single forward pass's attention computation.</li>
+<li><b>Adaptive CPU/GPU pipelining.</b> An asynchronous CPU-side manager keeps a deep queue of prepared inputs ahead of the GPU and monitors that queue's depth; if it detects the GPU is at risk of stalling because the queue is close to empty, it starts skipping optional per-step work (stop-string checks, admitting new sequences) until queue depth recovers, trading a small amount of per-step bookkeeping precision for keeping the GPU continuously fed<a class="cite" href="#ref-7">7</a>.</li>
+</ul>
+<p>For parallelism across GPUs, Tokasaurus makes a hardware-conditioned choice rather than a single default: on GPUs without NVLink, where tensor-parallel communication overhead is prohibitive, it uses pipeline parallelism, splitting already-large throughput-oriented batches into microbatches across pipeline stages; on NVLink-equipped GPUs (A100, H100, B200) it uses PyTorch's async tensor parallelism, which overlaps communication with compute but adds enough CPU overhead to the forward pass that it only pays off at large batch sizes (roughly 6,000+ tokens), so Tokasaurus keeps separate torch-compiled model graphs and switches TP on only once the batch crosses that size<a class="cite" href="#ref-7">7</a>. On eight NVLink-less L40S GPUs running Llama-3.1-70B, this pipeline-parallel path measured over 3&#215; the throughput of vLLM and SGLang on the same hardware<a class="cite" href="#ref-7">7</a>.</p>
+
+<h3 id="thundermla">2.3 ThunderMLA: fusing decode into one megakernel</h3>
+<p>ThunderMLA targets a narrower, deeper problem than Tokasaurus: the decode step itself, specifically for DeepSeek-style multi-head latent attention (MLA, Module 5), where DeepSeek's own FlashMLA kernel is the incumbent. FlashMLA's decode path runs as two separate kernel launches, and Hazy Research's own diagnosis is that the cost is not just the launch overhead itself but the "tail effects between kernel executions" — the second kernel cannot start filling the GPU until the first one's slowest-finishing block has drained, and decode's small batch-and-query counts (a handful of tokens across a handful of prompts) mean there often is not enough parallel work to hide that drain<a class="cite" href="#ref-2">2</a>. On a representative imbalanced-decode workload (batch 4, sequence lengths 4,641-1,730 tokens, 4 new tokens per prompt, 8-way tensor parallel, SXM H100), FlashMLA measured 52 &micro;s, 144 TFLOPs, and 1,199 GB/s of memory bandwidth — well under the H100's 989 TFLOPs / 3.35 TB/s specification ceiling<a class="cite" href="#ref-2">2</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f4t"><title id="f4t">FlashMLA's two-kernel-launch decode path leaves idle gaps between launches; ThunderMLA's fused megakernel runs continuously, with SMs pulling their next instruction from a GPU-resident instruction tensor.</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<text x="20" y="30" class="d-bold d-small">FlashMLA (two kernel launches)</text>
+<rect x="20" y="40" width="180" height="40" rx="6" class="d-block"/>
+<text x="110" y="65" text-anchor="middle" class="d-text-inv d-small">Kernel 1: attention</text>
+<rect x="220" y="40" width="40" height="40" rx="4" class="d-outline d-dashed"/>
+<text x="240" y="98" text-anchor="middle" class="d-small d-text-light">launch +</text>
+<text x="240" y="112" text-anchor="middle" class="d-small d-text-light">tail gap</text>
+<rect x="280" y="40" width="180" height="40" rx="6" class="d-block"/>
+<text x="370" y="65" text-anchor="middle" class="d-text-inv d-small">Kernel 2: combine</text>
+<text x="600" y="65" text-anchor="middle" class="d-mono d-small d-text-light">52 &micro;s, 144 TFLOPs, 1,199 GB/s</text>
+
+<text x="20" y="150" class="d-bold d-small">ThunderMLA (one fused megakernel)</text>
+<rect x="20" y="160" width="440" height="40" rx="6" class="d-hl"/>
+<text x="240" y="185" text-anchor="middle" class="d-small">SMs read next instruction from instruction tensor, no launch boundary</text>
+<path d="M470,180 L560,180" class="d-arrow" marker-end="url(#f4-arr)"/>
+<text x="650" y="185" text-anchor="middle" class="d-mono d-small">41 &micro;s, 183 TFLOPs, 1,520 GB/s</text>
+
+<text x="240" y="230" text-anchor="middle" class="d-small d-text-light">same representative workload: batch 4, mixed sequence lengths, 4 new tokens, 8-way TP, H100 SXM</text>
+</svg>
+<figcaption><b>Figure 4.</b> ThunderMLA replaces FlashMLA's attention-then-combine kernel pair with a single megakernel whose SMs pull work items from a GPU-resident instruction tensor instead of waiting on a second launch, cutting the representative-workload runtime from 52 &micro;s to 41 &micro;s (21% faster) on the same H100<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<p>The fusion mechanism: ThunderMLA builds "a simple virtual instruction set on the GPU. Instead of launching separate kernels, we fuse them into a single 'megakernel,' and then pass this megakernel its instructions at runtime through an instruction tensor"<a class="cite" href="#ref-2">2</a>. Within that one kernel launch, each SM reads its next instruction from the tensor, executes it, and reads the next one — attention and combine become instruction types dispatched inside one persistent kernel rather than two kernels separated by a launch boundary. Work is assigned to SMs by one of two schedulers built outside the kernel and reused across layers: a static scheduler that splits work into small pieces, builds a k-way reduction tree, and greedily assigns pieces to SMs via a priority queue; and a "makespan backwards" scheduler that starts from the known final reduction step and works backward with heuristic rollouts to choose an execution order that overlaps reduction with compute more tightly, worth roughly an additional 10% on top of the static scheduler<a class="cite" href="#ref-2">2</a>. Scheduling itself costs 1-2 ms, but amortizes because the same schedule is reused across dozens of layers of a large model and can be computed asynchronously on the CPU ahead of when it is needed<a class="cite" href="#ref-2">2</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> ThunderMLA vs. FlashMLA across four decode workloads, H100 SXM, 8-way tensor parallel<a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Workload</th><th class="num">FlashMLA</th><th class="num">ThunderMLA</th><th class="num">Speedup</th></tr></thead>
+<tbody>
+<tr><td class="row">B1, seq 64k, Q1</td><td class="num">55.0 &micro;s / 42 TFLOPs / 1,378 GB/s</td><td class="num" data-best>44.5 &micro;s / 52 TFLOPs / 1,700 GB/s</td><td class="num" data-best>23.6%</td></tr>
+<tr><td class="row">B64, seq 256-1024, Q4</td><td class="num">47.0 &micro;s / 124 TFLOPs / 1,212 GB/s</td><td class="num" data-best>39.5 &micro;s / 147 TFLOPs / 2,022 GB/s</td><td class="num" data-best>19.0%</td></tr>
+<tr><td class="row">B64, seq 512, Q2</td><td class="num">39.0 &micro;s / 59 TFLOPs / 1,092 GB/s</td><td class="num" data-best>28.6 &micro;s / 80 TFLOPs / 1,489 GB/s</td><td class="num" data-best>36.3%</td></tr>
+<tr><td class="row">B132, seq 4k, Q4</td><td class="num">226.0 &micro;s / 333 TFLOPs / 2,839 GB/s</td><td class="num" data-best>210.0 &micro;s / 358 TFLOPs / 3,055 GB/s</td><td class="num" data-best>7.6%</td></tr>
+</tbody>
+</table>
+
+<p>Across the range Hazy Research reports, ThunderMLA lands 20-35% faster than FlashMLA depending on workload shape<a class="cite" href="#ref-2">2</a> — the gain is largest for small, imbalanced batches (B64/Q2, 36.3%) where launch and tail-effect overhead is a proportionally larger share of a short kernel's total time, and smallest for large, compute-heavy batches (B132/Q4, 7.6%) where the two-launch overhead is already amortized against a longer-running kernel. Neither Tokasaurus nor ThunderMLA is part of the production stack surveyed in Modules 9-13: vLLM, SGLang, and TensorRT-LLM all still launch attention and combine as conventional, separately dispatched CUDA kernels.</p>
+
+<h2 id="unresolved-questions">3. State of the unresolved questions</h2>
+<p>Five modules in this course each surfaced a disagreement between credible, cited sources and did not resolve it — because the evidence needed to resolve it does not yet exist in public form. None of the five is settled as of this module's 2026-09-17 as-of date. Recapped in the order they arose:</p>
+
+<h3 id="recap-module-2">3.1 Module 2 — approximate vs. precise KV-cache routing</h3>
+<p>llm-d's router ships two modes for scoring which replica already holds a request's prefix: an approximate mode that hashes fixed-size blocks and keeps an in-memory LRU index with no query to any model server, and a precise mode that subscribes to real KVEvents streamed over ZeroMQ from each engine, at the cost of a tokenization round trip before every routing decision<a class="cite" href="#ref-9">9</a>. Module 2 found no controlled benchmark comparing the two modes' throughput or TTFT under identical traffic — the choice is currently made on architectural fit (is redundant-prefill cost measured to be high enough to justify the indexer) rather than on a published number.</p>
+
+<h3 id="recap-module-3">3.2 Module 3 — DistServe's goodput win vs. InferenceMAX's conditional TCO win</h3>
+<p>DistServe (OSDI 2024) measures SLO-constrained request rate per GPU on A100-class hardware and finds disaggregation wins by 2.0-12.6&#215; depending on metric, framed as close to unconditional once you optimize for goodput<a class="cite" href="#ref-10">10</a>. InferenceMAX measures TCO per million tokens on GB200/B200-class hardware and finds the win inverts above roughly 90 tokens/s/user of interactivity, where a single aggregated 8-GPU B200 server beats GB200 NVL72 disaggregated prefill<a class="cite" href="#ref-11">11</a>. Module 3's reconciliation: the two studies hold different variables fixed (SLO attainment vs. dollar cost) on different hardware generations three years apart, and InferenceMAX's own disaggregation implementation was, by the analysts' account, still under active optimization at time of measurement<a class="cite" href="#ref-11">11</a> — so the "crossover point" is a snapshot of one software stack's maturity, not a fixed hardware property. No study has published SLO attainment and TCO-per-token together on the same hardware generation.</p>
+
+<h3 id="recap-module-6">3.3 Module 6 — EP320 (December 2024) vs. EP144 (February 2025) for DeepSeek decode</h3>
+<p>DeepSeek's own V3 technical report specifies a 40-node, 320-GPU decode deployment unit at EP320, one expert per GPU, with IBGDA point-to-point all-to-all<a class="cite" href="#ref-12">12</a>. Two months later, DeepSeek's Day-6 Open Source Week disclosure describes production decode running at EP144 across 18 nodes, two routed experts per GPU<a class="cite" href="#ref-13">13</a> — a much smaller deployment unit. SGLang's independent reproduction lands at EP72 and recovers decode throughput within 6.6% of DeepSeek's own profile at under a quarter of the GPU count<a class="cite" href="#ref-14">14</a>. Module 6's reading: EP320 is a stated ceiling-case design, EP144 a live production average, and EPLB's own documentation frames larger EP as specifically suited to the decoding stage's "global" load-balancing policy<a class="cite" href="#ref-15">15</a> without claiming a fixed EP degree — so the two artifacts are not in conflict about a fact, but the general question of how EP degree should scale with decode QPS for any DeepSeek-class model remains open; no source publishes per-expert batch-size telemetry at matched traffic across multiple EP degrees.</p>
+
+<h3 id="recap-module-7">3.4 Module 7 — Mooncake's shared pool vs. a simpler point-to-point handoff</h3>
+<p>Given that KV cache already has to cross a node boundary once prefill and decode are disaggregated, Mooncake goes further and builds a shared, hash-addressed, cluster-wide cache pool with its own global scheduler (Conductor), reporting up to 525% higher throughput in simulated long-context scenarios and 75% more requests served under real Kimi production traffic<a class="cite" href="#ref-16">16</a>. The paper's own numbers cut the other way for the median case: cache-hit ratio on its 23,608-request production trace saturates near 50% even at large capacity, reaching 90% only for specific workloads like chat-to-document<a class="cite" href="#ref-16">16</a> — meaning roughly half of general-purpose prefill compute is never avoided regardless of pool size, while the shared pool's own hot-spot replication and early-rejection subsystems exist specifically to handle load-fluctuation failure modes that a simpler, non-shared point-to-point handoff would not introduce. Module 7's reading: the shared pool earns its complexity for long, frequently repeated contexts (RAG, agentic tool loops, shared system prompts) and earns it much less for short, largely unique prompts. No ablation isolating the sharing layer's marginal contribution from disaggregation's own decode-isolation effect has been published.</p>
+
+<h3 id="recap-module-12">3.5 Module 12 — engine-coupled router vs. separate orchestration layer</h3>
+<p>sglang-router ships as a single, high-performance Rust-based load balancer with multiple routing algorithms and native prefill-decode disaggregation support, run as one deployable process tightly coupled to SGLang workers only<a class="cite" href="#ref-17">17</a>. Dynamo and llm-d instead pull routing intelligence into a separate orchestration layer that sits above the inference engine and can front vLLM, SGLang, or TensorRT-LLM interchangeably<a class="cite" href="#ref-18">18</a>. Module 12's reading: the embedded-router approach has fewer moving parts and no extra network hop, and is the better default for a fleet that only ever runs one engine; the orchestration-layer approach is engine-agnostic and fits a platform team already standardized on Kubernetes' Gateway API. No published head-to-head benchmark compares sglang-router against Dynamo's Router or llm-d's EPP under an identical PD topology and identical hardware.</p>
+
+<table class="tbl tbl-dense">
+<caption><b>Table 4.</b> This course's five open disagreements, where they were raised, and what would settle each.</caption>
+<thead><tr><th>Module</th><th>Question</th><th>Positions</th><th>What would settle it</th></tr></thead>
+<tbody>
+<tr><td class="row">2</td><td>Approximate hashing or precise event-streaming for prefix-cache routing?</td><td>llm-d approximate (no engine query) vs. llm-d precise (ZMQ KVEvents)<a class="cite" href="#ref-9">9</a></td><td>A controlled throughput/TTFT comparison of both modes under identical traffic</td></tr>
+<tr><td class="row">3</td><td>Does disaggregation pay off unconditionally or only below an interactivity threshold?</td><td>DistServe/Splitwise goodput win<a class="cite" href="#ref-10">10</a> vs. InferenceMAX's ~90 tok/s/user TCO crossover<a class="cite" href="#ref-11">11</a></td><td>SLO attainment and TCO-per-token measured together, same hardware generation</td></tr>
+<tr><td class="row">6</td><td>How large should decode EP degree be for a DeepSeek-class MoE model?</td><td>EP320/one-expert-per-GPU<a class="cite" href="#ref-12">12</a> vs. EP144/EP72, denser per-GPU layout<a class="cite" href="#ref-13">13</a><a class="cite" href="#ref-14">14</a></td><td>Per-expert batch-size telemetry at multiple EP degrees, matched traffic</td></tr>
+<tr><td class="row">7</td><td>Does a shared, hash-addressed KV pool beat simple point-to-point handoff?</td><td>Mooncake's shared pool, production-adopted<a class="cite" href="#ref-16">16</a> vs. routing-only reuse (Module 2)</td><td>Same trace/hardware/PD split, sharing switched off vs. on</td></tr>
+<tr><td class="row">12</td><td>Should routing live inside the engine or in a separate orchestration layer?</td><td>sglang-router, one process<a class="cite" href="#ref-17">17</a> vs. Dynamo/llm-d, engine-agnostic layer<a class="cite" href="#ref-18">18</a></td><td>Identical PD topology and hardware, sglang-router vs. Dynamo Router vs. llm-d EPP</td></tr>
+</tbody>
+</table>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>This module's own disagreement is not about a number — it is about where the field's effort to close the gap between research and the production stack (Modules 1-14) should go next. Llumnix argues for smarter macro-level scheduling across instances; Tokasaurus and ThunderMLA argue, implicitly, for faster micro-level kernels within one instance; and the production stack itself, three years into disaggregation and two into wide EP, has adopted neither.</p>
+<div class="positions">
+<article class="position">
+<h4>Migration is infrastructure the production stack is genuinely missing</h4>
+<p class="who">Llumnix's own evidence<a class="cite" href="#ref-1">1</a>, reinforced by Module 4's undocumented mid-transfer recovery gap</p>
+<p>A 15&#215; P99 TTFT improvement and 36% cost saving on a 16-GPU cluster (Table 1) is a large, measured, reproducible gain from a mechanism that costs near-zero downtime to use. Every one of the four purposes it serves — load balancing, de-fragmentation, prioritization, auto-scaling — maps onto a real operational pain point the production stack still handles by cruder means: adding or draining whole workers (Modules 9, 14), not relocating individual requests. Module 4's own finding, that none of SGLang, TensorRT-LLM, or Dynamo documents what happens to a request whose transfer partner dies mid-flight, is a second, independent symptom of the same absence: a fleet that could migrate a request away from a struggling instance would have a natural answer to that gap, and today none of the three engines has one.</p>
+<ul class="pros"><li>Directly measured, large, multi-dimensional gains on a real (if modest, 16-GPU) cluster</li><li>Addresses an operational gap (mid-transfer partner death) this course independently identified in Module 4</li><li>The mechanism generalizes across four distinct scheduling problems rather than solving one narrowly</li></ul>
+<ul class="cons"><li>Evaluated on A10/LLaMA-7B-scale hardware and models, two generations behind the H100/GB200-scale deployments Modules 6, 9, and 13 measure</li><li>Adds a cluster-wide scheduling component (global scheduler plus per-instance llumlet) that itself becomes a scaling and failure-mode concern at fleet scale</li></ul>
+</article>
+<article class="position">
+<h4>Kernel-level fusion delivers more, sooner, without new orchestration surface</h4>
+<p class="who">Tokasaurus's and ThunderMLA's implicit bet<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-2">2</a></p>
+<p>Neither Tokasaurus nor ThunderMLA touches cluster scheduling at all — both work entirely within a single kernel launch or a single engine process, and both ship measured gains (over 3&#215; throughput for Tokasaurus's pipeline-parallel path, 20-35% for ThunderMLA's megakernel) without adding a global scheduler, a migration protocol, or a new failure mode at the cluster level. If the bottleneck a deployment actually has is GPU idle time from kernel-launch overhead and tail effects — which ThunderMLA's own FlashMLA baseline measurement shows leaves an H100 running at 144 of 939 advertised TFLOPs — then no amount of smarter cross-instance scheduling fixes that; the fix has to happen inside the kernel. This is a bet that per-GPU efficiency, not cross-GPU coordination, is the more tractable and more broadly applicable lever.</p>
+<ul class="pros"><li>No new cluster-level component, protocol, or failure mode introduced</li><li>Gains compound with whatever scheduling policy is already in place — a faster kernel helps under any router or connector</li><li>Directly measured against a real, current production baseline (DeepSeek's own FlashMLA)</li></ul>
+<ul class="cons"><li>Solves a different problem than Llumnix's — a perfectly fused megakernel still cannot rebalance load, de-fragment memory, or drain an instance across a cluster</li><li>Neither project is integrated into vLLM, SGLang, or TensorRT-LLM; adopting either means running a research codebase in production or reimplementing the technique inside a mainstream engine</li></ul>
+</article>
+<article class="position">
+<h4>Neither is necessary yet — the existing stack already covers most of the benefit</h4>
+<p class="who">Implicit in what Modules 9, 10, and 14 already ship</p>
+<p>Dynamo's Planner already rescales prefill and decode replica counts against measured SLA targets<a class="cite" href="#ref-6">6</a>; llm-d's Endpoint Picker already scores every new request against live prefix-cache and load state before admission (Module 2); and xPyD reconfiguration (Module 4) already adds and drains whole workers at runtime. None of that is migration, and none of it is a fused megakernel — but all three together address load imbalance, memory pressure, and elastic capacity at the admission boundary rather than mid-request, which is where most of a fleet's scheduling decisions already happen. A request that would benefit from migration in Llumnix's evaluation is, in a stack with good prefix-and-load-aware admission routing, less likely to land somewhere it needs to be moved away from in the first place.</p>
+<ul class="pros"><li>Zero new components — uses only mechanisms this course has already covered as shipping</li><li>Admission-time correction is simpler to reason about and debug than mid-request relocation</li></ul>
+<ul class="cons"><li>Admission-time routing cannot fix a request that becomes a problem <em>after</em> it is already running — a long-context request that grows past what its instance can hold has no recourse but preemption in the mainstream stack today</li><li>This is an absence of counter-evidence, not a measured comparison; nobody has quantified how much of Llumnix's 15&#215; gain a well-tuned admission-time router alone would recover</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>These are not substitutes for each other, because they operate at different layers: migration is a cluster-scheduling capability, kernel fusion is a per-GPU efficiency capability, and admission-time routing is what the production stack already has instead of either. A deployment could in principle adopt all three simultaneously with no conflict. The honest read of the evidence is that neither Llumnix nor the ThunderKittens-based kernels have been shown, in a head-to-head test against the mainstream stack's own mechanisms, to be necessary rather than merely sufficient: Llumnix was evaluated against INFaaS++, not against a Dynamo-Planner-plus-llm-d-EPP baseline (Table 1), and ThunderMLA was evaluated against FlashMLA in isolation, not against a full serving stack where kernel time is one term among several in end-to-end latency. What would actually settle which investment matters more for a given deployment is the comparison neither research artifact provides: the same traffic trace, the same hardware, once through today's admission-time-routing-only stack and once with migration or fused kernels added on top, isolating each mechanism's marginal contribution rather than comparing it only against an older or narrower baseline.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The clearest signal of what is likely to be stale within a year is not a prediction — it is the pace of change already visible in the sources this course cites. Four items are worth flagging explicitly rather than treating this course's numbers as fixed.</p>
+<table class="tbl tbl-dense">
+<caption><b>Table 5.</b> Claims in this course most likely to move within a year, and why.</caption>
+<thead><tr><th>Claim</th><th>Source</th><th>Why it is likely to move</th></tr></thead>
+<tbody>
+<tr><td class="row">Dynamo's component set and headline benchmark numbers (Module 9)</td><td>v1.4.2, 2026-08-29<a class="cite" href="#ref-19">19</a></td><td>Patch releases have shipped roughly monthly through 2026 (v1.4.0 &#8594; v1.4.1 &#8594; v1.4.2 in weeks), with a v1.5.0-dev TensorRT-LLM container already building<a class="cite" href="#ref-19">19</a></td></tr>
+<tr><td class="row">NIXL's supported backend list and transfer bug surface (Module 8)</td><td>v1.4.1, 2026-09-01<a class="cite" href="#ref-20">20</a></td><td>v1.4.1 closed a use-after-free window; v1.4.0 changed descriptor memory footprint by three orders of magnitude (44 MB &#8594; 7 KB); v1.3.2 fixed a transfer hang introduced one version earlier<a class="cite" href="#ref-20">20</a> &#8212; the abstraction is still actively settling, not stable</td></tr>
+<tr><td class="row">DeepSeek-class decode EP degree as "the" reference configuration (Module 6, &#167;3.3 above)</td><td>EP320<a class="cite" href="#ref-12">12</a> &#8594; EP144<a class="cite" href="#ref-13">13</a> in two months</td><td>Already moved once on public record; nothing in either disclosure suggests 144 is a final number rather than another snapshot of aggregate traffic at the time it was written</td></tr>
+<tr><td class="row">The ~90 tok/s/user disaggregation TCO crossover (Module 3, &#167;3.2 above)</td><td>InferenceMAX v1<a class="cite" href="#ref-11">11</a></td><td>Measured on one hardware generation (GB200 NVL72 vs. B200) with a disaggregation software stack the analysts themselves describe as still under active optimization; a new GPU generation or a more mature disaggregated-prefill implementation shifts the crossover point, not just the absolute numbers either side of it</td></tr>
+</tbody>
+</table>
+<p>None of this is a reason to distrust the numbers as of 2026-09-17 — every one of them carries a citation and an accessed date for exactly this reason. It is a reason to re-check version numbers and benchmark conditions before repeating any of them a year out, particularly the two version-churn rows, which are near-certain to have moved by the time this module is read again.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">paper</span>Sun, B., Huang, Z., Zhao, H., Xiao, W., Zhang, X., Li, Y., Lin, W. <em>Llumnix: Dynamic Scheduling for Large Language Model Serving</em>. arXiv:2406.03243v1, USENIX OSDI 2024. <a href="https://arxiv.org/pdf/2406.03243">https://arxiv.org/pdf/2406.03243</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the four rescheduling scenarios and virtual-usage abstraction (&#167;4.4, Figure 1, Algorithm 1), the multi-stage live-migration protocol and handshake (&#167;4.2-4.3, Figures 6-8), the freeness metric and Gloo-based transfer implementation (&#167;4.4, &#167;5), the KV-cache block-fusion sizing numbers (&#167;5, "Block fusion"), and the 16-GPU evaluation results (&#167;6, Table 1).</span></li>
+<li id="ref-2"><span class="ref-type">blog</span>Hazy Research. <em>ThunderMLA: FlashMLA, Faster and Fused-er!</em> Stanford University, published 2025-03-04. <a href="https://hazyresearch.stanford.edu/blog/2025-03-04-thundermla">https://hazyresearch.stanford.edu/blog/2025-03-04-thundermla</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the FlashMLA two-kernel-launch diagnosis, the megakernel/virtual-instruction-set mechanism, the static and makespan-backwards schedulers, and the four-workload benchmark table against FlashMLA.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>SGLang contributors. <em>PD Disaggregation</em>. SGLang Documentation, docs.sglang.io (live), 2026. <a href="https://docs.sglang.io/advanced_features/pd_disaggregation.html">https://docs.sglang.io/advanced_features/pd_disaggregation.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the SGLang heartbeat/bootstrap-timeout failure-detection defaults, recapped in contrast to Llumnix's planned migration.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>NVIDIA / TensorRT-LLM contributors. <em>Disaggregated Serving</em> (disagg-serving.md). TensorRT-LLM documentation, main branch, 2026. <a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md">https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: TensorRT-LLM's startup-time coordinator-reachability check and its explicitly not-yet-GA dynamic node joining/leaving status.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>NVIDIA. <em>Disaggregated Serving</em> (NVIDIA Dynamo Documentation). docs.nvidia.com/dynamo/knowledge-base, 2026. <a href="https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving">https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Dynamo's runtime-reconfigurable xPyD worker registration/deregistration mechanism, contrasted against per-request live migration.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>NVIDIA. <em>Planner Guide</em> (NVIDIA Dynamo Documentation, v1.2.1). <a href="https://docs.nvidia.com/dynamo/v1.2.1/components/planner/planner-guide">https://docs.nvidia.com/dynamo/v1.2.1/components/planner/planner-guide</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Planner's replica-count autoscaling framing, cited to show it operates on worker counts, not individual requests.</span></li>
+<li id="ref-7"><span class="ref-type">blog</span>Scaling Intelligence Lab (Hazy Research-adjacent group). <em>Tokasaurus: An LLM Inference Engine for High-Throughput Workloads</em>. Stanford University, published 2025. <a href="https://scalingintelligence.stanford.edu/blogs/tokasaurus/">https://scalingintelligence.stanford.edu/blogs/tokasaurus/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: dynamic Hydragen grouping, adaptive CPU/GPU pipelining, the pipeline-parallel-vs-async-TP hardware split, and the &gt;3&#215; L40S throughput measurement.</span></li>
+<li id="ref-8"><span class="ref-type">repo</span>HazyResearch contributors. <em>ThunderKittens</em> (GitHub repository README). Stanford University, Hazy Research Lab, main branch (v2.0, released 2026-01-11). <a href="https://github.com/HazyResearch/ThunderKittens">https://github.com/HazyResearch/ThunderKittens</a>. Accessed 2026-09-17. <span class="ref-use">Used for: what ThunderKittens actually is (a tile-primitive CUDA kernel framework), its warp/warpgroup abstraction, production users, and version history &#8212; fetched directly for this module to ground the "Thunder Agent" naming correction; not in the course's original source map.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>llm-d contributors. <em>Prefix-Cache Aware Routing</em> (llm-d docs). docs/dev (live), 2026. <a href="https://llm-d.ai/docs/dev/architecture/advanced/kv-management/prefix-cache-aware-routing">https://llm-d.ai/docs/dev/architecture/advanced/kv-management/prefix-cache-aware-routing</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the approximate (block-hash/LRU) vs. precise (KVEvents/ZMQ) routing modes recapped from Module 2.</span></li>
+<li id="ref-10"><span class="ref-type">paper</span>Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X., Zhang, H. <em>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</em>. arXiv:2401.09670v3, USENIX OSDI 2024. <a href="https://arxiv.org/pdf/2401.09670">https://arxiv.org/pdf/2401.09670</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the near-unconditional SLO-constrained goodput win recapped from Module 3.</span></li>
+<li id="ref-11"><span class="ref-type">analysis</span>SemiAnalysis. <em>InferenceMAX: Open Source Inference Benchmarking</em>. InferenceMAX v1, 2026. <a href="https://newsletter.semianalysis.com/p/inferencemax-open-source-inference">https://newsletter.semianalysis.com/p/inferencemax-open-source-inference</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the ~90 tok/s/user TCO crossover recapped from Module 3, and its flag as likely to move as hardware and the disaggregation stack mature.</span></li>
+<li id="ref-12"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3 Technical Report</em>. arXiv:2412.19437, 2024. <a href="https://arxiv.org/pdf/2412.19437">https://arxiv.org/pdf/2412.19437</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the December 2024 EP320/40-node decode deployment unit recapped from Module 6.</span></li>
+<li id="ref-13"><span class="ref-type">repo</span>DeepSeek-AI. <em>Day 6 (One More Thing): DeepSeek-V3/R1 Inference System Overview</em>. open-infra-index, #OpenSourceWeek, published 2025-02. <a href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the February 2025 EP144/18-node decode configuration recapped from Module 6.</span></li>
+<li id="ref-14"><span class="ref-type">blog</span>LMSYS Org. <em>Deploying DeepSeek with PD Disaggregation and Large-Scale Expert Parallelism on 96 H100 GPUs</em>. lmsys.org, published 2025-05-05. <a href="https://www.lmsys.org/blog/2025-05-05-large-scale-ep/">https://www.lmsys.org/blog/2025-05-05-large-scale-ep/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: SGLang's independent EP72 reproduction within 6.6% of DeepSeek's own decode profile, recapped from Module 6.</span></li>
+<li id="ref-15"><span class="ref-type">repo</span>DeepSeek-AI. <em>deepseek-ai/EPLB</em> (README). Main branch, 2026. <a href="https://github.com/deepseek-ai/EPLB/blob/main/README.md">https://github.com/deepseek-ai/EPLB/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: EPLB's "global" load-balancing policy framing for the decoding stage, recapped from Module 6.</span></li>
+<li id="ref-16"><span class="ref-type">paper</span>Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., Xu, X. <em>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</em>. arXiv:2407.00079v4, USENIX FAST 2025 (Best Paper Award). <a href="https://arxiv.org/pdf/2407.00079">https://arxiv.org/pdf/2407.00079</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the shared, hash-addressed cache pool's measured gains and its own cache-hit-ratio ceiling, recapped from Module 7.</span></li>
+<li id="ref-17"><span class="ref-type">repo</span>SGLang contributors. <em>sglang-router</em> (PyPI package page). SGLang / RadixArk, 0.3.2, 2026-01-15. <a href="https://pypi.org/project/sglang-router/">https://pypi.org/project/sglang-router/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the sglang-router description recapped from Module 12's engine-coupled-router position.</span></li>
+<li id="ref-18"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/dynamo</em> (README). v1.4.2 (container tags), 2026. <a href="https://github.com/ai-dynamo/dynamo">https://github.com/ai-dynamo/dynamo</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Dynamo's self-description as an engine-agnostic orchestration layer fronting vLLM/SGLang/TensorRT-LLM, recapped from Module 12's separate-orchestration position.</span></li>
+<li id="ref-19"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/dynamo Releases</em>. v1.4.2 (2026-08-29). <a href="https://github.com/ai-dynamo/dynamo/releases">https://github.com/ai-dynamo/dynamo/releases</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Dynamo's monthly-cadence patch release history, cited as evidence of version churn in "What is changing."</span></li>
+<li id="ref-20"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/nixl Releases</em>. v1.4.1 (2026-09-01). <a href="https://github.com/ai-dynamo/nixl/releases">https://github.com/ai-dynamo/nixl/releases</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NIXL's recent bug-fix and descriptor-format changes, cited as evidence of version churn in "What is changing."</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

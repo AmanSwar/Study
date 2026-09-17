@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Google TPU v5e/v5p/v6e/v7: Pod Architecture from Trillium to Ironwood · AI Inference Hardware</title>
+<meta name="description" content="TensorCore/MXU/SparseCore building blocks, per-chip specs for TPU v5e, v5p, v6e (Trillium) and v7 (Ironwood), torus pod topology, and Ironwood's inference-first prefill/decode design.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">AI Inference Hardware · Page 3</p>
+<h1>Google TPU v5e/v5p/v6e/v7: Pod Architecture from Trillium to Ironwood</h1>
+<p class="lede">Google's fifth-through-seventh-generation Tensor Processing Units are built from a different primitive than a GPU: a systolic-array matrix unit instead of SIMT tensor cores, and a torus fabric instead of a switched point-to-point network. This page covers the TensorCore/MXU/SparseCore building block, the per-chip compute/memory/interconnect specs across v5e, v5p, v6e (Trillium), and v7 (Ironwood), how 2D and 3D torus topologies scale to pods of up to 9,216 chips, and why Ironwood is the first TPU generation Google describes as designed for inference rather than adapted to it.</p>
+<div class="meta">
+<span class="chip chip-blue">Deep dive</span>
+<span class="chip"><b>35 min</b> read</span>
+<span class="chip"><b>7</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 400" role="img" aria-labelledby="f1t"><title id="f1t">TPU chip anatomy: TensorCore containing an MXU systolic array plus vector and scalar units, SparseCore alongside it, both backed by HBM, wired out through ICI to the pod.</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="20" width="760" height="360" rx="12" class="d-panel"/>
+<text x="40" y="48" class="d-title d-bold">One TPU chip</text>
+
+<rect x="50" y="70" width="330" height="220" rx="10" class="d-outline d-dashed"/>
+<text x="65" y="92" class="d-small d-text-light">TensorCore</text>
+
+<rect x="70" y="105" width="290" height="110" rx="8" class="d-block"/>
+<text x="215" y="130" text-anchor="middle" class="d-text-inv d-bold">MXU (systolic array)</text>
+<text x="215" y="150" text-anchor="middle" class="d-text-inv d-small">128x128 (pre-v6e) or</text>
+<text x="215" y="166" text-anchor="middle" class="d-text-inv d-small">256x256 (v6e, TPU7x) MACs</text>
+<text x="215" y="188" text-anchor="middle" class="d-text-inv d-small d-mono">bf16 in, FP32 accumulate</text>
+<text x="215" y="206" text-anchor="middle" class="d-text-inv d-small">x1, x2, x4, or x8 per TensorCore</text>
+
+<rect x="70" y="228" width="135" height="45" rx="8" class="d-block-2"/>
+<text x="137" y="255" text-anchor="middle" class="d-text-inv d-bold d-small">Vector unit</text>
+<rect x="225" y="228" width="135" height="45" rx="8" class="d-block-2"/>
+<text x="292" y="255" text-anchor="middle" class="d-text-inv d-bold d-small">Scalar unit</text>
+
+<rect x="420" y="70" width="180" height="220" rx="10" class="d-outline d-dashed"/>
+<text x="435" y="92" class="d-small d-text-light">Per chip</text>
+<rect x="440" y="108" width="140" height="80" rx="8" class="d-block-accent"/>
+<text x="510" y="140" text-anchor="middle" class="d-text-inv d-bold d-small">SparseCore(s)</text>
+<text x="510" y="160" text-anchor="middle" class="d-text-inv d-small">dataflow engine</text>
+<text x="510" y="176" text-anchor="middle" class="d-text-inv d-small">for embeddings</text>
+<text x="440" y="215" class="d-small d-text-light">Count/chip: 4 (v5e)</text>
+<text x="440" y="233" class="d-small d-text-light">1 TC x 4 MXU; 4 SC/chip</text>
+<text x="440" y="251" class="d-small d-text-light">on v5p, TPU7x; 2 on v6e</text>
+
+<rect x="630" y="105" width="130" height="110" rx="8" class="d-panel"/>
+<text x="695" y="130" text-anchor="middle" class="d-bold d-small">HBM</text>
+<text x="695" y="150" text-anchor="middle" class="d-small d-text-light">16-192 GiB/chip</text>
+<text x="695" y="168" text-anchor="middle" class="d-small d-text-light">across generations</text>
+<text x="695" y="190" text-anchor="middle" class="d-mono d-small">800-7,380 GBps</text>
+
+<path d="M360,160 L420,160" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M600,160 L630,160" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="50" y="315" width="710" height="50" rx="8" class="d-surface"/>
+<text x="405" y="345" text-anchor="middle" class="d-mono d-small">Inter-chip interconnect (ICI): 2D torus (v5e, v6e) or 3D torus (v5p, TPU7x) to the rest of the pod</text>
+</svg>
+<figcaption><b>Figure 1.</b> Every TPU chip in this generation range is built from the same four blocks: one or more TensorCores (each wrapping an MXU systolic array, a vector unit, and a scalar unit), one or more SparseCores for embedding-heavy sparse operations, on-chip HBM, and an ICI fabric out to the pod. Per-chip counts of TensorCores, MXUs, and SparseCores vary by generation (§2)<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<h2 id="tensorcore-mxu-sparsecore">1. The TensorCore, the MXU, and the SparseCore</h2>
+<p>A TPU chip contains one or more <b>TensorCores</b>. Each TensorCore consists of one or more <b>MXUs</b> (matrix multiply units), a vector unit, and a scalar unit<a class="cite" href="#ref-1">1</a>. The MXU does essentially all of the FLOPs; the vector unit runs elementwise ops like activations and softmax, and the scalar unit handles control flow and address generation<a class="cite" href="#ref-1">1</a>. This is the TPU equivalent of a GPU SM/CU housing tensor or matrix cores, but the internal mechanism is different in a way that matters for how you reason about peak throughput: an MXU is not an array of independent multiply-accumulate lanes issuing per-thread instructions, it is a <b>systolic array</b><a class="cite" href="#ref-1">1</a>.</p>
+
+<p>This is the point where a TPU stops resembling a GPU at the mechanism level rather than just the spec sheet. NVIDIA's tensor cores and AMD's matrix cores (pages 1 and 2) are SIMT execution units: a warp or wavefront of threads issues a matrix-multiply instruction, the core reads operands from register files/shared memory for that instruction, and the next instruction can be something else entirely — control flow, a different op, a different tile shape. An MXU issues nothing per cycle in that sense; once a matmul is mapped onto the grid, every PE in the array is doing the same multiply-accumulate every cycle until the operation drains, with no per-cycle instruction fetch inside the array at all. That is the source of a TPU's efficiency on large, regular matmuls (attention QK^T and score-value products, feed-forward projections) and the source of its dependence on XLA to statically tile and schedule work onto the array ahead of time rather than dispatching it dynamically the way a CUDA or ROCm kernel would.</p>
+
+<h3 id="mxu-systolic-array">1.1 The MXU as a systolic array</h3>
+<p>Google's own architecture documentation is explicit: "An MXU is composed of either 256 x 256 (TPU v6e and TPU7x) or 128 x 128 (TPU versions prior to v6e) multiply-accumulators in a systolic array. As each multiplication is executed, the result is passed to the next multiply-accumulator. The output is the summation of all multiplication results between the data and parameters."<a class="cite" href="#ref-1">1</a> Concretely: weights are loaded into the grid once and held stationary in each PE (processing element); activations stream in from one edge, partial sums propagate diagonally across the grid from PE to PE, and results drain out the far edge already fully accumulated. No PE ever fetches an operand from a register file or a cache line mid-computation — the only traffic in or out of the array is the activation stream in and the result stream out. That is what makes it power- and area-efficient for dense matmul and also what makes it a poor fit for anything irregular: a systolic array has no mechanism for a conditional branch, a gather, or a variable-length row, which is exactly the gap the SparseCore exists to fill (§1.2).</p>
+
+<p>The size of the grid sets the array's per-cycle throughput directly, because every one of its PEs computes one multiply-accumulate (MAC) per cycle once the pipeline is full. A 128x128 array — the MXU used in every generation prior to v6e, i.e. v5e and v5p in this page's scope — has 128 x 128 = 16,384 PEs, and Google's documentation independently states "Each MXU is capable of performing 16K multiply-accumulate operations per cycle"<a class="cite" href="#ref-1">1</a>: 16,384 rounds to "16K" exactly, so the two statements corroborate each other for the 128x128 generation.</p>
+
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 260" role="img" aria-label="Four steps of weight-stationary systolic-array dataflow inside an MXU, shown on a 4x4 stand-in grid">
+<defs><marker id="fs-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="400" y="26" text-anchor="middle" class="d-small d-text-light">4x4 stand-in for a 128x128 / 256x256 MXU grid</text>
+<g transform="translate(260,45)">
+<g class="d-outline"><rect x="0" y="0" width="40" height="40"/><rect x="40" y="0" width="40" height="40"/><rect x="80" y="0" width="40" height="40"/><rect x="120" y="0" width="40" height="40"/>
+<rect x="0" y="40" width="40" height="40"/><rect x="40" y="40" width="40" height="40"/><rect x="80" y="40" width="40" height="40"/><rect x="120" y="40" width="40" height="40"/>
+<rect x="0" y="80" width="40" height="40"/><rect x="40" y="80" width="40" height="40"/><rect x="80" y="80" width="40" height="40"/><rect x="120" y="80" width="40" height="40"/>
+<rect x="0" y="120" width="40" height="40"/><rect x="40" y="120" width="40" height="40"/><rect x="80" y="120" width="40" height="40"/><rect x="120" y="120" width="40" height="40"/></g>
+<g data-step="1">
+<rect x="2" y="2" width="36" height="36" class="d-fill-blue-soft"/><rect x="42" y="2" width="36" height="36" class="d-fill-blue-soft"/><rect x="82" y="2" width="36" height="36" class="d-fill-blue-soft"/><rect x="122" y="2" width="36" height="36" class="d-fill-blue-soft"/>
+<rect x="2" y="42" width="36" height="36" class="d-fill-blue-soft"/><rect x="42" y="42" width="36" height="36" class="d-fill-blue-soft"/><rect x="82" y="42" width="36" height="36" class="d-fill-blue-soft"/><rect x="122" y="42" width="36" height="36" class="d-fill-blue-soft"/>
+<rect x="2" y="82" width="36" height="36" class="d-fill-blue-soft"/><rect x="42" y="82" width="36" height="36" class="d-fill-blue-soft"/><rect x="82" y="82" width="36" height="36" class="d-fill-blue-soft"/><rect x="122" y="82" width="36" height="36" class="d-fill-blue-soft"/>
+<rect x="2" y="122" width="36" height="36" class="d-fill-blue-soft"/><rect x="42" y="122" width="36" height="36" class="d-fill-blue-soft"/><rect x="82" y="122" width="36" height="36" class="d-fill-blue-soft"/><rect x="122" y="122" width="36" height="36" class="d-fill-blue-soft"/>
+<text x="80" y="180" text-anchor="middle" class="d-small d-mono">every PE holds one weight, stationary</text>
+</g>
+<g data-step="2">
+<path d="M-30,20 L0,20" class="d-arrow-active" marker-end="url(#fs-arr)"/>
+<rect x="2" y="2" width="36" height="36" class="d-fill-orange"/>
+<text x="-60" y="24" class="d-small d-mono">act in</text>
+<text x="80" y="180" text-anchor="middle" class="d-small d-mono">column 0 activations enter the left edge</text>
+</g>
+<g data-step="3">
+<rect x="42" y="2" width="36" height="36" class="d-fill-orange"/><rect x="2" y="42" width="36" height="36" class="d-fill-orange"/>
+<path d="M38,20 L42,20" class="d-arrow" marker-end="url(#fs-arr)"/><path d="M20,38 L20,42" class="d-arrow" marker-end="url(#fs-arr)"/>
+<text x="80" y="180" text-anchor="middle" class="d-small d-mono">partial sums propagate diagonally, PE to PE</text>
+</g>
+<g data-step="4">
+<path d="M158,20 L190,20" class="d-arrow-active" marker-end="url(#fs-arr)"/>
+<rect x="122" y="2" width="36" height="36" class="d-fill-green"/>
+<text x="220" y="24" class="d-small d-mono">result out</text>
+<text x="80" y="180" text-anchor="middle" class="d-small d-mono">fully-accumulated results drain the far edge</text>
+</g>
+</g>
+</svg>
+</figure>
+<ol class="steps">
+<li><b>Load weights.</b> One operand matrix is loaded into the grid once and held stationary in every PE for the duration of the matmul — no weight re-fetch happens for the rest of the operation.</li>
+<li><b>Stream activations in.</b> The other operand streams in from one edge, one column (or row) per cycle, so the array never needs the whole activation matrix resident at once.</li>
+<li><b>Propagate partial sums.</b> Each PE multiplies its stationary weight by the incoming activation, adds the partial sum arriving from its neighbor, and passes the new partial sum onward — this is the "result is passed to the next multiply-accumulator" step Google's documentation describes<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>Drain results.</b> Once a partial sum has crossed every PE on its path, it emerges from the far edge already fully accumulated — no separate reduction pass is needed after the array.</li>
+</ol>
+</div>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>You can use this to sanity-check any TPU peak-FLOPS claim yourself: MACs/cycle/MXU (array rows x columns) x 2 FLOPs/MAC (one multiply, one add) x MXUs/TensorCore x TensorCores/chip x clock frequency = peak FLOPs/chip. Google publishes the peak FLOPs and the chip topology but not the clock, so the useful direction is usually to solve for the implied clock and check it is physically plausible.</p></aside>
+
+<details class="more"><summary>Worked derivation: implied MXU clock for v5e and v5p, and where the same arithmetic breaks for v6e</summary>
+<p>v5e has one TensorCore per chip with four 128x128 MXUs<a class="cite" href="#ref-2">2</a>, and a stated peak of 197 TFLOPs bf16 per chip<a class="cite" href="#ref-2">2</a>.</p>
+$$ \text{MACs/cycle per MXU} = 128 \times 128 = 16{,}384 $$
+$$ \text{FLOPs/cycle per chip} = 16{,}384 \times 2 \times 4\ \text{MXUs} = 131{,}072 $$
+$$ \text{implied clock} = \frac{197 \times 10^{12}}{131{,}072} \approx 1.503\ \text{GHz} $$
+<p>v5p has two TensorCores per chip, each with four 128x128 MXUs — eight MXUs total<a class="cite" href="#ref-3">3</a> — and a stated peak of 459 TFLOPs bf16 per chip<a class="cite" href="#ref-3">3</a>.</p>
+$$ \text{FLOPs/cycle per chip} = 16{,}384 \times 2 \times 8\ \text{MXUs} = 262{,}144 $$
+$$ \text{implied clock} = \frac{459 \times 10^{12}}{262{,}144} \approx 1.751\ \text{GHz} $$
+<p>Both implied clocks land in the same 1.5-1.75 GHz band, which is a plausible operating point for a large systolic array on a datacenter accelerator process and is internally consistent across two different chips of the same MXU generation — a genuine cross-check, not a coincidence built into the formula.</p>
+<p>Apply the identical formula to v6e (Trillium): one TensorCore, two 256x256 MXUs<a class="cite" href="#ref-4">4</a>, 918 TFLOPs bf16 per chip<a class="cite" href="#ref-4">4</a>.</p>
+$$ \text{MACs/cycle per MXU} = 256 \times 256 = 65{,}536 $$
+$$ \text{FLOPs/cycle per chip} = 65{,}536 \times 2 \times 2\ \text{MXUs} = 262{,}144 $$
+$$ \text{implied clock} = \frac{918 \times 10^{12}}{262{,}144} \approx 3.502\ \text{GHz} $$
+<p>3.5 GHz is not a plausible clock for a chip this size relative to the 1.5-1.75 GHz range the same arithmetic gives v5e and v5p. The likely explanation is that the "16K multiply-accumulate operations per cycle" line in Google's general architecture documentation is legacy text scoped to the 128x128-MXU generation and was not updated when the 256x256 MXU shipped with v6e<a class="cite" href="#ref-1">1</a> — the document states both array sizes in the same sentence and then gives a single "16K" throughput figure that only reconciles with the smaller one. This is a case where a vendor's own reference page is internally inconsistent rather than a case where the underlying hardware is unusual; treat the 256x256-generation peak-FLOPs figures (v6e, Ironwood) as authoritative and the "16K/cycle" line as describing only v5e/v5p-class MXUs.</p>
+</details>
+
+<div class="calc">
+<p class="calc-title">MXU peak FLOPS from array geometry</p>
+<div class="calc-row"><label for="c1-side">Array side (PEs)</label><select id="c1-side" name="side"><option value="128">128 (pre-v6e)</option><option value="256" selected>256 (v6e, TPU7x)</option></select></div>
+<div class="calc-row"><label for="c1-mxus">MXUs per chip</label><input type="range" id="c1-mxus" name="mxus" min="1" max="8" step="1" value="2"></div>
+<div class="calc-row"><label for="c1-clock">Clock (GHz)</label><input type="range" id="c1-clock" name="clock" min="0.5" max="4" step="0.05" value="1.5"></div>
+<div class="calc-out">
+<div>MACs/cycle (all MXUs)<output data-expr="side * side * mxus" data-format="si"></output></div>
+<div>Peak FLOPs/s<output data-expr="side * side * mxus * 2 * clock * 1e9" data-format="si"></output></div>
+</div>
+<p class="calc-note">Formula: \( \text{side}^2 \times \text{MXUs} \times 2 \times \text{clock} \). Set side=128, MXUs=4, clock≈1.5 GHz to reproduce v5e's stated 197 TFLOPs<a class="cite" href="#ref-2">2</a>; set side=256, MXUs=2 and raise the clock to see what it would take for v6e's stated 918 TFLOPs to reconcile with a 256x256 array at a plausible clock (it does not, at any clock under ~2 GHz — see the derivation above).</p>
+</div>
+
+<h3 id="sparsecore" data-text="SparseCore">1.2 SparseCore: a second, different core for embeddings</h3>
+<p>A SparseCore is not a smaller or cut-down MXU. Google describes it as a dataflow processor: "SparseCores are dataflow processors that accelerate models using sparse operations. A primary use case is accelerating recommendation models, which rely heavily on embeddings."<a class="cite" href="#ref-1">1</a> Where the MXU's systolic grid is efficient precisely because every PE does the same dense multiply-accumulate every cycle, embedding lookups are the opposite workload: a sparse table gather indexed by categorical IDs, followed by a scatter-add to combine looked-up rows, with no fixed access pattern the compiler can pipeline into a grid. Routing that traffic through a systolic array would stall it; the SparseCore exists as a separate execution unit specifically so the MXU is never blocked waiting on irregular memory access.</p>
+<p>SparseCore count per chip changes across generations independently of TensorCore/MXU count: v5e ships four SparseCores per chip, v5p and TPU7x (Ironwood) ship four per chip, and v6e ships two per chip<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-5">5</a>. v6e was also the generation that introduced SparseCore as a named, documented feature at all<a class="cite" href="#ref-4">4</a> — v5e and v5p already had the hardware, but Trillium's release is where Google began marketing it as a differentiator for embedding-heavy recommendation and ranking models. The XLA compiler decides how to use SparseCores; developers do not hand-schedule them directly, though XLA flags exist to tune the behavior<a class="cite" href="#ref-1">1</a>.</p>
+
+<h2 id="chip-specs-v5e-v5p-v6e-ironwood">2. Four generations, one chip table</h2>
+<p>v5e, v5p, v6e, and Ironwood are not a strict speed progression — v5e and v5p shipped in the same generation with deliberately different design points, and v6e and Ironwood each replace one of them. Table 1 puts all four on one grid; the sections below explain what each chip is actually for.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 1.</b> Per-chip specifications, TPU v5e through Ironwood (TPU7x). All figures are peak/theoretical, per Google Cloud's system-architecture documentation<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Spec</th><th class="num">v5e</th><th class="num">v5p</th><th class="num">v6e (Trillium)</th><th class="num">Ironwood (TPU7x)</th></tr></thead>
+<tbody>
+<tr><td class="row">Peak compute, BF16 (TFLOPs/chip)</td><td class="num">197</td><td class="num">459</td><td class="num">918</td><td class="num" data-best>2,307</td></tr>
+<tr><td class="row">Peak compute, FP8 (TFLOPs/chip)</td><td class="num">—</td><td class="num">459</td><td class="num">—</td><td class="num" data-best>4,614</td></tr>
+<tr><td class="row">Peak compute, Int8 (TOPs/chip)</td><td class="num">393</td><td class="num">—</td><td class="num">1,836</td><td class="num">—</td></tr>
+<tr><td class="row">HBM capacity (per chip)</td><td class="num">16 GB</td><td class="num">95 GiB</td><td class="num">32 GB</td><td class="num" data-best>192 GiB</td></tr>
+<tr><td class="row">HBM bandwidth (per chip)</td><td class="num">800 GiBps</td><td class="num">2,765 GBps</td><td class="num">1,638 GBps</td><td class="num" data-best>7,380 GBps</td></tr>
+<tr><td class="row">TensorCores / chip</td><td class="num">1</td><td class="num">2</td><td class="num">1</td><td class="num">2 (1 per chiplet)</td></tr>
+<tr><td class="row">MXUs / TensorCore (array size)</td><td class="num">4 (128x128)</td><td class="num">4 (128x128)</td><td class="num">2 (256x256)</td><td class="num">2 (256x256)</td></tr>
+<tr><td class="row">SparseCores / chip</td><td class="num">4</td><td class="num">4</td><td class="num">2</td><td class="num">4 (2 per chiplet)</td></tr>
+<tr><td class="row">ICI bandwidth (bidirectional, per chip)</td><td class="num">400 GBps</td><td class="num">1,200 GBps</td><td class="num">800 GBps</td><td class="num" data-best>1,200 GBps</td></tr>
+<tr><td class="row">ICI ports / chip</td><td class="num">4</td><td class="num">6</td><td class="num">4</td><td class="num">6</td></tr>
+<tr><td class="row">Interconnect topology</td><td class="num">2D torus</td><td class="num">3D torus</td><td class="num">2D torus</td><td class="num">3D torus</td></tr>
+<tr><td class="row">Chips per pod (max)</td><td class="num">256</td><td class="num">8,960</td><td class="num">256</td><td class="num" data-best>9,216</td></tr>
+<tr><td class="row">DCN bandwidth (per chip)</td><td class="num">—</td><td class="num">50 Gbps</td><td class="num">100 Gbps</td><td class="num">100 Gbps</td></tr>
+<tr><td class="row">vCPUs (per 4-chip VM)</td><td class="num">—<sup>†</sup></td><td class="num">208</td><td class="num">180</td><td class="num">224</td></tr>
+<tr><td class="row">RAM (per 4-chip VM)</td><td class="num">—<sup>†</sup></td><td class="num">448 GB</td><td class="num">720 GB</td><td class="num">960 GB</td></tr>
+</tbody>
+</table>
+<p class="small muted">† v5e's documentation reports host configuration as 8 chips/host with 512 GiB DRAM/host rather than a 4-chip-VM figure, so it is not directly comparable to the other three columns' 4-chip-VM rows<a class="cite" href="#ref-2">2</a>.</p>
+
+<h3 id="v5e">2.1 v5e: the cost/inference-optimized chip</h3>
+<p>v5e ships one TensorCore per chip with four 128x128 MXUs, 16 GB of HBM at 800 GiBps, and four ICI ports wired into a 2D torus<a class="cite" href="#ref-2">2</a>. Google positions it explicitly as a joint training-and-serving product with the caveat that the two jobs want opposite things from the scheduler: "Training jobs are optimized for throughput and availability, while serving jobs are optimized for latency. A training job on TPUs provisioned for serving could have lower availability and similarly, a serving job executed on TPUs provisioned for training could have higher latency."<a class="cite" href="#ref-2">2</a> A full v5e pod tops out at 256 chips arranged as a 16x16 2D torus, giving a pod-level peak of 50.63 PFLOPs bf16, 51.2 TB/s all-reduce bandwidth, and 100 PetaOps Int8<a class="cite" href="#ref-2">2</a>.</p>
+<p>16 GB of HBM per chip is small next to v5p's 95 GiB or Ironwood's 192 GiB — v5e is built to be cheap per chip and scaled out, not to hold the largest possible model on a single device. Serving a large model on v5e means either sharding across chips or accepting the memory ceiling; this is the same shape of constraint page 6 works through quantitatively for GPU HBM capacity, applied here to the smallest-memory TPU in the range.</p>
+<p>v5e VMs bundle up to eight chips per host, and the CPU-to-TPU path is non-uniform at the largest single-host size: "In 4-chip and smaller slices, all TPU chips share the same non-uniform memory access (NUMA) node. For 8-chip v5e TPU VMs, CPU-TPU communication will be more efficient within NUMA partitions."<a class="cite" href="#ref-2">2</a> Each host carries 512 GiB of DRAM<a class="cite" href="#ref-2">2</a> — this is host-side system memory feeding the chips over PCIe, separate from the 16 GB of on-chip HBM per chip, and it is the pool used for activation/optimizer-state offload the same way Ironwood's host memory tier works (§2.5).</p>
+
+<h3 id="v5p">2.2 v5p: the training/performance chip</h3>
+<p>v5p doubles the TensorCore count to two per chip (still four 128x128 MXUs each, eight total), roughly triples HBM to 95 GiB at 2,765 GBps, and moves to a six-port 3D torus at 1,200 GBps bidirectional ICI per chip<a class="cite" href="#ref-3">3</a>. The headline number is pod scale: a full v5p pod is 8,960 chips, and Google states the topology directly rather than leaving it implicit — "A TPU v5p Pod is composed of 8960 chips interconnected with reconfigurable high-speed links," with the largest documented single-slice shape at 16x16x24 (6,144 chips, 96 cubes) and Multislice extending a single training job to 18,432 chips by stitching multiple slices together over the data-center network<a class="cite" href="#ref-3">3</a>. A full pod comes out to 17,920 TensorCores across 8,960 chips, 2,240 hosts/VMs, and 140 cubes<a class="cite" href="#ref-3">3</a>.</p>
+<p>One spec-table detail worth flagging on its own: v5p's FP8 peak (459 TFLOPs) equals its BF16 peak (459 TFLOPs) exactly<a class="cite" href="#ref-3">3</a> — unlike v5e, v6e, and Ironwood, which all roughly double their throughput at FP8 or Int8 relative to bf16, v5p gets no speedup from dropping to 8-bit. v5p's MXU generation does not have an FP8-accelerated datapath the later three chips do; the 459/459 pairing in the spec table is not a rounding coincidence, it is the same number reported twice because there is only one number.</p>
+
+<h3 id="v6e-trillium">2.3 v6e (Trillium): the generational jump</h3>
+<p>v6e roughly doubles v5e's peak compute (918 vs. 197 TFLOPs bf16 — a 4.7x jump, not 2x, because v6e also moves to the larger 256x256 MXU) while cutting MXU count per TensorCore from four to two<a class="cite" href="#ref-4">4</a>. HBM capacity doubles to 32 GB and bandwidth roughly doubles to 1,638 GBps<a class="cite" href="#ref-4">4</a>; ICI bandwidth doubles from 400 to 800 GBps bidirectional, still over a 2D torus with four ports and a 256-chip pod ceiling<a class="cite" href="#ref-4">4</a>. Pod-level all-reduce bandwidth reaches 102.4 TB/s and bisection bandwidth 3.2 TB/s — both roughly double v5e's 51.2 TB/s and 1.6 TB/s<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-4">4</a>. v6e is also the generation where SparseCore is called out as a named "special feature" in Google's own spec table, even though the underlying hardware exists on v5e and v5p too<a class="cite" href="#ref-4">4</a>. Host-side provisioning grew alongside the chip: each v6e host carries 1,536 GiB of DRAM — three times v5e's 512 GiB — and four 200 Gbps NICs per host versus v5e's two 100 Gbps NICs, doubling both DCN bandwidth per pod (25.6 vs. 6.4 Tbps) and giving each host substantially more headroom for data loading and checkpoint I/O without touching HBM<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-4">4</a>.</p>
+
+<h3 id="ironwood-tpu7x">2.4 Ironwood (TPU7x): breaking from MegaCore</h3>
+<p>Every TPU generation up to and including v5p exposed a chip as a single "MegaCore" logical device — a unified memory space and a single programming target even where the chip physically had multiple TensorCores<a class="cite" href="#ref-5">5</a>. Ironwood ends that: "The Ironwood programming model lets you access two TPU chiplets instead of a single logical core (also known as MegaCore) architecture used in previous generations (TPU v4 and v5p) ... Ironwood TPUs are composed of two distinct chiplets, each with its own dedicated memory space. This is a departure from the unified memory space of the MegaCore architecture."<a class="cite" href="#ref-5">5</a> Each chiplet is a complete, self-contained unit: one TensorCore, two SparseCores, and 96 GB of HBM<a class="cite" href="#ref-5">5</a> — meaning the chip-level totals in Table 1 (192 GiB HBM, two TensorCores, four SparseCores) are exactly two chiplets' worth, not a monolithic design that happens to have those numbers.</p>
+<p>Google states the motivation for the split plainly, and it is not framed as a performance feature: "This change improves the cost-effectiveness and efficiency of manufacturing the chip."<a class="cite" href="#ref-5">5</a> This is a yield/reticle-limit argument — the same category of reasoning behind chiplet designs on the GPU side (pages 1 and 2 cover NVIDIA Blackwell's dual-die package and AMD's XCD chiplets respectively) — not a claim that splitting the chip made it faster per se. The two chiplets are connected by a die-to-die (D2D) interface Google describes as "six times faster than a 1D inter-chip interconnect (ICI) link"<a class="cite" href="#ref-5">5</a>; Ironwood's 3D torus carries 200 GBps bidirectional per axis<a class="cite" href="#ref-5">5</a>, and if that per-axis rate is the "1D ICI link" baseline the multiplier refers to, the D2D link runs in the neighborhood of 1,200 GBps — comparable to the entire chip's external ICI bandwidth, packed into a link that only has to reach the other half of the same package.</p>
+<p>Because each chiplet keeps its own memory space rather than sharing one, frameworks see the split directly: "Frameworks like JAX expose each Ironwood chip as two separate 'devices,' one for each chiplet ... JAX adds a fourth dimension to the topology specification to distinguish between chiplets."<a class="cite" href="#ref-5">5</a> Google is explicit that this is a deliberate concession to compatibility, not an oversight: "While this represents an architectural shift, the new design ensures that you can reuse existing software models with minimal changes ... The programming model for Ironwood is similar to that of TPU generations earlier than v4, such as TPU v3."<a class="cite" href="#ref-5">5</a> Section 6 covers why the chip is organized this way from the inference-workload side, not just the manufacturing side.</p>
+
+<h3 id="tpu7x-memory-hierarchy">2.5 TPU7x memory hierarchy: HBM, VMEM, and host offload</h3>
+<p>Ironwood's own documentation describes three memory tiers, not one, and is candid that the largest tier is not automatically the answer to a bandwidth problem: "Each chip is equipped with 192 GB of HBM, with bandwidth of approximately 7.37 TB/s. The large HBM capacity enables large batch sizes, which can improve throughput. However, despite its size, HBM can still be a bottleneck, particularly for memory-bound vector operations or inefficient data access patterns."<a class="cite" href="#ref-5">5</a> Underneath HBM sits VMEM, on-chip SRAM feeding the MXU directly: "VMEM is a smaller, on-chip SRAM ... with significantly higher bandwidth to the Matrix Multiply Unit (MXU) than HBM. This memory acts as a high-speed scratchpad for custom kernels. The size of this buffer is a tunable parameter."<a class="cite" href="#ref-5">5</a> This is the tier a hand-written Pallas kernel has to fit its working set into — block sizes for custom kernels are constrained by available VMEM, not by HBM capacity<a class="cite" href="#ref-5">5</a>.</p>
+<p>Above HBM, host DRAM is a fourth, off-chip tier reachable only over PCIe: "Each set of four TPU chips is connected to a CPU host using a PCIe network. While this connection has much lower bandwidth than HBM, the host's main memory can be used for offloading activations or optimizer states to free up HBM, a technique particularly useful for managing memory pressure in large models."<a class="cite" href="#ref-5">5</a> The ordering (VMEM fastest and smallest, feeding the MXU directly; HBM large and fast but chip-local; host DRAM largest and slowest, PCIe-attached) is the same shape of hierarchy a GPU exposes as registers/shared-memory, HBM, and pinned host memory — the terminology differs (VMEM instead of shared memory/L2, no cache hierarchy in the CPU sense) but the offload strategy for managing a model too large for HBM alone is the same idea applied to a different set of names.</p>
+
+<h2 id="ici-torus-topology">3. ICI and torus topology: 2D vs 3D</h2>
+
+<h3 id="torus-vs-mesh">3.1 What wraparound links buy you</h3>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>Google's vocabulary is precise and worth fixing before the topology comparisons below: a <b>Pod</b> is "a contiguous set of TPUs grouped together over a specialized network," a <b>slice</b> is "a collection of chips all located inside the same TPU Pod connected by high-speed inter-chip interconnects (ICI)," and a <b>cube</b> is specifically "a 4x4x4 topology of interconnected TPU chips," applicable only to 3D topologies from TPU v4 onward<a class="cite" href="#ref-1">1</a>. A slice is <b>single-host</b> if all its chips attach to one compute host and <b>multi-host</b> otherwise<a class="cite" href="#ref-1">1</a> — for TPU7x, a single host connects to four chips, so a 2x2x1 (4-chip) slice is single-host while 2x2x2 (8 chips, two hosts) and larger are multi-host<a class="cite" href="#ref-1">1</a>. "Pod" is the physical maximum; "slice" is what one job actually gets allocated (§4).</p></aside>
+<p>A torus is a mesh with the edges wrapped around: every chip has the same number of neighbors, including the ones at the physical boundary of the grid, because the last chip in a row is wired directly back to the first. A plain 2D mesh gives interior chips four neighbors and edge/corner chips fewer, which makes the network non-uniform and creates congestion at the edges under all-reduce-style collectives. Wrapping it into a torus makes every chip's neighbor count identical, which is why Google specifies "ICI ports per chip" as a single number per generation (four for v5e and v6e's 2D torus, six for v5p and Ironwood's 3D torus<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>) rather than a range.</p>
+<p>3D adds a third pair of wraparound links on top of the 2D grid's two pairs, at the cost of needing six ICI ports per chip instead of four and a more complex physical cabling topology. Google's v5p documentation notes the wraparound property is not automatic at every slice size: "All 4x4x4 and larger slices (one cube) have full 3D torus connectivity. Slices smaller than a full cube are 3D connected, however, they don't have wrap-around links that make them a 3D torus."<a class="cite" href="#ref-3">3</a> A "cube" — a 4x4x4 block of 64 chips — is the smallest unit that gets the full torus property; below that, small slices carve out of a pod are 3D-connected (each axis routed) but not 3D-toroidal (no wraparound), which matters for collective-communication bandwidth on small allocations.</p>
+
+<h3 id="2d-vs-3d-torus">3.2 v5e/v6e (2D) vs. v5p/Ironwood (3D)</h3>
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f2t"><title id="f2t">Side-by-side comparison of a 2D torus (v5e, v6e) and a 3D torus (v5p, Ironwood), showing wraparound links and port counts.</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<text x="200" y="30" text-anchor="middle" class="d-title d-bold">2D torus — v5e, v6e</text>
+<text x="200" y="50" text-anchor="middle" class="d-small d-text-light">4 ICI ports/chip, pod max 256 chips</text>
+<g>
+<!-- 4x4 grid with wraparound -->
+<g transform="translate(50,70)">
+<!-- grid nodes -->
+<rect x="0" y="0" width="40" height="30" rx="4" class="d-block"/><rect x="60" y="0" width="40" height="30" rx="4" class="d-block"/><rect x="120" y="0" width="40" height="30" rx="4" class="d-block"/><rect x="180" y="0" width="40" height="30" rx="4" class="d-block"/>
+<rect x="0" y="60" width="40" height="30" rx="4" class="d-block"/><rect x="60" y="60" width="40" height="30" rx="4" class="d-block"/><rect x="120" y="60" width="40" height="30" rx="4" class="d-block"/><rect x="180" y="60" width="40" height="30" rx="4" class="d-block"/>
+<rect x="0" y="120" width="40" height="30" rx="4" class="d-block"/><rect x="60" y="120" width="40" height="30" rx="4" class="d-block"/><rect x="120" y="120" width="40" height="30" rx="4" class="d-block"/><rect x="180" y="120" width="40" height="30" rx="4" class="d-block"/>
+<rect x="0" y="180" width="40" height="30" rx="4" class="d-block"/><rect x="60" y="180" width="40" height="30" rx="4" class="d-block"/><rect x="120" y="180" width="40" height="30" rx="4" class="d-block"/><rect x="180" y="180" width="40" height="30" rx="4" class="d-block"/>
+<!-- horizontal links -->
+<path d="M40,15 L60,15 M100,15 L120,15 M160,15 L180,15" class="d-arrow"/>
+<path d="M40,75 L60,75 M100,75 L120,75 M160,75 L180,75" class="d-arrow"/>
+<path d="M40,135 L60,135 M100,135 L120,135 M160,135 L180,135" class="d-arrow"/>
+<path d="M40,195 L60,195 M100,195 L120,195 M160,195 L180,195" class="d-arrow"/>
+<!-- vertical links -->
+<path d="M20,30 L20,60 M20,90 L20,120 M20,150 L20,180" class="d-arrow"/>
+<path d="M80,30 L80,60 M80,90 L80,120 M80,150 L80,180" class="d-arrow"/>
+<path d="M140,30 L140,60 M140,90 L140,120 M140,150 L140,180" class="d-arrow"/>
+<path d="M200,30 L200,60 M200,90 L200,120 M200,150 L200,180" class="d-arrow"/>
+<!-- wraparound (dashed) -->
+<path d="M220,15 C260,15 260,-20 -20,-20 C-20,15 -20,15 0,15" class="d-arrow d-dashed" fill="none"/>
+<path d="M20,-20 C20,-40 220,-40 220,225 C220,245 200,245 200,225" class="d-arrow d-dashed" fill="none"/>
+</g>
+<text x="200" y="330" text-anchor="middle" class="d-small d-text-light">dashed = wraparound (torus) links, 2 axes</text>
+</g>
+
+<line x1="400" y1="10" x2="400" y2="320" class="d-axis"/>
+
+<text x="600" y="30" text-anchor="middle" class="d-title d-bold">3D torus — v5p, Ironwood</text>
+<text x="600" y="50" text-anchor="middle" class="d-small d-text-light">6 ICI ports/chip, cube = 4x4x4 = 64 chips</text>
+<g transform="translate(470,80)">
+<!-- isometric-ish cube of chips: draw a 3x3x1 front face plus depth offset to suggest 3D -->
+<g class="d-outline">
+<rect x="0" y="0" width="200" height="200" rx="6"/>
+<rect x="30" y="-30" width="200" height="200" rx="6"/>
+<line x1="0" y1="0" x2="30" y2="-30"/>
+<line x1="200" y1="0" x2="230" y2="-30"/>
+<line x1="0" y1="200" x2="30" y2="170"/>
+<line x1="200" y1="200" x2="230" y2="170"/>
+</g>
+<rect x="80" y="80" width="40" height="40" rx="4" class="d-fill-orange"/>
+<text x="100" y="105" text-anchor="middle" class="d-text-inv d-small d-bold">chip</text>
+<path d="M120,100 L200,100" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+<text x="160" y="92" text-anchor="middle" class="d-small">x-axis</text>
+<path d="M100,80 L100,0" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+<text x="70" y="45" text-anchor="middle" class="d-small">y-axis</text>
+<path d="M120,80 L210,-10" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+<text x="200" y="50" text-anchor="middle" class="d-small">z-axis</text>
+</g>
+<text x="600" y="330" text-anchor="middle" class="d-small d-text-light">wraparound on all 3 axes once a slice is a full cube or larger</text>
+</svg>
+<figcaption><b>Figure 2.</b> v5e and v6e wire their ICI ports into a 2D torus (four ports/chip, wraparound on two axes); v5p and Ironwood use a 3D torus (six ports/chip, wraparound on three axes once the slice reaches a full 4x4x4 "cube" of 64 chips). The extra dimension is what lets v5p and Ironwood scale a single pod past 8,000 chips instead of capping at 256<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Topology and pod-scale comparison. Bisection and all-reduce bandwidth are pod-level aggregates, not per-chip<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Spec</th><th class="num">v5e</th><th class="num">v5p</th><th class="num">v6e</th><th class="num">Ironwood</th></tr></thead>
+<tbody>
+<tr><td class="row">Topology</td><td class="num">2D torus</td><td class="num">3D torus</td><td class="num">2D torus</td><td class="num">3D torus</td></tr>
+<tr><td class="row">Cube unit</td><td class="num">—</td><td class="num">4x4x4 = 64</td><td class="num">—</td><td class="num">4x4x4 = 64</td></tr>
+<tr><td class="row">Max single-slice size</td><td class="num">256 chips</td><td class="num">6,144 chips (96 cubes)</td><td class="num">256 chips</td><td class="num">9,216 chips (144 cubes)</td></tr>
+<tr><td class="row">Max Multislice size</td><td class="num">—</td><td class="num">18,432 chips</td><td class="num">—</td><td class="num">—<sup>*</sup></td></tr>
+<tr><td class="row">Bisection bandwidth / pod</td><td class="num">1.6 TB/s</td><td class="num">—</td><td class="num">3.2 TB/s</td><td class="num">—</td></tr>
+<tr><td class="row">All-reduce bandwidth / pod</td><td class="num">51.2 TB/s</td><td class="num">—</td><td class="num">102.4 TB/s</td><td class="num">—</td></tr>
+<tr><td class="row">DCN bandwidth / pod</td><td class="num">6.4 Tbps</td><td class="num">—</td><td class="num">25.6 Tbps</td><td class="num">—</td></tr>
+</tbody>
+</table>
+<p class="small muted">* Ironwood's documented maximum single-VM topology is 8x16x16 (2,048 chips)<a class="cite" href="#ref-5">5</a>; the full 9,216-chip superpod is reached through the optical fabric described in §5, not through the same Multislice-over-DCN mechanism v5p uses. Cells marked "—" are not stated in the cited documentation for that generation.</p>
+
+<h3 id="twisted-torus">3.3 Twisted torus: trading symmetry for bisection bandwidth</h3>
+<p>A plain 3D torus slice is only symmetric — every chip sees the same neighbor pattern — when every dimension is equal. An asymmetric shape like 4x4x8 is 3D-toroidal but not uniform: chips along the long axis have a different wraparound distance than chips along the short axes, which creates load imbalance under collective communication. v5p's documentation offers a fix at the wiring level rather than the software level: "For some 3D slice shapes, you can use a twisted torus topology ... The main benefit of twisted topologies is that they change an asymmetric torus topology (for example, 4x4x8) into a symmetric one."<a class="cite" href="#ref-3">3</a> The mechanism is a shifted wraparound rather than a straight one: "The difference between this twisted diagram and the untwisted one lies in the Y wrap-around edges. Instead of connecting to another TPU with the same X coordinate, these wrap-around edges shift to connect to the TPU at coordinate X+2 mod 4."<a class="cite" href="#ref-3">3</a> Twisting is supported wherever "each dimension is either equal to or twice the size of the smallest dimension"<a class="cite" href="#ref-3">3</a> — it is a property of specific slice shapes, not something available everywhere, and specifying it requires the Cloud TPU API directly rather than the default provisioning path<a class="cite" href="#ref-3">3</a>.</p>
+<p>The payoff is measured, not just architecturally plausible: "a 4x4x8 twisted topology provides a 70% theoretical increase in bisection bandwidth compared to a non-twisted 4x4x8 slice"<a class="cite" href="#ref-3">3</a>, and a 4x8x8 twisted shape gets roughly 40%<a class="cite" href="#ref-3">3</a> — larger relative gains on the more asymmetric shape, consistent with the mechanism (there is more imbalance to fix on 4x4x8 than on the nearer-cube 4x8x8). Measured end-to-end training impact is smaller than the bisection-bandwidth number alone would suggest: "Some experiments on the FSDP MaxText model showed 1-2 percentage point improvements in model FLOPs utilization (MFU) when using a twisted topology."<a class="cite" href="#ref-3">3</a> Twisted topologies are documented as available on v5p (and v4, outside this page's scope) via the Cloud TPU API<a class="cite" href="#ref-3">3</a>; Table 2's Ironwood row does not carry an equivalent twisted-topology option in the cited documentation.</p>
+
+<h2 id="pod-scale-serving-slices">4. Pod scale vs. what you can actually book for serving</h2>
+
+<h3 id="serving-slice-ceilings">4.1 Peak pod size is a training number, not a serving number</h3>
+<p>Every pod-size figure in Table 1 (256, 8,960, 256, 9,216) is the maximum size a training job can span. Serving a single model replica does not get the same ceiling. For v5e, Google documents a hard, much smaller list of supported serving shapes: "The following 2D slice shapes are supported for v5e: 1x1, 2x2 and 2x4"<a class="cite" href="#ref-2">2</a> — 1, 4, or 8 chips — even though the same chip's training slices scale all the way to the full 256-chip pod (16x16). Multi-host inference past that small-slice ceiling is not unsupported, but it requires a different serving layer: "Multi-host inference is supported using Sax"<a class="cite" href="#ref-2">2</a>.</p>
+<p>v6e's documented slice table shows the same pattern in more granular steps — 1x1, 2x2, 2x4, 4x4, 4x8, 8x8, 8x16, and 16x16, running from 1 chip up to the full 256-chip pod<a class="cite" href="#ref-4">4</a> — with an operational footnote that even the 8-chip (2x4) shape has two different mappings depending on whether it is provisioned as one VM or two, and the two-VM mapping is "only supported when using the GKE API"<a class="cite" href="#ref-4">4</a>. The number of chips in a slice and the number of VMs/hosts backing it are not the same axis, and getting them confused is a common source of miscounted capacity: a 2x4 v6e slice is 8 chips, but it can be either 1 VM or 2 VMs depending on configuration<a class="cite" href="#ref-4">4</a>.</p>
+
+<h3 id="sax-multi-host">4.2 Multi-host inference and the practical ceiling</h3>
+<p>Sax is the serving layer Google's TPU documentation points to for scaling a single model past the small serving-slice shapes in §4.1. Google's own Sax-specific documentation describes the mechanism as two components: "SAX admin server and SAX model server are two essential components that run a SAX cluster. The SAX admin server monitors and coordinates all SAX model servers in a SAX cluster ... only one of the SAX admin server is active through leader election, the others are standby servers. When the active admin server fails, a standby admin server will become active. The active SAX admin server assigns model replicas and inference requests to available SAX model servers."<a class="cite" href="#ref-6">6</a> Each model server runs inference via GSPMD on a single TPU VM worker, and Google is explicit about the scaling boundary: "Single-host TPU model serving requires a single SAX model server on a single-host TPU VM. Multi-host TPU model serving requires a group of SAX model servers on a multi-host TPU slice."<a class="cite" href="#ref-6">6</a></p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>The same Sax-specific page states, in its own words, that "Multi-host model serving is currently not available, but this document does provide an example with a 175B test model for preview"<a class="cite" href="#ref-6">6</a> — a narrower claim than v5e's main system-architecture page, which states flatly that "Multi-host inference is supported using Sax"<a class="cite" href="#ref-2">2</a>. Both pages are live as of this writing with no version stamp to resolve which is current; Google also documents a separate, newer path to the same goal — serving LLMs on multi-host TPU slices through GKE with JetStream and Pathways — which is the more likely production route today. Read "Sax handles multi-host inference" as directionally true and Google's stated mechanism (admin server plus model-server group, leader election for failover) as accurate, but do not take the specific "currently not available" line as still describing the present state without checking the live docs at deployment time.</p></aside>
+<p>v5p's own documentation frames slices in training terms almost exclusively — "The largest job that can be scheduled is a 96 cube (6144 chip) job"<a class="cite" href="#ref-3">3</a> — because v5p is not the inference-oriented sibling in this lineup; the topic list Google surfaces for it is Multislice training, not serving shapes<a class="cite" href="#ref-3">3</a>. Ironwood's documented topology table stops at 8x16x16 (2,048 chips, 512 hosts, 32 cubes) for the largest VM-addressable configuration Google lists explicitly<a class="cite" href="#ref-5">5</a>, even though the full superpod reaches 9,216 chips through the optical fabric covered in §5 — the gap between "largest documented multi-host VM topology" and "largest physical pod" is itself informative: most workloads, including most inference deployments, run well inside the documented VM-topology ceiling, and the full-superpod number is a training-scale and fabric-capability figure more than a per-job serving allocation.</p>
+<p>The practical reading for capacity planning: use the "chips per pod" row in Table 1 to reason about how much aggregate hardware Google can physically wire together for one customer, and use the slice tables (1x1 through 16x16 for v5e/v6e, the documented single- and multi-host topology tables for v5p/Ironwood) to reason about what a single job — training or serving — can actually be allocated. They are different numbers by roughly one to two orders of magnitude for the inference-oriented chips (v5e: 8-chip serving slice vs. 256-chip pod without Sax; v6e: same pattern), and much closer for the training-oriented chips (v5p, Ironwood), where the documented ceiling is itself already in the thousands of chips.</p>
+
+<h2 id="superpod-ocs">5. Superpod fabric: Optical Circuit Switching and the cube-of-cubes</h2>
+<p>Ironwood's 9,216-chip pod is not one flat 3D torus wired in copper end to end. It is built as a hierarchy: "Each chip is connected to 6 other chips in the 3D torus ... a single rack of these hosts has 64 Ironwood chips and forms a 'cube' ... a 9,216-chip system with 144 cubes."<a class="cite" href="#ref-7">7</a> 64 x 144 = 9,216, so the superpod is literally 144 copies of the same 4x4x4 cube unit that appears as the minimum full-torus slice in Table 2, stitched together one level up.</p>
+<p>The stitching between cubes uses a different physical layer than the stitching within a cube. Ironwood's ICI resiliency documentation is explicit that copper handles intra-cube links and optics handle inter-cube links: ICI resiliency "helps improve fault tolerance of optical links and optical circuit switches (OCS) that connect TPUs between cubes. (ICI connections within a cube use copper links that are not impacted [by optical-link faults])."<a class="cite" href="#ref-1">1</a> Optical Circuit Switching lets Google reconfigure which cubes are wired to which at the optical layer rather than the electrical layer — useful both for fault-tolerance (routing around a failed link or a failed cube without a hardware change) and, at pod-assembly time, for composing a superpod's inter-cube topology without a fixed, fully-populated copper mesh among 144 cube-sized units.</p>
+<p>Google frames the resulting fabric as one machine, not a federation of independent training clusters: "A full 9,216-chip Ironwood superpod leverages the OCS and ICI fabric to operate as a single, massive parallel processor."<a class="cite" href="#ref-7">7</a> At that scale the aggregate figures are: 42.5 FP8 ExaFLOPS and 1.77 PB of directly addressable HBM across the full superpod<a class="cite" href="#ref-7">7</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">Ironwood superpod hierarchy: one chip, a 64-chip cube (4x4x4, copper 3D torus), and 144 cubes forming a 9,216-chip superpod connected by Optical Circuit Switching.</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="90" width="90" height="90" rx="8" class="d-block-2"/>
+<text x="65" y="130" text-anchor="middle" class="d-text-inv d-bold">1 chip</text>
+<text x="65" y="150" text-anchor="middle" class="d-text-inv d-small">2 chiplets</text>
+
+<path d="M110,135 L170,135" class="d-arrow" marker-end="url(#f3-arr)"/>
+<text x="140" y="120" text-anchor="middle" class="d-small d-text-light">x64, copper 3D torus</text>
+
+<rect x="170" y="60" width="150" height="150" rx="8" class="d-panel"/>
+<g class="d-outline">
+<rect x="185" y="75" width="16" height="16"/><rect x="205" y="75" width="16" height="16"/><rect x="225" y="75" width="16" height="16"/><rect x="245" y="75" width="16" height="16"/>
+<rect x="185" y="95" width="16" height="16"/><rect x="205" y="95" width="16" height="16"/><rect x="225" y="95" width="16" height="16"/><rect x="245" y="95" width="16" height="16"/>
+<rect x="185" y="115" width="16" height="16"/><rect x="205" y="115" width="16" height="16"/><rect x="225" y="115" width="16" height="16"/><rect x="245" y="115" width="16" height="16"/>
+<rect x="185" y="135" width="16" height="16"/><rect x="205" y="135" width="16" height="16"/><rect x="225" y="135" width="16" height="16"/><rect x="245" y="135" width="16" height="16"/>
+</g>
+<text x="245" y="195" text-anchor="middle" class="d-bold d-small">1 cube</text>
+<text x="245" y="210" text-anchor="middle" class="d-small d-text-light">4x4x4 = 64 chips</text>
+
+<path d="M320,135 L380,135" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+<text x="350" y="120" text-anchor="middle" class="d-small d-text-light">x144, OCS</text>
+
+<rect x="380" y="30" width="380" height="240" rx="10" class="d-outline d-dashed"/>
+<text x="570" y="50" text-anchor="middle" class="d-small d-text-light">Superpod</text>
+<g>
+<rect x="400" y="65" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="432" y="65" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="464" y="65" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="496" y="65" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="528" y="65" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="560" y="65" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="592" y="65" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="624" y="65" width="26" height="26" rx="3" class="d-fill-cyan"/>
+<rect x="400" y="97" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="432" y="97" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="464" y="97" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="496" y="97" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="528" y="97" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="560" y="97" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="592" y="97" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="624" y="97" width="26" height="26" rx="3" class="d-fill-cyan"/>
+<rect x="400" y="129" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="432" y="129" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="464" y="129" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="496" y="129" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="528" y="129" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="560" y="129" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="592" y="129" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="624" y="129" width="26" height="26" rx="3" class="d-fill-cyan"/>
+<rect x="400" y="161" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="432" y="161" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="464" y="161" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="496" y="161" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="528" y="161" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="560" y="161" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="592" y="161" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="624" y="161" width="26" height="26" rx="3" class="d-fill-cyan"/>
+<rect x="400" y="193" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="432" y="193" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="464" y="193" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="496" y="193" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="528" y="193" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="560" y="193" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="592" y="193" width="26" height="26" rx="3" class="d-fill-cyan"/><rect x="624" y="193" width="26" height="26" rx="3" class="d-fill-cyan"/>
+</g>
+<text x="570" y="245" text-anchor="middle" class="d-small d-text-light">144 cubes (18x8 shown schematically)</text>
+<text x="570" y="260" text-anchor="middle" class="d-bold d-small">9,216 chips total</text>
+</svg>
+<figcaption><b>Figure 3.</b> Ironwood's pod is a two-level hierarchy: 64 chips form one 4x4x4 "cube" over copper 3D-torus ICI links, and 144 cubes are joined by Optical Circuit Switching into a 9,216-chip superpod acting as one parallel processor<a class="cite" href="#ref-7">7</a>. Intra-cube links are copper and unaffected by optical-link faults; inter-cube links are optical and covered by ICI resiliency<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="ironwood-inference-first-design">6. Ironwood's inference-first design philosophy</h2>
+<p>v5e, v5p, and v6e are all described by Google as flexible training-and-serving chips with an emphasis leaning one way or the other (v5e cost/serving, v5p performance/training). Ironwood is the first chip in this lineup Google frames the opposite way: as inference hardware first, with training capability as a consequence of scale rather than the design target. "Ironwood is specifically engineered for this [inference], with its large on-chip memory and compute power optimized for both the large-batch 'prefill' phase and the memory-bandwidth-intensive 'decode' phase of large generative models."<a class="cite" href="#ref-7">7</a></p>
+
+<h3 id="prefill-decode-codesign">6.1 Prefill and decode as explicit codesign targets</h3>
+<p>Prefill (processing the prompt, one forward pass over many tokens at once) is arithmetic-intensity-heavy and benefits from raw FLOPs; decode (generating one token at a time, re-reading the full KV cache every step) is bandwidth-bound and benefits from HBM bandwidth and capacity relative to compute. Table 1's HBM-bandwidth-per-chip figures let this be checked directly rather than taken on faith: dividing HBM bandwidth by peak bf16 compute gives bytes of memory bandwidth available per FLOP of compute, a chip-level (not workload-level) indicator of how memory-rich a design is relative to its own compute.</p>
+<div class="grid-2">
+<div>
+<p class="small muted">v5e: 800 GiBps = 858.99 GB/s (decimal) HBM bandwidth<a class="cite" href="#ref-2">2</a> over 197 TFLOPs bf16<a class="cite" href="#ref-2">2</a>:</p>
+$$ \frac{858.99 \times 10^9}{197 \times 10^{12}} \approx 0.00436\ \text{bytes/FLOP} $$
+<p class="small muted">v5p: 2,765 GB/s<a class="cite" href="#ref-3">3</a> over 459 TFLOPs<a class="cite" href="#ref-3">3</a>:</p>
+$$ \frac{2{,}765 \times 10^9}{459 \times 10^{12}} \approx 0.00602\ \text{bytes/FLOP} $$
+</div>
+<div>
+<p class="small muted">v6e: 1,638 GBps<a class="cite" href="#ref-4">4</a> over 918 TFLOPs<a class="cite" href="#ref-4">4</a>:</p>
+$$ \frac{1{,}638 \times 10^9}{918 \times 10^{12}} \approx 0.00178\ \text{bytes/FLOP} $$
+<p class="small muted">Ironwood: 7,380 GBps<a class="cite" href="#ref-5">5</a> over 2,307 TFLOPs<a class="cite" href="#ref-5">5</a>:</p>
+$$ \frac{7{,}380 \times 10^9}{2{,}307 \times 10^{12}} \approx 0.00320\ \text{bytes/FLOP} $$
+</div>
+</div>
+<p>v6e has the lowest bytes/FLOP ratio of the four chips (0.00178) — it is, by this measure, the most compute-heavy relative to its own memory bandwidth, which fits a chip whose headline generational claim was raw TFLOPs (§2.3). Ironwood's ratio (0.00320) is nearly 1.8x v6e's despite Ironwood having over 2x v6e's absolute compute — Ironwood added memory bandwidth faster than it added compute, which is exactly the shape of change you would make if the target workload were shifting from throughput-bound training toward a mix that includes bandwidth-bound decode. This is a derived metric, not a number Google publishes directly, but it is arithmetic on Google's own published peak figures and it is directionally consistent with the plain-language design claim quoted above.</p>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>None of these four bytes/FLOP ratios is close to what a decode-only, single-request workload actually needs — real decode arithmetic intensity depends on batch size, KV-cache size, and sequence length, and is a property of the serving workload, not just the chip. The chip-level ratio here measures how the hardware itself is proportioned, which sets the ceiling on how favorable a decode-bound workload's economics can be on that chip, not the achieved arithmetic intensity of any specific deployment.</p></aside>
+
+<h3 id="perf-per-watt">6.2 Perf/watt trajectory: Ironwood vs. Trillium vs. the 2018 TPU</h3>
+<p>Google states two perf/watt ratios for Ironwood directly: "Ironwood perf/watt is 2x relative to Trillium, our previous-generation TPU ... nearly 30x more power efficient than our first Cloud TPU from 2018."<a class="cite" href="#ref-7">7</a> Both ratios share Ironwood as the numerator, which makes it possible to derive Trillium's own perf/watt relative to the 2018 chip, even though Google does not state that ratio directly:</p>
+$$ \frac{\text{Ironwood}}{\text{TPU v1 (2018)}} = 30\times, \qquad \frac{\text{Ironwood}}{\text{Trillium}} = 2\times \implies \frac{\text{Trillium}}{\text{TPU v1 (2018)}} = \frac{30}{2} = 15\times $$
+<p>This 15x figure is a derived quantity, not a Google-published number, and it inherits whatever rounding sits inside Google's "nearly 30x" (stated as an approximation, not an exact figure<a class="cite" href="#ref-7">7</a>) — treat it as an estimate accurate to roughly the same precision as that qualifier, not a third significant figure.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 280" role="img" aria-labelledby="f4t"><title id="f4t">Bar chart of TPU perf-per-watt, indexed to the 2018 first-generation Cloud TPU, across Trillium and Ironwood.</title>
+<line x1="70" y1="220" x2="740" y2="220" class="d-axis"/>
+<line x1="70" y1="220" x2="70" y2="30" class="d-axis"/>
+<text x="30" y="225" class="d-small d-text-light">0x</text>
+<line x1="65" y1="150" x2="740" y2="150" class="d-grid"/><text x="30" y="154" class="d-small d-text-light">15x</text>
+<line x1="65" y1="80" x2="740" y2="80" class="d-grid"/><text x="30" y="84" class="d-small d-text-light">30x</text>
+<text x="20" y="120" class="d-text-light d-small" transform="rotate(-90 20 120)">perf/watt, indexed to 2018 TPU</text>
+
+<rect x="140" y="213" width="90" height="7" class="d-fill-blue"/>
+<text x="185" y="240" text-anchor="middle" class="d-mono d-small">1x</text>
+<text x="185" y="256" text-anchor="middle" class="d-small">2018 Cloud TPU (v1)</text>
+
+<rect x="340" y="150" width="90" height="70" class="d-fill-cyan"/>
+<text x="385" y="140" text-anchor="middle" class="d-mono d-small">~15x (derived)</text>
+<text x="385" y="240" text-anchor="middle" class="d-small">Trillium (v6e)</text>
+
+<rect x="540" y="80" width="90" height="140" class="d-fill-orange"/>
+<text x="585" y="70" text-anchor="middle" class="d-mono d-small">~30x</text>
+<text x="585" y="240" text-anchor="middle" class="d-small">Ironwood (v7)</text>
+</svg>
+<figcaption><b>Figure 4.</b> Perf/watt indexed to the 2018 first-generation Cloud TPU. The 2018 and Ironwood bars are Google's own stated ratios (Ironwood ≈30x the 2018 TPU, Ironwood = 2x Trillium)<a class="cite" href="#ref-7">7</a>; the Trillium bar (≈15x) is the derived quotient 30÷2, shown separately from the sourced figures because it is arithmetic, not a directly published number.</figcaption>
+</figure>
+
+<p>This trajectory is presented by Google as continuous engineering progress, not a step change unique to going inference-first — the framing to hold onto is narrower: Ironwood is the generation where the two-phase inference workload (prefill, decode) became a named codesign target rather than something a general-purpose training chip happened to also run acceptably. Whether that framing is best read as a genuine inference-first architecture or primarily as a chiplet-driven manufacturing decision with inference tuning layered on top is exactly the disagreement below.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Every fact in this section comes from Google's own published material, which makes the disagreement unusual: it is not two outside analysts reading the same chip differently, it is two of Google's own documents emphasizing different, non-contradictory causes for the same design decision. That is still worth resolving explicitly, because the two framings lead to different predictions about what Google will ship next — an "inference-first" reading suggests future chips fork further by workload, while a "manufacturing economics" reading suggests the chiplet split generalizes to any future chip regardless of target workload, the same way it already has on the GPU side.</p>
+<div class="positions">
+<article class="position">
+<h4>Ironwood is architected for inference, and the dual-chiplet split is part of that</h4>
+<p class="who">Google Cloud's own Ironwood-launch engineering blog<a class="cite" href="#ref-7">7</a></p>
+<p>The blog leads with the workload, not the silicon: Ironwood exists because "Ironwood is specifically engineered for [inference], with its large on-chip memory and compute power optimized for both the large-batch 'prefill' phase and the memory-bandwidth-intensive 'decode' phase"<a class="cite" href="#ref-7">7</a>. Under this reading, the per-chiplet 96 GB HBM allocation, the four SparseCores per chip, and the memory-bandwidth-to-compute ratio recovering past Trillium's (§6.1) are all consequences of designing around the prefill/decode split from the start.</p>
+<ul class="pros"><li>Matches the measured bytes/FLOP recovery from v6e to Ironwood (§6.1) — the hardware ratio moved in the direction the stated workload target implies.</li><li>Consistent with Google marketing Ironwood, not v6e or v5p, as the generation aimed at "the age of inference"<a class="cite" href="#ref-7">7</a>.</li></ul>
+<ul class="cons"><li>A launch blog has an obvious incentive to frame every design choice as workload-driven rather than cost-driven; it is not a neutral source on the question of motivation.</li><li>Does not explain why the split specifically takes the form of two independent chiplets with separate memory spaces — a structure whose stated rationale, in a different Google document, is manufacturing cost (see the other position).</li></ul>
+</article>
+<article class="position">
+<h4>The chiplet split is a manufacturing-economics decision; inference tuning is layered on top of it</h4>
+<p class="who">Google Cloud's own TPU7x system-architecture documentation<a class="cite" href="#ref-5">5</a></p>
+<p>The technical docs state the reason for the MegaCore-to-dual-chiplet change in one sentence, and it is not about inference: "This change improves the cost-effectiveness and efficiency of manufacturing the chip."<a class="cite" href="#ref-5">5</a> That is a yield/reticle-limit argument that would apply to any sufficiently large chip on a leading process node regardless of target workload — it is the same category of reasoning behind NVIDIA's Blackwell dual-die package and AMD's XCD chiplets (pages 1 and 2 cover both), neither of which is framed as inference-specific.</p>
+<ul class="pros"><li>Directly quoted from the primary technical documentation, not marketing copy, and stated as the explanation with no workload qualifier attached.</li><li>Matches an industry-wide pattern (GPU chiplets on pages 1-2) that has nothing to do with inference specifically, making it the more parsimonious explanation for the chiplet decision itself.</li></ul>
+<ul class="cons"><li>Does not by itself explain why each chiplet was sized at exactly 96 GB HBM and 2 SparseCores, or why the die-to-die link was built at roughly the chip's full external ICI bandwidth (§2.4) — choices that go beyond what a pure yield argument requires and do track the memory-bandwidth-recovery pattern in §6.1.</li><li>Treats "manufacturing cost" and "inference-optimized" as though they must be alternatives, when Google's own two documents describe the same chip.</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>These are not actually competing explanations for the same fact — they answer different questions. Why is Ironwood built from two chiplets instead of one larger die? Google's technical documentation gives a manufacturing-economics answer, and there is no reason to doubt it: the same reticle-limit logic explains chiplet designs across the industry independent of workload (pages 1 and 2 for the GPU cases). Why, given that a chiplet split was going to happen anyway, is each chiplet's memory and SparseCore allocation shaped the way it is, and why does the aggregate chip's memory-bandwidth-to-compute ratio move back toward v5e's after v6e pushed it down (§6.1)? That is a workload question, and the bytes/FLOP arithmetic in §6.1 is real, derived evidence — not just marketing language — that the specific allocation decisions inside the chiplet split are inference-shaped. Read it as: the chiplet boundary was forced by manufacturing economics; what goes inside each chiplet was a choice, and that choice is where the "inference-first" claim is actually falsifiable and, on the bytes/FLOP evidence available, currently holds up. What would settle it further is a like-for-like decode-throughput-per-watt or decode-throughput-per-dollar benchmark against v6e and against GPU parts on real serving workloads — a number this page does not have, and which belongs with the benchmark methodology on page 5 and the cross-vendor cost data on page 6.</p>
+</div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>Google Cloud. <em>TPU system architecture</em>. Live documentation. <a href="https://docs.cloud.google.com/tpu/docs/system-architecture-tpu-vm">https://docs.cloud.google.com/tpu/docs/system-architecture-tpu-vm</a>. Accessed 2026-09-17. <span class="ref-use">Used for: MXU systolic-array mechanism and array-size-by-generation, "16K multiply-accumulate operations per cycle" statement, SparseCore dataflow-processor description and per-generation SparseCore counts, TPU cube/topology/Multislice definitions, ICI resiliency and Optical Circuit Switching between cubes.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>Google Cloud. <em>TPU v5e</em>. Live documentation. <a href="https://docs.cloud.google.com/tpu/docs/v5e">https://docs.cloud.google.com/tpu/docs/v5e</a>. Accessed 2026-09-17. <span class="ref-use">Used for: v5e per-chip compute/HBM/ICI specs, TensorCore/MXU count, 2D torus and pod-scale figures, supported serving slice shapes and the Sax multi-host inference note.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>Google Cloud. <em>TPU v5p</em>. Live documentation. <a href="https://docs.cloud.google.com/tpu/docs/v5p">https://docs.cloud.google.com/tpu/docs/v5p</a>. Accessed 2026-09-17. <span class="ref-use">Used for: v5p per-chip compute/HBM/ICI specs, TensorCore/SparseCore/MXU counts, 3D torus and full-cube wraparound rule, single-slice and Multislice pod-scale figures.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>Google Cloud. <em>TPU v6e (Trillium)</em>. Live documentation. <a href="https://docs.cloud.google.com/tpu/docs/v6e">https://docs.cloud.google.com/tpu/docs/v6e</a>. Accessed 2026-09-17. <span class="ref-use">Used for: v6e per-chip compute/HBM/ICI specs, MXU array size and count, SparseCore feature listing, pod-level bandwidth figures, supported slice shapes.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>Google Cloud. <em>TPU7x (Ironwood)</em>. Live documentation. <a href="https://docs.cloud.google.com/tpu/docs/tpu7x">https://docs.cloud.google.com/tpu/docs/tpu7x</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Ironwood per-chip compute/HBM/ICI specs, dual-chiplet architecture and MegaCore departure, chiplet composition and D2D interconnect multiplier, per-axis 3D torus bandwidth, documented VM topology table, consolidated v5p/v6e/TPU7x spec table.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>Google Cloud. <em>SAX on Cloud TPU v5e</em>. Live documentation. <a href="https://docs.cloud.google.com/tpu/docs/SAX-on-inference-converter">https://docs.cloud.google.com/tpu/docs/SAX-on-inference-converter</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Sax admin-server/model-server architecture, leader election and failover, single-host vs. multi-host model-serving requirements, the multi-host-serving availability caveat.</span></li>
+<li id="ref-7"><span class="ref-type">blog</span>Google Cloud. <em>Inside the Ironwood TPU codesigned AI stack</em>. Google Cloud Blog, 2025. <a href="https://cloud.google.com/blog/products/compute/inside-the-ironwood-tpu-codesigned-ai-stack">https://cloud.google.com/blog/products/compute/inside-the-ironwood-tpu-codesigned-ai-stack</a>. Accessed 2026-09-17. <span class="ref-use">Used for: superpod cube/OCS topology and aggregate FLOPS/HBM figures, explicit prefill/decode inference-era design framing, perf/watt ratios vs. Trillium and the 2018 first-generation Cloud TPU.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

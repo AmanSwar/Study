@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TensorRT-LLM and Triton: Disaggregated Serving on GB200 · Multi-Node LLM Inference: From One Node to N</title>
+<meta name="description" content="TensorRT-LLM's context/generation server terminology, its cache-transceiver mechanism extended with GB200-specific detail, the three ways to deploy disaggregated TensorRT-LLM in production, and the measured 1.4x-6.11x speedup range read against NVL72's topology.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 13</p>
+<h1>TensorRT-LLM and Triton: Disaggregated Serving on GB200</h1>
+<p class="lede">TensorRT-LLM ships disaggregated serving as three separate deployment paths built around one shared mechanism, the request-ID-keyed cache-transceiver, and NVIDIA's own GB200 benchmarks show that mechanism's payoff swinging from 1.4&#215; to 6.11&#215; purely as a function of model and sequence-length ratio. This module extends the cache-transceiver mechanics from Module 4 with TensorRT-LLM-specific backend and scaling detail, reads those GB200 numbers against NVL72's rack-scale NVLink domain from Module 1, and closes Part 5 by placing TensorRT-LLM/Triton next to the other four stacks this part covered.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>30 min</b> read</span>
+<span class="chip"><b>9</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 4</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">Three deployment paths for disaggregated TensorRT-LLM, all built on the same context-server / cache-transceiver / generation-server core</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="400" y="20" text-anchor="middle" class="d-text-light d-small">one shared core</text>
+<rect x="220" y="30" width="140" height="60" rx="8" class="d-block-2"/>
+<text x="290" y="53" text-anchor="middle" class="d-text-inv d-bold">Context server(s)</text>
+<text x="290" y="72" text-anchor="middle" class="d-text-inv d-small">prefill</text>
+<rect x="440" y="30" width="140" height="60" rx="8" class="d-block-accent"/>
+<text x="510" y="53" text-anchor="middle" class="d-text-inv d-bold">Generation server(s)</text>
+<text x="510" y="72" text-anchor="middle" class="d-text-inv d-small">decode</text>
+<rect x="330" y="105" width="140" height="50" rx="8" class="d-panel"/>
+<text x="400" y="126" text-anchor="middle" class="d-title d-bold">cache-transceiver</text>
+<text x="400" y="144" text-anchor="middle" class="d-small">disagg_request_id</text>
+<path d="M290,90 L370,105" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M510,90 L430,105" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M400,155 L400,175" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+<text x="60" y="200" class="d-text-light d-small">three ways to launch this pair:</text>
+<rect x="30" y="215" width="220" height="95" rx="8" class="d-surface"/>
+<text x="140" y="238" text-anchor="middle" class="d-bold">trtllm-serve</text>
+<text x="140" y="256" text-anchor="middle" class="d-small">native OpenAI-compatible</text>
+<text x="140" y="272" text-anchor="middle" class="d-small">disaggregated server,</text>
+<text x="140" y="288" text-anchor="middle" class="d-small">round-robin / KV-aware</text>
+<rect x="290" y="215" width="220" height="95" rx="8" class="d-surface"/>
+<text x="400" y="238" text-anchor="middle" class="d-bold">NVIDIA Dynamo</text>
+<text x="400" y="256" text-anchor="middle" class="d-small">Router + Planner (Module 9),</text>
+<text x="400" y="272" text-anchor="middle" class="d-small">decoupled pre/post-</text>
+<text x="400" y="288" text-anchor="middle" class="d-small">processing workers</text>
+<rect x="550" y="215" width="220" height="95" rx="8" class="d-surface"/>
+<text x="660" y="238" text-anchor="middle" class="d-bold">Triton Inference Server</text>
+<text x="660" y="256" text-anchor="middle" class="d-small">ensemble model,</text>
+<text x="660" y="272" text-anchor="middle" class="d-small">disaggregated_serving_bls</text>
+<text x="660" y="288" text-anchor="middle" class="d-small">orchestrator</text>
+<path d="M140,215 L280,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M400,215 L400,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M660,215 L520,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+</svg>
+<figcaption><b>Figure 1.</b> TensorRT-LLM's own tech blog documents three architecturally distinct ways to run the same context-server/generation-server/cache-transceiver core in production &#8212; a native <code>trtllm-serve</code> orchestrator, NVIDIA Dynamo, and Triton Inference Server<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="terminology-three-paths">1. Context servers, generation servers, and three ways to run them</h2>
+<p>TensorRT-LLM's own vocabulary for the prefill/decode split is <b>context servers</b> and <b>generation servers</b>: a context server runs the context (prefill) phase that computes KV cache for prompt tokens, a generation server runs the generation (decode) phase that produces tokens one at a time from cached values<a class="cite" href="#ref-1">1</a>. Module 4 already covers the general connector pattern this maps onto (kv producer / kv consumer) and the request-ID-keyed transfer mechanism in detail; this module treats that mechanism as known and extends it with what is specific to TensorRT-LLM's own deployment surface and to GB200.</p>
+
+<p>The tech blog is explicit that "there are three different approaches to do disaggregated LLM inference with TensorRT LLM, where each approach offers distinct architectural and operational characteristics suited to different deployment scenarios"<a class="cite" href="#ref-1">1</a>:</p>
+
+<ul>
+<li><b>trtllm-serve, native.</b> <code>trtllm-serve</code> is TensorRT-LLM's own command-line utility for launching an OpenAI-compatible server per instance. In this path you launch one server per context instance and one per generation instance, then launch an additional "disaggregated" server that acts as the orchestrator: it receives client requests and dispatches them to the appropriate context and generation servers over the OpenAI REST API<a class="cite" href="#ref-1">1</a>. When a context instance finishes computing KV blocks for a prompt, it returns the prompt tokens, the first generated token, and a metadata payload the blog calls <code>ctx_params</code> back to the disaggregated server; generation instances use those parameters to establish communication with the context instance and pull the KV cache<a class="cite" href="#ref-1">1</a>. Configuration is a YAML file (<code>disagg_config.yaml</code>) naming the context and generation server URLs and the routing policy; the disaggregated server "supports various load balancing strategies, including round-robin and KV cache-aware routing"<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>NVIDIA Dynamo.</b> Module 9 covers Dynamo's own component architecture (Router, Planner, KVBM) in depth. Here it is one of three interchangeable ways to run TensorRT-LLM's disaggregation, and the tech blog's framing of why you'd pick it is specific: Dynamo "introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions"<a class="cite" href="#ref-1">1</a>. Requests are handled by pre/post-processing workers that query a smart router for the best decode worker; depending on KV-cache availability the decode worker can skip the prefill stage entirely or forward to a prefill worker, with <code>ctx_params</code>-equivalent metadata again carrying the handoff<a class="cite" href="#ref-1">1</a>.</li>
+<li><b>Triton Inference Server.</b> Covered in full in section 6: a Triton ensemble model with a Python business-logic-scripting (BLS) orchestrator routes requests between separately-deployed context and generation TensorRT-LLM models<a class="cite" href="#ref-1">1</a>.</li>
+</ul>
+
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>All three paths sit on top of the identical cache-transceiver and <code>disagg_request_id</code> mechanism from Module 4. What differs is the orchestration layer above it &#8212; how requests get routed to context/generation instances, what metadata format carries the handoff, and what operational tooling (autoscaling, observability, MLOps integration) comes attached. None of the three changes how the KV cache itself moves between GPUs.</p></aside>
+
+<h3 id="terminology-trtllm-serve-config">1.1 The trtllm-serve config surface, concretely</h3>
+<p>Because the native path is the one TensorRT-LLM's own GB200 benchmarks in section 4 were produced with, it is worth seeing what actually gets launched. Each context and generation instance is its own <code>trtllm-serve</code> process bound to a port; the disaggregated server is a separate process that reads a YAML file naming those ports and a routing policy<a class="cite" href="#ref-1">1</a>:</p>
+
+<pre class="code" data-lang="bash" data-title="launch context and generation servers"><code># context servers
+trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 \
+  --kv_cache_free_gpu_memory_fraction 0.15 &gt; output_ctx0 &amp;
+trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 \
+  --kv_cache_free_gpu_memory_fraction 0.15 &gt; output_ctx1 &amp;
+
+# generation servers
+trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 \
+  --kv_cache_free_gpu_memory_fraction 0.15 &gt; output_gen0 &amp;
+trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8004 \
+  --kv_cache_free_gpu_memory_fraction 0.15 &gt; output_gen1 &amp;
+
+# disaggregated orchestrator, reads disagg_config.yaml
+trtllm-serve disaggregated -c disagg_config.yaml</code></pre>
+
+<pre class="code" data-lang="yaml" data-title="disagg_config.yaml"><code>hostname: localhost
+port: 8000
+context_servers:
+  num_instances: 2
+  router:
+    type: round_robin
+  urls:
+    - "localhost:8001"
+    - "localhost:8002"
+generation_servers:
+  num_instances: 2
+  urls:
+    - "localhost:8003"
+    - "localhost:8004"</code></pre>
+
+<p>Two things in this file matter beyond the toy example. First, <code>num_instances</code> is a fixed integer set at launch &#8212; this is the config-level fact underneath the "not yet dynamic" status from section 2: changing the context:generation ratio means editing this file and relaunching, not sending a runtime command. Second, <code>router.type</code> is where the "round-robin and KV cache-aware routing" load-balancing choice from section 1 is actually made<a class="cite" href="#ref-1">1</a>; a production GB200 deployment scales this same file from two toy ports to the TEP/DEP instance counts in Table 1, with the router and instance-count fields carrying the operational weight.</p>
+
+<h2 id="cache-transceiver-extended">2. The cache-transceiver, extended: backend selection and the road to dynamic scaling</h2>
+<p>Module 4 derives the <code>disagg_request_id</code> binding mechanism, the <code>TRTLLM_NIXL_KVCACHE_BACKEND</code> environment variable, and the GB200-specific <code>UCX_CUDA_IPC_ENABLE_MNNVL</code> failure mode in full &#8212; that material is not repeated here. What that module leaves for this one: which protocols the cache-transceiver actually supports, why the TensorRT-LLM team currently steers users toward two of them, and what "dynamic node joining and leaving" concretely means as a roadmap item rather than a shipped feature.</p>
+
+<p>The cache-transceiver is deliberately decoupled from both the KV cache manager and the underlying communication library, and TensorRT-LLM states plainly that it supports three protocol families: "mainstream communication protocols&#8212;MPI, UCX, and NIXL&#8212;are all supported by TensorRT LLM, and the underlying communication protocols utilize RDMA / NVLink"<a class="cite" href="#ref-1">1</a>. That is a wider menu than the disagg-serving doc's own default (NIXL, with UCX or LIBFABRIC underneath it, from Module 4) suggests in isolation &#8212; MPI is a supported transport for the cache exchange itself, not just for process coordination.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f2t"><title id="f2t">Cache-transceiver protocol selection: MPI, UCX, and NIXL are all supported, but UCX and NIXL are recommended because dynamic scaling is being built on top of them</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="320" y="15" width="160" height="46" rx="8" class="d-panel"/>
+<text x="400" y="43" text-anchor="middle" class="d-title d-bold">cache-transceiver</text>
+<path d="M340,61 L120,110" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M400,61 L400,110" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+<path d="M460,61 L680,110" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+<rect x="30" y="112" width="180" height="50" rx="8" class="d-block-muted"/>
+<text x="120" y="132" text-anchor="middle" class="d-text-inv d-bold">MPI</text>
+<text x="120" y="150" text-anchor="middle" class="d-text-inv d-small">supported, not preferred</text>
+<rect x="310" y="112" width="180" height="50" rx="8" class="d-block"/>
+<text x="400" y="132" text-anchor="middle" class="d-text-inv d-bold">UCX</text>
+<text x="400" y="150" text-anchor="middle" class="d-text-inv d-small">default transport</text>
+<rect x="590" y="112" width="180" height="50" rx="8" class="d-block"/>
+<text x="680" y="132" text-anchor="middle" class="d-text-inv d-bold">NIXL</text>
+<text x="680" y="150" text-anchor="middle" class="d-text-inv d-small">default backend</text>
+<path d="M400,162 L400,182" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M680,162 L680,182" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="280" y="184" width="420" height="60" rx="8" class="d-hl"/>
+<text x="490" y="206" text-anchor="middle" class="d-bold">dynamic node join/leave</text>
+<text x="490" y="224" text-anchor="middle" class="d-small">being built on top of UCX/NIXL &#8212; in progress, not GA</text>
+<text x="400" y="245" text-anchor="middle" class="d-text-light d-small">RDMA / NVLink underneath all three</text>
+</svg>
+<figcaption><b>Figure 2.</b> TensorRT-LLM supports MPI, UCX, and NIXL as cache-transceiver protocols, but the team recommends UCX and NIXL specifically because dynamic scaling is being layered on top of them, not on MPI<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>The reason the team narrows the recommendation is stated directly: "we recommend using UCX and NIXL backends, as we are adding a dynamic scaling mechanism on top of them&#8212;specifically, dynamic node joining and leaving. This allows customers to adjust the load based on traffic demands or switch roles between context and generation dynamically"<a class="cite" href="#ref-1">1</a>. Two things are worth separating in that sentence. First, "dynamic node joining and leaving" means changing the number of context or generation instances in a running deployment without a restart &#8212; the same capability category as Dynamo's runtime-reconfigurable xPyD from Module 4, but TensorRT-LLM's own docs describe it as being "built on top of" the existing cache-transceiver mechanism<a class="cite" href="#ref-2">2</a>, i.e. future work layered on infrastructure that already exists for the static case. Second, "switch roles between context and generation dynamically" is a distinct and more unusual capability: reassigning a GPU that is currently serving as a generation server to serve as a context server (or vice versa) without redeploying it, which would let a fleet reshape its context:generation ratio in place as traffic mix shifts, rather than only adding or removing whole instances at a fixed ratio.</p>
+
+<p>As of this tech blog's own "Future Work" list, neither capability is shipped: the team states it plans to "support dynamic scaling of context and generation instances based on traffic load"<a class="cite" href="#ref-1">1</a> as forthcoming work, alongside overlapping KV cache communication and compute on a per-layer basis and improving performance at larger expert-parallel scales<a class="cite" href="#ref-1">1</a>. Read together with Module 4's framing, this is not a disagreement about design &#8212; it is one project's roadmap item, documented consistently across its tech blog and its reference docs, with a stated reason (UCX/NIXL, not MPI, are where the investment is going) for which transport will end up supporting it first.</p>
+
+<p>One more property of the transceiver matters for a GB200-scale deployment specifically: when a context or generation instance spans multiple GPUs (any of the TEP/DEP configurations in section 4), "KV cache transmission between different sets of GPUs can occur in parallel"<a class="cite" href="#ref-1">1</a> &#8212; the transceiver does not serialize a multi-GPU instance's transfer into one stream. TensorRT-LLM also states directly that "the optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models," and ships "a set of environment variables for selection in different environments"<a class="cite" href="#ref-1">1</a> to tune for each case. Section 5 makes this concrete for GB200 NVL72: whether a given transfer is "single-node multi-GPU" (inside one rack's NVLink domain) or "multi-node multi-GPU" (crossing to InfiniBand) is exactly the placement question the rack-fit arithmetic below answers.</p>
+
+<h2 id="rate-matching">3. Measuring the payoff: rate matching and the per-GPU throughput formula</h2>
+<p>Every speedup number in section 4 &#8212; the 1.4&#215;, the 6.11&#215;, all of it &#8212; comes out of one measurement procedure, and it is worth understanding the procedure before trusting the numbers it produces. TensorRT-LLM's own methodology note explains why a naive comparison is not straightforward: producing a performance curve for disaggregated serving requires sweeping the full combinatorial space of parallelism strategies &#8212; TP, EP, DP, PP, and options like MTP speculative decoding &#8212; independently for context and generation stages, and "as the number of context (CTX) and generation (GEN) servers increases, the number of possible configurations grows exponentially"<a class="cite" href="#ref-1">1</a>.</p>
+
+<p>The team's answer is a two-step process<a class="cite" href="#ref-1">1</a>:</p>
+<ol>
+<li><b>Rate matching.</b> Measure request throughput (requests/s/GPU) for context servers across TP/EP/DP/PP mappings that satisfy the TTFT constraint, and pick the most efficient one. Separately measure total throughput (tok/s) and latency (tok/s/user) for generation servers across mappings, concurrency levels, and MTP on/off. Then find the ratio of context workers to generation workers such that the aggregated throughput of the context pool matches the aggregated throughput of the generation pool for the workload's ISL/OSL &#8212; i.e. size the two pools so neither one idles waiting on the other.</li>
+<li><b>End-to-end measurement.</b> Benchmark actual <code>trtllm-serve disaggregated</code> deployments at the most promising configurations identified in step 1, within the practical limit of total GPUs available.</li>
+</ol>
+
+<p>Once the ratio is fixed, throughput per GPU at a given configuration is computed as<a class="cite" href="#ref-1">1</a>:</p>
+$$ \text{Throughput per GPU} = \frac{\text{Total Output Tokens/s}}{\left(\dfrac{\text{NumCtxGPUs} \times \text{GenReqRate}}{\text{CtxReqRate}}\right) + \text{NumGenGPUs}} $$
+
+<p>Read the denominator as "how many GPUs does this configuration really cost, expressed in a single common unit." <code>NumGenGPUs</code> counts generation GPUs directly. The first term rescales the context pool's GPU count by the ratio of generation-to-context per-GPU request rates (<code>GenReqRate</code> / <code>CtxReqRate</code>), which converts a count of context GPUs into the equivalent number of generation-GPU-units they represent once the two rates are rate-matched &#8212; the point of the rescaling is that a context GPU and a generation GPU are not interchangeable units of capacity, so a raw GPU count would misstate the true cost of the configuration. Dividing total output tokens per second by that combined GPU-equivalent count is what produces the "tokens/s/GPU" figure that a rate-matched Pareto curve plots against latency (tok/s/user)<a class="cite" href="#ref-1">1</a>.</p>
+
+<p>This is also why a single "disaggregation gives N&#215;" headline is the wrong unit to carry away: the speedup is read off the vertical gap between two Pareto curves &#8212; aggregated (all context+generation phases sharing GPUs) versus disaggregated (rate-matched split pools) &#8212; at a fixed latency target, and that gap changes shape with ISL:OSL ratio, MTP setting, and GPU count exactly because the rate-matching ratio itself changes with those inputs. Section 4's table is the set of gaps TensorRT-LLM has published; Module 3 already establishes the general principle that this number is workload-shape-dependent rather than a hardware constant<a class="cite" href="#ref-1">1</a> &#8212; this section is the arithmetic behind why that is true, not a restatement of the conclusion.</p>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>TensorRT-LLM reports both a "rate-matched" curve (idealized: fractional ctx:gen ratios, no KV-transfer overhead) and an E2E curve (what you can actually reproduce with integer instance counts and real transfer cost) for the same configuration, and notes a 0&#8211;25% gap between them<a class="cite" href="#ref-1">1</a>. When comparing a vendor speedup number to your own deployment, check which curve it was read from &#8212; the E2E number is the one that will reproduce.</p></aside>
+
+<h2 id="gb200-benchmarks">4. GB200 benchmark numbers by model and GPU count</h2>
+<p>All performance studies in this section were run on GB200 GPUs<a class="cite" href="#ref-1">1</a>. Module 3 already tabulates the headline range across two models (DeepSeek R1, Qwen3) and uses it to argue that disaggregation's payoff is conditional on workload shape, not a hardware constant &#8212; that argument is not repeated here. What this section adds is the dimension Module 3 leaves aside: how the speedup moves with the number of GPUs per context/generation instance, and the TensorRT-LLM-specific parallelism notation (TEP/DEP) the source uses to label each configuration.</p>
+
+<h3 id="gb200-benchmarks-notation">4.1 Reading TEP/DEP notation</h3>
+<p>Configurations in the source are labeled with attention-parallelism shorthand, e.g. <code>CTX=1xTEP-4|GEN=2xDEP-8</code>, meaning one context instance using tensor-parallel attention at degree 4 (with expert parallelism), paired with two generation instances using data-parallel attention (the attention-DP + EP layout from Module 5) at expert-parallel degree 8<a class="cite" href="#ref-1">1</a>. The source states directly that "configurations with attention DP and attention TP were considered, with 4, 8, 16 or 32 GPUs per instance"<a class="cite" href="#ref-1">1</a> &#8212; both parallelism strategies from Module 5 are candidates for either side of the pipeline, and instance size scales from 4 up to 32 GPUs.</p>
+
+<p>The full sweep behind Table 1 is large enough that NVIDIA ships it as a reproducible artifact rather than a fixed set of numbers to take on faith: "we provide a set of scripts to reproduce the performance data presented in this paper"<a class="cite" href="#ref-1">1</a>. That matters for how to read the table &#8212; every row is one point NVIDIA chose to publish out of the much larger TP/EP/DP/PP &#215; MTP &#215; concurrency grid the rate-matching methodology in section 3 sweeps, not necessarily the single best achievable configuration at that ISL:OSL ratio.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> GB200 disaggregation speedups by model, sequence-length ratio, and configuration<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Model</th><th>ISL:OSL</th><th>Configuration detail</th><th class="num">Speedup over aggregated</th></tr></thead>
+<tbody>
+<tr><td class="row">DeepSeek R1</td><td>4400:1200</td><td>MTP off, 4&#8211;32 GPUs/instance</td><td class="num">1.4&#8211;1.8&#215;</td></tr>
+<tr><td class="row">DeepSeek R1</td><td>4400:1200</td><td>MTP on</td><td class="num" data-best>1.6&#8211;2.5&#215;</td></tr>
+<tr><td class="row">DeepSeek R1</td><td>8192:256</td><td>GEN4 (4 GPUs/generation instance)</td><td class="num">up to 1.73&#215;</td></tr>
+<tr><td class="row">DeepSeek R1</td><td>8192:256</td><td>GEN8 (8 GPUs/generation instance)</td><td class="num">up to 2.0&#215;</td></tr>
+<tr><td class="row">DeepSeek R1</td><td>4096:1024</td><td>MTP = 1, 2, or 3, at 50 tok/s/user</td><td class="num">1.7&#215;</td></tr>
+<tr><td class="row">Qwen3</td><td>8192:1024</td><td>attention DP/TP, 4&#8211;32 GPUs/instance</td><td class="num" data-best>1.7&#8211;6.11&#215;</td></tr>
+</tbody>
+</table>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">DeepSeek R1 disaggregation speedup on GB200 across five tested configurations</title>
+<line x1="70" y1="240" x2="760" y2="240" class="d-axis"/>
+<line x1="70" y1="40" x2="70" y2="240" class="d-axis"/>
+<text x="30" y="45" class="d-mono d-small">2.5&#215;</text>
+<line x1="70" y1="48" x2="760" y2="48" class="d-grid"/>
+<text x="30" y="145" class="d-mono d-small">1.25&#215;</text>
+<line x1="70" y1="144" x2="760" y2="144" class="d-grid"/>
+<text x="30" y="238" class="d-mono d-small">0&#215;</text>
+<rect x="100" y="98" width="70" height="142" class="d-fill-blue"/>
+<text x="135" y="90" text-anchor="middle" class="d-mono d-small">1.4&#8211;1.8&#215;</text>
+<text x="135" y="256" text-anchor="middle" class="d-small">4400:1200</text>
+<text x="135" y="270" text-anchor="middle" class="d-small">MTP off</text>
+<rect x="210" y="45" width="70" height="195" class="d-fill-orange"/>
+<text x="245" y="37" text-anchor="middle" class="d-mono d-small">1.6&#8211;2.5&#215;</text>
+<text x="245" y="256" text-anchor="middle" class="d-small">4400:1200</text>
+<text x="245" y="270" text-anchor="middle" class="d-small">MTP on</text>
+<rect x="320" y="107" width="70" height="133" class="d-fill-blue"/>
+<text x="355" y="99" text-anchor="middle" class="d-mono d-small">up to 1.73&#215;</text>
+<text x="355" y="256" text-anchor="middle" class="d-small">8192:256</text>
+<text x="355" y="270" text-anchor="middle" class="d-small">GEN4</text>
+<rect x="430" y="86" width="70" height="154" class="d-fill-blue"/>
+<text x="465" y="78" text-anchor="middle" class="d-mono d-small">up to 2.0&#215;</text>
+<text x="465" y="256" text-anchor="middle" class="d-small">8192:256</text>
+<text x="465" y="270" text-anchor="middle" class="d-small">GEN8</text>
+<rect x="540" y="108" width="70" height="132" class="d-fill-blue"/>
+<text x="575" y="100" text-anchor="middle" class="d-mono d-small">1.7&#215;</text>
+<text x="575" y="256" text-anchor="middle" class="d-small">4096:1024</text>
+<text x="575" y="270" text-anchor="middle" class="d-small">MTP=1,2,3</text>
+<text x="415" y="20" text-anchor="middle" class="d-text-light d-small">speedup over aggregated serving, GB200</text>
+</svg>
+<figcaption><b>Figure 3.</b> DeepSeek R1 disaggregation speedup on GB200 across five ISL:OSL/MTP configurations; MTP amplifies the win by an average of 20&#8211;30% at the 4400:1200 point<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="gb200-benchmarks-qwen3">4.2 Qwen3: the widest published range</h3>
+<p>Qwen3 at ISL 8192, OSL 1024 produced the widest range in this source: "the data indicate that the speedups achieved by disaggregation over aggregation range from 1.7x to 6.11x"<a class="cite" href="#ref-1">1</a>. The source does not publish the same GEN4/GEN8 GPU-count breakdown for Qwen3 that it does for DeepSeek R1's ISL8192:OSL256 point, only that the same 4&#8211;32-GPU-per-instance sweep and TP/DP attention-parallelism space were evaluated<a class="cite" href="#ref-1">1</a>. Reading Table 1 and Figure 3 together: the low end of every range (1.4&#215;, 1.7&#215;) clusters near what MTP-off DeepSeek R1 achieves at 4400:1200, and the high end scales up with either MTP (DeepSeek R1) or with whatever combination of GPU count and concurrency produced Qwen3's 6.11&#215; point &#8212; the mechanism in both cases is the same rate-matching procedure from section 3, just landing at a different point on the Pareto curve.</p>
+
+<p>The one clean within-model comparison the source does publish is DeepSeek R1's ISL8192:OSL256 point at GEN4 versus GEN8: growing the generation instance from 4 to 8 GPUs moves the ceiling from 1.73&#215; to 2.0&#215;<a class="cite" href="#ref-1">1</a>. That is consistent with the rate-matching arithmetic from section 3 &#8212; a larger generation instance changes <code>NumGenGPUs</code> and the achievable <code>GenReqRate</code> simultaneously, which shifts where the rate-matched ctx:gen ratio lands and therefore how much of the interference Module 3 attributes to colocated serving the disaggregated split actually removes at that concurrency. It is not evidence that "more GPUs per instance" is a general lever for a bigger speedup on its own; the source does not test a GEN16 or GEN32 point at this specific ISL:OSL ratio to confirm the trend continues.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 200" role="img" aria-labelledby="f4t"><title id="f4t">Qwen3 disaggregation speedup range on GB200: 1.7x to 6.11x</title>
+<line x1="70" y1="150" x2="760" y2="150" class="d-axis"/>
+<line x1="70" y1="30" x2="70" y2="150" class="d-axis"/>
+<text x="30" y="35" class="d-mono d-small">6.11&#215;</text>
+<text x="30" y="148" class="d-mono d-small">0&#215;</text>
+<rect x="200" y="30" width="220" height="120" class="d-fill-orange-soft" stroke-dasharray="4 3"/>
+<text x="310" y="24" text-anchor="middle" class="d-mono d-small">1.7&#215; &#8211; 6.11&#215;</text>
+<line x1="200" y1="150" x2="200" y2="24" class="d-line d-stroke-orange"/>
+<line x1="420" y1="150" x2="420" y2="24" class="d-line d-stroke-orange"/>
+<text x="310" y="170" text-anchor="middle" class="d-small">Qwen3, ISL 8192 : OSL 1024, GB200</text>
+<text x="600" y="90" text-anchor="middle" class="d-text-light d-small">4&#8211;32 GPUs/instance,</text>
+<text x="600" y="108" text-anchor="middle" class="d-text-light d-small">attention DP or TP</text>
+</svg>
+<figcaption><b>Figure 4.</b> The full published Qwen3 range: a single workload family spans more than 3.5&#215; in measured disaggregation speedup depending on which GPU-count/parallelism configuration is chosen<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="nvl72-placement">5. Applying NVL72's topology to disaggregated placement</h2>
+<p>Module 1 establishes that a GB200 NVL72 rack is one flat 72-GPU NVLink domain at 130 TB/s aggregate rack bandwidth, and that the interconnect cliff into InfiniBand/RoCE does not disappear at NVL72 scale &#8212; it moves from the 8-GPU node boundary to the 72-GPU rack boundary<a class="cite" href="#ref-3">3</a>. Section 4's benchmarks all ran "on GB200 GPUs"<a class="cite" href="#ref-1">1</a> without the source specifying whether each configuration stayed inside one rack. Combining the two sourced facts gives a concrete way to read the configurations in Table 1 against that boundary.</p>
+
+<h3 id="nvl72-placement-worked">5.1 Worked arithmetic: when does a context/generation pair fit in one rack?</h3>
+<p>A GB200 NVL72 rack holds 72 GPUs<a class="cite" href="#ref-3">3</a>. Section 4.1 established that individual context or generation instances in TensorRT-LLM's own tests scale from 4 to 32 GPUs, and that a full serving deployment combines multiple such instances &#8212; the example notation <code>CTX=1xTEP-4|GEN=2xDEP-8</code> means one 4-GPU context instance paired with two 8-GPU generation instances, for 4 + 16 = 20 GPUs total<a class="cite" href="#ref-1">1</a>. That configuration fits inside a single rack with 52 GPUs to spare. Scale the same shape up to the largest tested instance size: a hypothetical <code>CTX=1xTEP-32|GEN=2xDEP-32</code> deployment would need 32 + (2 &#215; 32) = 96 GPUs &#8212; more than one rack's 72-GPU capacity.</p>
+
+<div class="calc">
+<p class="calc-title">Does a context/generation deployment fit in one NVL72 rack?</p>
+<div class="calc-row"><label for="c1">Context instances</label><input type="range" id="c1" name="nctx" min="1" max="4" step="1" value="1"></div>
+<div class="calc-row"><label for="c2">GPUs per context instance</label><input type="range" id="c2" name="gctx" min="4" max="32" step="4" value="4"></div>
+<div class="calc-row"><label for="c3">Generation instances</label><input type="range" id="c3" name="ngen" min="1" max="4" step="1" value="2"></div>
+<div class="calc-row"><label for="c4">GPUs per generation instance</label><input type="range" id="c4" name="ggen" min="4" max="32" step="4" value="8"></div>
+<div class="calc-out">
+<div>Total GPUs<output data-expr="nctx * gctx + ngen * ggen" data-format="int"></output></div>
+<div>Racks needed (72 GPU/rack)<output data-expr="ceil((nctx * gctx + ngen * ggen) / 72)" data-format="int"></output></div>
+</div>
+<p class="calc-note">Rack capacity: 72 GPUs, 130 TB/s NVLink domain<a class="cite" href="#ref-3">3</a>. Instance sizes 4&#8211;32 GPUs match the tested range<a class="cite" href="#ref-1">1</a>. When the total exceeds 72, at least one context&#8211;generation pair's cache-transceiver transfer must cross the rack boundary into InfiniBand/RoCE rather than staying on NVLink.</p>
+</div>
+
+<p>The implication follows directly from Module 1's cliff, not from anything TensorRT-LLM's own docs state about NVL72 specifically: when a full deployment's context and generation GPUs together fit within 72, every cache-transceiver transfer between a context server and its paired generation server can in principle stay entirely inside the NVLink switch fabric, at the full per-GPU NVLink5 rate Module 1 derives (&#8776;1.8 TB/s)<a class="cite" href="#ref-3">3</a>, with no RDMA hop. Once the deployment's total GPU footprint crosses 72 &#8212; which the largest tested instance sizes (32 GPUs per instance, multiple instances per deployment) make easy to reach &#8212; some context-generation pairs necessarily span racks, and their KV transfer falls back to Quantum-X800 InfiniBand or Spectrum-X800 Ethernet, the same interconnect tier Module 1 quantifies for inter-node transfer generally<a class="cite" href="#ref-3">3</a>. TensorRT-LLM's cache-transceiver already supports both paths &#8212; its documentation states transfer happens "over RDMA / NVLink"<a class="cite" href="#ref-1">1</a> without requiring the operator to choose one exclusively &#8212; but which path a given context/generation pair actually uses is a placement decision, not something the transceiver protocol itself determines.</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>None of the sources reviewed for this module state which specific rack-placement TensorRT-LLM's own GB200 benchmarks used, or whether the reported speedups already include any cross-rack transfers. The rack-fit arithmetic above is this module's own combination of two independently sourced facts (instance sizing from TensorRT-LLM's tech blog, rack capacity from the GB200 NVL72 product page), not a claim either source makes directly.</p></aside>
+
+<h2 id="triton-bls">6. Triton Inference Server as the third path: the BLS ensemble orchestrator</h2>
+<p>The third of the three deployment paths from section 1 builds disaggregated serving out of Triton Inference Server's existing model-composition primitives rather than a purpose-built orchestrator process. The approach uses "a Triton ensemble model, comprising a preprocessor, an orchestrator implemented as a Python business logic scripting (BLS) backend, and a post-processor. The orchestrator is responsible for routing client requests to context and generation instances, managing the flow of prompt tokens, and handling the return of generated tokens"<a class="cite" href="#ref-1">1</a>. This relies specifically on the Triton TensorRT-LLM backend together with TensorRT-LLM's Executor API, which the source notes "is supported only for the TensorRT backend"<a class="cite" href="#ref-1">1</a> &#8212; i.e. the C++ engine path, not every backend TensorRT-LLM ships.</p>
+
+<h3 id="triton-bls-mechanism">6.1 The disaggregated_serving_bls model repository</h3>
+<p>Triton's own worked example names the BLS model <code>disaggregated_serving_bls</code>. It is configured with the names of the context and generation TensorRT-LLM models it should route between; each of those models is assigned <code>gpu_device_ids</code> and a <code>participant_ids</code> range identifying which MPI ranks belong to it<a class="cite" href="#ref-4">4</a>. The ensemble model that a client actually calls is renamed from the usual <code>tensorrt_llm</code> entry point to <code>disaggregated_serving_bls</code><a class="cite" href="#ref-4">4</a>. Launching the server requires one additional MPI rank beyond the context and generation models' own parallelism degree: "the world size should be equal to <code>tp*pp</code> of context model + <code>tp*pp</code> of generation model + 1. The additional process is required for the orchestrator"<a class="cite" href="#ref-4">4</a>. Multiple copies of context or generation models &#8212; i.e. data parallelism on either side &#8212; are supported by assigning each copy its own <code>participant_ids</code> and <code>gpu_device_ids</code> range and setting an instance count in the model configuration<a class="cite" href="#ref-4">4</a>. As of this documentation, "only the C++ version of the backend is supported"<a class="cite" href="#ref-4">4</a> for this path.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f5t"><title id="f5t">Triton's ensemble pipeline for disaggregated serving: preprocessor, BLS orchestrator, context/generation TensorRT-LLM models, postprocessor</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="100" width="120" height="60" rx="8" class="d-block-muted"/>
+<text x="80" y="125" text-anchor="middle" class="d-text-inv d-bold">Pre-</text>
+<text x="80" y="143" text-anchor="middle" class="d-text-inv d-small">processor</text>
+<path d="M140,130 L200,130" class="d-arrow" marker-end="url(#f5-arr)"/>
+<rect x="200" y="90" width="200" height="80" rx="8" class="d-panel"/>
+<text x="300" y="115" text-anchor="middle" class="d-title d-bold">disaggregated_serving_bls</text>
+<text x="300" y="133" text-anchor="middle" class="d-small">Python BLS orchestrator</text>
+<text x="300" y="151" text-anchor="middle" class="d-small">routes ctx_params handoff</text>
+<path d="M400,110 L460,60" class="d-arrow" marker-end="url(#f5-arr)"/>
+<path d="M400,150 L460,200" class="d-arrow" marker-end="url(#f5-arr)"/>
+<rect x="460" y="30" width="150" height="60" rx="8" class="d-block-2"/>
+<text x="535" y="55" text-anchor="middle" class="d-text-inv d-bold">context model</text>
+<text x="535" y="73" text-anchor="middle" class="d-text-inv d-small">TRT-LLM backend</text>
+<rect x="460" y="170" width="150" height="60" rx="8" class="d-block-accent"/>
+<text x="535" y="195" text-anchor="middle" class="d-text-inv d-bold">generation model</text>
+<text x="535" y="213" text-anchor="middle" class="d-text-inv d-small">TRT-LLM backend</text>
+<path d="M610,60 L660,110" class="d-arrow" marker-end="url(#f5-arr)"/>
+<path d="M610,200 L660,150" class="d-arrow" marker-end="url(#f5-arr)"/>
+<rect x="660" y="100" width="120" height="60" rx="8" class="d-block-muted"/>
+<text x="720" y="125" text-anchor="middle" class="d-text-inv d-bold">Post-</text>
+<text x="720" y="143" text-anchor="middle" class="d-text-inv d-small">processor</text>
+</svg>
+<figcaption><b>Figure 5.</b> Triton's ensemble pipeline for disaggregated TensorRT-LLM: a preprocessor and postprocessor bracket a BLS orchestrator (<code>disaggregated_serving_bls</code>) that routes each request to a context model instance and then a generation model instance<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h3 id="triton-bls-modes">6.2 Leader mode vs. orchestrator mode, and why it matters for multi-node</h3>
+<p>Separately from the BLS routing layer, the general Triton TensorRT-LLM backend has two process-spawning modes for multi-GPU model instances, and only one of them is multi-node capable. In <b>leader mode</b>, "the TensorRT-LLM backend spawns one Triton Server process for every GPU. The process with rank 0 is the leader process," and the mode "is friendly with slurm deployments since it doesn't use <code>MPI_Comm_spawn</code>"<a class="cite" href="#ref-5">5</a>. In <b>orchestrator mode</b>, "the TensorRT-LLM backend spawns a single Triton Server process that acts as an orchestrator and spawns one Triton Server process for every GPU that each model requires" &#8212; useful when serving multiple models from one backend instance &#8212; but because it uses <code>MPI_Comm_spawn</code>, "it might not work properly with slurm deployments," and the documentation states plainly that "this currently only works for single node deployments"<a class="cite" href="#ref-5">5</a>. A multi-node, multi-GPU disaggregated deployment on Triton therefore runs in leader mode, coordinated via MPI/Slurm launch scripts rather than the backend's own orchestrator-mode process spawning<a class="cite" href="#ref-5">5</a>; Triton's own documentation points to a dedicated multi-node tutorial for this path rather than folding multi-node launch into either spawning mode's default behavior<a class="cite" href="#ref-5">5</a>.</p>
+
+<h2 id="part5-synthesis">7. Closing Part 5: five stacks, converging primitives</h2>
+<p>Part 5 has now covered five ways to run multi-node LLM inference in the open-source ecosystem: NVIDIA Dynamo (Module 9), llm-d (Module 10), vLLM (Module 11), SGLang (Module 12), and TensorRT-LLM/Triton (this module). Laid side by side, the design choices this part documented separately resolve into a small number of shared answers.</p>
+
+<table class="tbl tbl-dense">
+<caption><b>Table 2.</b> Disaggregation across the five stacks covered in Part 5: default KV-transfer path and dynamic node join/leave status<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Stack</th><th>Default transfer backend</th><th>Sync vs. overlapped transfer</th><th>Dynamic node join/leave</th></tr></thead>
+<tbody>
+<tr><td class="row">NVIDIA Dynamo</td><td>NIXL (VRAM-to-VRAM, non-blocking)<a class="cite" href="#ref-6">6</a></td><td>Backend-dependent (see below)</td><td data-best>Shipped &#8212; runtime-reconfigurable xPyD<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">vLLM (native)</td><td>Selectable connector: NixlConnector, MooncakeConnector, LMCacheConnectorV1, others<a class="cite" href="#ref-7">7</a></td><td>Synchronous (<code>LookupBuffer.drop_select</code> blocks)<a class="cite" href="#ref-7">7</a></td><td>Not documented as GA in the connector docs reviewed</td></tr>
+<tr><td class="row">SGLang</td><td>Mooncake or NIXL (selectable)<a class="cite" href="#ref-8">8</a></td><td>Overlapped (bootstrap handshake)<a class="cite" href="#ref-8">8</a></td><td>Not documented as GA in the docs reviewed</td></tr>
+<tr><td class="row">TensorRT-LLM / Triton</td><td>NIXL (UCX default, LIBFABRIC option); MPI and plain UCX also supported<a class="cite" href="#ref-1">1</a></td><td>Synchronous per request, overlapped across requests<a class="cite" href="#ref-1">1</a></td><td data-worst>Explicitly in progress, not GA &#8212; built on UCX/NIXL<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a></td></tr>
+<tr><td class="row">llm-d</td><td>Delegates to backend engine (vLLM/SGLang) connectors</td><td>Backend-dependent</td><td>Backend-dependent</td></tr>
+</tbody>
+</table>
+
+<p>Two convergence signals stand out. First, <b>NIXL is becoming the shared transport underneath every stack's KV-transfer path except where a project supplies its own (Mooncake, as an alternative in SGLang and as its own connector in vLLM)</b> &#8212; NIXL's own architecture doc frames it as "targeted for accelerating point to point communications in AI inference frameworks such as NVIDIA Dynamo," built on a modular plug-in backend architecture with UCX and GPUDirect Storage as its actively supported backends<a class="cite" href="#ref-9">9</a>, and Module 8 covers that architecture directly; this module and Modules 9, 11, and 12 each show a different production system choosing it as a default or a first-class option. Second, <b>every stack that documents dynamic node joining/leaving as a capability treats it the same way structurally</b>: workers register with a discovery mechanism, publish metadata about their capacity, and drain in-flight requests before deregistering. Dynamo documents this as shipped (Module 4, Module 9); TensorRT-LLM documents the identical shape as forthcoming, built on the same NIXL/UCX transport its cache-transceiver already uses<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>. The gap between the two is a maturity gap on a shared design, not a disagreement about what the feature should look like.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Rough production-maturity read across Part 5's five stacks, as documented as of 2026-09-17.</caption>
+<thead><tr><th>Stack</th><th>Orchestration model</th><th>What's shipped</th><th>What's explicitly not GA</th></tr></thead>
+<tbody>
+<tr><td class="row">NVIDIA Dynamo</td><td>Dedicated orchestration layer above engines</td><td>Router, SLA-driven Planner, runtime-reconfigurable xPyD<a class="cite" href="#ref-6">6</a></td><td>Rapid version churn (v1.4.x/v1.5.0-dev cadence, Module 9)</td></tr>
+<tr><td class="row">llm-d</td><td>Kubernetes-native EPP reference implementation</td><td>Layered filter/score/select scheduler, InferencePool CRD (GA)<a class="cite" href="#ref-6">6</a></td><td>Headline benchmarks are self-reported, scope-limited (Module 10)</td></tr>
+<tr><td class="row">vLLM</td><td>Connector abstraction inside the engine itself</td><td>Wide connector list, production-stack reference router<a class="cite" href="#ref-7">7</a></td><td>Disaggregated prefill labeled "experimental" in vLLM's own docs<a class="cite" href="#ref-7">7</a></td></tr>
+<tr><td class="row">SGLang</td><td>Bootstrap handshake inside the engine, standalone Rust router</td><td>Dual transfer backend, heterogeneous-TP staging buffer<a class="cite" href="#ref-8">8</a></td><td>Failure handling for mid-transfer partner death thinly documented (Module 4)</td></tr>
+<tr><td class="row">TensorRT-LLM / Triton</td><td>Three interchangeable deployment paths on one core mechanism</td><td>Cache-transceiver, three protocol backends, GB200 benchmarks across two model families<a class="cite" href="#ref-1">1</a></td><td>Dynamic node join/leave in progress<a class="cite" href="#ref-2">2</a>; Triton BLS path restricted to the C++ backend<a class="cite" href="#ref-4">4</a></td></tr>
+</tbody>
+</table>
+
+<p>None of the five stacks is uniformly ahead of the others across every axis in Table 3; each is furthest along on the capability its home organization needed first &#8212; Dynamo on cross-engine orchestration, llm-d on the Kubernetes-standard routing contract, vLLM and SGLang on connector/backend flexibility inside a single engine, TensorRT-LLM on GB200-specific measured performance with three separate operational entry points. A useful way to read this part as a whole: every stack independently arrived at the same three-part shape &#8212; a producer role, a consumer role, and a pluggable transfer layer between them &#8212; and the remaining differences are in what sits above that shape (routing intelligence, autoscaling, deployment tooling) rather than in the KV-movement mechanism itself. That convergence is evidence the underlying problem has a fairly narrow set of correct solutions, even though the tooling built around it is still visibly unsettled on every axis Table 3 marks as not-GA.</p>
+
+<p>Module 14 picks the story up from here at the Kubernetes deployment layer, which sits above all five stacks and is common to whichever engine is chosen underneath.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The field does not disagree about the cache-transceiver mechanism itself &#8212; all three deployment paths in section 1 share it unmodified. The live disagreement is operational: given the same underlying mechanism, which of the three deployment paths should a team actually run in production? TensorRT-LLM's own tech blog presents all three as legitimate, each "suited to different deployment scenarios"<a class="cite" href="#ref-1">1</a>, without ranking them &#8212; the trade-offs below are this module's synthesis of what that framing implies, not a ranking any single source states.</p>
+<div class="positions">
+<article class="position">
+<h4>Native trtllm-serve: fewest moving parts</h4>
+<p class="who">TensorRT-LLM's own default path<a class="cite" href="#ref-1">1</a></p>
+<p>Launch context and generation servers directly with <code>trtllm-serve</code>, add a YAML-configured disaggregated server as orchestrator. No external orchestration framework, no separate MLOps platform dependency &#8212; the entire stack is TensorRT-LLM's own tooling, and the routing policy (round-robin or KV-cache-aware) is built in<a class="cite" href="#ref-1">1</a>.</p>
+<ul class="pros"><li>Single dependency surface; easiest to reason about and debug</li><li>Direct path to whatever GB200 benchmark numbers TensorRT-LLM publishes, since that is the tooling those benchmarks were measured with</li></ul>
+<ul class="cons"><li>No autoscaling or SLA-driven scaling built in (that is Dynamo's job, Module 9)</li><li>Dynamic node joining/leaving is explicitly in-progress on this path too, so today's instance counts are fixed at launch<a class="cite" href="#ref-2">2</a></li></ul>
+</article>
+<article class="position">
+<h4>NVIDIA Dynamo: treat TensorRT-LLM as one of three backends</h4>
+<p class="who">Dynamo's own architecture, covered in full in Module 9<a class="cite" href="#ref-6">6</a></p>
+<p>Run TensorRT-LLM's context/generation servers underneath Dynamo's Router, SLA-driven Planner, and runtime-reconfigurable xPyD. The tech blog's own case for this path is decoupled pre/post-processing workers that help specifically under high concurrency<a class="cite" href="#ref-1">1</a>, on top of the KV-aware routing and autoscaling Module 9 covers.</p>
+<ul class="pros"><li>Dynamic node join/leave and SLA-driven autoscaling are already shipped here, not roadmap items</li><li>Same orchestration layer works across vLLM and SGLang backends too, so a fleet running mixed engines gets one control plane</li></ul>
+<ul class="cons"><li>An added dependency with its own fast-moving release cadence (Module 9's v1.4.x/v1.5.0-dev churn)</li><li>Headline speedup claims for the combination are vendor-reported and backend/model-specific (Module 9)</li></ul>
+</article>
+<article class="position">
+<h4>Triton Inference Server: fold into existing MLOps investment</h4>
+<p class="who">Triton's ensemble/BLS approach<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a></p>
+<p>Use Triton's existing ensemble-model and BLS-scripting primitives to build the orchestrator, fitting disaggregated TensorRT-LLM into whatever Triton-based serving, monitoring, and multi-framework tooling an organization already runs.</p>
+<ul class="pros"><li>No new serving platform to adopt for teams already standardized on Triton for other models</li><li>Multi-node support exists via leader mode and a dedicated Slurm/MPI tutorial<a class="cite" href="#ref-5">5</a></li></ul>
+<ul class="cons"><li>Restricted to the Executor API and the C++ backend specifically, "supported only for the TensorRT backend"<a class="cite" href="#ref-1">1</a></li><li>The worked BLS example available for review runs from an archived documentation version rather than the actively updated <code>llmapi</code>-based getting-started flow in current Triton TensorRT-LLM backend docs<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-4">4</a>, a signal (not a documented statement) that this path may be receiving less active development attention than the other two</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>None of the three is categorically better; the choice tracks what a team already operates. A team benchmarking or reproducing TensorRT-LLM's own GB200 numbers should use native <code>trtllm-serve</code>, since that is the tooling behind every number in Table 1<a class="cite" href="#ref-1">1</a>. A team that needs SLA-driven autoscaling, cross-engine orchestration, or already-shipped dynamic node join/leave should run under Dynamo (Module 9) rather than wait for TensorRT-LLM's native path to reach GA on the same capability. A team with sunk investment in Triton's model-repository tooling, multi-framework serving, and existing monitoring integrations has a real reason to prefer the BLS path despite its C++-backend restriction, provided that restriction does not conflict with a model that needs a non-TensorRT backend elsewhere in the same deployment. What would settle this more precisely than "it depends on your existing stack" is a published operational-overhead comparison &#8212; deployment complexity, mean time to recover from a worker failure, upgrade friction &#8212; across all three paths on identical GB200 hardware; none of the sources reviewed for this module publish one.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>NVIDIA / TensorRT-LLM Team. <em>Disaggregated Serving in TensorRT LLM</em> (Tech Blog). 2026. <a href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: context/generation server terminology, the three deployment paths (trtllm-serve, Dynamo, Triton), KV cache exchange protocol support (MPI/UCX/NIXL), rate-matching methodology and per-GPU throughput formula, GB200 benchmark numbers for DeepSeek R1 and Qwen3, TEP/DEP notation, future-work dynamic scaling statement.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>NVIDIA / TensorRT-LLM contributors. <em>Disaggregated Serving</em> (disagg-serving.md). Main branch docs, 2026. <a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md">https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: dynamic node joining/leaving status ("being built on top of" the cache-transceiver mechanism), cross-reference to Module 4's disagg_request_id derivation.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>NVIDIA. <em>GB200 NVL72</em> (product page). 2026. <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">https://www.nvidia.com/en-us/data-center/gb200-nvl72/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 72-GPU rack capacity, 130 TB/s NVLink bandwidth, rack-fit worked arithmetic (§5).</span></li>
+<li id="ref-4"><span class="ref-type">official</span>NVIDIA. <em>Running Disaggregated Serving with Triton TensorRT-LLM Backend</em>. Archived documentation (Triton Inference Server release 2580). <a href="https://docs.nvidia.com/deeplearning/triton-inference-server/archives/triton-inference-server-2580/user-guide/docs/tensorrtllm_backend/all_models/disaggregated_serving/README.html">https://docs.nvidia.com/deeplearning/triton-inference-server/archives/triton-inference-server-2580/user-guide/docs/tensorrtllm_backend/all_models/disaggregated_serving/README.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: disaggregated_serving_bls ensemble/BLS mechanism, participant_ids/gpu_device_ids configuration, world_size formula, C++-backend-only restriction.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>NVIDIA. <em>TensorRT-LLM Backend</em> (README, Triton Inference Server user guide). Live docs, 2026. <a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/tensorrtllm_backend/README.html">https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/tensorrtllm_backend/README.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: leader mode vs. orchestrator mode distinction, multi-node Slurm/MPI support, current llmapi-based getting-started flow.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>NVIDIA. <em>Disaggregated Serving</em> (NVIDIA Dynamo Documentation). 2026. <a href="https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving">https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Dynamo's NIXL-based non-blocking transfer, runtime-reconfigurable xPyD, cross-stack synthesis table (§7).</span></li>
+<li id="ref-7"><span class="ref-type">official</span>vLLM contributors. <em>Disaggregated Prefilling</em> (vLLM Documentation). 2026. <a href="https://docs.vllm.ai/en/latest/features/disagg_prefill/">https://docs.vllm.ai/en/latest/features/disagg_prefill/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: cross-stack synthesis table (§7) &#8212; vLLM's connector list and synchronous default, experimental status.</span></li>
+<li id="ref-8"><span class="ref-type">official</span>SGLang contributors. <em>PD Disaggregation</em> (SGLang Documentation). 2026. <a href="https://docs.sglang.io/advanced_features/pd_disaggregation.html">https://docs.sglang.io/advanced_features/pd_disaggregation.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: cross-stack synthesis table (§7) &#8212; SGLang's dual transfer backend and overlapped bootstrap transfer.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>NVIDIA (ai-dynamo). <em>NIXL Architecture</em> (nixl.md). Main branch docs, 2026. <a href="https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md">https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NIXL's role as point-to-point transport primitive and actively supported backends, cross-stack synthesis (§7).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

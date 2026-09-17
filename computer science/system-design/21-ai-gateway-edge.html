@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edge and API Gateway for AI Inference Platforms · System Design</title>
+<meta name="description" content="Why LLM inference traffic breaks generic HTTP load balancing, and the gateway architecture -- auth check, rate limiter, router, provider call, async accounting -- that OpenAI-, Anthropic-, and open-source-gateway-style platforms converge on instead.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 21</p>
+  <h1>Edge and API Gateway for AI Inference Platforms</h1>
+  <p class="lede">Every inference platform Aman builds against sits behind a gateway before it ever reaches a GPU, and that gateway does five specific jobs in a specific order: check identity and budget, check rate limits, pick a backend, call the provider, and record what happened without slowing the response down. This module derives that lifecycle from the gateways that have published it -- LiteLLM, the Kubernetes Gateway API Inference Extension, Kong AI Gateway, Azure API Management, Cloudflare AI Gateway -- and gives every later module in this part a numbered stage to attach to.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>38 min</b> read</span>
+    <span class="chip"><b>15</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-18</span>
+    <span class="chip">Prerequisite: <b>Module 1</b>, <b>Module 10</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">The AI gateway request lifecycle, from client to provider and back, with an async accounting branch</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="15" y="140" width="90" height="56" rx="8" class="d-block-muted"/>
+    <text x="60" y="172" text-anchor="middle" class="d-text-inv d-bold">Client</text>
+
+    <path d="M105,168 L140,168" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="140" y="40" width="620" height="260" rx="12" class="d-panel"/>
+    <text x="160" y="64" class="d-title d-bold">AI gateway</text>
+
+    <rect x="160" y="85" width="130" height="60" rx="8" class="d-block"/>
+    <text x="225" y="108" text-anchor="middle" class="d-text-inv d-bold">1. Auth +</text>
+    <text x="225" y="124" text-anchor="middle" class="d-text-inv d-bold">budget check</text>
+
+    <path d="M290,115 L330,115" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="330" y="85" width="130" height="60" rx="8" class="d-block"/>
+    <text x="395" y="108" text-anchor="middle" class="d-text-inv d-bold">2. Rate</text>
+    <text x="395" y="124" text-anchor="middle" class="d-text-inv d-bold">limiter</text>
+
+    <path d="M460,115 L500,115" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="500" y="85" width="130" height="60" rx="8" class="d-block"/>
+    <text x="565" y="108" text-anchor="middle" class="d-text-inv d-bold">3. Router</text>
+    <text x="565" y="124" text-anchor="middle" class="d-text-inv d-small">LB, fallback, retry</text>
+
+    <path d="M225,145 L225,220 L565,220 L565,145" class="d-dashed d-outline" fill="none"/>
+    <text x="395" y="240" text-anchor="middle" class="d-text-light d-small">critical path -- every stage synchronous, no DB write blocks the response</text>
+
+    <path d="M630,115 L680,115" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="680" y="85" width="60" height="60" rx="8" class="d-block-accent"/>
+    <text x="710" y="112" text-anchor="middle" class="d-text-inv d-bold">4.</text>
+    <text x="710" y="128" text-anchor="middle" class="d-text-inv d-small">Provider</text>
+
+    <path d="M565,145 L565,270" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="440" y="255" width="250" height="60" rx="8" class="d-surface d-dashed"/>
+    <text x="565" y="278" text-anchor="middle" class="d-bold">5. Async spend + rate-limit</text>
+    <text x="565" y="296" text-anchor="middle" class="d-small">logging (off critical path)</text>
+
+    <path d="M740,115 L780,115 L780,170 L110,170" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <text x="780" y="150" text-anchor="end" class="d-text-light d-small">response streams back</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> LiteLLM's own description of its proxy's request path: a bearer token is checked against a cached budget (with a database fallback on a cache miss), then a parallel-request rate limiter checks rpm/tpm at the key, user, and team level, then the router load-balances, retries, and falls back before calling the provider; spend logging and rate-limit accounting run as background tasks after the response has already left<a class="cite" href="#ref-1">1</a>. Section 4 shows Kong AI Gateway and Azure API Management implementing the same stage ordering through their own policy pipelines.</figcaption>
+</figure>
+
+<h2 id="gateway-in-the-request-path">1. The gateway's place in the request path</h2>
+<p>Module 1 established the L7 reverse-proxy vocabulary: TLS termination, routing on host/path, and load balancing by round robin, least-connections, ip-hash, or weight across an interchangeable pool of backends<a class="cite" href="#ref-2">2</a>. An AI gateway sits in exactly that position in the topology -- the first hop inside your trust boundary that terminates the client's connection -- but it is answering a different question. A classical L7 balancer asks "which of these identical backends should handle this request." An AI gateway asks "which model, under whose budget, at what priority, and did this key already burn its quota this minute" before it asks anything about backend health at all. The identity and quota questions are Module 22's subject in depth; this module's job is to fix the lifecycle those questions sit inside, so Module 22 can cite a stage number instead of re-deriving the whole request path.</p>
+<p>The gateway is also a trust boundary in Module 10's sense: it is the point where an external, unauthenticated bearer token becomes an internal, authorized, budgeted principal. Everything downstream of the gateway -- router, provider adapter, backend fleet -- can assume that boundary has already been crossed correctly. That assumption is why the gateway has to get identity and budget checks right on every request rather than sampling or deferring them, even though (as section 6 shows) the bookkeeping those checks produce is deliberately allowed to lag.</p>
+<p>There is a second, quieter continuity with Module 20: the router's job of translating a caller's request into whatever wire format a specific provider expects is the same problem Airbnb's Service IDL solved for internal service boundaries -- a declared contract that lets the caller and the callee change independently, as long as both honor the contract<a class="cite" href="#ref-1">1</a>. Module 20 covered that contract for services one company owns end to end; an AI gateway's router enforces the same discipline across provider boundaries it does not control at all, which is why the translation logic in stage 2.3 below has to be maintained continuously against a moving target rather than agreed once and left alone.</p>
+<h2 id="request-lifecycle">2. The request lifecycle, stage by stage</h2>
+<p>LiteLLM's own architecture documentation is the most precise public description of this lifecycle available, because LiteLLM is a proxy whose entire job is being this lifecycle, and it names each stage explicitly<a class="cite" href="#ref-1">1</a>. The stages generalize past LiteLLM specifically: Kong AI Gateway's plugin chain, Azure API Management's policy pipeline, and the Kubernetes Gateway API Inference Extension's Endpoint Picker all implement the same ordering under different names, which section 4 compares directly.</p>
+<p class="small muted">Coverage note: OpenAI and Anthropic have not published a gateway architecture document comparable to LiteLLM's or the Inference Extension's. What each has published publicly is the caller-visible behavior of usage tiers, spend limits, and rate limits -- the input to Module 22's identity and rate-limit design, not the internal lifecycle of their own edge tier. This module does not infer or fabricate either company's internal gateway mechanics beyond what their own documentation states about caller-visible behavior.</p>
+
+<h3 id="request-lifecycle-auth">2.1 Auth and budget check</h3>
+<p>The request arrives with a bearer token. The gateway looks up whether that token (a "virtual key" -- section 5 covers the concept in depth) is valid and under its budget. LiteLLM's documentation is explicit about the lookup path: a cache lookup first, with a database fallback only on a cache miss<a class="cite" href="#ref-1">1</a>. That ordering matters mechanically, not just for latency: a database round trip on every request would put a synchronous write-adjacent read in the critical path of every single call, which is the exact anti-pattern Module 8 and Module 11 already flagged for high-throughput systems. A cache-first check means the enforcement is only as fresh as the last cache write, which reappears as a real consistency problem in section 6.</p>
+
+<h3 id="request-lifecycle-rate-limiter">2.2 Parallel-request rate limiter</h3>
+<p>Once the key is authenticated and within budget, a separate check asks whether it is within its rate limit -- requests per minute and tokens per minute, evaluated at the key, user, and team level simultaneously<a class="cite" href="#ref-1">1</a>. This is a distinct mechanism from the budget check in stage 2.1: a key can be well within its dollar budget and still get a 429 for sending too many requests in too short a window. Module 22 derives the token-bucket, fixed-window, and sliding-window algorithms that implement this stage and the disagreement about which one is correct; this module only fixes where the check sits in the pipeline -- after identity, before routing -- and notes that "parallel" in LiteLLM's own naming reflects that the limiter runs as an independent check next to, not serialized inside, the budget check.</p>
+
+<h3 id="request-lifecycle-router">2.3 Router</h3>
+<p>The router is where an AI gateway earns its name over a generic reverse proxy. LiteLLM's router performs load balancing across configured deployments of a model, applies fallbacks when a deployment errors, retries transient failures, and translates the caller's request into the target provider's SDK format<a class="cite" href="#ref-1">1</a>. Section 3 derives why this stage cannot be satisfied by Module 1's round-robin or least-connections algorithms alone once the backends are stateful GPU-backed model servers rather than interchangeable stateless web servers.</p>
+<p>The SDK-translation half of the router's job is not cosmetic. A caller writing against one schema (commonly the OpenAI Chat Completions shape, since it is the de facto lingua franca) expects the gateway to speak whatever the chosen backend actually requires. Envoy AI Gateway's own usage-based rate-limiting documentation gives a concrete instance of why this matters beyond convenience: token-usage accounting itself depends on the response having a recognizable shape, so the gateway "automatically captures token usage through its request/response transformer" for a provider like AWS Bedrock whose native response format is not OpenAI-shaped<a class="cite" href="#ref-10">10</a>. If the translation layer is wrong or incomplete for a given backend, stage 2.5's accounting silently degrades along with it -- the two concerns are coupled even though they sit in different stages of the lifecycle.</p>
+
+<h3 id="request-lifecycle-provider-call">2.4 Provider call</h3>
+<p>The gateway makes the actual call to the model backend -- an internal GPU fleet, or an external provider's API. This is the boundary Module 25 designs in detail: what signals the backend exposes back across this call (KV-cache utilization, queue depth) so the router in stage 2.3 can make a better decision next time, and what a stable contract across a backend upgrade must guarantee. This module treats the call itself as a single edge in the lifecycle diagram; Module 25 opens it up.</p>
+
+<h3 id="request-lifecycle-async-logging">2.5 Async, off-critical-path accounting</h3>
+<p>After the response is already on its way back to the client, LiteLLM's documentation states plainly that spend logging, rate-limit accounting, and any configured logging callbacks all run as background tasks -- "no database write sits in the request path"<a class="cite" href="#ref-1">1</a>. Section 6 treats this as more than an implementation detail: it is a deliberate consistency trade, and it creates a window during which the system's view of a key's spend and rate-limit state is stale relative to reality.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> The five lifecycle stages, what each one checks, and where it sits relative to the response. Source: LiteLLM's proxy architecture documentation<a class="cite" href="#ref-1">1</a>; sync/async classification is this module's reading of that description.</caption>
+<thead><tr><th>Stage</th><th>Checks / does</th><th>Timing</th><th>Failure mode</th></tr></thead>
+<tbody>
+<tr><td class="row">1. Auth + budget</td><td>Bearer token valid, key/user/team under max spend</td><td class="num">Sync, cache-first</td><td>401 (invalid), 429/402-style rejection (over budget)</td></tr>
+<tr><td class="row">2. Rate limiter</td><td>rpm/tpm at key, user, team level</td><td class="num">Sync, parallel to stage 1</td><td>429 Too Many Requests</td></tr>
+<tr><td class="row">3. Router</td><td>Load balance, fallback, retry, SDK translation</td><td class="num">Sync</td><td>Fallback to next deployment or provider</td></tr>
+<tr><td class="row">4. Provider call</td><td>Actual inference call</td><td class="num">Sync</td><td>Timeout, error surfaced to router for retry</td></tr>
+<tr><td class="row">5. Accounting</td><td>Spend logging, rate-limit counters, callbacks</td><td class="num" data-worst>Async, off critical path</td><td>Delayed enforcement, not request failure</td></tr>
+</tbody>
+</table>
+
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Stages 1-4 are synchronous and gate the request; stage 5 is asynchronous and never gates anything. That split is why the gateway can enforce identity and routing on every request without paying a database write's latency on every request -- and why the enforcement it does synchronously (stage 1's cache lookup) is provably staler than the ground truth stage 5 eventually writes.</p></aside>
+<h2 id="why-l7-breaks">3. Why generic L7 balancing breaks for inference traffic</h2>
+<p>The Kubernetes project's own announcement of the Gateway API Inference Extension states the problem as plainly as any source in this course states anything: "unlike typical short-lived, stateless web requests, LLM inference sessions are often long-running, resource-intensive, and partially stateful. For example, a single GPU-backed model server may keep multiple inference sessions active and maintain in-memory token caches"<a class="cite" href="#ref-3">3</a>. Every assumption behind Module 1's load-balancing algorithms breaks against that sentence.</p>
+
+<h3 id="why-l7-breaks-stateful">3.1 Stateful, long-running, partially cached sessions</h3>
+<p>Round robin and least-connections both assume that any backend in the pool can serve any request equally well, so the only question worth optimizing is which backend is currently least busy. That assumption holds for a fleet of stateless web servers reading from a shared database. It does not hold for a fleet of model replicas: a request that hits a replica already holding a matching prefix in its KV cache is cheaper to serve there than anywhere else in the fleet, and a request that hits a replica with a cold cache pays the full prefill cost regardless of that replica's current connection count. Least-connections has no way to see cache state at all -- it counts connections, not bytes of reusable KV cache -- so it will happily send a request to an idle-but-cold replica over a busier-but-warm one, forfeiting exactly the reuse the platform is paying GPU memory to hold.</p>
+<p>Session length compounds the problem. A stateless web request completes in milliseconds; an LLM generation can run for seconds to minutes while holding GPU memory the whole time. A load balancer that treats connection count as a proxy for load will systematically under-weight a backend serving a few long, expensive generations and over-weight one serving many short, cheap ones, because "number of active connections" was never the right unit of load for this workload in the first place.</p>
+
+<h3 id="why-l7-breaks-signals">3.2 The signals a generic balancer does not have</h3>
+<p>The same announcement names the two things a classical balancer is missing: "traditional load balancers focused on HTTP path or round-robin lack the specialized capabilities needed for these workloads. They also don't account for model identity or request criticality (e.g., interactive chat vs. batch jobs)"<a class="cite" href="#ref-3">3</a>. The Gateway API Inference Extension's own architecture doc names the two routing signals it adds instead: KV-cache utilization and queue depth on each candidate model server<a class="cite" href="#ref-4">4</a>. Module 25 designs the full contract for how a GPU backend exposes those two signals across the platform boundary and what a stable interface must guarantee across a backend topology change; this module only needs the fact that they exist and that a generic L7 balancer has no field to carry them in.</p>
+<p>"Model identity" is the more basic gap. A classical balancer routes on host and path -- fine when every backend behind a path serves the same content. An inference gateway's router must route on model name, and frequently on model version, because two backends behind the same logical endpoint may be running different checkpoints, different quantizations, or entirely different model families with different latency and cost profiles. Path-based routing degenerates into a proxy for model identity only if the operator is disciplined about giving every model its own path -- the Inference Extension instead makes model identity a first-class field the router reads directly, via an <code>InferencePool</code> object that represents a set of endpoints running a given model-server framework, with the Endpoint Picker (EPP) fetching live metrics from that pool's endpoints to choose the one that "best achieve[s] the configured objectives"<a class="cite" href="#ref-4">4</a>.</p>
+<p>"Request criticality" is the newer gap, and it is the one this module leaves narrowest, on purpose. The Inference Extension's own architecture documentation claims that model-server-aware, metrics-driven load balancing "has been proven to reduce the serving latency and improve accelerator utilization" relative to generic L7 balancing<a class="cite" href="#ref-4">4</a>, but a routing decision informed by KV-cache utilization and queue depth still has to decide what to do when every candidate backend is saturated -- whether an interactive chat request should preempt a batch job's slot, and what a caller is told when nothing is available at all. That is a scheduling and admission-control question, not a routing-signal question, and Module 24 designs it: SLO-tiered service classes, fallback and graceful-degradation ordering, and the point at which the gateway stops trying to route and starts queueing or rejecting.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">The same incoming request routed by a classical L7 balancer versus an inference-aware gateway</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <text x="200" y="24" text-anchor="middle" class="d-title d-bold">Classical L7: round robin</text>
+    <rect x="150" y="40" width="100" height="44" rx="8" class="d-block-muted"/>
+    <text x="200" y="66" text-anchor="middle" class="d-text-inv d-bold">Request</text>
+    <path d="M200,84 L200,110" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="60" y="120" width="70" height="44" rx="8" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="95" y="146" text-anchor="middle" class="d-small">Replica A</text>
+    <rect x="165" y="120" width="70" height="44" rx="8" class="d-hl"/>
+    <text x="200" y="146" text-anchor="middle" class="d-small d-bold">Replica B</text>
+    <rect x="270" y="120" width="70" height="44" rx="8" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="305" y="146" text-anchor="middle" class="d-small">Replica C</text>
+    <path d="M200,110 L200,120" class="d-arrow d-arrow-active" marker-end="url(#f2-arr)"/>
+    <text x="200" y="185" text-anchor="middle" class="d-text-light d-small">picked: "next in rotation"</text>
+    <text x="200" y="203" text-anchor="middle" class="d-text-light d-small">B has a cold KV cache and a full queue</text>
+
+    <line x1="400" y1="10" x2="400" y2="280" class="d-axis d-dashed"/>
+
+    <text x="600" y="24" text-anchor="middle" class="d-title d-bold">Inference-aware: EPP</text>
+    <rect x="550" y="40" width="100" height="44" rx="8" class="d-block-muted"/>
+    <text x="600" y="66" text-anchor="middle" class="d-text-inv d-bold">Request</text>
+    <text x="600" y="98" text-anchor="middle" class="d-mono d-small">model=A, priority=interactive</text>
+    <path d="M600,84 L600,110" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="460" y="120" width="70" height="44" rx="8" class="d-hl"/>
+    <text x="495" y="140" text-anchor="middle" class="d-small d-bold">Replica A</text>
+    <text x="495" y="155" text-anchor="middle" class="d-mono d-small">KV 30%</text>
+    <rect x="565" y="120" width="70" height="44" rx="8" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="600" y="140" text-anchor="middle" class="d-small">Replica B</text>
+    <text x="600" y="155" text-anchor="middle" class="d-mono d-small">KV 95%</text>
+    <rect x="670" y="120" width="70" height="44" rx="8" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="705" y="140" text-anchor="middle" class="d-small">Replica C</text>
+    <text x="705" y="155" text-anchor="middle" class="d-mono d-small">queue 12</text>
+    <path d="M600,110 L495,120" class="d-arrow d-arrow-active" marker-end="url(#f2-arr)"/>
+    <text x="600" y="185" text-anchor="middle" class="d-text-light d-small">picked: A -- matching model, warm cache,</text>
+    <text x="600" y="203" text-anchor="middle" class="d-text-light d-small">low queue depth</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Left: a classical round-robin balancer sends the next request to whichever replica is next in rotation, regardless of that replica's cache state or queue<a class="cite" href="#ref-2">2</a>. Right: the Gateway API Inference Extension's Endpoint Picker reads model identity, KV-cache utilization, and queue depth from each candidate and routes on those signals instead<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+<h2 id="ext-proc-pattern">4. The ext-proc pattern: extend an existing gateway instead of building one</h2>
+<p>The Gateway API Inference Extension's own architecture documentation states its design choice directly: it works by "leveraging Envoy's External Processing Protocol to extend any gateway that supports both ext-proc and Gateway API into an inference gateway"<a class="cite" href="#ref-4">4</a>. That sentence is the whole idea. Instead of writing a new data plane that terminates TLS, parses HTTP/2, pools connections, and retries on your behalf -- all of which Envoy (or any comparable proxy) has already solved and hardened over years of production traffic -- you leave the data plane alone and insert a hook into it that lets an external process see and modify each request.</p>
+
+<h3 id="ext-proc-mechanism">4.1 The ext_proc mechanism</h3>
+<p>Envoy's External Processing filter (ext_proc) is a bidirectional gRPC stream between Envoy and an external processor: Envoy sends the processor <code>ProcessingRequest</code> messages and the processor replies with <code>ProcessingResponse</code> messages<a class="cite" href="#ref-5">5</a>. The filter can be configured to send events at any subset of four points in a message's lifecycle -- request headers, request body, response headers, response trailers -- and the processor can change which of those points it wants to see on a message-by-message basis, which lets a handler subscribe only to the events it actually needs and avoid unnecessary round trips<a class="cite" href="#ref-5">5</a>. The processor can examine and modify headers, body, and trailers, or short-circuit the whole exchange by returning a brand-new response directly<a class="cite" href="#ref-5">5</a>. For an inference gateway, this is exactly the hook a routing decision needs: intercept the request headers (to read the model name and the caller's identity), call out to a process that has live KV-cache and queue-depth telemetry from the backend fleet, and get back a modified request pointed at the chosen replica -- all without Envoy itself knowing anything about models, KV caches, or queues.</p>
+<p>The per-message event subscription matters for exactly the latency reason the design guide for this stack calls out: a routing decision only needs the request headers, since model name and caller identity both travel there, so a well-built processor subscribes to header events only and skips the request-body callback entirely, avoiding the added round trip of streaming the full prompt body through the external processor before making a decision it did not need the body for<a class="cite" href="#ref-5">5</a>. A processor that also wants to inspect or transform the body (to rewrite a prompt, or to compute a request's true token count before the provider call) pays for that visibility with an additional callback in the same gRPC stream -- the mechanism supports it, but every subscribed event is one more round trip against the request's total latency budget.</p>
+<p>The Endpoint Picker (EPP) in the Gateway API Inference Extension is that external processor. It is described as "an implementation of an Inference Router that will fetch metrics from whichever portion of the InferencePool endpoints can best achieve the configured objectives"<a class="cite" href="#ref-4">4</a> -- in ext_proc terms, it is the gRPC server on the other end of the stream, and Envoy (or any Gateway-API-and-ext-proc-capable proxy) is the unmodified data plane in front of it.</p>
+
+<h3 id="ext-proc-implementations">4.2 Three implementations of the same idea</h3>
+<p>The pattern is not unique to Kubernetes. Kong AI Gateway's second major version replaces the older, AI-specific "AI Proxy" plugin with an "AI Model" entity that "defines the upstream provider, model name, and routing behavior," while attaching AI-specific policies -- AI Semantic Cache, AI Prompt Guard, AI Rate Limiting Advanced -- on top of Kong's existing, plugin-centric request-processing pipeline<a class="cite" href="#ref-6">6</a>. The AI capability is new; the pipeline it plugs into is the same one Kong has run non-AI traffic through for years.</p>
+<p>Azure API Management states the relationship even more directly for its own AI gateway feature set: "the AI gateway, including MCP server capabilities, extends API Management's existing API gateway; it's not a separate offering"<a class="cite" href="#ref-7">7</a>. The token-limit policy that enforces a tokens-per-minute quota (<code>llm-token-limit</code>), the semantic-cache lookup/store policies, and the load-balancing and circuit-breaker configuration on backends are all additions to the same policy pipeline that has always processed API Management's REST traffic -- not a parallel system<a class="cite" href="#ref-7">7</a>.</p>
+<p>The Gateway API Inference Extension project also separates who configures each side of this split into two named roles: an "Inference Platform Admin," who "creates and manages the infrastructure necessary to run LLM workloads," including the gateway configuration itself, and an "Inference Workload Owner," who owns one or more model-serving workloads and is responsible for defining that workload's request priorities and rollout of model/adapter changes<a class="cite" href="#ref-4">4</a> (Concepts: Roles and Personas). That split matches the extension pattern structurally: the platform admin operates the shared, extended gateway (the thing sections 4.1-4.2 describe), while the workload owner's decisions -- what counts as high priority, which adapter is live -- are exactly the configuration the EPP reads at request time rather than something baked into the gateway itself. Module 24 is where request priority, defined by the workload owner in this framing, becomes a scheduling and admission decision rather than just a label attached to a request.</p>
+<p>Three organizations, three different underlying proxies (Envoy via the Gateway API, Kong's own nginx-based core, Azure's own gateway runtime), and the same architectural answer: keep the hardened data plane, add an AI-aware policy or processing layer beside it. The disagreement section below contrasts this extension pattern with the alternative of not reusing an existing gateway at all.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">An existing Envoy-class gateway extended by an external processor over gRPC, rather than replaced</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="20" y="110" width="90" height="50" rx="8" class="d-block-muted"/>
+    <text x="65" y="140" text-anchor="middle" class="d-text-inv d-bold">Client</text>
+    <path d="M110,135 L150,135" class="d-arrow" marker-end="url(#f3-arr)"/>
+
+    <rect x="150" y="60" width="220" height="160" rx="12" class="d-panel"/>
+    <text x="260" y="82" text-anchor="middle" class="d-title d-bold">Envoy / Gateway API</text>
+    <text x="260" y="98" text-anchor="middle" class="d-text-light d-small">unmodified data plane</text>
+    <rect x="175" y="115" width="170" height="50" rx="8" class="d-block"/>
+    <text x="260" y="135" text-anchor="middle" class="d-text-inv d-bold">ext_proc filter</text>
+    <text x="260" y="150" text-anchor="middle" class="d-text-inv d-small">headers / body hook</text>
+
+    <path d="M345,140 Q420,95 495,120" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <text x="420" y="90" text-anchor="middle" class="d-mono d-small">gRPC: ProcessingRequest</text>
+    <path d="M495,150 Q420,175 345,155" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <text x="420" y="185" text-anchor="middle" class="d-mono d-small">ProcessingResponse</text>
+
+    <rect x="495" y="95" width="150" height="80" rx="10" class="d-block-accent"/>
+    <text x="570" y="122" text-anchor="middle" class="d-text-inv d-bold">External processor</text>
+    <text x="570" y="140" text-anchor="middle" class="d-text-inv d-small">e.g. Endpoint Picker (EPP)</text>
+    <text x="570" y="156" text-anchor="middle" class="d-text-inv d-small">reads KV-cache / queue depth</text>
+
+    <path d="M370,135 L730,135" class="d-arrow d-dashed" marker-end="url(#f3-arr)"/>
+    <text x="700" y="120" text-anchor="middle" class="d-text-light d-small">chosen backend</text>
+    <rect x="700" y="145" width="70" height="44" rx="8" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="735" y="171" text-anchor="middle" class="d-small">Model server</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The ext-proc architecture: Envoy (or another Gateway-API-and-ext-proc-capable proxy) keeps terminating TLS and forwarding traffic; a separate gRPC processor -- the Endpoint Picker in the Kubernetes Gateway API Inference Extension -- receives request headers/body over a bidirectional gRPC stream and returns a routing decision<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>. Kong AI Gateway's AI Model entity and Azure API Management's AI-gateway policies extend their own respective data planes the same way<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 2.</b> Five published gateway architectures for AI/LLM traffic, compared on deployment model and the mechanism each uses to add inference-aware behavior. Sources as cited per row.</caption>
+<thead><tr><th>Gateway</th><th>Deployment model</th><th>Extension mechanism</th><th>Inference-aware signal</th><th>Caching</th></tr></thead>
+<tbody>
+<tr><td class="row">LiteLLM</td><td>Self-run Python proxy</td><td>Application code (not a data-plane extension)</td><td>Model/deployment config, not live KV-cache telemetry<a class="cite" href="#ref-1">1</a></td><td>Optional response cache, app-level</td></tr>
+<tr><td class="row">K8s Gateway API Inference Extension</td><td>Self-run, on top of an existing Envoy/Gateway-API proxy</td><td>ext_proc gRPC hook (Endpoint Picker)<a class="cite" href="#ref-4">4</a></td><td data-best>KV-cache utilization, queue depth<a class="cite" href="#ref-3">3</a></td><td>None specified</td></tr>
+<tr><td class="row">Kong AI Gateway</td><td>Self-run, on top of Kong's existing core</td><td>AI Model entity + policy plugins<a class="cite" href="#ref-6">6</a></td><td>Routing behavior per AI Model config<a class="cite" href="#ref-6">6</a></td><td>AI Semantic Cache plugin<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">Azure API Management</td><td>Managed PaaS, existing APIM instance</td><td>AI-gateway policies on existing policy pipeline<a class="cite" href="#ref-7">7</a></td><td>Round-robin / weighted / priority / session-aware backend LB<a class="cite" href="#ref-7">7</a></td><td><code>llm-semantic-cache-lookup/store</code><a class="cite" href="#ref-7">7</a></td></tr>
+<tr><td class="row">Cloudflare AI Gateway</td><td>Fully managed edge service</td><td>Vendor-hosted proxy in front of provider APIs<a class="cite" href="#ref-12">12</a></td><td>None (routes to named provider)</td><td>Exact-match, disabled by default<a class="cite" href="#ref-13">13</a></td></tr>
+</tbody>
+</table>
+<h2 id="virtual-keys">5. Virtual keys: identity as a spend and rate-limit hierarchy</h2>
+<p>Stage 2.1's auth/budget check is a lookup against a "virtual key" -- a credential the platform issues to a caller, distinct from the underlying provider API key it maps to. LiteLLM's virtual-key documentation gives the most complete public description of how this hierarchy is structured, and it generalizes to every gateway that separates "who is calling" from "which upstream credential actually pays the provider."</p>
+
+<h3 id="virtual-keys-rollup">5.1 Key, user, team: rollup and inheritance</h3>
+<p>A virtual key's owner is whoever its <code>user_id</code> field points at, and a key can additionally carry a <code>team_id</code><a class="cite" href="#ref-8">8</a>. Spend is tracked at all three levels independently: per-key spend is retrievable directly, and "if the key has an attached <code>user_id</code> or <code>team_id</code>, the spend for that user is tracked in the <code>LiteLLM_UserTable</code>, and team in the <code>LiteLLM_TeamTable</code>"<a class="cite" href="#ref-1">1</a>. Every completion, chat completion, and embeddings call updates these three running totals in USD, computed from the provider's own per-token pricing<a class="cite" href="#ref-8">8</a>.</p>
+<p>Rate limits (<code>tpm_limit</code>, <code>rpm_limit</code>) and spend caps (<code>max_budget</code>) follow an inheritance model rather than three independently-set numbers: a key without its own explicit limit inherits its owner's limit -- "the owner's <code>tpm_limit</code> and <code>rpm_limit</code> whenever they are set, and the owner's <code>max_budget</code> for keys with no team"<a class="cite" href="#ref-8">8</a>. An administrator can also cap what any key-creation request is allowed to set, via <code>upperbound_key_generate_params</code>, which prevents a delegated key-issuer from minting a key with a higher limit than the org intends to allow at all<a class="cite" href="#ref-8">8</a>.</p>
+
+<h3 id="virtual-keys-limit-types">5.2 Hard limits, soft limits, and scope restrictions</h3>
+<p>Beyond the numeric budget, a virtual key can carry hard limits on tokens, requests, or upstream billing, soft limits that only trigger an alert rather than a rejection, model allow-lists, and its own per-key rate limits, independent of what its owner would otherwise inherit<a class="cite" href="#ref-1">1</a>. A hard limit is enforced at stage 2.1 of the lifecycle -- the request is rejected before it reaches the router. A soft limit does not touch the request path at all; it is a monitoring signal that fires off the critical path, in the same async category as stage 2.5's accounting. Module 22 derives the specific algorithms (token bucket, fixed window, sliding window) that enforce the numeric side of this; this module's job is only to place the virtual key at the correct point in the lifecycle and show that it is a hierarchy, not a flat list of unrelated credentials.</p>
+<p>The market has not converged on a single shape for this hierarchy outside LiteLLM's key/user/team/org model. Portkey originally exposed "Virtual Keys" as a single flat mapping -- one Portkey API key giving access to many providers' credentials without exposing them in application code -- and has since deprecated that model in favor of a "Model Catalog," described as offering "fine-grained budgets, rate limits, and model allow-lists" at what is now a provider-and-model routing-table level rather than a per-caller identity level<a class="cite" href="#ref-9">9</a>. The direction of that migration is informative: a flat, single-purpose virtual key (one key, one provider's credentials) is being replaced by something closer to LiteLLM's structured hierarchy, because a flat mapping has nowhere to attach a team-level budget rollup at all.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 280" role="img" aria-labelledby="f4t"><title id="f4t">Virtual-key spend rolling up from key to user to team, with an independent limit check at each level</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="300" y="15" width="200" height="50" rx="10" class="d-block-accent"/>
+    <text x="400" y="36" text-anchor="middle" class="d-text-inv d-bold">Team: eng-infra</text>
+    <text x="400" y="52" text-anchor="middle" class="d-text-inv d-small">max_budget = $2,000/mo</text>
+
+    <path d="M400,65 L400,95" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+    <rect x="130" y="100" width="180" height="50" rx="10" class="d-block"/>
+    <text x="220" y="121" text-anchor="middle" class="d-text-inv d-bold">User: alice</text>
+    <text x="220" y="137" text-anchor="middle" class="d-text-inv d-small">spend = $640</text>
+
+    <rect x="490" y="100" width="180" height="50" rx="10" class="d-block"/>
+    <text x="580" y="121" text-anchor="middle" class="d-text-inv d-bold">User: bob</text>
+    <text x="580" y="137" text-anchor="middle" class="d-text-inv d-small">spend = $610</text>
+
+    <path d="M300,40 L310,40 L310,125 L310,125" class="d-arrow" marker-end="url(#f4-arr)" fill="none"/>
+    <path d="M220,150 L220,180" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M580,150 L580,180" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+    <rect x="60" y="190" width="110" height="46" rx="8" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="115" y="212" text-anchor="middle" class="d-small d-bold">Key sk-1</text>
+    <text x="115" y="227" text-anchor="middle" class="d-mono d-small">$400</text>
+    <rect x="180" y="190" width="110" height="46" rx="8" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="235" y="212" text-anchor="middle" class="d-small d-bold">Key sk-2</text>
+    <text x="235" y="227" text-anchor="middle" class="d-mono d-small">$240</text>
+    <rect x="420" y="190" width="110" height="46" rx="8" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="475" y="212" text-anchor="middle" class="d-small d-bold">Key sk-3</text>
+    <text x="475" y="227" text-anchor="middle" class="d-mono d-small">$610</text>
+    <text x="400" y="260" text-anchor="middle" class="d-text-light d-small">team total $1,250 of $2,000 -- each key/user checked independently at request time</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> A virtual key's spend rolls up to its owning user and, if attached, to a team; each level carries its own independently-checked budget and rate limit, with unset limits inherited from the owner above<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-8">8</a>. Numbers are an illustrative example built from the documented mechanism, not a published case.</figcaption>
+</figure>
+
+<table class="tbl">
+<caption><b>Table 3.</b> Worked example: a team budget can trip even though no single key or user has individually exceeded anything, because the check that matters is the rollup, not any one level in isolation.</caption>
+<thead><tr><th>Level</th><th class="num">Spend this month ($)</th><th class="num">max_budget ($)</th><th>Under limit?</th></tr></thead>
+<tbody>
+<tr><td class="row">Key sk-1 (alice)</td><td class="num">400</td><td class="num">1,000 (inherited from alice)</td><td>Yes</td></tr>
+<tr><td class="row">Key sk-2 (alice)</td><td class="num">240</td><td class="num">1,000 (inherited from alice)</td><td>Yes</td></tr>
+<tr><td class="row">User alice</td><td class="num">640</td><td class="num">1,000</td><td>Yes</td></tr>
+<tr><td class="row">Key sk-3 (bob)</td><td class="num">610</td><td class="num">1,000 (inherited from bob)</td><td>Yes</td></tr>
+<tr><td class="row">User bob</td><td class="num">610</td><td class="num">1,000</td><td>Yes</td></tr>
+<tr><td class="row">Team eng-infra</td><td class="num" data-worst>1,250</td><td class="num">2,000</td><td>Yes, but at 62.5% with two users only</td></tr>
+</tbody>
+</table>
+<p>Every individual key and every individual user in Table 3 is comfortably under its own budget. The number that actually constrains the team's next hire's key is the $2,000 team ceiling minus the $1,250 already spent by two users -- an aggregate the per-key and per-user checks in stage 2.1 cannot see unless the check is explicitly performed at the team level too, which is exactly why LiteLLM tracks spend at all three levels independently rather than deriving the team total lazily from its members at check time<a class="cite" href="#ref-1">1</a>.</p>
+<h2 id="async-accounting-consistency">6. Async accounting and the staleness window it creates</h2>
+<p>Stage 2.5 runs after the response has already left the gateway: "after the response is returned to the client, spend logging, rate-limit accounting, and logging callbacks all run as asynchronous background tasks -- no database write sits in the request's critical path"<a class="cite" href="#ref-1">1</a>. This is the right engineering call for latency, and it is exactly the kind of trade-off Module 5 named in the abstract: choosing to serve every request without paying a synchronous write's latency, in exchange for a bounded period during which the gateway's enforced state (what it checked against at stage 2.1/2.2) lags the true state (what stage 2.5 will eventually record).</p>
+
+<h3 id="async-accounting-window">6.1 The window is real, not theoretical</h3>
+<p>Two published gateways sit at different points on this trade-off, and the difference is a genuine, cited disagreement rather than a matter of taste. Envoy AI Gateway's usage-based rate limiting checks, on request arrival, "if processing this request would exceed the configured token limit. If the limit would be exceeded, the request is rejected with a 429 status code. If within the limit, the request is processed and its token usage is counted towards the total"<a class="cite" href="#ref-10">10</a> -- an optimistic-admission design: the check happens against whatever total has already landed, and the request's own eventual usage is folded in only after it completes. A burst of concurrent requests can each pass that pre-check against the same stale total before any of their usage has been counted, because none of them has finished yet.</p>
+<p>Anthropic's rate-limit documentation describes the more conservative alternative for its own tokens-per-minute limits: input-token throughput is "estimated at the beginning of a request and adjusted during it to reflect actual input tokens used," and output-token throughput counts only tokens actually generated, in real time<a class="cite" href="#ref-11">11</a>. That is a pessimistic-then-corrected design -- reserve a worst-case estimate up front, adjust downward once the true count is known -- rather than an optimistic one. Module 22 derives both algorithms and the general problem they are solving (you cannot know an LLM request's true token cost until generation finishes) in full; this module's point is narrower: the choice of where in the lifecycle you reconcile is inseparable from stage 2.5's async design, because any reconciliation has to happen off the critical path by construction once you have decided the critical path performs no blocking write.</p>
+
+<h3 id="async-accounting-calc">6.2 Sizing the overspend window</h3>
+<p>The size of the staleness window is a function of three things: how many requests the affected key can issue per second, the average dollar or token cost per request, and how long it takes the async accounting path to land a write that the next admission check will actually see (whether that is a cache invalidation delay, a batched-write interval, or simply the in-flight duration of concurrent requests that haven't completed yet). Multiplying request rate by cost by window length gives the worst-case overspend a single key can achieve before enforcement catches up -- not a probabilistic estimate, a hard ceiling on how bad an optimistic-admission design can be for a given key's throughput.</p>
+
+<div class="calc">
+  <p class="calc-title">Worst-case overspend during the async-accounting window</p>
+  <div class="calc-row"><label for="ov-rps">Requests/sec this key can sustain</label><input type="range" id="ov-rps" name="rps" min="1" max="200" step="1" value="20"></div>
+  <div class="calc-row"><label for="ov-cost">Average cost per request ($)</label><input type="range" id="ov-cost" name="cost" min="0.001" max="1" step="0.001" value="0.05"></div>
+  <div class="calc-row"><label for="ov-win">Reconciliation lag (ms)</label><input type="range" id="ov-win" name="win" min="10" max="5000" step="10" value="500"></div>
+  <div class="calc-out">
+    <div>Requests admitted before enforcement catches up<output data-expr="floor(rps * win / 1000)" data-format="int"></output></div>
+    <div>Worst-case overspend<output data-expr="rps * win / 1000 * cost" data-format="fixed:2"></output> <span>USD</span></div>
+  </div>
+  <p class="calc-note">Formula: \( \text{overspend} = \text{rps} \times \frac{\text{win}}{1000} \times \text{cost} \). At 20 req/s, five cents/request, and a 500 ms reconciliation lag, a single key can push roughly $0.50 past its limit before the next admission check reflects it<a class="cite" href="#ref-1">1</a>. Scale rps to a burst of concurrent requests during an incident and the same arithmetic explains why an optimistic-admission gateway needs a hard cap on concurrent in-flight requests per key, independent of its steady-state rate limit.</p>
+</div>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>Neither design is a bug. Optimistic admission (Envoy AI Gateway) keeps every request's latency identical regardless of accounting load; pessimistic estimate-then-adjust (Anthropic) bounds the overspend at the cost of a slightly more complex per-request accounting path. A platform with a small number of high-trust, high-volume keys can tolerate the optimistic design's window; a platform selling metered access to arbitrary third parties generally cannot, and layers a hard concurrency cap per key on top of whichever rate-limit algorithm Module 22 describes.</p></aside>
+
+<h3 id="async-accounting-idempotency">6.3 The async write still has to be idempotent</h3>
+<p>Stage 2.5 running off the critical path does not exempt it from the retry problem Module 8 and Module 18 already established: a router that retries a failed provider call (stage 2.3's job) or a client that retries a dropped connection can cause the same logical request to be accounted for twice unless the accounting write itself is keyed the same way Stripe keys a payment retry -- a client- or gateway-generated identifier whose second write is recognized as a duplicate of the first rather than a second charge<a class="cite" href="#ref-1">1</a>. Airbnb's Orpheus library (Module 20) and Stripe's Idempotency-Key header (Module 18) solved this exact problem for two different kinds of financial writes; an AI gateway's async spend log is a third instance of the same problem, and Module 23 designs the credit ledger that has to get it right for token-metered billing specifically, including the harder case of a request that is retried mid-stream rather than cleanly before or after.</p>
+<h2 id="edge-caching">7. Why the edge tier of an AI gateway caches almost nothing</h2>
+<p>Module 1 and Module 2 established that a classical CDN's whole reason for existing is caching: an edge PoP holds a copy of the response and serves it without a round trip to origin, and Cloudflare's own reference architecture describes tiered caching -- certain data centers acting as reverse proxies to origin for other data centers -- specifically to raise the cache-hit rate further<a class="cite" href="#ref-14">14</a>. An AI gateway sits in the same topological position and, on most traffic, does almost none of that.</p>
+<p>Cloudflare AI Gateway's own caching documentation is explicit about why: caching is "disabled by default" and, when turned on, a cache hit requires an exact match -- the cache key is the SHA-256 hash of the concatenated provider, endpoint, model, provider authentication header, and full request body, so "any difference in the body -- including messages, tools, or model parameters -- will result in a separate cache entry"<a class="cite" href="#ref-13">13</a>. A classical HTTP cache keys on a URL and a handful of headers because many different clients request the identical resource; an LLM request's cache key is effectively its entire prompt, and most prompts sent to a shared endpoint are unique strings that will never recur byte-for-byte. TTLs when caching is enabled range from a minimum of 60 seconds to a maximum of one month, with a 5-minute default when neither a per-request nor a gateway-level TTL is configured<a class="cite" href="#ref-13">13</a> -- numbers that only matter for the minority of traffic where the exact same request really does repeat, which Cloudflare's own documentation frames narrowly: it names "a support bot that asks 'How can I help you?' and lets the user select an answer from a limited set of options" as the kind of workload this benefits, not general chat traffic<a class="cite" href="#ref-13">13</a>.</p>
+<p>Cloudflare AI Gateway itself is positioned as a unified front door across providers -- it "sits in front of multiple AI model providers" including Workers AI, Anthropic, Google Gemini, OpenAI, and Replicate, adding rate limiting, retries, model fallback, and analytics on top of whichever provider the request is routed to<a class="cite" href="#ref-12">12</a> -- but the caching feature is opt-in precisely because exact-match caching captures only a narrow slice of real traffic. This is the same conclusion Module 2's cache-placement analysis would predict once you note that an LLM prompt is closer to a unique query than to a static asset: the cache-hit ratio a CDN reports for images and scripts (routinely well above 90% for popular content) has no LLM-traffic analogue, because there is no equivalent of "the same JPEG requested by ten thousand different clients."</p>
+<p>The workaround the market has converged on is not exact-match caching at all, but semantic caching: compare a new prompt's embedding to previously-cached prompts' embeddings and serve a cached completion if the vector proximity clears a threshold, rather than requiring byte-identical input. Kong AI Gateway ships this as its AI Semantic Cache policy, and Azure API Management implements the same idea via <code>llm-semantic-cache-store</code> and <code>llm-semantic-cache-lookup</code> policies backed by Azure Managed Redis or another RediSearch-compatible external cache<a class="cite" href="#ref-7">7</a>. Semantic caching only helps when a meaningful fraction of traffic really does cluster around a small number of recurring intents -- FAQ-style bots, support triage, structured extraction over a narrow domain -- which is a materially smaller share of an AI gateway's traffic than the share of a classical CDN's traffic that a URL-keyed cache successfully serves.</p>
+<p>Semantic caching also reintroduces a correctness question that exact-match caching never had to answer. A classical cache hit is a proof of identity: byte-for-byte the same request gets byte-for-byte the same response, so serving from cache is never observably different from recomputing it. A semantic-cache hit is a proof of similarity above a configured threshold, not identity -- two prompts that a vector-similarity score judges "close enough" can still differ in exactly the clause that changes the correct answer (a negation, a changed constraint, a different number in an otherwise identical sentence). Neither Kong's nor Azure's documentation states a default similarity threshold or a false-hit rate, so an operator turning this feature on is trading some unmeasured rate of wrong-but-plausible cached answers for the token-cost reduction, and has to set the threshold empirically against its own traffic rather than a documented default<a class="cite" href="#ref-7">7</a>.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Every gateway this module cites has already chosen one of three answers to a question none of them frames as a single decision, but which is the same decision every time: given that Envoy-class data planes already solve TLS termination, HTTP/2, connection pooling, and retries, should the AI-specific logic live inside that data plane as an extension, beside it as a purpose-built application proxy you run yourself, or entirely outside your infrastructure as a vendor-hosted service?</p>
+<div class="positions">
+  <article class="position">
+    <h4>Extend an existing L7 gateway (ext-proc / plugin)</h4>
+    <p class="who">Kubernetes Gateway API Inference Extension, Kong AI Gateway, Azure API Management<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a></p>
+    <p>Keep the hardened, already-operated data plane (Envoy, Kong's core, Azure's gateway runtime) and add AI-specific routing/policy logic through a defined extension point -- ext_proc's gRPC hook, Kong's plugin/entity model, or Azure's policy pipeline. You inherit years of production hardening on the parts of the problem that have nothing to do with LLMs.</p>
+    <ul class="pros"><li>No need to reimplement TLS, HTTP/2, connection pooling, or retry logic</li><li>Kubernetes-native deployments get InferencePool/EPP integration with existing Gateway API tooling for free<a class="cite" href="#ref-4">4</a></li><li>Operationally, it's one gateway to run, not two</li></ul>
+    <ul class="cons"><li>Every AI-aware decision costs an extra network hop (the ext_proc gRPC round trip) that a purpose-built proxy avoids by making the decision in-process<a class="cite" href="#ref-5">5</a></li><li>Constrained by the host gateway's request/response model and configuration surface</li></ul>
+  </article>
+  <article class="position">
+    <h4>A purpose-built application-layer proxy</h4>
+    <p class="who">LiteLLM<a class="cite" href="#ref-1">1</a></p>
+    <p>Run a proxy whose entire codebase is AI-gateway logic -- virtual keys, per-provider SDK translation, cost calculation, router fallbacks -- as ordinary application code rather than as an extension to someone else's data plane.</p>
+    <ul class="pros"><li>Every check (auth, budget, routing) happens in-process with no extra network hop</li><li>Fastest to change: adding a new provider or a new cost model is an application-code change, not a data-plane redeployment</li><li>Full visibility into and control over LLM-specific state (token counts, provider quirks) that a generic ext_proc processor has to reconstruct from raw bytes</li></ul>
+    <ul class="cons"><li>You own connection handling, TLS, HTTP/2, and retry semantics yourself, or depend on whatever your web framework gives you for free -- reimplementing what Envoy has already hardened</li><li>Scaling the proxy itself becomes your operational problem rather than an existing gateway's already-solved one</li></ul>
+  </article>
+  <article class="position">
+    <h4>Fully managed, vendor-hosted gateway-as-a-service</h4>
+    <p class="who">Cloudflare AI Gateway<a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-15">15</a></p>
+    <p>Point client traffic at a vendor's edge instead of operating any gateway infrastructure at all; the vendor handles routing to providers, rate limiting, retries/fallback, and (optionally) caching.</p>
+    <ul class="pros"><li>Zero infrastructure to run or scale -- "it only takes one line of code to get started"<a class="cite" href="#ref-12">12</a></li><li>Provider-agnostic unified interface across OpenAI, Anthropic, Gemini, and others out of the box<a class="cite" href="#ref-12">12</a></li></ul>
+    <ul class="cons"><li>Another network hop and another party's incident history between your client and the model provider</li><li>Routing and caching logic limited to what the vendor exposes as configuration, not arbitrary application code</li><li>Vendor lock-in on the identity/budget model the gateway imposes</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The right answer tracks where you already have sunk infrastructure and how much custom AI-specific logic you need, not any inherent superiority of one pattern. If you already run Kubernetes with a Gateway-API-capable ingress (or Kong, or Azure API Management) for non-AI traffic, the ext-proc/plugin extension is close to free marginal cost and gets you inference-aware routing without a second system to operate -- this is the right default for a platform team bolting AI traffic onto existing infrastructure. If your AI-specific logic (custom cost models, unusual provider SDKs, a bespoke virtual-key hierarchy) is complex and changes weekly, a purpose-built proxy like LiteLLM is faster to iterate on precisely because it is ordinary application code with no extension-point ceremony, and the extra latency of doing everything in-process is usually smaller than the ext_proc round trip it avoids. If you have no existing gateway investment and want to ship quickly with minimal operational surface, the vendor-hosted option is rational, with the accepted cost of an additional hop and reduced customization. No source in this map publishes a head-to-head latency or feature-velocity benchmark across all three; that comparison, run on comparable traffic, is what would actually settle which pattern wins at a given scale rather than which one a given team happened to already have running.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Azure API Management's "unified model API" is in preview as of 2026-09-18: a single OpenAI-compatible endpoint in front of multiple providers' backends, with format translation and governance policy applied once across all of them rather than once per provider integration<a class="cite" href="#ref-7">7</a>. That collapses part of what a router (stage 2.3) does today into a declared API shape instead of custom routing code, and is worth re-checking once it leaves preview.</p>
+<p>Portkey's move from a flat "Virtual Keys" credential model to a "Model Catalog" routing table<a class="cite" href="#ref-9">9</a> is a live data point that the identity layer of these gateways is still being redesigned, not settled; LiteLLM's key/user/team hierarchy (section 5) is the most structured public example today, but it is one design among several still in motion.</p>
+<p>MCP server governance is entering the same gateways this module describes: both Kong AI Gateway and Azure API Management now list MCP server registration and policy enforcement alongside their LLM-proxying features<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a>. Whether MCP traffic ends up going through the same auth/budget/rate-limit lifecycle this module derives, or through a materially different one, is unresolved in the public documentation as of 2026-09-18 and is out of this module's scope.</p>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>BerriAI / LiteLLM contributors. <em>Life of a Request (LiteLLM Proxy architecture)</em>. docs.litellm.ai live docs, 2026. <a href="https://docs.litellm.ai/docs/proxy/architecture">https://docs.litellm.ai/docs/proxy/architecture</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the five-stage request lifecycle (auth/budget check, parallel rate limiter, router, provider call, async accounting), cache-first key lookup, virtual-key hard/soft limits and key/user/team spend rollup.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>NGINX. <em>Using nginx as HTTP load balancer</em>. NGINX / F5, live documentation, 2026. <a href="https://nginx.org/en/docs/http/load_balancing.html">https://nginx.org/en/docs/http/load_balancing.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: round robin, least-connections, and ip-hash as the classical L7 balancing algorithms contrasted against inference-aware routing.</span></li>
+<li id="ref-3"><span class="ref-type">blog</span>Kubernetes project contributors. <em>Introducing Gateway API Inference Extension</em>. kubernetes.io/blog, published 2025-06-05. <a href="https://kubernetes.io/blog/2025/06/05/introducing-gateway-api-inference-extension/">https://kubernetes.io/blog/2025/06/05/introducing-gateway-api-inference-extension/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: why LLM inference sessions are long-running/stateful/partially cached, why generic L7 balancers lack model-identity and criticality awareness, and the naming of KV-cache utilization and queue depth as routing signals.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>kubernetes-sigs contributors (Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA). <em>Introduction (Kubernetes Gateway API Inference Extension)</em>. Kubernetes SIGs, live docs, 2026. <a href="https://gateway-api-inference-extension.sigs.k8s.io/">https://gateway-api-inference-extension.sigs.k8s.io/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the InferencePool/Endpoint Picker (EPP) architecture, the statement that it extends any ext-proc-and-Gateway-API-capable gateway rather than replacing it, the claimed latency/utilization benefit, and (Concepts: Roles and Personas page) the Inference Platform Admin / Inference Workload Owner role split.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>Envoy Proxy project. <em>External Processing Filter (ext_proc)</em>. envoyproxy.io, latest docs, 2026. <a href="https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter">https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the bidirectional gRPC ProcessingRequest/ProcessingResponse stream, the four interception points (request/response headers/body/trailers), and per-message dynamic subscription to events.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>Kong Inc. <em>Kong AI Gateway</em>. developer.konghq.com, live docs, 2026. <a href="https://developer.konghq.com/ai-gateway/">https://developer.konghq.com/ai-gateway/</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the AI Model entity replacing the AI Proxy plugin, and AI-specific policies (AI Semantic Cache, AI Prompt Guard, AI Rate Limiting Advanced) layered on Kong's existing plugin pipeline.</span></li>
+<li id="ref-7"><span class="ref-type">official</span>Microsoft. <em>AI gateway capabilities in Azure API Management</em>. Microsoft Learn, updated 2026-06-25. <a href="https://learn.microsoft.com/en-us/azure/api-management/genai-gateway-capabilities">https://learn.microsoft.com/en-us/azure/api-management/genai-gateway-capabilities</a>. Accessed 2026-09-18. <span class="ref-use">Used for: "extends API Management's existing API gateway; it's not a separate offering," the llm-token-limit policy, semantic caching via llm-semantic-cache-lookup/store, backend load balancing (round-robin/weighted/priority/session-aware) and circuit breaker with Retry-After-based trip duration, and the unified model API preview.</span></li>
+<li id="ref-8"><span class="ref-type">official</span>BerriAI / LiteLLM contributors. <em>Virtual Keys</em>. docs.litellm.ai live docs, 2026. <a href="https://docs.litellm.ai/docs/proxy/virtual_keys">https://docs.litellm.ai/docs/proxy/virtual_keys</a>. Accessed 2026-09-18. <span class="ref-use">Used for: key-to-owner mapping via user_id/team_id, budget/rate-limit inheritance from owner to key, and upperbound_key_generate_params.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>Portkey. <em>Virtual Keys</em>. portkey.ai/docs, live docs, 2026. <a href="https://portkey.ai/docs/product/ai-gateway/virtual-keys">https://portkey.ai/docs/product/ai-gateway/virtual-keys</a>. Accessed 2026-09-18. <span class="ref-use">Used for: the deprecated flat Virtual Keys model and its migration to a Model Catalog routing table with fine-grained budgets/rate limits/model allow-lists.</span></li>
+<li id="ref-10"><span class="ref-type">official</span>Envoy AI Gateway project (rebranded "Agent Router" in v0.1 docs). <em>Usage-based Rate Limiting</em>. v0.1 docs, 2026. <a href="https://aigateway.envoyproxy.io/docs/0.1/capabilities/usage-based-ratelimiting/">https://aigateway.envoyproxy.io/docs/0.1/capabilities/usage-based-ratelimiting/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the optimistic-admission enforcement design (check against current total, admit, count actual usage afterward).</span></li>
+<li id="ref-11"><span class="ref-type">official</span>Anthropic. <em>Rate limits</em>. Claude API docs, live documentation, 2026. <a href="https://platform.claude.com/docs/en/api/rate-limits">https://platform.claude.com/docs/en/api/rate-limits</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the pessimistic estimate-then-adjust design for input-token throughput limits, contrasted with Envoy AI Gateway's optimistic admission.</span></li>
+<li id="ref-12"><span class="ref-type">official</span>Cloudflare. <em>AI Gateway</em>. developers.cloudflare.com, live documentation, 2026. <a href="https://developers.cloudflare.com/ai-gateway/">https://developers.cloudflare.com/ai-gateway/</a>. Accessed 2026-09-18. <span class="ref-use">Used for: AI Gateway as a unified front door across providers (Workers AI, Anthropic, Gemini, OpenAI, Replicate), rate limiting, retries/fallback, and one-line-of-code deployment.</span></li>
+<li id="ref-13"><span class="ref-type">official</span>Cloudflare. <em>Caching</em>. AI Gateway features docs, live documentation, 2026. <a href="https://developers.cloudflare.com/ai-gateway/features/caching/">https://developers.cloudflare.com/ai-gateway/features/caching/</a>. Accessed 2026-09-18. <span class="ref-use">Used for: caching disabled by default, the SHA-256 exact-match cache key over provider/endpoint/model/auth header/full body, and the 60-second-to-one-month TTL range with a 5-minute default.</span></li>
+<li id="ref-14"><span class="ref-type">official</span>Cloudflare. <em>Content Delivery Network (CDN) Reference Architecture</em>. Cloudflare, live documentation, 2026. <a href="https://developers.cloudflare.com/reference-architecture/cdn-reference-architecture">https://developers.cloudflare.com/reference-architecture/cdn-reference-architecture</a>. Accessed 2026-09-17. <span class="ref-use">Used for: tiered caching as the classical CDN pattern contrasted against an AI gateway's near-absence of caching.</span></li>
+<li id="ref-15"><span class="ref-type">official</span>Cloudflare. <em>Rate limiting</em>. AI Gateway features docs, live documentation, 2026. <a href="https://developers.cloudflare.com/ai-gateway/features/rate-limiting/">https://developers.cloudflare.com/ai-gateway/features/rate-limiting/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Cloudflare AI Gateway named as the "Where experts disagree" example of a fully managed, vendor-hosted gateway.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

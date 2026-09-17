@@ -1,0 +1,1197 @@
+{
+  "topic": "Multi-node LLM inference: scaling serving from one 8-GPU node to N nodes (replication, routing, prefill/decode disaggregation, cross-node MoE, and the open-source stack)",
+  "kind": "course",
+  "createdAt": "2026-09-17",
+  "researcher": "study-researcher",
+  "subtopics": [
+    { "id": "replication-routing", "title": "Replication + routing: KV-cache-aware, prefix-aware, load/SLO-aware routers, session affinity" },
+    { "id": "pd-disaggregation", "title": "Prefill/decode disaggregation: mechanism, ratios, KV transfer paths, scheduling, failure modes" },
+    { "id": "wide-ep-moe", "title": "Cross-node model parallelism for MoE: wide EP, DeepEP all-to-all, expert placement/load balancing, attention-DP+EP layouts, NVL72 vs 8-GPU" },
+    { "id": "multi-node-kv-management", "title": "Multi-node KV management: prefix caching across nodes, offload tiers (HBM/host/SSD/remote), Mooncake, LMCache, NIXL" },
+    { "id": "interconnect-transport", "title": "Interconnect & transport: NVLink/NVSwitch vs InfiniBand/RoCE vs NVL72 fabric, GPUDirect RDMA, UCX/NIXL, real bandwidth/latency" },
+    { "id": "stack-dynamo", "title": "NVIDIA Dynamo: router, planner, KVBM, disaggregation" },
+    { "id": "stack-llm-d", "title": "llm-d: inference scheduler, EPP, Kubernetes Gateway API Inference Extension" },
+    { "id": "stack-vllm-multinode", "title": "vLLM multi-node + disaggregated prefill + production stack" },
+    { "id": "stack-sglang", "title": "SGLang router + PD disaggregation + wide EP" },
+    { "id": "stack-trtllm-triton", "title": "TensorRT-LLM / Triton disaggregated serving" },
+    { "id": "stack-mooncake", "title": "Mooncake: KVCache-centric disaggregated architecture, Transfer Engine, Conductor" },
+    { "id": "stack-lmcache", "title": "LMCache: tiered KV cache offload and reuse layer" },
+    { "id": "stack-nixl", "title": "NIXL: NVIDIA Inference Xfer Library" },
+    { "id": "stack-deepep-deepseek", "title": "DeepEP and DeepSeek's published inference-system design (EP32/EP320, EPLB)" },
+    { "id": "stack-orchestration", "title": "Ray Serve, KServe, AIBrix, LeaderWorkerSet — orchestration layer where relevant" },
+    { "id": "k8s-ops", "title": "Kubernetes/operations: deployment topologies, SLO autoscaling, multi-tenant serving, observability, upgrades/failure handling" },
+    { "id": "capacity-economics", "title": "Capacity planning & economics: goodput under TTFT/ITL SLOs, tokens/s/$ vs N, when disaggregation pays, Little's-law reasoning" },
+    { "id": "frontier-research", "title": "Frontier/research: DistServe, Splitwise, Llumnix, Mooncake paper, Hazy Research multi-GPU serving work" },
+    { "id": "amd-multinode", "title": "AMD MI300X/MI355X multi-node serving: RCCL, IB/RoCE, vLLM-ROCm" },
+    { "id": "tpu-multihost", "title": "TPU multi-host serving: ICI, Pathways, JetStream" }
+  ],
+  "sources": [
+    {
+      "id": "S1",
+      "type": "repo",
+      "title": "ai-dynamo/dynamo (README)",
+      "authors": "NVIDIA / ai-dynamo contributors",
+      "org": "NVIDIA",
+      "year": "2026",
+      "version": "v1.4.2 (container tags); v1.5.0-dev builds referenced",
+      "url": "https://github.com/ai-dynamo/dynamo",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Primary repository and README for NVIDIA Dynamo, the datacenter-scale distributed inference orchestration layer above vLLM/SGLang/TensorRT-LLM.",
+      "covers": ["stack-dynamo", "pd-disaggregation", "multi-node-kv-management"],
+      "facts": [
+        { "claim": "Dynamo is described as the orchestration layer above inference engines, not a replacement for them", "where": "README header", "quote": "The open-source, datacenter-scale inference stack. Dynamo is the orchestration layer above inference engines" },
+        { "claim": "Named components: Router (KV-aware routing), Planner (SLA-driven autoscaler), KV Block Manager (KVBM, offloads KV cache GPU->CPU->SSD->remote), ModelExpress (GPU-to-GPU weight streaming via NIXL/NVLink), Grove (Kubernetes operator for topology-aware gang scheduling)", "where": "Core Capabilities / architecture section", "quote": "Separates prefill and decode into independently scalable GPU pools; KV-Aware Routing routes requests based on worker load and KV cache overlap" },
+        { "claim": "Dynamo reports 7x higher throughput per GPU (DeepSeek R1 on GB200), 2x faster TTFT with KV-aware routing, and 750x higher throughput (DeepSeek-R1 on GB300) in headline claims", "where": "README highlights", "quote": "7x higher throughput per GPU (DeepSeek R1 on GB200); 2x faster time-to-first-token (KV-aware routing); 750x higher throughput (DeepSeek-R1 on GB300)" },
+        { "claim": "Supported backends: vLLM, SGLang, TensorRT-LLM", "where": "README backend list", "quote": "vLLM, SGLang, TensorRT-LLM" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S2",
+      "type": "official",
+      "title": "Disaggregated Serving (NVIDIA Dynamo Documentation)",
+      "authors": "NVIDIA",
+      "org": "NVIDIA",
+      "year": "2026",
+      "version": "docs.nvidia.com/dynamo knowledge-base (live)",
+      "url": "https://docs.nvidia.com/dynamo/knowledge-base/concepts/system-architecture/disaggregated-serving",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "NVIDIA's own architectural description of how Dynamo implements disaggregated prefill/decode, including backend-specific transfer behavior.",
+      "covers": ["pd-disaggregation", "stack-dynamo", "multi-node-kv-management"],
+      "facts": [
+        { "claim": "Dynamo uses NIXL to transfer KV cache directly from prefill-engine VRAM to decode-engine VRAM, non-blocking", "where": "Efficient KV Transfer section", "quote": "Dynamo leverages NIXL to transfer KV cache directly from the VRAM of the prefill engine to the VRAM of the decode engine. The KV transfer is non-blocking, allowing GPU forward passes to continue serving other requests during the transfer." },
+        { "claim": "Backend-specific behavior differs: SGLang uses bootstrap coordination so decode can begin while KV transfer proceeds in parallel; vLLM and TensorRT-LLM run prefill synchronously and decode waits for prefill completion", "where": "Backend-Specific Transfer Metadata section", "quote": "SGLang: bootstrap coordination allowing decode phase to begin immediately while the KV transfer proceeds in parallel. vLLM and TRTLLM: Prefill runs synchronously; decode waits for prefill to complete before proceeding." },
+        { "claim": "Dynamo supports runtime-reconfigurable xPyD (x prefill workers, y decode workers); workers register with discovery service and publish RuntimeConfig including KV capacity on add, and drain active requests before deregistering on remove", "where": "Runtime-Reconfigurable xPyD section", "quote": "Dynamo's disaggregation design supports runtime-reconfigurable xPyD (x prefill workers, y decode workers). Workers can be added and removed at runtime." },
+        { "claim": "The doc explicitly declines to encode prefill/decode boundary as a universal token threshold", "where": "Performance Characteristics section", "quote": "should not be encoded as a universal token threshold" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S3",
+      "type": "repo",
+      "title": "ai-dynamo/dynamo Releases",
+      "authors": "NVIDIA / ai-dynamo contributors",
+      "org": "NVIDIA",
+      "year": "2026",
+      "version": "v1.4.2 (2026-08-29); v1.5.0-dev builds in progress",
+      "url": "https://github.com/ai-dynamo/dynamo/releases",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Release log establishing Dynamo's current version and release cadence (monthly-scale churn).",
+      "covers": ["stack-dynamo"],
+      "facts": [
+        { "claim": "Latest tagged release is v1.4.2, dated August 29, 2026, a patch fixing NIXL loader-path resolution in the Frontend and SGLang Runtime images", "where": "Releases page", "quote": "Dynamo v1.4.2 is a patch release on top of v1.4.1. It fixes NIXL loader-path resolution in the Frontend and SGLang Runtime images" },
+        { "claim": "v1.4.1 added OpenAI-compatible classify and pooling endpoints to the Dynamo Frontend with vLLM worker support", "where": "Releases page", "quote": "Dynamo v1.4.1 is a patch release on top of v1.4.0. It adds OpenAI-compatible classify and pooling endpoints to the Dynamo Frontend with vLLM worker support" },
+        { "claim": "A dev build v1.5.0-gemma-4-31b-dev.1 ships an official TensorRT-LLM runtime container built on TensorRT-LLM 1.3.0rc25", "where": "Releases page", "quote": "Dynamo v1.5.0-gemma-4-31b-dev.1 adds an official TensorRT-LLM runtime container for Gemma-4-31B, built on TensorRT-LLM 1.3.0rc25" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S4",
+      "type": "official",
+      "title": "Planner Guide (NVIDIA Dynamo Documentation, v1.2.1)",
+      "authors": "NVIDIA",
+      "org": "NVIDIA",
+      "year": "2026",
+      "version": "v1.2.1",
+      "url": "https://docs.nvidia.com/dynamo/v1.2.1/components/planner/planner-guide",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Official documentation of the Dynamo Planner, the SLO-driven autoscaler for prefill/decode worker counts.",
+      "covers": ["stack-dynamo", "k8s-ops", "capacity-economics"],
+      "facts": [
+        { "claim": "The Planner is an autoscaling controller that adjusts prefill and decode engine replica counts at runtime to meet latency SLAs, using Prometheus metrics or load-predictor output plus engine performance models", "where": "Planner overview", "quote": "adjusts prefill and decode engine replica counts at runtime to meet latency SLAs" },
+        { "claim": "Default SLA targets: TTFT 500.0 ms, ITL 50.0 ms", "where": "Planner configuration defaults", "quote": "TTFT (Time to First Token): Default target of 500.0 milliseconds; ITL (Inter-Token Latency): Default target of 50.0 milliseconds" },
+        { "claim": "Four scaling modes exist: throughput, latency, load, sla; when load-based and throughput-based scaling are both active, load-based scaling runs after throughput-based scaling and adjusts above the throughput-derived floor", "where": "Scaling Logic section", "quote": "throughput updates the lower-bound replicas, then load-based scaling can adjust above that floor" },
+        { "claim": "SLA-mode uses a Rust engine performance shim with native AIC estimates plus online FPM tuning or FPM regression fallback, bootstrapped from self-benchmark or profiler-generated (npz/JSON) data", "where": "Performance Model Mechanism section", "quote": "the Rust engine performance shim with native AIC estimates when available, plus online FPM tuning or FPM regression fallback" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S5",
+      "type": "blog",
+      "title": "NVIDIA Dynamo 0.4 Delivers 4x Faster Performance, SLO-Based Autoscaling, and Real-Time Observability",
+      "authors": "NVIDIA",
+      "org": "NVIDIA Developer Blog",
+      "year": "2025",
+      "version": "Dynamo 0.4 (published 2025-08-13)",
+      "url": "https://developer.nvidia.com/blog/dynamo-0-4-delivers-4x-faster-performance-slo-based-autoscaling-and-real-time-observability",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "NVIDIA engineering blog with dated, model-specific performance numbers and the observability metric list Dynamo emits.",
+      "covers": ["stack-dynamo", "capacity-economics", "k8s-ops"],
+      "facts": [
+        { "claim": "gpt-oss-120b on Dynamo + TensorRT-LLM on B200 achieved up to 4x faster interactivity (tokens/second/user) for very long input sequence lengths", "where": "Performance section", "quote": "Running the new OpenAI gpt-oss-120b model using Dynamo and TensorRT-LLM on NVIDIA B200 achieved up to 4x faster interactivity (tokens/second/user) for very long input sequence lengths" },
+        { "claim": "DeepSeek-R1 671B on GB200 NVL72 with TensorRT-LLM and Dynamo achieved 2.5x higher throughput (tokens/second/GPU)", "where": "Performance section", "quote": "running the DeepSeek-R1 671B model on NVIDIA GB200 NVL72 and TensorRT-LLM with Dynamo achieved 2.5x higher throughput (tokens/second/GPU)" },
+        { "claim": "Planner predicts future traffic with ARIMA or Prophet time-series models, then calculates minimum PD workers to meet SLA targets under predicted demand", "where": "SLO-based autoscaling section", "quote": "It predicts future traffic patterns using advanced time-series models such as ARIMA or Prophet" },
+        { "claim": "Metrics emitted via Prometheus: requests/sec, request duration, TTFT, ITL, input/output sequence length, GPU utilization and power usage", "where": "Observability section", "quote": "Average requests per second and request duration; Average time to first token (TTFT) and inter-token latency (ITL); Average input and output sequence length; GPU utilization and power usage" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S6",
+      "type": "repo",
+      "title": "llm-d-inference-scheduler architecture.md",
+      "authors": "llm-d contributors",
+      "org": "llm-d (CNCF Sandbox; Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA)",
+      "year": "2026",
+      "version": "main branch, doc undated",
+      "url": "https://github.com/llm-d/llm-d-inference-scheduler/blob/main/docs/architecture.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Primary architecture document for llm-d's inference scheduler, the component that implements KV-cache-aware and load-aware scheduling behind the Endpoint Picker.",
+      "covers": ["replication-routing", "stack-llm-d"],
+      "facts": [
+        { "claim": "Routing pipeline stages: Request Control (flow-control admission, global Screener does preliminary endpoint filtering) -> Filtering -> Scoring (weighted set of scorers) -> Selection (highest-scored pod)", "where": "Scheduling Components", "quote": "Pods in an InferencePool go through a sequential chain of filters; Filtered pods are scored using a weighted set of scorers; The highest-scored pod is selected" },
+        { "claim": "Named plugins: prefix-cache-scorer, decode-filter, max-score-picker, session-id-producer, precise-prefix-cache-producer, inflight-load-producer", "where": "Named Plugins & Scorers", "quote": "prefix-cache-scorer (prefix cache awareness); decode-filter (decode stage filtering); max-score-picker (scoring algorithm); session-id-producer (session affinity data); precise-prefix-cache-producer (KV-cache producer); inflight-load-producer (load awareness)" },
+        { "claim": "Data layer follows a Source -> Extract -> Attribute lifecycle populating per-endpoint attributes in a shared datastore for scorers", "where": "Data Layer Architecture", "quote": "The data layer follows a Source -> Extract -> Attribute lifecycle" },
+        { "claim": "Design principle: no core changes needed to add new scorers or filters (pluggability)", "where": "Design Principles", "quote": "Pluggability: No core changes are needed to add new scorers or filters" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S7",
+      "type": "repo",
+      "title": "llm-d/llm-d (README)",
+      "authors": "llm-d contributors",
+      "org": "llm-d (CNCF Sandbox since March 2026; Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA)",
+      "year": "2026",
+      "version": "v0.7 (May 2026)",
+      "url": "https://github.com/llm-d/llm-d",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Primary project README stating llm-d's five 'well-lit path' themes, founding orgs, and its own headline benchmark numbers.",
+      "covers": ["stack-llm-d", "replication-routing", "pd-disaggregation", "wide-ep-moe", "k8s-ops"],
+      "facts": [
+        { "claim": "llm-d organizes its offering into five themes: Intelligent Routing (prefix-cache and load-aware balancing), Advanced KV-Cache Management (tiered offloading to CPU/disk), Serving Large Models (prefill/decode disaggregation and wide expert-parallelism), Operational Excellence (flow control and SLO-aware autoscaling), Batch Processing (OpenAI-compatible APIs)", "where": "Well-Lit Paths summary", "quote": "Intelligent Routing (prefix-cache and load-aware balancing), Advanced KV-Cache Management (tiered offloading to CPU/disk), Serving Large Models (prefill/decode disaggregation and wide expert-parallelism), Operational Excellence (flow control and SLO-aware autoscaling), and Batch Processing" },
+        { "claim": "Supported inference engines: vLLM and SGLang", "where": "Supported Inference Engines", "quote": "vLLM and SGLang handle efficiently running large language models on accelerators" },
+        { "claim": "Founding organizations: Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA; became CNCF Sandbox project March 2026", "where": "Project background", "quote": "Red Hat, Google Cloud, IBM Research, CoreWeave, and NVIDIA (CNCF Sandbox project as of March 2026)" },
+        { "claim": "Headline claims: 3x higher output throughput and 2x faster TTFT with prefix-cache routing; 40% latency reduction with predicted scheduling; up to 70% higher tokens/sec with disaggregation; 50k tokens/sec cluster throughput on 16x16 B200s; 13.9x throughput improvement with hierarchical KV offloading", "where": "README benchmark claims", "quote": "3x higher output throughput; 2x faster TTFT with prefix-cache routing; 40% reduction in latency with predicted scheduling; Up to 70% higher tokens/sec with disaggregation; 50k tokens/sec cluster throughput (16x16 B200s); 13.9x throughput improvement with hierarchical KV offloading" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S8",
+      "type": "official",
+      "title": "Prefix-Cache Aware Routing (llm-d docs)",
+      "authors": "llm-d contributors",
+      "org": "llm-d",
+      "year": "2026",
+      "version": "docs/dev (live)",
+      "url": "https://llm-d.ai/docs/dev/architecture/advanced/kv-management/prefix-cache-aware-routing",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Primary mechanism description for how llm-d's router learns and scores KV-cache state, in both approximate and precise modes.",
+      "covers": ["replication-routing", "stack-llm-d", "multi-node-kv-management"],
+      "facts": [
+        { "claim": "Approximate mode: approx-prefix-cache-producer splits prompts into fixed-size blocks (example: 16 tokens approximated as characters) and builds a rolling hash chain; EPP keeps an in-memory LRU index of which prefix hashes were recently sent to which pods; prefix-cache-scorer scores on ratio of matched blocks to total prompt blocks", "where": "Approximate Implementation", "quote": "The approx-prefix-cache-producer splits the incoming prompt into fixed-size blocks (e.g., 16 tokens approximated as characters) and builds a rolling hash chain... an in-memory LRU index of which prefix hashes were recently sent to which Pods" },
+        { "claim": "Precise mode: model servers (vLLM) emit KVEvents over ZeroMQ whenever internal KV cache changes (blocks added/evicted); the KV-Cache Indexer subscribes and maintains a globally consistent view of exactly which token blocks reside on which pods", "where": "Precise Implementation", "quote": "Model servers (like vLLM) are configured to emit KVEvents over ZeroMQ (ZMQ) whenever their internal KV cache changes (blocks added or evicted)... maintains a precise, globally consistent view of exactly which token blocks reside on which Pods" },
+        { "claim": "Precise mode uses vLLM's HTTP render endpoint (/v1/completions/render) to obtain exact token IDs for tokenization", "where": "Precise Implementation, tokenization approach", "quote": "The token-producer plugin sends the prompt to vLLM's HTTP render endpoint (/v1/completions/render)" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S9",
+      "type": "repo",
+      "title": "kubernetes-sigs/gateway-api-inference-extension (README)",
+      "authors": "Kubernetes SIG contributors",
+      "org": "Kubernetes SIGs",
+      "year": "2026",
+      "version": "GA since v1.0.0",
+      "url": "https://github.com/kubernetes-sigs/gateway-api-inference-extension",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Official Kubernetes SIG repository defining the InferencePool API and Endpoint Picker Protocol that llm-d, AIBrix, and others build on.",
+      "covers": ["replication-routing", "stack-llm-d", "k8s-ops"],
+      "facts": [
+        { "claim": "Project optimizes self-hosting generative models on Kubernetes by leveraging Envoy's External Processing to transform gateways into inference gateways", "where": "Project description", "quote": "Gateway API Inference Extension optimizes self-hosting Generative Models on Kubernetes" },
+        { "claim": "The Endpoint Picker (EPP) is a data-plane component communicating via the Envoy external processing protocol, acting as the Router, intercepting requests and routing to optimal model server replicas", "where": "EPP description", "quote": "A data-plane component that communicates via the Envoy external processing protocol, and acts as the Router" },
+        { "claim": "Goals: request scheduling algorithm that is KV-cache and request-cost aware; route client model names to use-case-specific LoRA adapters; prefix-cache aware load balancing on roadmap", "where": "Named features", "quote": "Request scheduling algorithm that is kv-cache and request cost aware; Route client model names to use-case specific LoRA adapters" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S10",
+      "type": "official",
+      "title": "InferencePool (Kubernetes Gateway API Inference Extension docs)",
+      "authors": "Kubernetes SIG contributors",
+      "org": "Kubernetes SIGs",
+      "year": "2026",
+      "version": "InferencePool GA since v1.0.0; endpointPickerRef optional since v1.5.0",
+      "url": "https://gateway-api-inference-extension.sigs.k8s.io/api-types/inferencepool/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The formal API spec for InferencePool, the CRD every EPP-based router (llm-d, AIBrix) is built against.",
+      "covers": ["replication-routing", "k8s-ops"],
+      "facts": [
+        { "claim": "InferencePoolSpec has three core fields: selector (must exactly match model server pod labels), targetPorts (ports the Inference Gateway routes to), endpointPickerRef (references the EPP service)", "where": "InferencePoolSpec fields", "quote": "The selector field specifies which Pods belong to this pool. The labels in this selector must exactly match the labels applied to your model server Pods... The endpointPickerRef field references the Endpoint Picker (EPP) service that monitors key metrics from model servers within the InferencePool and provides intelligent routing decisions" },
+        { "claim": "An HTTPRoute may reference multiple InferencePools as backendRefs", "where": "HTTPRoute relationship", "quote": "an HTTPRoute may reference multiple InferencePools as backendRefs" },
+        { "claim": "Until release v1.5.0, endpointPickerRef was required; now optional, to allow InferencePool usage without a user-managed EPP deployment", "where": "endpointPickerRef note", "quote": "Until release v1.5.0, the InferencePool field endpointPickerRef was required. Currently, it is optional, to allow usages of InferencePool without user-managed Endpoint Picker deployments" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S11",
+      "type": "repo",
+      "title": "EPP Architecture Proposal (0683-epp-architecture-proposal)",
+      "authors": "Kubernetes SIG / Gateway API Inference Extension contributors",
+      "org": "Kubernetes SIGs",
+      "year": "2026",
+      "version": "main branch proposal doc",
+      "url": "https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/0683-epp-architecture-proposal/README.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Design proposal for the layered EPP architecture (Routing / Flow Controller / Scheduling layers) that llm-d's scheduler implements.",
+      "covers": ["replication-routing", "stack-llm-d"],
+      "facts": [
+        { "claim": "Requests flow through three layers: Routing Layer (per-InferenceModel routing rules and request enrichment) -> Flow Controller (priority, fairness, queueing) -> Scheduling Layer (load-balancing algorithm routing based on current InferencePool state)", "where": "Routing decision process", "quote": "the Scheduling Layer is the load balancing algorithm that intelligently routes requests based on the current state of the InferencePool" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S12",
+      "type": "official",
+      "title": "Disaggregated Prefilling (vLLM Documentation)",
+      "authors": "vLLM contributors",
+      "org": "vLLM Project",
+      "year": "2026",
+      "version": "docs.vllm.ai/en/latest (experimental feature); vLLM package version 0.29.0 released 2026-09-09 per PyPI",
+      "url": "https://docs.vllm.ai/en/latest/features/disagg_prefill/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "vLLM's own documentation of its KV-connector abstraction for disaggregated prefill/decode, the mechanism that every connector (LMCache, NIXL, Mooncake) plugs into.",
+      "covers": ["pd-disaggregation", "stack-vllm-multinode", "multi-node-kv-management"],
+      "facts": [
+        { "claim": "vLLM disaggregation separates prefill instance and decode instance, using a connector to transfer prefill KV caches and results", "where": "Mechanism overview", "quote": "One for prefill (we call it prefill instance) and one for decode (we call it decode instance), and then use a connector to transfer the prefill KV caches and results" },
+        { "claim": "Three core abstractions: Connector (kv consumer retrieves KV caches of a batch from kv producer), LookupBuffer (insert/drop_select APIs), Pipe (single-direction FIFO for tensor transmission)", "where": "Architecture abstractions", "quote": "Connector: Enables kv consumer to retrieve the KV caches of a batch of request from kv producer; LookupBuffer: Provides insert and drop_select APIs; Pipe: A single-direction FIFO pipe for tensor transmission" },
+        { "claim": "Named connectors: ExampleConnector, LMCacheConnectorV1, NixlConnector, MooncakeConnector, MoRIIOConnector (ROCm only), MultiConnector, OffloadingConnector, FlexKVConnectorV1, PyNcclConnector", "where": "Connector list", "quote": "LMCacheConnectorV1; NixlConnector; MooncakeConnector; MoRIIOConnector (ROCm only); MultiConnector; OffloadingConnector; FlexKVConnectorV1" },
+        { "claim": "The feature is labelled experimental and subject to change", "where": "Document banner", "quote": "This feature is experimental and subject to change" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S13",
+      "type": "repo",
+      "title": "vllm-project/production-stack (README)",
+      "authors": "vLLM Project contributors",
+      "org": "vLLM Project",
+      "year": "2026",
+      "version": "released 2026-01-22",
+      "url": "https://github.com/vllm-project/production-stack",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Reference Kubernetes deployment stack for vLLM: router + serving-engine pods + observability, maintained by the vLLM project itself.",
+      "covers": ["stack-vllm-multinode", "replication-routing", "k8s-ops"],
+      "facts": [
+        { "claim": "Production Stack scales from a single vLLM instance to a distributed deployment without application code changes; three components: serving engine, request router, observability stack (Prometheus + Grafana)", "where": "README architecture", "quote": "Scale from a single vLLM instance to a distributed vLLM deployment without changing any application code... The serving engine: The vLLM engines that run different LLMs; A request router: Directs requests to appropriate backends based on routing keys or session IDs to maximize KV cache reuse" },
+        { "claim": "Router supports round-robin, session-ID based routing, and automatic Kubernetes service discovery", "where": "Router description", "quote": "round-robin routing, session-ID based routing, and automatic Kubernetes service discovery" },
+        { "claim": "Integrates KV cache offloading via LMCache (tutorial 6: 'How to Enable KV Cache Offloading with LMCache')", "where": "Tutorials list", "quote": "How to Enable KV Cache Offloading with LMCache" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S14",
+      "type": "official",
+      "title": "Expert Parallel Deployment (vLLM Documentation)",
+      "authors": "vLLM contributors",
+      "org": "vLLM Project",
+      "year": "2026",
+      "version": "docs.vllm.ai/en/latest (live)",
+      "url": "https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "vLLM's own guide to DP+EP configuration for MoE models across multiple nodes, with concrete CLI flags.",
+      "covers": ["wide-ep-moe", "stack-vllm-multinode"],
+      "facts": [
+        { "claim": "vLLM computes EP_SIZE = TP_SIZE x DP_SIZE; EP is more efficient combined with DP than alone", "where": "DP+EP configuration", "quote": "EP_SIZE = TP_SIZE x DP_SIZE... EP is more efficient when used in conjunction with DP" },
+        { "claim": "With TP=1, attention weights are replicated across all DP ranks; MoE layers are sharded across all EP ranks using the full EP group size", "where": "Attention-DP + Expert-Parallel layout", "quote": "attention weights remain replicated across all DP ranks... Expert (MoE) Layers Sharded across all EP ranks" },
+        { "claim": "2-node deployment example: --data-parallel-size 16 (total), --data-parallel-size-local 8 (per node), --data-parallel-start-rank 8 for the second node", "where": "Multi-node example", "quote": "--data-parallel-size 16... --data-parallel-size-local 8... --data-parallel-start-rank 8" },
+        { "claim": "EPLB integration parameters: window_size 1000 steps for tracking, step_interval 3000 for rebalancing frequency; memory overhead approximately 2.4 GB per redundant expert per EP rank on DeepSeek-V3", "where": "EPLB integration", "quote": "\"window_size\": 1000... \"step_interval\": 3000... 2.4 GB for one redundant expert per EP rank" },
+        { "claim": "Single-node H200 example command: vllm serve deepseek-ai/DeepSeek-V3-0324 --tensor-parallel-size 1 --data-parallel-size 8 --enable-expert-parallel", "where": "Example commands", "quote": "vllm serve deepseek-ai/DeepSeek-V3-0324 --tensor-parallel-size 1 --data-parallel-size 8 --enable-expert-parallel" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S15",
+      "type": "official",
+      "title": "Metrics (vLLM Design Documentation)",
+      "authors": "vLLM contributors",
+      "org": "vLLM Project",
+      "year": "2026",
+      "version": "docs.vllm.ai/en/latest/design/metrics (v1 engine)",
+      "url": "https://docs.vllm.ai/en/latest/design/metrics/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Canonical list of Prometheus metrics vLLM exposes, the substrate for goodput/SLO dashboards and autoscaling in any multi-node deployment.",
+      "covers": ["k8s-ops", "capacity-economics"],
+      "facts": [
+        { "claim": "Named gauges: vllm:num_requests_running, vllm:kv_cache_usage_perc (fraction of used KV cache blocks, 0-1), vllm:cache_config_info, vllm:lora_requests_info", "where": "Gauges list", "quote": "vllm:num_requests_running - Currently executing requests; vllm:kv_cache_usage_perc - Fraction of used KV cache blocks (0-1)" },
+        { "claim": "Named histograms: vllm:time_to_first_token_seconds, vllm:inter_token_latency_seconds, vllm:request_time_per_output_token_seconds, vllm:e2e_request_latency_seconds, vllm:request_prefill_time_seconds, vllm:request_decode_time_seconds, vllm:kv_block_lifetime_seconds, vllm:kv_block_idle_before_evict_seconds, vllm:kv_block_reuse_gap_seconds", "where": "Histograms list", "quote": "vllm:time_to_first_token_seconds - TTFT latency distribution; vllm:inter_token_latency_seconds - Time between successive outputs" },
+        { "claim": "Deprecated in v1: vllm:num_requests_swapped, vllm:cpu_cache_usage_perc, vllm:time_in_queue_requests (superseded by request_queue_time_seconds)", "where": "Deprecated metrics", "quote": "vllm:num_requests_swapped - Legacy CPU offload mode (removed in v1)" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S16",
+      "type": "official",
+      "title": "PD Disaggregation (SGLang Documentation)",
+      "authors": "SGLang contributors",
+      "org": "SGLang / RadixArk",
+      "year": "2026",
+      "version": "docs.sglang.io (live)",
+      "url": "https://docs.sglang.io/advanced_features/pd_disaggregation.html",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "SGLang's own documentation of its prefill/decode disaggregation implementation, transfer backends, and heterogeneous-TP staging buffer optimization.",
+      "covers": ["pd-disaggregation", "stack-sglang", "wide-ep-moe"],
+      "facts": [
+        { "claim": "Disaggregation targets two unified-engine problems: Prefill Interruption (incoming batches delay token generation) and DP Attention Imbalance (parallel workers process mixed workloads)", "where": "Core Architecture", "quote": "Prefill Interruption where incoming batches delay token generation, and DP Attention Imbalance where parallel workers process mixed workloads" },
+        { "claim": "Two transfer backends: Mooncake (installed via mooncake-transfer-engine, configurable per-GPU InfiniBand device mapping) and NIXL (installed via pip install nixl, UCX backend by default, LIBFABRIC via SGLANG_DISAGGREGATION_NIXL_BACKEND)", "where": "Transfer Backends", "quote": "Mooncake (requires uv pip install mooncake-transfer-engine)... NIXL (installs via pip install nixl): Uses UCX backend by default; supports LIBFABRIC" },
+        { "claim": "Multi-node DeepSeek example uses TP=16, DP=8, --enable-dp-attention, --moe-a2a-backend deepep across separate prefill/decode master nodes", "where": "Deployment Patterns", "quote": "Multi-Node DeepSeek (TP=16, DP=8): Separate prefill/decode master nodes with distributed initialization; --enable-dp-attention for parallel KV attention; --moe-a2a-backend deepep for expert routing" },
+        { "claim": "Heterogeneous TP with GPU staging buffer enables 2-5x throughput improvement when prefill/decode use different TP sizes; incompatible with MLA models (DeepSeek-V2/V3)", "where": "Advanced Features", "quote": "Enables 2-5x throughput improvement when prefill/decode use different TP sizes... Incompatible with MLA models (DeepSeek-V2/V3)" },
+        { "claim": "Decode workers use heartbeat monitoring (default SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL=5.0s) to detect prefill failures; bootstrap handshake has default 300s timeout", "where": "Bootstrap Handshake & KV Transfer", "quote": "Decode workers use heartbeat monitoring (SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL=5.0s) to detect prefill failures" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S17",
+      "type": "repo",
+      "title": "sglang-router (PyPI package page)",
+      "authors": "SGLang contributors",
+      "org": "SGLang / RadixArk",
+      "year": "2026",
+      "version": "0.3.2 (2026-01-15)",
+      "url": "https://pypi.org/project/sglang-router/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Version-of-record for SGLang's standalone Rust router, which implements PD-aware load balancing.",
+      "covers": ["stack-sglang", "replication-routing"],
+      "facts": [
+        { "claim": "sglang-router is described as a high-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support, current version 0.3.2 released 2026-01-15", "where": "Package metadata", "quote": "High-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S18",
+      "type": "blog",
+      "title": "Deploying DeepSeek with PD Disaggregation and Large-Scale Expert Parallelism on 96 H100 GPUs",
+      "authors": "LMSYS Org",
+      "org": "LMSYS / SGLang team",
+      "year": "2025",
+      "version": "published 2025-05-05",
+      "url": "https://www.lmsys.org/blog/2025-05-05-large-scale-ep/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "First open-source reproduction of DeepSeek-scale wide-EP + PD disaggregation, with concrete GPU counts and per-node throughput matched against DeepSeek's own published numbers.",
+      "covers": ["wide-ep-moe", "stack-sglang", "stack-deepep-deepseek", "capacity-economics"],
+      "facts": [
+        { "claim": "Deployment: 12 nodes on Atlas Cloud, 8 H100 GPUs each (96 GPUs total); prefill tested at EP32 (4 nodes), decode tested at EP72 (9 nodes)", "where": "Hardware Architecture", "quote": "12 nodes in the Atlas Cloud, each equipped with 8 H100 GPUs" },
+        { "claim": "Prefill throughput per node: 57,674 / 54,543 / 50,302 tokens/s for prompt lengths 1K/2K/4K respectively; decode: 22,282 tokens/s per node for 2K inputs; combined headline: 52.3k input tok/s and 22.3k output tok/s per node", "where": "Throughput Performance", "quote": "57,674, 54,543, and 50,302 tokens per second for prompt lengths of 1K, 2K, and 4K, respectively... 52.3k input tokens per second and 22.3k output tokens per second per node" },
+        { "claim": "Resulting cost: $0.20/1M output tokens, about one-fifth the official DeepSeek Chat API price; up to 5x higher output throughput than vanilla TP on the same resources", "where": "Cost Comparison", "quote": "translates to a cost of $0.20/1M output tokens, which is about one-fifth the cost of the official DeepSeek Chat API... improves the output throughput by up to 5x" },
+        { "claim": "SGLang prefill with simulated optimal load balancing was within 5.6% of DeepSeek's official profile; decode was 6.6% below DeepSeek's official profile", "where": "Comparison to Official DeepSeek", "quote": "within 5.6% of DeepSeek's official profile... 6.6% below DeepSeek's official profile" },
+        { "claim": "Integrates DeepEP, DeepGEMM, and EPLB", "where": "Software Components", "quote": "DeepEP, DeepGEMM, and EPLB" }
+      ],
+      "conflicts": ["S29 (DeepSeek's own Day-6 blog) reports 73.7k tok/s/node prefill and 14.8k tok/s/node decode on H800 with its production EP32/EP144 config; SGLang's reproduction reports 52.3k/22.3k on H100 at EP32/EP72 — different hardware (H800 vs H100) and different EP degree for decode, so figures are not directly comparable, only both cited as 'near DeepSeek-scale'."]
+    },
+    {
+      "id": "S19",
+      "type": "blog",
+      "title": "RadixArk Joins Forces with Google to Bring Full SGLang Features to TPUs",
+      "authors": "LMSYS Org / RadixArk",
+      "org": "LMSYS / RadixArk / Google Cloud",
+      "year": "2026",
+      "version": "published 2026-07-30",
+      "url": "https://www.lmsys.org/blog/2026-07-30-sglang-google-tpu/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Announces the SGL-JAX backend bringing SGLang's router/PD/wide-EP stack to Google TPUs — the cross-cutting bridge between the GPU-centric open-source stack and TPU serving.",
+      "covers": ["stack-sglang", "tpu-multihost"],
+      "facts": [
+        { "claim": "SGLang runs on the latest TPU generations today via SGL-JAX, supporting model families including Gemma, Qwen, DeepSeek, GLM, Mimo, Kimi, Ling, MiniMax, and Grok, plus diffusion models Wan and Flux", "where": "Current and Upcoming Support", "quote": "developers can run SGLang on the latest TPU generations through SGL-JAX, with support for major large language model and multimodal families including Gemma, Qwen, DeepSeek, GLM, Mimo, Kimi, Ling, MiniMax, and Grok" },
+        { "claim": "RadixArk will add SGL-torchtpu, a PyTorch-native TPU backend with eager execution and MPMD support; features include data/tensor/expert/context/pipeline parallelism, Radix Cache, HiCache, quantization, and speculative decoding on TPU Pallas kernels", "where": "Future Support / Key Features", "quote": "RadixArk will roll out SGL-torchtpu as an additional PyTorch-native TPU backend, featuring eager execution, PyTorch ecosystem compatibility, and MPMD support... parallelism (data, tensor, expert, context, and pipeline), Radix Cache, HiCache, quantization, and speculative decoding" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S20",
+      "type": "official",
+      "title": "Disaggregated Serving in TensorRT LLM (Tech Blog)",
+      "authors": "NVIDIA / TensorRT-LLM team",
+      "org": "NVIDIA",
+      "year": "2026",
+      "version": "nvidia.github.io/TensorRT-LLM (blog5)",
+      "url": "https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "NVIDIA's own dated benchmark numbers for TensorRT-LLM disaggregated serving across multiple models, ISL/OSL ratios, and GPU counts on GB200.",
+      "covers": ["pd-disaggregation", "stack-trtllm-triton", "capacity-economics"],
+      "facts": [
+        { "claim": "DeepSeek R1 (ISL 4400, OSL 1200): disaggregation speedup 1.4x-1.8x without MTP, 1.6x-2.5x with MTP (20-30% higher than MTP-off)", "where": "DeepSeek R1 results", "quote": "speedups obtained with disaggregation range from 1.4x to 1.8x... reaching 1.6x to 2.5x, averaging 20-30% higher than MTP-off" },
+        { "claim": "DeepSeek R1 (ISL 8192, OSL 256): up to 1.73x speedup with GEN4, up to 2x with GEN8", "where": "ISL 8192 OSL 256 results", "quote": "achieving up to 1.73x speedup with GEN4 and up to 2x with GEN8" },
+        { "claim": "Qwen3 (ISL 8192, OSL 1024): disaggregation speedups over aggregation range 1.7x to 6.11x", "where": "Qwen3 results", "quote": "speedups achieved by disaggregation over aggregation range from 1.7x to 6.11x" },
+        { "claim": "Terminology: context servers (prefill) and generation servers (decode); communication protocols MPI, UCX, and NIXL all supported, using RDMA/NVLink", "where": "Architecture description", "quote": "context servers and generation servers... mainstream communication protocols-MPI, UCX, and NIXL-are all supported by TensorRT LLM, and the underlying communication protocols utilize RDMA / NVLink" },
+        { "claim": "Testing conducted on GB200 GPUs across configurations from 4 to 32 GPUs per instance", "where": "Test setup", "quote": "Testing conducted on GB200 GPUs with various configurations ranging from 4 to 32 GPUs per instance" }
+      ],
+      "conflicts": ["Speedup magnitude varies 1.4x-6.11x purely by ISL:OSL ratio and model within the same source; contradicts any single-number 'disaggregation gives Nx' claim from other sources — the number is workload-shape-dependent, not a hardware constant."]
+    },
+    {
+      "id": "S21",
+      "type": "official",
+      "title": "Disaggregated Serving (TensorRT-LLM docs, disagg-serving.md)",
+      "authors": "NVIDIA / TensorRT-LLM contributors",
+      "org": "NVIDIA",
+      "year": "2026",
+      "version": "main branch docs",
+      "url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Implementation-level doc for TensorRT-LLM's disaggregated_params/cache-transceiver mechanism, complementing the tech-blog benchmark numbers.",
+      "covers": ["pd-disaggregation", "stack-trtllm-triton"],
+      "facts": [
+        { "claim": "Context and generation phases of one request must share a single request ID (DisaggregatedParams.disagg_request_id) because KV-cache transfer is keyed by it", "where": "Disaggregated Params mechanism", "quote": "The context and generation phases of one request must share a single request ID" },
+        { "claim": "The KV cache exchange module is responsible for efficient transmission/reception of the cache, implemented via KvCacheTransceiverV2; default backend is NIXL, transferring over RDMA/NVLink, with TRTLLM_NIXL_KVCACHE_BACKEND selecting UCX (default) or LIBFABRIC", "where": "Cache Transceiver section", "quote": "the KV cache exchange module is responsible for efficient transmission and reception of the cache... backend: NIXL. It transfers over RDMA / NVLink... TRTLLM_NIXL_KVCACHE_BACKEND selects between UCX (default) and LIBFABRIC" },
+        { "claim": "Dynamic node joining/leaving for disaggregated deployments is being built on top of the existing mechanism (in progress, not yet GA)", "where": "Status note", "quote": "dynamic node joining and leaving—is being built on top of it" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S22",
+      "type": "paper",
+      "title": "Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving",
+      "authors": "Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, Xinran Xu",
+      "org": "Moonshot AI / Tsinghua University (MADSys)",
+      "year": "2024",
+      "version": "arXiv:2407.00079v4 (2025-09-03); Best Paper Award, USENIX FAST 2025",
+      "url": "https://arxiv.org/pdf/2407.00079",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The originating peer-reviewed paper (FAST 2025 Best Paper) for the KVCache-centric disaggregated architecture that underlies Mooncake, cited/implemented by vLLM, SGLang, and LMDeploy.",
+      "covers": ["multi-node-kv-management", "stack-mooncake", "pd-disaggregation", "frontier-research"],
+      "facts": [
+        { "claim": "Mooncake is the serving platform for Kimi (Moonshot AI); architecture separates prefill and decoding clusters and leverages underutilized CPU/DRAM/SSD/RDMA of the GPU cluster to implement a disaggregated KVCache", "where": "Abstract / §1", "quote": "It features a KVCache-centric disaggregated architecture that separates the prefill and decoding clusters. It also leverages the underutilized CPU, DRAM, and SSD resources of the GPU cluster to implement a disaggregated cache of KVCache" },
+        { "claim": "Compared to baseline, Mooncake achieves up to 525% throughput increase in simulated scenarios while adhering to SLOs; under real workloads, enables handling 75% more requests", "where": "Abstract", "quote": "Mooncake can achieve up to a 525% increase in throughput in certain simulated scenarios while adhering to SLOs. Under real workloads, Mooncake's innovative architecture enables Kimi to handle 75% more requests" },
+        { "claim": "Global scheduler is named Conductor, dispatching requests based on current KVCache distribution and workload; per-request workflow has 4 steps: KVCache Reuse, Incremental Prefill, KVCache Transfer, Decoding", "where": "§3, Figure 4", "quote": "Conductor is responsible for dispatching requests based on the current distribution of the KVCache and workloads" },
+        { "claim": "SLO definitions used in experiments: TTFT_P90 = 10x baseline single-request TTFT, TBT_P90 = 5x baseline", "where": "§2, Preliminary", "quote": "in the end-to-end experiment of this paper (§8.1), we set TTFT_P90 = 10x and TBT_P90 = 5x" },
+        { "claim": "KVCache stored as paged blocks in CPU memory with hash values (block size 512 tokens) determined by own hash and prefix, for deduplication; transfer handled by a GPUDirect-RDMA-based component called Messenger", "where": "§3, Figure 3 caption, §4", "quote": "Each block is attached with a hash value determined by both its own hash and its prefix for deduplication... handled by a separate (GPUDirect) RDMA-based component called Messenger" },
+        { "claim": "Prefill chunking threshold (prefill_chunk) is typically larger than 1000 tokens", "where": "§3, step 2 Incremental Prefill", "quote": "If the number of uncached input tokens exceeds a certain threshold (prefill_chunk)... This threshold is selected to fully utilize the corresponding GPU's computational power and is typically larger than 1000 tokens" },
+        { "claim": "Open-sourced 1-hour real-world request trace: 23,608 entries, average input length 7,590 tokens, average output length 182 tokens, average input:output ratio ~720; cache hit ratio rises from 30% to 50% as block capacity grows from 1,000 to 50,000 (LRU/LFU/LengthAwareCache table)", "where": "§4.2, Table 1", "quote": "an average input length of 7,590 tokens and an average output length of 182 tokens. The average input-output ratio is approximately 720... Increasing the cache capacity from 1,000 to 50,000 blocks boosts the cache hit ratio from 30% to 50%" },
+        { "claim": "Paper explicitly debates whether prefill/decode separation is still needed given chunked prefill, and decides to keep it disaggregated for two reasons: cross-node parallelism needs for long context, and VRAM savings", "where": "§5", "quote": "it is worth discussing whether this separation is still necessary with the introduction of chunked prefill... we decided to maintain Mooncake's disaggregated architecture" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S23",
+      "type": "repo",
+      "title": "kvcache-ai/Mooncake (README)",
+      "authors": "Moonshot AI / MADSys contributors",
+      "org": "Moonshot AI / Tsinghua MADSys",
+      "year": "2026",
+      "version": "main branch, updates through August 2026",
+      "url": "https://github.com/kvcache-ai/Mooncake/blob/main/README.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The open-source implementation repository: Transfer Engine, Store, and EP/Process-Group components, plus measured RoCE bandwidth numbers not in the paper.",
+      "covers": ["stack-mooncake", "multi-node-kv-management", "interconnect-transport"],
+      "facts": [
+        { "claim": "Repo provides Transfer Engine (batched data movement across storage/network/accelerator), Mooncake Store (distributed KV-cache storage engine), and Mooncake EP & Process Group (fault-tolerant distributed execution for large-scale MoE inference)", "where": "README components", "quote": "Transfer Engine (TE): a high-performance data transfer framework... Mooncake Store: a high-performance distributed key-value cache storage engine designed for LLM inference... Mooncake EP & Process Group (PG): fault-tolerant distributed execution for large-scale MoE inference" },
+        { "claim": "Transfer Engine supports TCP, RDMA, AWS EFA, NVMe-oF, NVLink, HIP, Barex, CXL, and Ascend-family transports", "where": "README supported transports", "quote": "TCP, RDMA, AWS EFA, NVMe-oF, NVLink, HIP, Barex, CXL, and Ascend-family transports" },
+        { "claim": "With 40 GB of data, Transfer Engine delivers up to 87 GB/s on 4x200 Gbps RoCE and 190 GB/s on 8x400 Gbps RoCE, about 2.4x and 4.6x faster than TCP respectively", "where": "README benchmark", "quote": "Mooncake Transfer Engine delivers up to 87 GB/s and 190 GB/s of bandwidth in 4x200 Gbps and 8x400 Gbps RoCE networks respectively, which are about 2.4x and 4.6x faster than the TCP protocol" },
+        { "claim": "vLLM and SGLang both officially support Mooncake Transfer Engine for disaggregated prefilling; Mooncake became a PD-disaggregation backend for LMDeploy in June 2025", "where": "Integration timeline", "quote": "vLLM officially supports Mooncake Transfer Engine for disaggregated prefilling... SGLang officially supports Mooncake Transfer Engine for disaggregated prefilling... Mooncake serves as a PD disaggregation backend for LMDeploy" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S24",
+      "type": "official",
+      "title": "Example: Offload KV cache to CPU (LMCache Documentation)",
+      "authors": "LMCache contributors",
+      "org": "LMCache",
+      "year": "2026",
+      "version": "docs.lmcache.ai (live)",
+      "url": "https://docs.lmcache.ai/getting_started/quickstart/offload_kv_cache.html",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Primary quickstart doc for LMCache's tiered KV-cache offload mechanism and its vLLM connector configuration.",
+      "covers": ["stack-lmcache", "multi-node-kv-management"],
+      "facts": [
+        { "claim": "LMCache automatically stores and retrieves KV cache from secondary storage when GPU memory is insufficient, using chunked transfer (default chunk size 256 tokens)", "where": "Mechanism description", "quote": "LMCache will automatically handle storing and managing KV cache in CPU memory... default configuration specifying a chunk size of 256 tokens" },
+        { "claim": "Supported offload backends: CPU memory, local file system, Mooncake Storage, InfiniStore, Redis, ValKey", "where": "Backend list", "quote": "CPU memory; Local file system; Mooncake Storage; InfiniStore; Redis; ValKey" },
+        { "claim": "vLLM integration via KVTransferConfig: connector name 'LMCacheConnectorV1', role 'kv_both'", "where": "vLLM integration example", "quote": "\"kv_connector\":\"LMCacheConnectorV1\", \"kv_role\":\"kv_both\"" },
+        { "claim": "Example config: CPU memory limit 5.0 GB, ~1.5 GB per 10,000 tokens; observed ~7.43x speedup on second-run inference with CPU offloading enabled", "where": "Configuration example / results", "quote": "CPU memory limit: 5.0 GB... Token workload ratio: 1.5 GB per 10,000 tokens... approximately 7.43x speedup in second-run inference when using LMCache CPU offloading" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S24b",
+      "type": "repo",
+      "title": "LMCache/LMCache (README)",
+      "authors": "LMCache contributors",
+      "org": "LMCache",
+      "year": "2026",
+      "version": "main branch",
+      "url": "https://github.com/LMCache/LMCache",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Project-level description of LMCache's storage-backend plugin surface and its integration timeline with vLLM and Dynamo.",
+      "covers": ["stack-lmcache", "multi-node-kv-management"],
+      "facts": [
+        { "claim": "LMCache is described as a KV cache management layer for LLM inference that turns KV cache from temporary state into reusable 'AI-native knowledge'", "where": "README description", "quote": "A KV cache management layer for LLM inference. It turns KV cache from a temporary state into reusable AI-native knowledge" },
+        { "claim": "Pluggable storage backends: CPU RAM, local disk (SSD), Redis/Valkey, Mooncake, InfiniStore, S3-compatible object storage, NIXL, and GDS", "where": "Storage backends list", "quote": "CPU RAM, local disk (SSD), Redis/Valkey, Mooncake, InfiniStore, S3-compatible object storage, NIXL, and GDS" },
+        { "claim": "LMCache extended multimodal support in vLLM V1 (July 2025 update); NVIDIA Dynamo integrated LMCache in September 2025", "where": "Integration timeline", "quote": "LMCache extends its turbo-boost to multimodal models in vLLM V1... NVIDIA Dynamo integrates LMCache, accelerating LLM inference" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S25",
+      "type": "official",
+      "title": "NIXL Architecture (nixl.md)",
+      "authors": "NVIDIA / ai-dynamo contributors",
+      "org": "NVIDIA (ai-dynamo)",
+      "year": "2026",
+      "version": "main branch docs",
+      "url": "https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The primary architecture document for NIXL, the point-to-point transfer library underlying Dynamo, TensorRT-LLM, and SGLang's KV-transfer paths.",
+      "covers": ["stack-nixl", "interconnect-transport", "multi-node-kv-management"],
+      "facts": [
+        { "claim": "NIXL is targeted for accelerating point-to-point communications in AI inference frameworks such as Dynamo, providing abstraction over memory (CPU/GPU) and storage (file/block/object) types via a modular plug-in architecture", "where": "Overview", "quote": "targeted for accelerating point to point communications in AI inference frameworks such as NVIDIA Dynamo, while providing an abstraction over various types of memory (e.g., CPU and GPU) and storage (e.g., file, block and object store) through a modular plug-in architecture" },
+        { "claim": "Three core abstractions: Memory Sections (unify memory/storage types behind a buffer-list primitive), Transfer Backend Interface (selects optimal backend), Metadata Handler (establishes agent-to-agent communication, caches metadata)", "where": "Key Abstractions", "quote": "Memory Sections: Unifies various types of memory and storage... Transfer Backend Interface: Abstracts different transfer backends... Metadata Handler: Manages data for establishing data communication between the NIXL agents" },
+        { "claim": "Actively supported backends: UCX and NVIDIA Magnum IO GPUDirect Storage (GDS); other filesystem/block/object backends in development; transfer protocols include RoCE, InfiniBand, GPUDirect RDMA, NVMe-oF, TCP, and NVLink", "where": "Supported Backends", "quote": "UCX and NVIDIA Magnum IO GPUDirect Storage (actively supported)... Support for other file systems (including DFS), block and object storage are in development... RoCE, InfiniBand, GPUDirect RDMA, NVMe-oF, TCP, and NVLink" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S26",
+      "type": "repo",
+      "title": "ai-dynamo/nixl Releases",
+      "authors": "NVIDIA / ai-dynamo contributors",
+      "org": "NVIDIA",
+      "year": "2026",
+      "version": "v1.4.1 (2026-09-01)",
+      "url": "https://github.com/ai-dynamo/nixl/releases",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Version-of-record for NIXL, showing the pace of change (bug fixes and format optimizations shipping weekly).",
+      "covers": ["stack-nixl"],
+      "facts": [
+        { "claim": "Latest release v1.4.1 (2026-09-01) closes a use-after-free window in the transfer-request path and restores num_experts parameter for CUDA graph reuse across rank changes", "where": "v1.4.1 release notes", "quote": "closes a use-after-free window in the transfer-request path and restores the num_experts parameter for CUDA graph reuse across rank changes" },
+        { "claim": "v1.4.0 introduced stride (compressed) descriptors reducing memory from ~44 MB to ~7 KB, and a new nixl::trace tracing framework with NVTX backend for Nsight Systems integration", "where": "v1.4.0 release notes", "quote": "Introduces stride (compressed) descriptors reducing memory from ~44 MB to ~7 KB, adds a new nixl::trace tracing framework with NVTX backend for Nsight Systems integration" },
+        { "claim": "v1.3.2 fixed a cross-node EFA transfer hang introduced in 1.3.1 via a per-rail flush strategy", "where": "v1.3.2 release notes", "quote": "Fixes a cross-node EFA transfer hang introduced in 1.3.1 through per-rail flush strategy" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S27",
+      "type": "repo",
+      "title": "deepseek-ai/DeepEP (README)",
+      "authors": "DeepSeek-AI",
+      "org": "DeepSeek-AI",
+      "year": "2026",
+      "version": "main branch (v2 kernels)",
+      "url": "https://github.com/deepseek-ai/DeepEP/blob/main/README.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The primary repository for DeepEP, the expert-parallel all-to-all communication library that every wide-EP deployment (vLLM, SGLang, Dynamo) integrates for MoE dispatch/combine.",
+      "covers": ["wide-ep-moe", "stack-deepep-deepseek", "interconnect-transport"],
+      "facts": [
+        { "claim": "DeepEP provides high-throughput, low-latency all-to-all GPU kernels (MoE dispatch and combine) with low-precision (FP8) support; normal kernels optimize NVLink-to-RDMA-domain forwarding for training/prefill, low-latency kernels use pure RDMA for decode", "where": "README overview", "quote": "high-throughput and low-latency all-to-all GPU kernels (MoE dispatch and combine) with low-precision support including FP8... kernels optimized for asymmetric-domain bandwidth forwarding, such as forwarding data from NVLink domain to RDMA domain... low-latency kernels with pure RDMA to minimize delays" },
+        { "claim": "Benchmark (8K tokens/batch, 7168 hidden dim, top-8 experts, FP8 dispatch/BF16 combine): NVLink SM100 EP8 dispatch 726 GB/s / combine 740 GB/s at 64 SMs (643/675 GB/s at 24 SMs, min config); RDMA SM90 CX7 EP8x2 dispatch/combine 90/81 GB/s at 12 SMs; RDMA SM90 EP8x4 61/61 GB/s at 6 SMs; RDMA SM100 EP8x2 90/91 GB/s at 12 SMs", "where": "Performance table", "quote": "SM100 | N/A | EP 8 | 726 GB/s (NVLink) | 740 GB/s (NVLink) | 64 (Max perf)... SM90 | CX7 | EP 8 x 2 | 90 GB/s (RDMA) | 81 GB/s (RDMA) | 12" },
+        { "claim": "Requires Hopper (SM90) GPUs or newer, CUDA 12.3+ for SM90; kernels JIT-compiled at runtime, no CUDA compilation needed at install", "where": "Requirements", "quote": "Hopper (SM90) GPUs... CUDA 12.3 and above for SM90 GPUs... compiled at runtime via a lightweight Just-In-Time (JIT) module" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S28",
+      "type": "paper",
+      "title": "DeepSeek-V3 Technical Report",
+      "authors": "DeepSeek-AI",
+      "org": "DeepSeek-AI",
+      "year": "2024",
+      "version": "arXiv:2412.19437",
+      "url": "https://arxiv.org/pdf/2412.19437",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The originating technical report for DeepSeek-V3's inference deployment strategy (§3.4), the primary published numbers for cross-node EP degree in production.",
+      "covers": ["wide-ep-moe", "stack-deepep-deepseek", "frontier-research", "interconnect-transport"],
+      "facts": [
+        { "claim": "DeepSeek-V3 is deployed on an H800 cluster; GPUs within a node connect via NVLink, all GPUs across the cluster connect via IB; prefill and decode stages are deployed separately", "where": "§3.4, Inference and Deployment", "quote": "We deploy DeepSeek-V3 on the H800 cluster, where GPUs within each node are interconnected using NVLink, and all GPUs across the cluster are fully interconnected via IB... we employ the following deployment strategy that separates the prefilling and decoding stages" },
+        { "claim": "Prefilling minimum deployment unit: 4 nodes, 32 GPUs. Attention: TP4 with Sequence Parallelism, combined with DP8. MoE: EP32. Dense MLPs in shallow layers use 1-way TP. 32 redundant experts deployed (each GPU hosts its original 8 experts plus 1 redundant expert), rearranged every ~10 minutes; two micro-batches overlap attention+MoE of one with dispatch+combine of the other", "where": "§3.4.1, Prefilling", "quote": "The minimum deployment unit of the prefilling stage consists of 4 nodes with 32 GPUs. The attention part employs 4-way Tensor Parallelism (TP4) with Sequence Parallelism (SP), combined with 8-way Data Parallelism (DP8)... we use 32-way Expert Parallelism (EP32)... For the deployment of DeepSeek-V3, we set 32 redundant experts for the prefilling stage" },
+        { "claim": "Decoding minimum deployment unit: 40 nodes, 320 GPUs. Attention: TP4 with SP, combined with DP80. MoE: EP320, each GPU hosts only one expert; 64 GPUs are responsible for hosting redundant and shared experts; all-to-all dispatch/combine performed via direct point-to-point transfers over IB using IBGDA technology", "where": "§3.4.2, Decoding", "quote": "The minimum deployment unit of the decoding stage consists of 40 nodes with 320 GPUs. The attention part employs TP4 with SP, combined with DP80, while the MoE part uses EP320. For the MoE part, each GPU hosts only one expert, and 64 GPUs are responsible for hosting redundant experts and shared experts... we leverage the IBGDA technology to further minimize latency" },
+        { "claim": "Decode batch size per expert is typically within 256 tokens; decode is memory-access bound, not compute bound, so only a small portion of SMs is allocated to dispatch+MoE+combine", "where": "§3.4.2, closing paragraph", "quote": "the batch size per expert is relatively small (usually within 256 tokens), and the bottleneck is memory access rather than computation" },
+        { "claim": "Hardware-design suggestion: current all-to-all communication implementation allocates 20 of the 132 SMs on H800 for communication, an inefficiency the paper asks vendors to address with dedicated co-processor hardware", "where": "§3.5.1, Communication Hardware", "quote": "the current communication implementation relies on expensive SMs (e.g., we allocate 20 out of the 132 SMs available in the H800 GPU for this purpose)" }
+      ],
+      "conflicts": ["S29 (DeepSeek's Feb 2025 Day-6 Open Source Week blog, a later production snapshot) reports decoding uses EP144 across 18 nodes (144 GPUs) with each GPU hosting 2 routed experts + 1 shared expert — a much smaller decode deployment unit than this report's original EP320/40-node/320-GPU configuration from December 2024. The company appears to have significantly shrunk the minimum decode deployment unit between the two publications."]
+    },
+    {
+      "id": "S29",
+      "type": "repo",
+      "title": "Day 6 (One More Thing): DeepSeek-V3/R1 Inference System Overview",
+      "authors": "DeepSeek-AI",
+      "org": "DeepSeek-AI (open-infra-index, #OpenSourceWeek)",
+      "year": "2025",
+      "version": "published 2025-02 (Open Source Week Day 6)",
+      "url": "https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "DeepSeek's own later production-deployment disclosure with per-node throughput and real cost/profit figures for its online service — the closest thing to ground truth for wide-EP economics at hyperscale.",
+      "covers": ["wide-ep-moe", "stack-deepep-deepseek", "capacity-economics", "frontier-research"],
+      "facts": [
+        { "claim": "Prefilling: Routed Expert EP32, MLA/Shared Expert DP32, across 4 nodes; each GPU handles 9 routed experts and 1 shared expert", "where": "Parallelism Configurations", "quote": "Routed Expert EP32, MLA/Shared Expert DP32... each GPU handling 9 routed experts and 1 shared expert" },
+        { "claim": "Decoding: Routed Expert EP144, MLA/Shared Expert DP144, across 18 nodes; each GPU manages 2 routed experts and 1 shared expert", "where": "Parallelism Configurations", "quote": "Routed Expert EP144, MLA/Shared Expert DP144... across 18 nodes, with each GPU managing 2 routed experts and 1 shared expert" },
+        { "claim": "Each H800 node delivers average throughput of ~73.7k tokens/s input (including cache hits) during prefilling, and ~14.8k tokens/s output during decoding", "where": "Throughput Metrics", "quote": "an average throughput of ~73.7k tokens/s input (including cache hits) during prefilling or ~14.8k tokens/s output during decoding" },
+        { "claim": "Daily operational cost $87,072; theoretical daily revenue at R1 pricing $562,027, yielding 545% cost profit margin (actual revenue lower due to V3's cheaper pricing and discounts)", "where": "Cost and Profitability", "quote": "Daily operational cost: $87,072... Theoretical daily revenue at R1 pricing would reach $562,027, yielding a 545% cost profit margin" },
+        { "claim": "Three load balancers used: prefill, decode, and expert-parallel, addressing computational and dispatch imbalance; two microbatches executed alternately so communication cost of one is hidden behind computation of the other", "where": "Load Balancing section", "quote": "two microbatches executed alternately and the communication cost of one microbatch is hide behind the computation of the other" }
+      ],
+      "conflicts": ["See S28 conflict note: this blog's EP144/18-node decode configuration is much smaller than the technical report's EP320/40-node configuration published ~2 months earlier."]
+    },
+    {
+      "id": "S30",
+      "type": "repo",
+      "title": "deepseek-ai/EPLB (README)",
+      "authors": "DeepSeek-AI",
+      "org": "DeepSeek-AI",
+      "year": "2026",
+      "version": "main branch",
+      "url": "https://github.com/deepseek-ai/EPLB/blob/main/README.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The open-sourced reference implementation of DeepSeek's expert-parallel load balancing algorithm (redundant-expert replication + placement), used across the wide-EP ecosystem (vLLM, SGLang).",
+      "covers": ["wide-ep-moe", "stack-deepep-deepseek"],
+      "facts": [
+        { "claim": "Core strategy: redundant-experts approach duplicates heavy-loaded experts, then heuristically packs duplicated experts to GPUs for load balance; group-limited expert routing tries to place experts of the same group on the same node to reduce inter-node traffic", "where": "Overview", "quote": "DeepSeek adopts a redundant experts strategy that duplicates heavy-loaded experts, then heuristically packs the duplicated experts to GPUs to ensure load balancing across different GPUs... attempts to place the experts of the same group to the same node to reduce inter-node data traffic" },
+        { "claim": "Hierarchical load balancing policy: pack expert groups to nodes evenly first, then replicate experts within each node; used in prefilling stage with smaller expert-parallel size", "where": "Hierarchical Load Balancing", "quote": "We first pack the expert groups to nodes evenly, ensuring the loads of different nodes are balanced. Then, we replicate the experts within each node... can be used in prefilling stage with a smaller expert-parallel size" },
+        { "claim": "Global load balancing policy: replicates experts globally regardless of expert groups, packs to individual GPUs; used in decoding stage with larger expert-parallel size", "where": "Global Load Balancing", "quote": "Replicates the experts globally regardless of expert groups, and pack the replicated experts to individual GPUs... adopted in decoding stage with a larger expert-parallel size" },
+        { "claim": "Main function eplb.rebalance_experts computes a balanced expert replication/placement plan from estimated expert loads", "where": "Implementation", "quote": "the deployed EP load balancing algorithm in eplb.py, which computes a balanced expert replication and placement plan based on the estimated expert loads. The main function of the load balancer is eplb.rebalance_experts" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S31",
+      "type": "repo",
+      "title": "vllm-project/aibrix (README)",
+      "authors": "AIBrix contributors",
+      "org": "ByteDance (now under vllm-project)",
+      "year": "2026",
+      "version": "v0.7.0 (2026-06-16)",
+      "url": "https://github.com/vllm-project/aibrix",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "ByteDance's open-source Kubernetes control plane for vLLM, now hosted under the vllm-project org, contributing to Gateway API Inference Extension standardization.",
+      "covers": ["stack-orchestration", "k8s-ops", "replication-routing"],
+      "facts": [
+        { "claim": "AIBrix components: LLM Gateway and Routing, LLM App-Tailored Autoscaler, Distributed KV Cache (cross-engine reuse), Unified AI Runtime sidecar, High-Density LoRA Management, GPU Hardware Failure Detection, cost-efficient heterogeneous serving with SLO guarantees", "where": "README architecture", "quote": "LLM Gateway and Routing: Efficiently manage and direct traffic across multiple models and replicas... LLM App-Tailored Autoscaler... Distributed KV Cache: Enables high-capacity, cross-engine KV reuse... GPU Hardware Failure Detection" },
+        { "claim": "Latest release v0.7.0, dated 2026-06-16", "where": "Release info", "quote": "v0.7.0 released 2026-06-16" },
+        { "claim": "ByteDance collaborated with Google to drive standardization of LLM serving on Kubernetes via Working Group Serving, contributing to the Gateway API Inference Extension", "where": "Collaboration note", "quote": "ByteDance has collaborated with Google to drive standardization of LLM serving in Kubernetes through Working Group Serving and contributing to the Gateway API Inference Extension" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S32",
+      "type": "official",
+      "title": "Serving LLMs (Ray Serve Documentation)",
+      "authors": "Ray / Anyscale contributors",
+      "org": "Anyscale (Ray project)",
+      "year": "2026",
+      "version": "Ray 2.58.0",
+      "url": "https://docs.ray.io/en/latest/serve/llm/index.html",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Official Ray Serve documentation for its LLM serving primitives, covering multi-node deployment configuration.",
+      "covers": ["stack-orchestration", "k8s-ops"],
+      "facts": [
+        { "claim": "Ray Serve LLM builds on Ray Serve primitives for distributed, multi-node LLM serving and exposes an OpenAI-compatible API; supports multi-node, multi-model deployment with autoscaling and load balancing", "where": "Overview", "quote": "Ray Serve LLM deploys large language models in production. It builds on Ray Serve primitives for distributed, multi-node LLM serving and exposes an OpenAI-compatible API... Multi-node, multi-model deployment with autoscaling and load balancing" },
+        { "claim": "Named interfaces: LLMConfig (deployment configuration object), build_openai_app (constructs OpenAI-compatible app), serve.run() (execution)", "where": "Configuration example", "quote": "LLMConfig... build_openai_app... serve.run()" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S33",
+      "type": "official",
+      "title": "Multi-node/Multi-GPU Inference (KServe docs)",
+      "authors": "KServe contributors",
+      "org": "KServe (CNCF)",
+      "year": "2026",
+      "version": "kserve.github.io/website (live)",
+      "url": "https://kserve.github.io/website/docs/model-serving/generative-inference/multi-node",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Official KServe documentation for its multi-node ServingRuntime built on vLLM, with concrete parallelism-to-GPU-count arithmetic.",
+      "covers": ["stack-orchestration", "k8s-ops"],
+      "facts": [
+        { "claim": "tensorParallelSize configures how model weights are sharded across GPUs; pipelineParallelSize determines how model layers are split across GPUs; Total GPUs = tensorParallelSize x pipelineParallelSize", "where": "Parameter definitions", "quote": "tensorParallelSize: this value is only used to configure tensor parallelism—that is, how the model weights are sharded across GPUs... pipelineParallelSize: This parameter determines how the model layers are split across the GPUs... Total GPUs = tensorParallelSize x pipelineParallelSize" },
+        { "claim": "16-GPU/2-node example: pipelineParallelSize=2, tensorParallelSize=8, workerSpec.resources.requests.gpu=8, resulting in vllm serve --tensor-parallel-size 8 --pipeline-parallel-size 2", "where": "Case 1 example", "quote": "pipelineParallelSize = 2... tensorParallelSize = 8... vllm serve /path/to/the/model/in/the/container --tensor-parallel-size 8 --pipeline-parallel-size 2" },
+        { "claim": "Supported ServingRuntime is kserve-huggingfaceserver-multinode, built on vLLM's multi-node/multi-GPU feature", "where": "Supported runtime", "quote": "kserve-huggingfaceserver-multinode, which is built on vLLM, which supports multi-node/multi-GPU feature" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S34",
+      "type": "repo",
+      "title": "kubernetes-sigs/lws (LeaderWorkerSet README)",
+      "authors": "Kubernetes SIG contributors",
+      "org": "Kubernetes SIGs",
+      "year": "2026",
+      "version": "main branch",
+      "url": "https://github.com/kubernetes-sigs/lws/blob/main/README.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The Kubernetes SIG API for deploying a group of pods as a unit of replication, the substrate underneath most multi-node inference deployment topologies (vLLM, SGLang, JetStream on GKE).",
+      "covers": ["k8s-ops", "stack-orchestration"],
+      "facts": [
+        { "claim": "LeaderWorkerSet is an API for deploying a group of pods as a unit of replication, addressing multi-host inference workloads where the LLM is sharded and run across multiple devices on multiple nodes", "where": "README description", "quote": "An API for deploying a group of pods as a unit of replication... It aims to address common deployment patterns of AI/ML inference workloads, especially multi-host inference workloads where the LLM will be sharded and run across multiple devices on multiple nodes" },
+        { "claim": "LWS and llm-d APIs are being co-designed together (llm-d is a CNCF Sandbox project)", "where": "Collaboration note", "quote": "Both APIs are being co-designed with llm-d (CNCF sandbox project)" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S35",
+      "type": "paper",
+      "title": "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving",
+      "authors": "Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, Hao Zhang",
+      "org": "Peking University / UC San Diego / StepFun; USENIX OSDI 2024",
+      "year": "2024",
+      "version": "arXiv:2401.09670v3 (2024-06-06)",
+      "url": "https://arxiv.org/pdf/2401.09670",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The foundational OSDI 2024 paper defining goodput-optimized prefill/decode disaggregation and the placement algorithms every later system (Mooncake, Dynamo, TensorRT-LLM, SGLang) cites.",
+      "covers": ["pd-disaggregation", "frontier-research", "capacity-economics"],
+      "facts": [
+        { "claim": "DistServe serves up to 7.4x more requests or 12.6x tighter SLO than state-of-the-art systems while staying within latency constraints for >90% of requests", "where": "Abstract", "quote": "DistServe can serve up to 7.4x more requests or 12.6x tighter SLO, compared to state-of-the-art systems, while staying within latency constraints for > 90% of requests" },
+        { "claim": "Per-GPU goodput defined as the maximum request rate servable adhering to SLO attainment goal (e.g. 90%) for each provisioned GPU; on a single A100 serving a 13B LLM, colocated per-GPU goodput is only ~1.6 rps versus 5.6 rps prefill-only / 10 rps decode-only when phases are separated", "where": "§1, Figure 1 discussion", "quote": "the maximum achievable goodput on a single A100 GPU... is about 1.6 requests per second (rps)... which achieve per-GPU goodput of 5.6 rps for the prefill phase and 10 rps for decoding" },
+        { "claim": "Cluster testbed: 4 nodes, 32 GPUs; each node 8x NVIDIA 80GB A100 SXM connected with NVLink; cross-node bandwidth 25 Gbps", "where": "§6.1", "quote": "We deploy DistServe on a cluster with 4 nodes and 32 GPUs. Each node has 8 NVIDIA SXM A100-80GB GPUs connected with NVLINK. The cross-node bandwidth is 25Gbps" },
+        { "claim": "KV cache transmission overhead is insubstantial: even for OPT-175B, KV cache transmission accounts for less than 0.1% of total latency; over 95% of requests experience transfer delay under 30ms despite limited cross-node bandwidth, because the placement algorithm keeps same-stage prefill/decode segments on one node using intra-node NVLink", "where": "§6.3, Figure 10", "quote": "for OPT-175B, the KV Cache transmission only accounts for less than 0.1% of the total latency... over 95% of requests experience a delay of less than 30ms, despite our testbed having only limited cross-node bandwidth" },
+        { "claim": "Two placement algorithms: high node-affinity (Infiniband clusters, negligible cross-node transfer overhead, any two nodes can host prefill/decode) vs low node-affinity (colocate prefill/decode instance segments of the same pipeline stage on one node to use NVLink, required when cross-node bandwidth is limited)", "where": "§4.1-4.2", "quote": "On high node-affinity clusters equipped with Infiniband, KV caches transmission overhead across nodes is negligible... A straightforward solution is to always colocate prefill and decoding instances on the same node, utilizing the NVLINK" },
+        { "claim": "Fault tolerance and preemption are explicitly out of scope / future work; a fault in a decode instance mapped to multiple prefill instances could cripple the entire cluster due to prefill-decode dependency", "where": "§4.3, Preemption and fault tolerance", "quote": "DistServe does not implement advanced runtime policies like preemption and fault tolerance... a fault in a single decode instance mapped to multiple prefill instances could potentially cripple the entire service and cluster" }
+      ],
+      "conflicts": ["S44 (SemiAnalysis InferenceMAX) finds disaggregation's TCO advantage is conditional on interactivity target (crosses over around 90 tok/s/user on GB200 NVL72 vs 8-GPU B200), whereas this paper's framing treats disaggregation as a near-unconditional win for goodput under fixed SLOs on A100-era hardware — the two are reconciled by noting DistServe measures request-rate goodput at fixed SLOs while SemiAnalysis measures TCO per token across a range of interactivity targets on newer hardware where single-node aggregated throughput is much higher."]
+    },
+    {
+      "id": "S36",
+      "type": "paper",
+      "title": "Splitwise: Efficient Generative LLM Inference Using Phase Splitting",
+      "authors": "Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Inigo Goiri, Saeed Maleki, Ricardo Bianchini",
+      "org": "University of Washington / Microsoft; ISCA 2024",
+      "year": "2023",
+      "version": "arXiv:2311.18677v2",
+      "url": "https://arxiv.org/pdf/2311.18677",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The Microsoft/UW ISCA 2024 paper that independently proposed phase-splitting (prefill/decode) around the same time as DistServe, with a production-trace-driven cluster design methodology.",
+      "covers": ["pd-disaggregation", "frontier-research", "interconnect-transport"],
+      "facts": [
+        { "claim": "A100 vs H100: TFLOPs 19.5 vs 66.9 (3.43x), HBM capacity 80GB vs 80GB (1.00x), HBM bandwidth 2039 vs 3352 GBps (1.64x), power 400W vs 700W (1.75x), NVLink 50 vs 100 Gbps [per-lane], InfiniBand 200 vs 400 GBps, cost per machine $17.6/hr vs $38/hr (2.16x)", "where": "Table I", "quote": "TFLOPs: 19.5 / 66.9 / 3.43x; HBM capacity: 80GB / 80GB / 1.00x; HBM bandwidth: 2039GBps / 3352GBps / 1.64x; Power: 400W / 700W / 1.75x; NVLink: 50Gbps / 100Gbps / 2.00x; Infiniband: 200GBps / 400GBps / 2.00x; Cost per machine: $17.6/hr / $38/hr / 2.16x" },
+        { "claim": "Splitwise-based clusters achieve 1.4x higher throughput at 20% lower cost than current designs, or alternatively 2.35x more throughput under the same cost and power budgets", "where": "Abstract", "quote": "Splitwise clusters achieve up to 1.4x higher throughput at 20% lower cost. Alternatively, they can deliver 2.35x more throughput under the same power and cost budgets" },
+        { "claim": "Traces from two production Azure LLM inference services (coding, conversation), 20 minutes long, captured November 11, 2023, publicly released", "where": "§III, Production traces", "quote": "We use production traces taken from two Azure LLM inference services on November 11th 2023... We have released a subset of our traces" },
+        { "claim": "Coding service median prompt size 1500 tokens, median 13 generated tokens; conversation service median prompt 1020 tokens, near-bimodal generated distribution with median 129 tokens", "where": "§III.A", "quote": "median prompt size of 1500 tokens... the median number of output token is 13 tokens... median number of prompt tokens for this trace is 1020 tokens... a median of 129 tokens generated" },
+        { "claim": "State transfer between prompt-computation and token-generation machines is implemented over back-end InfiniBand interconnects available in today's datacenters, achieving efficiency without perceived performance loss", "where": "§I", "quote": "We implement these transfers in an optimized manner over the back-end Infiniband interconnects avaialble in datacenters today, allowing us to increase efficiency without any perceived performance loss" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S37",
+      "type": "paper",
+      "title": "Llumnix: Dynamic Scheduling for Large Language Model Serving",
+      "authors": "Biao Sun, Ziming Huang, Hanyu Zhao, Wencong Xiao, Xinyi Zhang, Yong Li, Wei Lin",
+      "org": "Alibaba Group; USENIX OSDI 2024",
+      "year": "2024",
+      "version": "arXiv:2406.03243v1",
+      "url": "https://arxiv.org/pdf/2406.03243",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The OSDI 2024 paper introducing cross-instance live request migration for LLM serving, the mechanism underlying rebalancing/de-fragmentation/priority-scheduling/failure-recovery across a multi-instance fleet.",
+      "covers": ["k8s-ops", "frontier-research", "pd-disaggregation"],
+      "facts": [
+        { "claim": "Llumnix improves P99 first-token latency by up to 15x and P99 per-token generation latency by up to 2x compared to state-of-the-art scheduler INFaaS, on a 16-GPU cluster with realistic workloads; accelerates high-priority requests by 1.5x and achieves 36% cost saving while delivering similar tail latencies", "where": "§1, Introduction summary", "quote": "Evaluation on a 16-GPU cluster using realistic workloads shows that Llumnix improves P99 first-token latency by up to 15x and P99 per-token generation latency by up to 2x, compared against a state-of-the-art scheduler INFaaS. Llumnix also accelerates high-priority requests by 1.5x, and achieves 36% cost saving while delivering similar tail latencies" },
+        { "claim": "Four rescheduling scenarios unified via 'virtual usage': load balancing, de-fragmentation, prioritization, auto-scaling; live migration is near-zero downtime, constant to sequence length", "where": "§1, Figure 1", "quote": "Llumnix reschedules requests for multiple purposes (Figure 1): load balancing for reducing preemptions and interference, de-fragmentation for mitigating queuing delays, prioritization of urgent requests... Llumnix introduces near-zero downtime that is constant to sequence lengths" },
+        { "claim": "Implemented as a scheduling layer on top of vLLM; distributed architecture enabling continuous rescheduling with high scalability", "where": "§1, closing", "quote": "We have implemented Llumnix as a scheduling layer on top of inference engines. Llumnix currently supports a representative system, vLLM" },
+        { "claim": "Motivating experiment: LLaMA-7B on A10 GPU, 2,000-request Poisson trace with power-law input/output lengths, shows request preemptions rise sharply with memory pressure, significantly inflating P95/P99 latency", "where": "§3, Figure 3", "quote": "Figure 3 shows an experiment of LLaMA-7B model serving using vLLM on an A10 GPU running a trace of 2,000 requests generated from a Poisson distribution" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S38",
+      "type": "blog",
+      "title": "Tokasaurus: An LLM Inference Engine for High-Throughput Workloads",
+      "authors": "Scaling Intelligence Lab (Hazy Research-adjacent group)",
+      "org": "Stanford University, Scaling Intelligence Lab (SAIL)",
+      "year": "2025",
+      "version": "published 2025",
+      "url": "https://scalingintelligence.stanford.edu/blogs/tokasaurus/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The real Stanford project in this space — verifies that 'Thunder Agent' is not a real named project; the actual Hazy Research/Stanford-adjacent multi-GPU serving work is Tokasaurus, ThunderMLA, and ThunderKittens.",
+      "covers": ["frontier-research"],
+      "facts": [
+        { "claim": "Tokasaurus is an LLM inference engine optimized for throughput-intensive workloads, built by Stanford's Scaling Intelligence Lab (SAIL)", "where": "Introduction", "quote": "Tokasaurus, a new LLM inference engine optimized for throughput-intensive workloads" },
+        { "claim": "Mechanisms: dynamic Hydragen grouping to exploit shared prefixes, asynchronous/adaptive CPU management to minimize overhead, pipeline parallelism for GPUs without NVLink, async tensor parallelism for NVLink-equipped GPUs", "where": "Key mechanisms", "quote": "Dynamic Hydragen grouping to exploit shared prefixes... Pipeline parallelism for GPUs without NVLink and async tensor parallelism for NVLink-equipped GPUs" },
+        { "claim": "Outperforms vLLM and SGLang by up to 3x+ on throughput benchmarks; improves throughput by over 3x versus vLLM and SGLang on Llama-3.1-70B with eight L40S GPUs", "where": "Performance comparisons", "quote": "Outperform vLLM and SGLang by up to 3x+... Improves throughput by over 3x versus vLLM and SGLang on Llama-3.1-70B with eight L40S GPUs" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S39",
+      "type": "blog",
+      "title": "ThunderMLA: FlashMLA, Faster and Fused-er!",
+      "authors": "Hazy Research",
+      "org": "Stanford University, Hazy Research",
+      "year": "2025",
+      "version": "published 2025-03-04",
+      "url": "https://hazyresearch.stanford.edu/blog/2025-03-04-thundermla",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Hazy Research's own blog on ThunderMLA, its fused decode megakernel built on ThunderKittens — the actual Hazy Research multi-GPU-serving-adjacent kernel work Aman is referring to.",
+      "covers": ["frontier-research", "wide-ep-moe"],
+      "facts": [
+        { "claim": "ThunderMLA is a completely fused 'megakernel' for decode that is 20-35% faster than DeepSeek's FlashMLA on diverse workloads", "where": "Introduction", "quote": "ThunderMLA is a completely fused 'megakernel' for decode that's 20-35% faster than DeepSeek's FlashMLA on diverse workloads" },
+        { "claim": "Megakernel design eliminates kernel-launch overhead by creating a virtual instruction set on the GPU, fusing kernels via an interpreter template within ThunderKittens", "where": "Design description", "quote": "eliminates these kernel launches by creating a simple virtual instruction set on the GPU. Instead of launching separate kernels, we fuse them into a single 'megakernel'... an interpreter template within ThunderKittens" },
+        { "claim": "Representative workload (4 prompts, 4 tokens): ThunderMLA runs in 41 us achieving 183 TFLOPs / 1520 GB/s vs FlashMLA's 52 us achieving 144 TFLOPS / 1199 GB/s on an SXM H100", "where": "Benchmark example", "quote": "ThunderMLA runs in just 41 us, achieving 183 TFLOPs and 1520 GB/s... FlashMLA... 52 us on an SXM H100, achieving just 144 TFLOPS and 1199 GB/s" },
+        { "claim": "Published March 4, 2025", "where": "Post metadata", "quote": "Mar 4, 2025 · 10 min read" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S40",
+      "type": "official",
+      "title": "GB200 NVL72 (product page)",
+      "authors": "NVIDIA",
+      "org": "NVIDIA",
+      "year": "2026",
+      "version": "n/a (live product page)",
+      "url": "https://www.nvidia.com/en-us/data-center/gb200-nvl72/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Vendor spec sheet for the GB200 NVL72 rack, the reference rack-scale unit for what changes when the NVLink domain grows past one 8-GPU node.",
+      "covers": ["interconnect-transport", "wide-ep-moe"],
+      "facts": [
+        { "claim": "GB200 NVL72 configuration: 36 Grace CPUs, 72 Blackwell GPUs", "where": "Specs table", "quote": "36 Grace CPU | 72 Blackwell GPUs" },
+        { "claim": "NVLink bandwidth across the rack: 130 TB/s", "where": "Specs table", "quote": "NVLink Bandwidth: 130 TB/s" },
+        { "claim": "GPU memory: 13.4 TB HBM3E at 576 TB/s aggregate bandwidth", "where": "Specs table", "quote": "13.4 TB HBM3E | 576 TB/s" },
+        { "claim": "NVFP4 Tensor Core 1,440/720 PFLOPS (sparse/dense); FP8/FP6 720 PFLOPS; FP32 5,760 TFLOPS; FP64 2,880 TFLOPS", "where": "Specs table", "quote": "1,440 | 720 PFLOPS (NVFP4)... FP32: 5,760 TFLOPS... FP64: 2,880 TFLOPS" },
+        { "claim": "Networking beyond the rack uses NVIDIA Quantum-X800 InfiniBand, Spectrum-X800 Ethernet, and BlueField-3 DPUs for scaling across hundreds/thousands of Blackwell GPUs", "where": "Networking section", "quote": "NVIDIA Quantum-X800 InfiniBand, NVIDIA Spectrum-X800 Ethernet, and NVIDIA BlueField-3 DPUs... efficient scalability across hundreds and thousands of Blackwell GPUs" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S41",
+      "type": "official",
+      "title": "NVIDIA ConnectX-7 NDR 400G InfiniBand Adapter Card (datasheet)",
+      "authors": "NVIDIA",
+      "org": "NVIDIA",
+      "year": "2021",
+      "version": "Datasheet Apr21",
+      "url": "https://www.nvidia.com/content/dam/en-zz/Solutions/networking/infiniband-adapters/infiniband-connectx7-data-sheet.pdf",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Vendor datasheet for ConnectX-7 NDR, the standard scale-out NIC deployed with H100/H200-generation clusters (predecessor to the Quantum-X800/ConnectX-8 generation used with GB200 NVL72).",
+      "covers": ["interconnect-transport"],
+      "facts": [
+        { "claim": "Max total bandwidth 400 Gb/s, IBTA Spec 1.5 compliant, 1/2/4 network ports, PCIe Gen5 up to x32 lanes, RDMA message rate 330-370 million messages per second", "where": "Product specifications table", "quote": "Max total bandwidth: 400Gb/s; Number of network ports: 1/2/4; Host interface: PCIe Gen5, up to x32 lanes; RDMA message rate: 330-370 million messages per second" },
+        { "claim": "Supports GPUDirect RDMA, GPUDirect Storage, hardware-based congestion control, out-of-order RDMA with adaptive routing, and NVIDIA In-Network Computing (collective operations, MPI Tag Matching, MPI All-to-All offloads)", "where": "Features list", "quote": "GPUDirect RDMA; GPUDirect Storage; Out-of-order RDMA supporting adaptive routing... Collective operations offloads; MPI tag matching; MPI All-to-All offloads" },
+        { "claim": "HPC software libraries supported: NVIDIA HPC-X and UCX, UCC, NCCL, OpenMPI, MVAPICH, MPICH, OpenSHMEM, PGAS", "where": "HPC Software Libraries", "quote": "NVIDIA HPC-X and UCX, UCC, NCCL, OpenMPI, MVAPICH, MPICH, OpenSHMEM, PGAS" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S42",
+      "type": "blog",
+      "title": "Benchmarking GPUDirect RDMA on Modern Server Platforms",
+      "authors": "NVIDIA",
+      "org": "NVIDIA Developer Blog",
+      "year": "2014",
+      "version": "n/a (historical, Ivy Bridge Xeon / K40m GPUs)",
+      "url": "https://developer.nvidia.com/blog/benchmarking-gpudirect-rdma-on-modern-server-platforms/",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "NVIDIA's own microbenchmark establishing the GPUDirect RDMA mechanism and latency floor; numbers are from 2014-era hardware (Ivy Bridge/K40, PCIe3, single/dual-rail FDR InfiniBand) and are two Infiniband generations out of date for bandwidth, but the latency-floor mechanism and 'faster than staging below ~400-500KB' crossover logic still hold architecturally.",
+      "covers": ["interconnect-transport"],
+      "facts": [
+        { "claim": "Host-to-Host latency measured with ibv_ud_pingpong is 1.3us; Host-to-GPU latency 1.7us via GPUDirect RDMA", "where": "Latency section", "quote": "Host-to-Host latency measured with ibv_ud_pingpong is 1.3us... Latency is 1.7us (Host-to-GPU)" },
+        { "claim": "On a PCIe-switch platform, GPUDirect RDMA achieves dual-rail bandwidth up to 11.6 GB/s host-to-GPU and 7.4 GB/s peak GPU-to-GPU; on Ivy Bridge without a PCIe switch, inter-socket QPI-traversal GPU-to-GPU write bandwidth collapses to 250 MB/s", "where": "Bandwidth figures", "quote": "PCIe Switch: 11.6GB/s (dual-rail, Host-to-GPU)... PCIe Switch: 7.4GB/s peak (dual-rail, GPU-to-GPU)... Inter-socket QPI traversal GPU-to-GPU (write): 250MB/s" },
+        { "claim": "GPUDirect RDMA is faster than the staging (bounce-buffer) approach for message sizes up to 400-500KB on Ivy Bridge Xeon", "where": "Trade-off statement", "quote": "GPUDirect RDMA is faster than the staging approach for message sizes up to 400-500KB (on Ivy Bridge Xeon)" }
+      ],
+      "conflicts": ["Bandwidth figures here (single-digit GB/s, 2014 PCIe3/FDR-era) are roughly two orders of magnitude below DeepEP's measured NVLink dispatch bandwidth (726 GB/s, S27) and ConnectX-7 NDR's 400 Gb/s=50 GB/s link rate (S41); kept only for the latency-floor mechanism and the size-dependent staging-vs-RDMA crossover logic, not as a current bandwidth reference."]
+    },
+    {
+      "id": "S43",
+      "type": "analysis",
+      "title": "InferenceMAX: Open Source Inference Benchmarking",
+      "authors": "SemiAnalysis",
+      "org": "SemiAnalysis",
+      "year": "2026",
+      "version": "InferenceMAX v1",
+      "url": "https://newsletter.semianalysis.com/p/inferencemax-open-source-inference",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Independent third-party benchmark/analysis (labelled analysis, not vendor-primary) normalizing multi-GPU/multi-node inference performance by total cost of ownership; the only source found with an explicit disaggregation break-even point.",
+      "covers": ["capacity-economics", "pd-disaggregation"],
+      "facts": [
+        { "claim": "'TCO per million tokens' is presented as the primary north-star metric, not raw throughput", "where": "Framing statement", "quote": "TCO per million tokens is the true north star that customers care about - performance is merely a stepping stone to calculating this metric" },
+        { "claim": "Below 90 tok/s/user interactivity, GB200 NVL72 on TRT-LLM with Dynamo disaggregated prefill decisively outperforms all single-node 8-GPU servers on TCO per million tokens; above 90 tok/s/user, B200 on TRT-LLM beats GB200 NVL72", "where": "Disaggregated Prefill Findings", "quote": "Below 90 tok/s/user interactivity, the GB200 NVL72 on the TRT-LLM engine using Dynamo disagg prefill decisively outperforms all single node 8-GPU servers on TCO per million tokens... for interactivity levels above 90 tok/s/user, the B200 on TRT-LLM beats the GB200 NVL72" },
+        { "claim": "At 90 tok/s/user on GPT-OSS 120B (MXFP4 weights), MI300X processes 750,000 tokens/s per provisioned MW while MI355X processes 2,550,000 tokens/s per provisioned MW (~3x)", "where": "AMD generational comparison", "quote": "MI300X processes 750,000 tokens/s per provisioned MW; MI355X processes 2,550,000 tokens/s per provisioned MW" },
+        { "claim": "Multi-token prediction (MTP) can deliver 2-3x greater interactivity (tok/s/user) for equivalent cost, demonstrated on DeepSeek R1", "where": "MTP finding", "quote": "Multi-token prediction (MTP) can deliver 2-3x greater interactivity (tok/s/user)" },
+        { "claim": "The greater token-throughput-per-MW potential for B200/H200 requires implementing disaggregated prefill and wide expert parallelism over Spectrum-X as well as InfiniBand", "where": "Disaggregation/wide-EP framing", "quote": "The potential for greater token throughput per MW for the B200 and H200 can be unlocked by implementing disaggregated prefill and wide expert parallelism over SpectrumX as well as InfiniBand" }
+      ],
+      "conflicts": ["See S35 conflict note (DistServe vs InferenceMAX framing of when disaggregation pays)."]
+    },
+    {
+      "id": "S44",
+      "type": "official",
+      "title": "Multi-node setup for AI workloads (ROCm Documentation)",
+      "authors": "AMD",
+      "org": "AMD",
+      "year": "2026",
+      "version": "rocm.docs.amd.com/en/latest (live)",
+      "url": "https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/system-setup/multi-node-setup.html",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "AMD's own official multi-node RCCL/RDMA setup documentation for Instinct GPU clusters.",
+      "covers": ["amd-multinode", "interconnect-transport"],
+      "facts": [
+        { "claim": "Required RDMA/networking packages on Ubuntu: iproute2, librdmacm-dev, rdmacm-utils, infiniband-diags, ibverbs-utils, perftest", "where": "Required packages", "quote": "apt install -y iproute2... librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest" },
+        { "claim": "Key environment variables: MASTER_ADDR, NNODES, NODE_RANK for distributed launch; NCCL_SOCKET_IFNAME for inter-node interface selection; NCCL_IB_HCA to configure RDMA interfaces (e.g. rdma0..rdma7); NCCL_IB_GID_INDEX=3 for RoCE deployments", "where": "Environment variables", "quote": "NCCL_SOCKET_IFNAME: specifies which network interface to use for inter-node communication; NCCL_IB_HCA: Configure RDMA interfaces... NCCL_IB_GID_INDEX: Set to 3 for RoCE deployments" },
+        { "claim": "For InfiniBand-equipped nodes, RCCL activates RDMA automatically; for Broadcom RoCE NICs, the exact same RoCE library version must be installed on all hosts", "where": "RoCE library requirements", "quote": "For InfiniBand-equipped nodes, RCCL activates RDMA automatically... It is crucial to install the exact same version of the RoCE library that is installed on your host system" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S45",
+      "type": "official",
+      "title": "vLLM V1 performance optimization (ROCm AI Ecosystem docs)",
+      "authors": "AMD",
+      "org": "AMD",
+      "year": "2026",
+      "version": "rocm.docs.amd.com/en/latest (live)",
+      "url": "https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/vllm-optimization.html",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "AMD's own optimization guide for vLLM on MI300-series GPUs, including DP+EP scaling numbers for MoE.",
+      "covers": ["amd-multinode", "stack-vllm-multinode", "wide-ep-moe"],
+      "facts": [
+        { "claim": "AITER attention backends deliver 2.7-4.4x TPS over legacy ROCM_ATTN for MHA models (ROCM_AITER_FA), 15-20% decode improvement at high concurrency with shuffled KV cache layout, and 1.2-1.5x higher TPS over TRITON_MLA for MLA models", "where": "Performance figures", "quote": "2.7-4.4x TPS over legacy ROCM_ATTN (MHA models with ROCM_AITER_FA backend)... 1.2-1.5x higher TPS over TRITON_MLA (MLA models)" },
+        { "claim": "Named attention backends: ROCM_AITER_FA, ROCM_AITER_MLA, ROCM_AITER_MLA_SPARSE, ROCM_AITER_UNIFIED_ATTN, ROCM_ATTN, TRITON_MLA", "where": "Backend list", "quote": "ROCM_AITER_FA, ROCM_AITER_MLA, ROCM_AITER_MLA_SPARSE, ROCM_AITER_UNIFIED_ATTN, ROCM_ATTN, TRITON_MLA" },
+        { "claim": "DP+EP for MoE gives 16-47% higher throughput than TP at >=512 concurrent requests; DeepSeek-R1 with DP+EP reaches 7,114 TPS at 1024 concurrent requests", "where": "Expert parallelism at scale", "quote": "16-47% higher throughput (DP+EP vs TP at >=512 concurrent requests for MoE)... 7,114 TPS for DeepSeek-R1 at 1024 concurrent requests (with DP+EP configuration)" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S46",
+      "type": "talk",
+      "title": "AMD Instinct MI300X Generative AI Accelerator and Platform Architecture (Hot Chips 2024)",
+      "authors": "Alan Smith, Vamsi Alla",
+      "org": "AMD, Hot Chips 2024",
+      "year": "2024",
+      "version": "Hot Chips 2024, August 2024",
+      "url": "https://hc2024.hotchips.org/assets/program/conference/day1/23_HC2024.AMD.MI300X.ASmith(MI300X).v1.Final.20240817.pdf",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Official AMD architecture talk (Hot Chips) with the authoritative MI300X memory/interconnect/compute specs and 8-GPU platform aggregate numbers.",
+      "covers": ["amd-multinode", "interconnect-transport"],
+      "facts": [
+        { "claim": "MI300X: 153 billion transistors, TSMC 5nm/6nm FinFET, 192 GB HBM3 at 5.2 TB/s, 304 Compute Units, 1,216 Matrix Cores", "where": "Slide 4, Multi-chiplet Accelerator", "quote": "153 Billion Transistors in TSMC 5nm | 6nm FinFET... 192 GB HBM3 5.2 TB/s... 304 Compute Units 1,216 Matrix Cores" },
+        { "claim": "4th Generation Infinity Fabric link bandwidth 896 GB/s per GPU; Infinity Fabric Advanced Package (AP) bisection 4.8 TB/s; Infinity Fabric AP bisection at board level 6 TB/s; host PCIe 5.0 at 128 GB/s", "where": "Slide 4 diagram annotations", "quote": "4th Generation Infinity Fabric 896 GB/s... Infinity Fabric Advanced Package (AP) 4.8 TB/s bisection... Infinity Fabric AP 6 TB/s bisection... Host PCIe Gen5 Link 128 GB/s" },
+        { "claim": "MI300X peak matrix performance vs MI250X: Matrix FP16/BF16 1307.4 vs 383 TFLOP/s (3.4x); Matrix FP8 2614.9 TFLOP/s (MI250X N/A); Matrix INT8 2614.9 vs 383 TOPS (6.8x)", "where": "Slide 5, CDNA3 Architecture table", "quote": "Matrix FP16: 2048 / 1024 (FLOPS/clock/CU) ... 1307.4 / 383 (Peak TFLOP/s) / 3.4x... Matrix INT8: 4096 / 1024 ... 2614.9 / 383 / 6.8x" },
+        { "claim": "8x MI300X platform: 1.5 TB total HBM3 at 42.4 TB/s aggregate bandwidth, supporting ~680B parameter models for inference vs a single 8x H100 HGX platform's 640 GB HBM3 at 25.6 TB/s supporting ~290B parameter inference", "where": "Slide 6, Max LLM size per system table", "quote": "Single Nvidia H100 HGX: 640 GB HBM3 | 25.6 TB/s... Single AMD Instinct MI300X Platform: 1.5 TB HBM3 | 42.4 TB/s... Inference: ~290B (H100 HGX) vs ~680B (MI300X Platform)" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S47",
+      "type": "analysis",
+      "title": "AMD Instinct MI355X — Specs, Pricing & AI Inference Benchmarks",
+      "authors": "SemiAnalysis / InferenceX",
+      "org": "SemiAnalysis (InferenceX chip database)",
+      "year": "2026",
+      "version": "live vendor-data-aggregation page",
+      "url": "https://inferencex.semianalysis.com/chips/mi355x",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Third-party analysis/aggregation source (labelled analysis, not primary AMD documentation — AMD's own product pages timed out on repeated fetch attempts in this research pass) collating MI355X specs including networking details not on AMD's marketing pages.",
+      "covers": ["amd-multinode", "interconnect-transport"],
+      "facts": [
+        { "claim": "MI355X: 288 GB HBM3e at 8 TB/s; peak 10,066 TFLOP/s dense FP4, 5,033 TFLOP/s FP8, 2,516 TFLOP/s dense BF16; 1,400 W TDP per chip (~2.09 kW all-in)", "where": "Chip spec table", "quote": "288 GB HBM3e... 8 TB/s... 10,066 dense FP4 and 5,033 FP8 TFLOP/s... 2,516 dense TFLOP/s (BF16)... 1,400 W TDP per chip... about 2.09 kW all-in per chip" },
+        { "claim": "8-GPU node: 5th-gen Infinity Fabric at 538 GB/s per chip forming a full-mesh node, ~4.3 TB/s aggregate per-node bandwidth; multi-node networking via RoCEv2 Ethernet with Pollara 400GbE NIC", "where": "Interconnect section", "quote": "538 GB/s per chip... 8-chip 5th Gen Infinity Fabric domain forms full-mesh node... RoCEv2 Ethernet with Pollara 400GbE" }
+      ],
+      "conflicts": ["S44 (AMD's own ROCm docs) and this analysis page are complementary, not contradictory, but note AMD's own marketing/spec pages (amd.com) could not be fetched in this research pass (repeated timeouts); MI355X numbers here should be treated as analysis-tier until cross-checked against an AMD-hosted PDF brief."]
+    },
+    {
+      "id": "S48",
+      "type": "official",
+      "title": "TPU v6e (Google Cloud Documentation)",
+      "authors": "Google",
+      "org": "Google Cloud",
+      "year": "2026",
+      "version": "docs.cloud.google.com/tpu/docs/v6e (live)",
+      "url": "https://docs.cloud.google.com/tpu/docs/v6e",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Official Google Cloud spec page for TPU v6e (Trillium), including ICI bandwidth and the explicit inference-optimized 8-chip single-VM slice.",
+      "covers": ["tpu-multihost", "interconnect-transport"],
+      "facts": [
+        { "claim": "TPU v6e pod: 256 chips; bidirectional ICI bandwidth per chip 800 GBps; HBM per chip 32 GB at 1638 GBps; peak compute per chip 918 TFLOPs bf16, 1836 TOPs Int8; pod-level BF16 peak 234.9 PFLOPs; 2D torus topology", "where": "Specs table", "quote": "256 chips (per Pod)... Bidirectional inter-chip interconnect (ICI) bandwidth (per chip): 800 GBps... HBM capacity per chip: 32 GB... HBM bandwidth per chip: 1638 GBps... Peak compute per chip (bf16): 918 TFLOPs... BF16 peak compute per Pod: 234.9 PFLOPs... Interconnect topology: 2D torus" },
+        { "claim": "8-chip slices (v6e-8) attached to a single VM are explicitly optimized for inference, allowing all 8 chips to be used in a single serving workload; multi-host configurations scale from 1x1 up to 16x16 (256 chips) across up to 64 VMs", "where": "Inference use case / multi-host config", "quote": "Slices with 8 chips (v6e-8) attached to a single VM are optimized for inference, allowing all 8 chips to be used in a single serving workload" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S49",
+      "type": "official",
+      "title": "TPU7x (Ironwood) (Google Cloud Documentation)",
+      "authors": "Google",
+      "org": "Google Cloud",
+      "year": "2026",
+      "version": "docs.cloud.google.com/tpu/docs/tpu7x (live)",
+      "url": "https://docs.cloud.google.com/tpu/docs/tpu7x",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Official Google Cloud spec page for TPU7x (Ironwood), Google's most recent TPU generation and the direct point of comparison to GB200 NVL72 for rack-scale inference.",
+      "covers": ["tpu-multihost", "interconnect-transport"],
+      "facts": [
+        { "claim": "TPU7x pod footprint: 9,216 chips, similar in scale to TPU v5p; each chip has two TensorCores and four SparseCores", "where": "Architecture section", "quote": "With a 9,216-chip footprint per Pod, TPU7x shares many similarities with TPU v5p... Each TPU7x chip contains two TensorCores and four SparseCores" },
+        { "claim": "Each chip: 192 GB HBM at ~7.37 TB/s bandwidth; peak compute per chip 2,307 TFLOPs BF16, 4,614 TFLOPs FP8", "where": "Memory / compute specs", "quote": "Each chip is equipped with 192 GB of HBM, with bandwidth of approximately 7.37 TB/s... Peak compute per chip (BF16): 2307 TFLOPs; Peak compute per chip (FP8): 4614 TFLOPs" },
+        { "claim": "Bidirectional ICI bandwidth per chip 1,200 GBps; data-center-network (DCN) bandwidth per chip 100 Gbps; 4-chip VM has 224 vCPUs and 960 GB RAM", "where": "Interconnect / VM specs", "quote": "Bidirectional inter-chip interconnect (ICI) bandwidth per chip (GBps): 1200; Data center network (DCN) bandwidth per chip (Gbps): 100... Number of vCPUs (4-chip VM): 224; RAM (GB) (4-chip VM): 960" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S50",
+      "type": "official",
+      "title": "Perform multihost inference using Pathways (AI Hypercomputer docs)",
+      "authors": "Google",
+      "org": "Google Cloud",
+      "year": "2026",
+      "version": "docs.cloud.google.com/ai-hypercomputer (live)",
+      "url": "https://docs.cloud.google.com/ai-hypercomputer/docs/workloads/pathways-on-cloud/multihost-inference",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Official Google documentation for Pathways-based multi-host TPU inference, the single-controller orchestration layer analogous to Dynamo/llm-d on the GPU side.",
+      "covers": ["tpu-multihost", "stack-orchestration"],
+      "facts": [
+        { "claim": "Named components in the deployment: pathways-proxy (proxy server), pathways-rm (resource manager, --node_type=resource_manager), jax-tpu (JAX/TPU inference engine), jetstream-http (HTTP interface); orchestration uses a LeaderWorkerSet with a leader managing workers across multiple hosts", "where": "Deployment YAML / architecture", "quote": "pathways-proxy... pathways-rm... jax-tpu... jetstream-http... The YAML uses LeaderWorkerSet with a leader managing workers across multiple hosts" },
+        { "claim": "Example topology: v6e-16 (16-chip configuration); a disaggregated-mode example uses two v6e-8 slices", "where": "Configuration examples", "quote": "v6e-16 (16-chip configuration); disaggregated mode uses two v6e-8 slices" },
+        { "claim": "Example checkpoint restoration times: Llama3.1-405B ~7 minutes, Llama2-70B ~2 minutes", "where": "Numeric example", "quote": "Llama3.1-405B checkpoint restoration: ~7 minutes... Llama2-70B checkpoint restoration: ~2 minutes" },
+        { "claim": "Access to Pathways on Cloud requires contacting a Google Cloud account representative (not fully self-serve GA at time of writing)", "where": "Access note", "quote": "To get access to Pathways, you need to contact your Google Cloud Account representative" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S51",
+      "type": "repo",
+      "title": "AI-Hypercomputer/JetStream (README)",
+      "authors": "Google",
+      "org": "Google (AI Hypercomputer)",
+      "year": "2026",
+      "version": "main branch",
+      "url": "https://github.com/AI-Hypercomputer/JetStream/blob/main/README.md",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "The primary repository for JetStream, Google's throughput/memory-optimized TPU inference engine used underneath Pathways multi-host serving.",
+      "covers": ["tpu-multihost", "stack-orchestration"],
+      "facts": [
+        { "claim": "JetStream is a throughput and memory optimized engine for LLM inference on XLA devices, starting with TPUs (GPU support planned)", "where": "README description", "quote": "JetStream is a throughput and memory optimized engine for LLM inference on XLA devices, starting with TPUs (and GPUs in future -- PRs welcome)" },
+        { "claim": "Two reference engine implementations exist: a JAX engine (via MaxText) and a PyTorch engine (jetstream-pytorch)", "where": "Reference engines", "quote": "one for Jax models and another for Pytorch models" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S52",
+      "type": "blog",
+      "title": "LLM Inference Performance Engineering: Best Practices",
+      "authors": "Databricks Mosaic Research team",
+      "org": "Databricks",
+      "year": "2023",
+      "version": "published 2023-10-12",
+      "url": "https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Older (Oct 2023) but still-cited engineering-blog source for the batch-size/latency/throughput arithmetic that underlies capacity planning before scaling to disaggregation; single-node-scoped, useful only as a baseline against which multi-node/disaggregated numbers should be compared.",
+      "covers": ["capacity-economics"],
+      "facts": [
+        { "claim": "On A100 serving MPT-7B (512 input / 64 output tokens), maximizing throughput with batch size 64 increases latency by 4x while increasing throughput by 14x", "where": "Latency Trade-Off section", "quote": "if we maximize throughput with a batch size of 64, latency increases by 4x while throughput increases by 14x" },
+        { "claim": "Continuous batching can achieve 10x-20x better throughput than dynamic/static batching", "where": "Throughput section", "quote": "continuous batching...can achieve 10x-20x better throughput than dynamic batching" },
+        { "claim": "For Llama2-70B, going from 4x to 8x GPUs only decreases TTFT latency by 0.7x at small batch sizes (512-token input, batch size 1) — i.e., doubling GPUs does not halve latency at low batch size", "where": "Latency / Table 1", "quote": "for Llama2-70B going from 4x to 8x GPUs only decreases latency by 0.7x at small batch sizes" }
+      ],
+      "conflicts": []
+    },
+    {
+      "id": "S53",
+      "type": "official",
+      "title": "Understand LLM latency and throughput metrics (Anyscale Docs)",
+      "authors": "Anyscale",
+      "org": "Anyscale",
+      "year": "2026",
+      "version": "docs.anyscale.com (live)",
+      "url": "https://docs.anyscale.com/llm/serving/benchmarking/metrics",
+      "accessed": "2026-09-17",
+      "fetched": true,
+      "authority": "Vendor documentation giving precise, formula-level definitions of TTFT/TPOT/ITL/goodput used consistently across the multi-node serving literature.",
+      "covers": ["capacity-economics", "k8s-ops"],
+      "facts": [
+        { "claim": "TTFT is the time elapsed between submitting a prompt and receiving the first token of the model's response", "where": "TTFT definition", "quote": "Time to first token (TTFT) refers to the time elapsed between submitting a prompt and receiving the first token of the model's response" },
+        { "claim": "TPOT (1 request) = Avg(ITL) = (E2E latency - TTFT) / (#Output Tokens - 1); across N requests, Avg TPOT = mean of per-request TPOTs while Avg ITL = sum of all ITLs / total output tokens across requests (these differ when requests have unequal output lengths)", "where": "Formulas section", "quote": "TPOT (1 request) = Avg(ITL) = (E2E latency - TTFT) / (#Output Tokens - 1)... Avg TPOT (N requests) = (TPOT1 + TPOT2 + ... + TPOTN) / N; Avg ITL (N requests) = Sum of all ITLs / #Output Tokens across requests" },
+        { "claim": "Goodput = (# Requests Meeting All SLOs / Total Requests) x 100%", "where": "Goodput definition", "quote": "Goodput measures the percentage of requests that meet your defined Service Level Objectives (SLOs)... Goodput = (# Requests Meeting All SLOs / Total Requests) x 100%" }
+      ],
+      "conflicts": []
+    }
+  ],
+  "disagreements": [
+    {
+      "topic": "When does prefill/decode disaggregation actually pay off?",
+      "positions": [
+        { "claim": "Disaggregation is close to a strict win for goodput under fixed TTFT/TPOT SLOs: DistServe shows 7.4x more requests or 12.6x tighter SLO than colocated systems on A100s; Mooncake reports up to 525% throughput and 75% more real-world requests; TensorRT-LLM measures 1.4x-6.11x speedups on GB200 depending on ISL:OSL ratio.", "sources": ["S35", "S22", "S20"] },
+        { "claim": "In production TCO terms on current hardware, disaggregation's advantage is conditional on the interactivity (tok/s/user) target: GB200 NVL72 with disaggregated prefill beats single 8-GPU B200 nodes only below about 90 tok/s/user; above that crossover, the simpler aggregated 8-GPU B200 server wins on TCO per million tokens.", "sources": ["S43"] }
+      ]
+    },
+    {
+      "topic": "Is a second (decode) pool worth the operational cost, or does chunked-prefill on a single colocated engine capture most of the benefit?",
+      "positions": [
+        { "claim": "Disaggregation is necessary: colocating prefill and decode causes measurable prefill-decode interference (DistServe measures decoding slowdown with each added prefill job) and chunked-prefill only mitigates, does not eliminate, this interference while adding O(N^2) redundant KV-cache HBM reads for N prefill chunks. Mooncake explicitly reconsidered the question after chunked-prefill became common and chose to keep disaggregation for long-context multi-node prefill and VRAM-saving reasons.", "sources": ["S35", "S22"] },
+        { "claim": "vLLM's default production path is a single colocated engine with continuous batching and chunked-prefill (with disaggregation offered only as an explicitly 'experimental' KV-connector feature) — implying that for many deployments the added complexity of a second pool, a KV transport layer, and cross-pool scheduling is not (yet) considered worth it outside of large-scale or SLO-critical deployments.", "sources": ["S12"] }
+      ]
+    },
+    {
+      "topic": "How large should the cross-node decode expert-parallel degree be for a DeepSeek-class MoE model?",
+      "positions": [
+        { "claim": "DeepSeek-V3's own December 2024 technical report specifies a decode minimum deployment unit of EP320 across 40 nodes (320 GPUs), each GPU hosting exactly one expert, with 64 GPUs dedicated to redundant/shared experts.", "sources": ["S28"] },
+        { "claim": "DeepSeek's own February 2025 Open Source Week disclosure describes production decode running at EP144 across only 18 nodes (144 GPUs), each GPU hosting 2 routed experts plus 1 shared expert — a much smaller unit reached after roughly two months of operating the service.", "sources": ["S29"] }
+      ]
+    },
+    {
+      "topic": "Approximate vs. precise KV-cache-aware routing",
+      "positions": [
+        { "claim": "Approximate prefix-cache scoring (fixed-size block hashing plus an in-memory LRU index of recently-routed prefixes) is cheap, scales with fleet size without a synchronous global state, and is llm-d's default scheduling mode.", "sources": ["S8"] },
+        { "claim": "Precise KV-cache indexing subscribes to real KV cache add/evict events emitted by vLLM (and SGLang, TensorRT-LLM) over ZeroMQ and maintains an exact, globally consistent view of which token blocks live on which pod — correct at the cost of an event-streaming subsystem and tokenization round-trips to the engine.", "sources": ["S8"] }
+      ]
+    }
+  ],
+  "coverage": {
+    "well": [
+      "replication-routing",
+      "pd-disaggregation",
+      "wide-ep-moe",
+      "multi-node-kv-management",
+      "interconnect-transport",
+      "stack-dynamo",
+      "stack-llm-d",
+      "stack-vllm-multinode",
+      "stack-sglang",
+      "stack-trtllm-triton",
+      "stack-mooncake",
+      "stack-lmcache",
+      "stack-nixl",
+      "stack-deepep-deepseek",
+      "stack-orchestration",
+      "k8s-ops",
+      "capacity-economics",
+      "frontier-research",
+      "amd-multinode",
+      "tpu-multihost"
+    ],
+    "thin": [],
+    "none": []
+  },
+  "notes": "All 20 subtopics reached 'well' (>=2 primary/official sources with extracted facts). Two important cautions for writers: (1) 'Thunder Agent' from Hazy Research does not exist as a named project — verified via direct search and fetch. The real Hazy Research / Stanford-adjacent work in this space is Tokasaurus (S38, throughput-optimized inference engine from Stanford's Scaling Intelligence Lab), ThunderMLA (S39, a fused decode megakernel built on ThunderKittens), and ThunderKittens itself (the underlying tile-kernel DSL, referenced but not separately fetched as a source in this pass — add a dedicated fetch if a module needs ThunderKittens internals). Do not write about a project called 'Thunder Agent'; cover Tokasaurus/ThunderMLA/ThunderKittens instead and flag the naming correction explicitly for Aman. (2) A widely-shared personal-blog post applying Little's Law to LLM serving (tianpan.co, claiming work-conserving schedulers unlock 30-70% more GPU throughput) was found and read but deliberately excluded as a citable source: it is an unverified individual blog with an unsourced headline statistic, which fails the content-standards source hierarchy (no Medium/Substack/unknown-author blogs). Ground any Little's-law-style capacity-planning reasoning in DistServe's M/D/1 queueing analysis (S35, §3.1, Eq. 1-3) and the Anyscale/Databricks goodput and batch-size-latency formulas (S53, S52) instead. AMD's own product marketing pages (amd.com/en/products/accelerators/instinct/mi350/mi355x*) timed out on every fetch attempt in this research pass; MI355X specs are sourced from a SemiAnalysis/InferenceX aggregation page (S47, analysis-tier) cross-checked against AMD's own Hot Chips 2024 talk for the prior-generation MI300X (S46, talk-tier, official). A writer who needs a fully AMD-primary MI355X source should retry the fetch or use AMD's downloadable PDF product brief. TensorRT-LLM and NIXL both ship pre-release version tags (rc builds, v1.4.x) roughly monthly; state the accessed-date (2026-09-17) alongside any version number cited, since this stack is actively evolving. GPUDirect RDMA bandwidth numbers in S42 are from 2014-era hardware (Ivy Bridge/K40) and are two InfiniBand generations out of date — cite only for the RDMA mechanism and latency floor (~1.7us), never as a current bandwidth reference; use DeepEP (S27) and ConnectX-7 (S41) for current numbers. Two DeepSeek self-reported EP configurations for decode (EP320/40 nodes in the Dec-2024 tech report vs EP144/18 nodes in the Feb-2025 Day-6 blog) genuinely disagree and should be presented as the deployment evolving over two months, not as an error in either source."
+}

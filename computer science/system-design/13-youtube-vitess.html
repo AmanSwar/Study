@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YouTube and Vitess: Sharded MySQL at Video Scale, and What Isn't Public · System Design</title>
+<meta name="description" content="Vitess's VTGate/VTTablet architecture, the topology service, the per-connection MySQL memory problem it was built to solve, and an explicit accounting of what Google/YouTube has and has not published about the rest of the stack.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 13</p>
+  <h1>YouTube and Vitess: Sharded MySQL at Video Scale, and What Isn't Public</h1>
+  <p class="lede">Vitess is the one part of YouTube's stack that Google has actually documented at engineering depth: a MySQL-sharding proxy that served 100% of YouTube's database traffic for over five years<a class="cite" href="#ref-1">1</a>. This module goes deep on Vitess's VTGate/VTTablet/topology-service mechanism and the connection-memory arithmetic that motivated it, then draws an explicit line around everything else — transcoding, recommendations, CDN delivery — that Google/YouTube has not published at comparable depth.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>30 min</b> read</span>
+    <span class="chip"><b>18</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Modules 3, 10</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">Two regions: what Google/YouTube has documented at engineering depth, and what it has not</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="15" y="15" width="770" height="30" class="d-panel"/>
+    <text x="400" y="35" text-anchor="middle" class="d-bold d-title">One product, two very different levels of public disclosure</text>
+
+    <rect x="20" y="60" width="365" height="255" rx="10" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="202" y="85" text-anchor="middle" class="d-bold">Documented at engineering depth</text>
+
+    <rect x="45" y="100" width="315" height="46" rx="8" class="d-block"/>
+    <text x="202" y="119" text-anchor="middle" class="d-text-inv d-bold d-small">Vitess: VTGate + VTTablet</text>
+    <text x="202" y="135" text-anchor="middle" class="d-text-inv d-small">100% of YouTube DB traffic, 5+ yrs</text>
+
+    <rect x="45" y="156" width="315" height="40" rx="8" class="d-block-2"/>
+    <text x="202" y="172" text-anchor="middle" class="d-text-inv d-bold d-small">Topology service</text>
+    <text x="202" y="187" text-anchor="middle" class="d-text-inv d-small">etcd / ZooKeeper / Consul</text>
+
+    <rect x="45" y="206" width="315" height="40" rx="8" class="d-block-2"/>
+    <text x="202" y="222" text-anchor="middle" class="d-text-inv d-bold d-small">Keyspace / shard / VSchema</text>
+    <text x="202" y="237" text-anchor="middle" class="d-text-inv d-small">explicit sharding scheme, &#167;2</text>
+
+    <rect x="45" y="256" width="315" height="46" rx="8" class="d-block-muted d-dashed"/>
+    <text x="202" y="273" text-anchor="middle" class="d-small d-bold">Zanzibar authorization</text>
+    <text x="202" y="289" text-anchor="middle" class="d-small">names YouTube as a client only<a class="cite" href="#ref-3">3</a></text>
+
+    <rect x="415" y="60" width="365" height="255" rx="10" class="d-fill-amber-soft d-stroke-red"/>
+    <text x="597" y="85" text-anchor="middle" class="d-bold">Not documented at comparable depth</text>
+
+    <rect x="440" y="100" width="315" height="46" rx="8" class="d-block-accent"/>
+    <text x="597" y="119" text-anchor="middle" class="d-text-inv d-bold d-small">Transcoding pipeline</text>
+    <text x="597" y="135" text-anchor="middle" class="d-text-inv d-small">no Google/YouTube account at all</text>
+
+    <rect x="440" y="156" width="315" height="46" rx="8" class="d-block-accent"/>
+    <text x="597" y="175" text-anchor="middle" class="d-text-inv d-bold d-small">Recommendations</text>
+    <text x="597" y="191" text-anchor="middle" class="d-text-inv d-small">one dated 2016 paper only<a class="cite" href="#ref-14">14</a></text>
+
+    <rect x="440" y="212" width="315" height="46" rx="8" class="d-block-accent"/>
+    <text x="597" y="231" text-anchor="middle" class="d-text-inv d-bold d-small">CDN / edge delivery</text>
+    <text x="597" y="247" text-anchor="middle" class="d-text-inv d-small">peering mechanics only<a class="cite" href="#ref-16">16</a></text>
+
+    <rect x="440" y="268" width="315" height="34" rx="8" class="d-block-muted d-dashed"/>
+    <text x="597" y="289" text-anchor="middle" class="d-small">&#167;6 states this gap explicitly</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The blue region is what this module covers in mechanism-level detail, grounded in Vitess's own documentation<a class="cite" href="#ref-1">1</a>. The orange region is named so the reader does not mistake silence for an implied architecture — &#167;6 gives the precise, sourced boundary of each gap.</figcaption>
+</figure>
+
+<h2 id="why-vitess">1. Why YouTube needed something like Vitess</h2>
+<p>Vitess's own history page tells the origin story plainly, and it is worth reading as a case study in how a scaling problem migrates from one layer of a system to another until something has to absorb it permanently. YouTube's MySQL database reached a point where peak traffic would soon exceed its serving capacity. The first fix was the standard one: split the single instance into a primary for writes and a replica for reads<a class="cite" href="#ref-2">2</a>. That bought time, but read traffic — the page's own phrasing is "demand for cat videos at an all-time high" — grew enough to overload the replica, so YouTube added more replicas. That, too, was temporary: write traffic eventually became too large for the primary to keep up with, "requiring YouTube to shard data to handle incoming traffic"<a class="cite" href="#ref-2">2</a>. Sharding would have become necessary on size grounds alone even if write throughput hadn't forced it, since a single MySQL instance has a practical ceiling on how much data it can hold and still serve efficiently.</p>
+<p>The part of this story that matters architecturally is what sharding did to the application layer. Once the data lived on multiple MySQL instances, every piece of code that touched the database had to first work out which shard held the row it wanted, then connect to the right instance. That routing logic got embedded directly in application source code<a class="cite" href="#ref-2">2</a> — which means every service, every script, every one-off analysis job had to carry (and keep correctly synchronized) the same shard-mapping knowledge. Vitess's contribution was to delete that requirement: "Vitess let YouTube remove that logic from the application source code, introducing a proxy between the application and the database to route and manage database interactions"<a class="cite" href="#ref-2">2</a>. This is the general pattern this course keeps returning to — Module 10 named it explicitly for Vitess's VTGate as "the same 'one logical endpoint, many physical backends' shape a service-mesh sidecar provides for general RPC" — and it is worth being precise about what changed: the sharding <em>decision</em> (how many shards, which key ranges) didn't go away, it moved from being re-implemented in every client into being centralized in one piece of infrastructure that every client talks to identically.</p>
+<p>The scale that made this worth doing is not fully quantified in Vitess's own documentation, but two adjacent facts anchor it. First, the payoff: "since then, YouTube has scaled its user base by a factor of more than 50, greatly increasing its capacity to serve pages, process newly uploaded videos, and more"<a class="cite" href="#ref-2">2</a> — a 50x user-base multiplier is the kind of growth that a single, unsharded MySQL primary has no plausible path through. Second, current scale gives a feel for the traffic Vitess's descendant infrastructure has to sustain today: YouTube's own press materials report "over 20 million videos uploaded daily"<a class="cite" href="#ref-15">15</a> as of this module's as-of date, each of which needs metadata rows written, indexed, and later served on every watch.</p>
+<p>Vitess did not stay a YouTube-internal tool. In February 2018 the Cloud Native Computing Foundation's Technical Oversight Committee voted to accept it as a CNCF incubation project, and it became "the eighth CNCF project to graduate in November 2019, joining Kubernetes, Prometheus, Envoy, CoreDNS, containerd, Fluentd, and Jaeger"<a class="cite" href="#ref-2">2</a>. Companies including Slack, Square, and JD.com now run it in production<a class="cite" href="#ref-1">1</a>, independent of YouTube.</p>
+<ol class="timeline">
+  <li><time>2010</time><b>Created at YouTube</b><p>Built to remove shard-routing logic from application code after primary/replica scaling ran out of headroom<a class="cite" href="#ref-2">2</a>.</p></li>
+  <li><time>Feb 2018</time><b>CNCF incubation</b><p>The CNCF Technical Oversight Committee accepts Vitess as an incubating project<a class="cite" href="#ref-2">2</a>.</p></li>
+  <li><time>Nov 2019</time><b>CNCF graduation</b><p>Eighth project to graduate, alongside Kubernetes, Prometheus, Envoy, and others<a class="cite" href="#ref-2">2</a>.</p></li>
+</ol>
+<aside class="callout callout-note"><span class="callout-title">A second, unrelated crumb of documented YouTube infrastructure</span><p>Google's Zanzibar paper — the global authorization system covered generally in Module 10 — states in its own abstract that it is "used by a wide array of services offered by Google, including Calendar, Cloud, Drive, Maps, Photos, and YouTube"<a class="cite" href="#ref-3">3</a>. That confirms YouTube uses Zanzibar to answer "is this user allowed to do this" for some class of objects. It says nothing about which objects, and nothing about video delivery, transcoding, or recommendations — it is a permissions system, not a content pipeline. It is mentioned here because it is one of only two Google-authored primary sources in this course's map that name YouTube directly (the other is Vitess's own documentation); everything else in &#167;6 is either absent or third-party.</p></aside>
+
+<p>Sharded MySQL behind a proxy was not the only path available in 2010, and Vitess's own documentation states, in its comparison against NoSQL stores, exactly what the alternative would have cost: "if you're considering a NoSQL solution primarily because of concerns about the scalability of MySQL, Vitess might be a more appropriate choice," because "NoSQL databases do not define relationships between database tables, and only support a subset of the SQL language," "NoSQL datastores do not usually support transactions," and "NoSQL solutions have custom APIs, leading to custom architectures, applications, and tools"<a class="cite" href="#ref-1">1</a>. Read against &#167;1's history, this is the same choice stated from the other direction: YouTube's problem was connection and shard-routing overhead, not a data-modeling mismatch with SQL, so discarding SQL semantics (joins, WHERE clauses, transactions, the query language every engineer on the team already knew) to fix a purely operational problem would have been solving the wrong layer. Module 3's Bigtable and Dynamo case studies are the other side of that trade: both accepted a restricted data model in exchange for scaling properties Vitess gets by other means (proxying and sharding an unmodified engine) rather than by giving up SQL.</p>
+
+<h2 id="architecture">2. The architecture: VTGate, VTTablet, and how a query finds its shard</h2>
+<p>Module 10 introduced Vitess's two moving parts at the level a general services module needs: VTGate as a MySQL-protocol-speaking proxy, VTTablet as a per-instance agent, and a topology service holding the map between them. This section goes one level deeper, into the pieces that actually decide <em>which</em> shard a given query belongs to — keyspaces, shards, VSchema, and Vindexes — because that decision logic is the part a general service-mesh treatment has no equivalent for.</p>
+
+<h3 id="vtgate-role">2.1 VTGate: one endpoint, protocol-compatible, routing-aware</h3>
+<p>VTGate is described in Vitess's own component documentation as "a lightweight proxy server that routes traffic to the correct VTTablet servers and returns consolidated results back to the client"<a class="cite" href="#ref-9">9</a>. It speaks both the MySQL wire protocol and a Vitess-specific gRPC protocol, so "your applications can connect to VTGate as if it is a MySQL Server"<a class="cite" href="#ref-9">9</a> — no driver change, no application-level awareness that the database behind the wire is actually dozens or hundreds of separate MySQL instances. When it decides where to send a query, VTGate takes into account "the sharding scheme, required latency and the availability of tables and their underlying MySQL instances"<a class="cite" href="#ref-9">9</a>: the sharding scheme tells it which shard a row lives on, the latency requirement (a transactional write versus a tolerant analytics read) tells it whether it may route to a lagging replica, and instance availability lets it avoid a MySQL instance that is currently down or failing over.</p>
+
+<h3 id="vttablet-role">2.2 VTTablet and the tablet types that encode a MySQL instance's job</h3>
+<p>Vitess's documentation defines a tablet plainly: "a combination of a mysqld process and a corresponding vttablet process, usually running on the same machine"<a class="cite" href="#ref-7">7</a>. VTTablet is the half of that pair doing the work: it "manages queries, connections, and replication"<a class="cite" href="#ref-1">1</a> for its one MySQL instance. Every tablet is assigned a <em>tablet type</em>, and that type is what tells VTGate whether it is safe to route a given query there. Vitess documents six types<a class="cite" href="#ref-7">7</a>:</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> Vitess tablet types and what each is safe to route<a class="cite" href="#ref-7">7</a>.</caption>
+  <thead><tr><th>Type</th><th>Role</th><th>Conventional use</th></tr></thead>
+  <tbody>
+    <tr><td class="row">primary</td><td>The replica currently serving as the MySQL primary for its shard</td><td>All writes; consistent reads</td></tr>
+    <tr><td class="row">replica</td><td>Eligible for promotion to primary</td><td>Live, user-facing read traffic (website frontend)</td></tr>
+    <tr><td class="row">rdonly</td><td>Not eligible for promotion</td><td>Backups, dumps, heavy analytical queries, MapReduce</td></tr>
+    <tr><td class="row">backup</td><td>Stopped replication at a consistent snapshot to upload a backup</td><td>Returns to its prior type once the backup finishes</td></tr>
+    <tr><td class="row">restore</td><td>Started with no data, restoring from the latest backup</td><td>Becomes <code>replica</code> or <code>rdonly</code> once caught up</td></tr>
+    <tr><td class="row">drained</td><td>Reserved by a Vitess background process</td><td>e.g. held out of serving during resharding</td></tr>
+  </tbody>
+</table>
+<p>This is the mechanism behind the latency/consistency trade-off VTGate makes when routing: sending a query to a <code>replica</code> or <code>rdonly</code> tablet buys horizontal read scaling at the cost of possible replication lag, while a <code>primary</code> read is always current but does not scale by adding more tablets. &#167;5 returns to exactly what guarantee each choice buys.</p>
+
+<h3 id="keyspace-shard-vindex">2.3 Keyspace, shard, VSchema, and Vindex: the sharding-scheme layer VTGate consults</h3>
+<p>A <em>keyspace</em> is Vitess's name for a logical database: "if you're using sharding, a keyspace maps to multiple MySQL databases; if you're not using sharding, a keyspace maps directly to a MySQL database name. In either case, a keyspace appears as a single database from the standpoint of the application"<a class="cite" href="#ref-5">5</a>. A <em>shard</em> is "a subset of a keyspace"<a class="cite" href="#ref-6">6</a> — a contiguous range of an unsigned integer keyspace-id space, written in hexadecimal. Vitess's own notation examples make the range arithmetic explicit: "<code>-80</code> == <code>00-80</code> == <code>0000-8000</code> == ... a plain <code>-</code> denotes the full keyrange," and because the ranges are left-justified, "<code>80-</code> is not the same as <code>80-FF</code>. This is why: <code>80-FF</code> == <code>8000-FF00</code>. Therefore <code>FFFF</code> will be out of the <code>80-FF</code> range"<a class="cite" href="#ref-6">6</a>. An unsharded keyspace has exactly one shard, conventionally named <code>0</code> or <code>-</code><a class="cite" href="#ref-6">6</a>; a sharded keyspace can have "hundreds of shards" for some Vitess users<a class="cite" href="#ref-6">6</a>.</p>
+<p>What maps an actual row to a position in that keyspace-id range is a <em>Vindex</em> ("vitess index"), configured per table in a <em>VSchema</em>: "a VSchema allows you to describe how data is organized within keyspaces and shards. This information is used for routing queries, and also during resharding operations. For a keyspace, you can specify if it's sharded or not. For sharded keyspaces, you can specify the list of vindexes for each table"<a class="cite" href="#ref-8">8</a>. Vitess's own documentation gives a concrete example of the arithmetic: "a <code>xxhash</code> type vindex produces an unsigned 64-bit integer as output... all integers less than <code>0x8000000000000000</code> will fall in shard <code>-80</code>. Any number with the highest bit set will be >= <code>0x8000000000000000</code>, and will therefore belong to shard <code>80-</code>"<a class="cite" href="#ref-6">6</a>.</p>
+<figure class="fig fig-plain">
+  <svg viewBox="0 0 800 160" role="img" aria-labelledby="f5t"><title id="f5t">A Vindex hashes a row's shard key into a position in the keyspace-id range, which selects a shard</title>
+    <rect x="20" y="20" width="150" height="50" rx="6" class="d-surface d-outline"/>
+    <text x="95" y="40" text-anchor="middle" class="d-small d-bold">row: user_id=482913</text>
+    <text x="95" y="58" text-anchor="middle" class="d-mono d-small d-text-light">shard key column</text>
+    <path d="M170,45 L235,45" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <text x="202" y="35" text-anchor="middle" class="d-mono d-small">xxhash Vindex</text>
+    <rect x="235" y="20" width="150" height="50" rx="6" class="d-surface d-outline"/>
+    <text x="310" y="40" text-anchor="middle" class="d-mono d-small d-bold">0x91A2...</text>
+    <text x="310" y="58" text-anchor="middle" class="d-small d-text-light">64-bit keyspace id</text>
+    <path d="M385,45 L445,45" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="20" y="100" width="760" height="40" class="d-panel"/>
+    <line x1="400" y1="100" x2="400" y2="140" class="d-dashed d-axis"/>
+    <text x="210" y="124" text-anchor="middle" class="d-mono d-small">shard -80  (ids &lt; 0x8000000000000000)</text>
+    <text x="600" y="124" text-anchor="middle" class="d-mono d-small">shard 80-  (ids &#8805; 0x8000000000000000)</text>
+    <rect x="595" y="90" width="10" height="14" class="d-fill-orange"/>
+    <text x="600" y="88" text-anchor="middle" class="d-small">&#9660;</text>
+    <defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+  </svg>
+  <figcaption><b>Figure 2.</b> A row's shard key column is hashed by a Vindex into a 64-bit keyspace id, and that id's value against the hex keyrange boundaries picks the owning shard<a class="cite" href="#ref-6">6</a>.</figcaption>
+</figure>
+<p>This is a deliberately different design from the consistent-hash ring in Module 3: a Dynamo-style ring places a key by hashing it directly onto a circular space that virtual nodes divide, with placement and replica selection fused into one mechanism. Vitess separates them — the Vindex is a pluggable function the schema author chooses per table (hash-based like <code>xxhash</code>, or a direct pass-through for an already-well-distributed binary column<a class="cite" href="#ref-6">6</a>), and the resulting id is then matched against explicit, human-assigned hexadecimal shard boundaries rather than an automatically-rebalanced ring. The trade-off is explicitness for automation: an operator can reason about exactly which shard owns which id range and can resize deliberately, at the cost of not getting the ring's near-automatic rebalancing on membership change.</p>
+<p>Putting the three layers together gives the full request path: VTGate accepts a MySQL-protocol query, consults the VSchema to find the table's Vindex, computes the keyspace id, matches it against the keyspace's shard boundaries, and forwards the query to a VTTablet of an appropriate tablet type fronting that shard's MySQL instance.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f2t"><title id="f2t">Application query resolved through VTGate's Vindex lookup to a specific VTTablet and mysqld instance</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="20" y="130" width="120" height="60" rx="8" class="d-block-muted"/>
+    <text x="80" y="163" text-anchor="middle" class="d-text-inv d-bold d-small">Application</text>
+    <path d="M140,160 L210,160" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="175" y="150" text-anchor="middle" class="d-mono d-small">MySQL wire protocol</text>
+
+    <rect x="210" y="70" width="190" height="180" rx="10" class="d-panel"/>
+    <text x="305" y="90" text-anchor="middle" class="d-bold d-small">VTGate</text>
+    <rect x="225" y="100" width="160" height="40" rx="6" class="d-block-2"/>
+    <text x="305" y="124" text-anchor="middle" class="d-text-inv d-small">1. VSchema &#8594; Vindex</text>
+    <rect x="225" y="150" width="160" height="40" rx="6" class="d-block-2"/>
+    <text x="305" y="174" text-anchor="middle" class="d-text-inv d-small">2. keyspace id &#8594; shard</text>
+    <rect x="225" y="200" width="160" height="40" rx="6" class="d-block-2"/>
+    <text x="305" y="224" text-anchor="middle" class="d-text-inv d-small">3. pick tablet type</text>
+
+    <path d="M400,160 L465,120" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M400,190 L465,220" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="435" y="105" text-anchor="middle" class="d-small d-text-light">shard -80</text>
+    <text x="435" y="235" text-anchor="middle" class="d-small d-text-light">shard 80-</text>
+
+    <rect x="465" y="80" width="150" height="70" rx="8" class="d-block-accent"/>
+    <text x="540" y="105" text-anchor="middle" class="d-text-inv d-bold d-small">VTTablet</text>
+    <text x="540" y="122" text-anchor="middle" class="d-text-inv d-small">replica, shard -80</text>
+    <path d="M615,115 L665,115" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="665" y="90" width="115" height="50" rx="8" class="d-surface d-outline"/>
+    <text x="722" y="120" text-anchor="middle" class="d-mono d-small">mysqld</text>
+
+    <rect x="465" y="185" width="150" height="70" rx="8" class="d-block-accent"/>
+    <text x="540" y="210" text-anchor="middle" class="d-text-inv d-bold d-small">VTTablet</text>
+    <text x="540" y="227" text-anchor="middle" class="d-text-inv d-small">primary, shard 80-</text>
+    <path d="M615,220 L665,220" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="665" y="195" width="115" height="50" rx="8" class="d-surface d-outline"/>
+    <text x="722" y="225" text-anchor="middle" class="d-mono d-small">mysqld</text>
+
+    <rect x="20" y="270" width="760" height="50" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="400" y="300" text-anchor="middle" class="d-small">The application never learns how many shards exist or which one holds a given row&#8212;VTGate resolves that on every query<a class="cite" href="#ref-9">9</a>.</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> An application query arrives at VTGate speaking the MySQL protocol; VTGate resolves the table's Vindex, the resulting keyspace id, and the owning shard, then forwards to a VTTablet of the tablet type appropriate to the query's consistency requirement<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a>.</figcaption>
+</figure>
+
+<h2 id="topology-service">3. The topology service: the map every VTGate consults</h2>
+<p>Everything in &#167;2 assumed VTGate already knows which shards exist, which VTTablet fronts which MySQL instance, and which tablet is currently the primary for a shard. That knowledge lives in the topology service, which Vitess describes as "a set of backend processes running on different servers. Those servers store topology data and provide a distributed locking service"<a class="cite" href="#ref-4">4</a>. Vitess treats the actual storage backend as pluggable behind a common interface — "Vitess uses a plug-in system to support various backends for storing topology data, which are assumed to provide a distributed, consistent key-value store. The default topology service plugin is etcd2"<a class="cite" href="#ref-4">4</a> — with etcd, ZooKeeper, or Consul all supported<a class="cite" href="#ref-1">1</a>. Any of the three would be recognizable from Module 6: they are exactly the class of consensus-backed coordination kernels that module derived from Raft and Zab, repurposed here to hold one specific kind of state — cluster topology — rather than general application locks.</p>
+<p>The topology service is explicitly two-tiered, and the split matters for both fault tolerance and performance:</p>
+<ul>
+  <li><strong>Global topology.</strong> Stores data that "does not change frequently... data about keyspaces and shards as well as the primary tablet alias for each shard," used for operations like reparenting and resharding<a class="cite" href="#ref-4">4</a>. Because losing it would be catastrophic and it is read rarely, Vitess recommends spreading it across multiple cells: "in order to survive any single cell going down, the global topology service should have nodes in multiple cells, with enough to maintain quorum in the event of a cell failure"<a class="cite" href="#ref-4">4</a> — the same majority-quorum reasoning Module 6 derived for Raft, applied here to placement rather than log replication.</li>
+  <li><strong>Local topology.</strong> One instance per cell, holding "data about tablets in the cell, the keyspace graph for that cell, and the replication graph for that cell"<a class="cite" href="#ref-4">4</a>. Vitess is explicit that this must stay available for day-to-day operation: "the local topology service must be available for Vitess to discover tablets and adjust routing as tablets come and go."<a class="cite" href="#ref-4">4</a></li>
+</ul>
+<p>The detail worth pulling out for a reader used to reasoning about tail latency is what the topology service is <em>not</em> on the hook for: "no calls to the topology service are made in the critical path of serving a query at steady state. That means queries are still served during temporary unavailability of topology"<a class="cite" href="#ref-4">4</a>. VTGate caches the routing information it needs and only re-consults the topology service when that cached view might be stale — a tablet failing over, a shard splitting — rather than on every single query. This is the same principle ZooKeeper's own paper (Module 6) states for its read path: serve the common case from a local, possibly-slightly-stale cache, and reserve the strongly-consistent coordination service for the events that actually change the world rather than for steady-state traffic.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">Global topology spanning multiple cells feeding per-cell local topology, feeding VTGate's cached routing state</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="230" y="20" width="340" height="60" rx="10" class="d-block"/>
+    <text x="400" y="45" text-anchor="middle" class="d-text-inv d-bold d-small">Global topology (etcd / ZK / Consul)</text>
+    <text x="400" y="63" text-anchor="middle" class="d-text-inv d-small">keyspaces, shards, primary alias per shard</text>
+
+    <path d="M330,80 L200,130" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M470,80 L600,130" class="d-arrow" marker-end="url(#f3-arr)"/>
+
+    <rect x="60" y="130" width="280" height="55" rx="8" class="d-block-2 d-dashed"/>
+    <text x="200" y="152" text-anchor="middle" class="d-text-inv d-bold d-small">Local topology &#8212; cell A</text>
+    <text x="200" y="170" text-anchor="middle" class="d-text-inv d-small">tablets, keyspace &amp; replication graph</text>
+
+    <rect x="460" y="130" width="280" height="55" rx="8" class="d-block-2 d-dashed"/>
+    <text x="600" y="152" text-anchor="middle" class="d-text-inv d-bold d-small">Local topology &#8212; cell B</text>
+    <text x="600" y="170" text-anchor="middle" class="d-text-inv d-small">tablets, keyspace &amp; replication graph</text>
+
+    <path d="M200,185 L200,220" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M600,185 L600,220" class="d-arrow" marker-end="url(#f3-arr)"/>
+
+    <rect x="90" y="220" width="220" height="50" rx="8" class="d-surface d-outline"/>
+    <text x="200" y="248" text-anchor="middle" class="d-small d-bold">VTGate cached routing state</text>
+    <rect x="490" y="220" width="220" height="50" rx="8" class="d-surface d-outline"/>
+    <text x="600" y="248" text-anchor="middle" class="d-small d-bold">VTGate cached routing state</text>
+
+    <rect x="20" y="280" width="760" height="16" class="d-fill-blue-soft"/>
+    <text x="400" y="292" text-anchor="middle" class="d-small">steady-state queries never call the topology service<a class="cite" href="#ref-4">4</a></text>
+  </svg>
+  <figcaption><b>Figure 4.</b> The global topology is quorum-replicated across cells because it must survive a cell outage; each cell's local topology feeds VTGate's own cached routing state, which is what queries actually consult at steady state<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h2 id="connection-overhead">4. The problem Vitess actually solves: MySQL's per-connection memory cost</h2>
+<p>Vitess's own comparison table states the constraint in one sentence: "every MySQL connection has a memory overhead that ranges between 256KB and almost 3MB, depending on which MySQL release you're using. As your user base grows, you need to add RAM to support additional connections, but the RAM does not contribute to faster queries. In addition, there is a significant CPU cost associated with obtaining the connections"<a class="cite" href="#ref-1">1</a>. Two things about that sentence matter for a systems reader. First, the overhead is per <em>connection</em>, not per query — an idle connection held open "just in case" costs the same memory as a busy one. Second, that memory buys nothing: it is bookkeeping (thread stacks, per-connection buffers, session state), not buffer-pool space that would make a query faster. Every additional connection is pure tax.</p>
+<p>That range is not arbitrary, and MySQL's own reference manual documents exactly what it is spent on. "Each thread that the server uses to manage client connections requires some thread-specific space," specifically "a stack (<code>thread_stack</code>)... a connection buffer (<code>net_buffer_length</code>)... a result buffer (<code>net_buffer_length</code>)," where the connection and result buffers each "begin with a size equal to <code>net_buffer_length</code> bytes, but are dynamically enlarged up to <code>max_allowed_packet</code> bytes as needed"<a class="cite" href="#ref-11">11</a>. The stack term alone explains Vitess's stated 256KB floor: <code>thread_stack</code> defaults to 262,144 bytes — 256 KiB — on a 64-bit build<a class="cite" href="#ref-12">12</a>, and MySQL's classic connection handler runs one OS thread per connection, so that stack is paid once per open connection whether or not the connection is doing anything. The upper end of Vitess's stated range comes from the same buffers growing under load: a connection that has just run a large sort or scan can be holding an enlarged sort buffer (<code>sort_buffer_size</code>) or read buffer (<code>read_buffer_size</code>) on top of its fixed stack, and the manual notes a copy of the current statement string is kept for the duration of a running statement as well<a class="cite" href="#ref-11">11</a> — which is how a connection sitting idle can cost barely more than a stack frame, while one that just finished a heavy query can be holding several megabytes it has not yet released.</p>
+<p>The arithmetic below is illustrative, not a disclosed YouTube number — Vitess's documentation states the per-connection overhead range but not YouTube's actual fleet size or per-process connection count, and this course's source map has neither. Take a hypothetical fleet of 4,000 application-server processes, each configured to hold 25 concurrent connections open to a MySQL primary — a plausible shape for a web tier serving a high-traffic product, chosen only to make the units concrete:</p>
+<div class="grid-2">
+<div>
+<p class="small muted">Lower bound (256 KiB/connection)</p>
+$$ 4{,}000 \times 25 \times 256\ \text{KiB} = 100{,}000 \times 256\ \text{KiB} \approx 24.4\ \text{GiB} $$
+</div>
+<div>
+<p class="small muted">Upper bound (3 MiB/connection)</p>
+$$ 4{,}000 \times 25 \times 3\ \text{MiB} = 100{,}000 \times 3\ \text{MiB} \approx 293\ \text{GiB} $$
+</div>
+</div>
+<p>That is 24 to 293 gibibytes of RAM on the database server spent purely on holding connections open, before a single byte of that memory has cached a row or served a query — and it scales linearly with the number of application processes, which is exactly the dimension that grows fastest as a product adds traffic. Vitess's fix is to stop the application from holding raw MySQL connections at all: "Vitess creates very lightweight connections. Vitess' connection pooling feature uses Go's concurrency support to map these lightweight connections to a small pool of MySQL connections. As such, Vitess can easily handle thousands of connections"<a class="cite" href="#ref-1">1</a>. The documentation does not publish an exact pool size — only that it is "small" relative to the number of logical application connections it serves — so the figure below marks that bar honestly as an order-of-magnitude claim rather than inventing a number Vitess itself does not give.</p>
+<figure class="fig">
+  <svg viewBox="-40 0 860 300" role="img" aria-labelledby="f4t"><title id="f4t">Bar chart: raw MySQL connection memory at the documented lower and upper per-connection bound, versus Vitess's undisclosed-size pooled model</title>
+    <line x1="60" y1="230" x2="780" y2="230" class="d-axis"/>
+    <line x1="60" y1="20" x2="60" y2="230" class="d-axis"/>
+    <line x1="60" y1="180" x2="780" y2="180" class="d-grid"/>
+    <line x1="60" y1="130" x2="780" y2="130" class="d-grid"/>
+    <line x1="60" y1="80" x2="780" y2="80" class="d-grid"/>
+    <line x1="60" y1="30" x2="780" y2="30" class="d-grid"/>
+    <text x="50" y="234" text-anchor="end" class="d-small d-text-light">0</text>
+    <text x="50" y="184" text-anchor="end" class="d-small d-text-light">75</text>
+    <text x="50" y="134" text-anchor="end" class="d-small d-text-light">150</text>
+    <text x="50" y="84" text-anchor="end" class="d-small d-text-light">225</text>
+    <text x="50" y="34" text-anchor="end" class="d-small d-text-light">300</text>
+    <text x="20" y="15" class="d-small d-text-light">GiB</text>
+
+    <rect x="150" y="215" width="120" height="15" class="d-fill-blue"/>
+    <text x="210" y="205" text-anchor="middle" class="d-mono d-small">24.4 GiB</text>
+    <text x="210" y="250" text-anchor="middle" class="d-small">raw MySQL&#10;256 KiB/conn</text>
+
+    <rect x="380" y="34" width="120" height="196" class="d-fill-orange"/>
+    <text x="440" y="24" text-anchor="middle" class="d-mono d-small">293 GiB</text>
+    <text x="440" y="250" text-anchor="middle" class="d-small">raw MySQL&#10;3 MiB/conn</text>
+
+    <rect x="610" y="223" width="120" height="7" class="d-fill-green d-dashed"/>
+    <text x="670" y="213" text-anchor="middle" class="d-mono d-small">size undisclosed</text>
+    <text x="670" y="250" text-anchor="middle" class="d-small">Vitess pooled</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> For the illustrative 4,000-process &#215; 25-connections-each fleet defined above, raw per-connection MySQL memory overhead<a class="cite" href="#ref-1">1</a> ranges from about 24 to 293 GiB depending on MySQL release; Vitess collapses this to "a small pool," a real but undisclosed number<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<div class="calc">
+  <p class="calc-title">Raw MySQL connection memory (illustrative fleet)</p>
+  <div class="calc-row"><label for="c1">App-server processes</label><input type="range" id="c1" name="N" min="100" max="20000" step="100" value="4000" data-format="si"></div>
+  <div class="calc-row"><label for="c2">Connections held per process</label><input type="range" id="c2" name="C" min="1" max="100" step="1" value="25"></div>
+  <div class="calc-row"><label for="c3">Per-connection overhead</label><select id="c3" name="B"><option value="262144">256 KiB (documented lower bound)</option><option value="3145728">3 MiB (documented upper bound)</option></select><span></span></div>
+  <div class="calc-out">
+    <div>Total connection memory<output data-expr="N * C * B" data-format="bytes"></output></div>
+  </div>
+  <p class="calc-note">\( M = N \times C \times B \), with \(B\) fixed to the two bounds Vitess's own documentation states<a class="cite" href="#ref-1">1</a>; \(N\) and \(C\) are yours to set — the point is that \(M\) grows linearly in both and buys zero query throughput.</p>
+</div>
+<p>Connection pooling is the mechanism that motivated Vitess, but Vitess's own feature list names three more protections that ride along with it, all documented on the same page: "query de-duping — reuse results of an in-flight query for any identical requests received while the in-flight query was still executing," a "transaction manager" that "limits the number of concurrent transactions and manages timeouts to optimize overall throughput," and query rewriting that "uses a configurable set of rules to rewrite queries that might hurt database performance," such as adding a missing <code>LIMIT</code><a class="cite" href="#ref-1">1</a>. All three exploit the same architectural fact that made pooling possible: because every query already passes through VTGate and VTTablet rather than going straight to <code>mysqld</code>, there is a natural place to intercept it before it becomes load on the database.</p>
+
+<h2 id="operating-a-shard-fleet">5. Operating a sharded fleet: durability, consistency, and resharding</h2>
+<p>Routing is only half of what a sharding layer has to get right; the other half is what happens when a shard's primary dies, or when the number of shards itself needs to change. Vitess's own scalability-philosophy documentation states positions on both that are worth reading against Module 3's general replication treatment and Module 4/5's isolation-level and two-phase-commit vocabulary, because Vitess makes concrete, named choices inside that space rather than leaving them abstract.</p>
+<p>On durability, Vitess explicitly rejects relying on a single disk flush: "the new approach to durability is achieved by copying the data to multiple machines, and even geographical locations"<a class="cite" href="#ref-10">10</a> — the same replication-over-durable-write logic Module 3 derived generally, operationalized here as a specific recommendation to enable semi-synchronous replication, because "this allows Vitess to failover to a new replica when a primary goes down, with no data loss"<a class="cite" href="#ref-10">10</a>. The corollary recommendation is unusual enough to flag: "avoid recovering a crashed database. Instead, create a fresh one from a recent backup and let it catch up"<a class="cite" href="#ref-10">10</a> — treating a crashed MySQL instance as disposable rather than something to repair in place, which only works because the semi-sync replicas already hold a durable copy. Leaning on replication this way also lets an operator relax MySQL's own disk-durability settings — Vitess recommends disabling <code>sync_binlog</code>, since doing so "greatly reduces the number of IOPS to the disk thereby increasing effective throughput"<a class="cite" href="#ref-10">10</a>, trading a per-write fsync for reliance on the replica set.</p>
+<p>On consistency, Vitess is explicit that sharding is not free of new anomalies and names exactly which ones an application must tolerate: "cross-shard reads may not be consistent with each other," and in what it calls best-effort mode, "cross-shard transactions can fail in the middle and result in partial commits"<a class="cite" href="#ref-10">10</a> — an availability/consistency trade every reader of Module 5's PACELC framing will recognize immediately. The alternative Vitess offers is 2PC mode, which "give[s] you distributed atomic guarantees," but at a stated cost: "choosing this option increases the write cost by approximately 50%"<a class="cite" href="#ref-10">10</a>. A single-shard transaction pays none of this: it "continue[s] to remain ACID, just like MySQL supports it"<a class="cite" href="#ref-10">10</a>, because it never needs coordination across tablets. This is exactly the incentive structure that makes shard-key choice a first-order design decision rather than an implementation detail — a schema whose shard key keeps related rows on the same shard avoids the 50% tax entirely, while a poorly chosen key pays it on every multi-row transaction.</p>
+<p>Read consistency is tunable per query through tablet type, formalizing what &#167;2.2's table only implied: a <code>REPLICA</code>/<code>RDONLY</code> read can be "stale depending on replica lag," and Vitess mitigates the risk operationally rather than by blocking — "VTGate servers are capable of monitoring replica lag and can be configured to avoid serving data from instances that are lagging beyond X seconds"<a class="cite" href="#ref-10">10</a>. A read from the <code>PRIMARY</code> tablet, by contrast, gives read-after-write consistency at isolation level <code>READ_COMMITTED</code>, and a primary transaction upgrades that to <code>REPEATABLE_READ</code> with full ACID writes for a single shard<a class="cite" href="#ref-10">10</a> — vocabulary straight out of Module 4's isolation-level ladder, just applied per-tablet instead of per-database.</p>
+<p>One replication topology Vitess deliberately does not support is active-active (multi-master): "Vitess doesn't support active-active replication... since all writes have to eventually be applied to all writable servers, it's not a sustainable strategy. Vitess addresses this problem through sharding, which can scale indefinitely"<a class="cite" href="#ref-10">10</a>. In its place, Vitess documents automatic primary-failover — "native capability for detecting primary failures and performing a failover to a new primary within seconds of failure detection"<a class="cite" href="#ref-10">10</a> — as sufficient high availability for most applications, while conceding one gap outright: "low-latency geographically distributed writes... is not addressed by Vitess. The current recommendation is to absorb the latency cost," or shard by geography so that most primaries end up local to their own write traffic<a class="cite" href="#ref-10">10</a>.</p>
+<p>Finally, resharding — changing the number of shards on a running cluster — is documented as an explicit, verified data-migration workflow rather than an instantaneous operation: "the data in the source shards is copied into the destination shards, allowed to catch up on replication, and then compared against the original to ensure data integrity. Then the live serving infrastructure is shifted to the destination shards, and the source shards are deleted"<a class="cite" href="#ref-6">6</a>. Vitess's own summary of the user-facing cost of that whole workflow is "just a few seconds of read-only downtime"<a class="cite" href="#ref-1">1</a> per migration — a small, bounded, and specifically stated cost for an operation that, done by hand against unsharded application code, is exactly the kind of project that pushed YouTube toward Vitess in the first place (&#167;1).</p>
+<p>Operators are also steered toward smaller MySQL instances than the one-per-host default the industry tends to run: Vitess recommends "instances be broken up into manageable chunks (250GB per MySQL server), and not to shy away from running multiple instances per host," because "there are fewer lock contentions to worry about, replication is a lot happier, production impact of outages is smaller, backups and restores run faster"<a class="cite" href="#ref-10">10</a> — smaller blast radius per instance, at the (stated as roughly neutral) cost of the same aggregate resource usage.</p>
+
+<h2 id="what-is-public">6. What is actually public about the rest of YouTube</h2>
+<p>Figure 1 drew the boundary; this section states it precisely enough to act on, the same way Module 12 stated the same kind of boundary for Gmail's storage architecture. Vitess sits on the well-documented side because it has a dedicated project, a public docs site, and a named history going back to 2010. The rest of what makes YouTube work as a video product — encoding, ranking, and delivery — has no source in this course's map that documents it at comparable depth, and each of the three gaps is a slightly different shape.</p>
+<p><strong>Transcoding.</strong> No source available to this module describes how an uploaded video is split into encode jobs, how those jobs are distributed across machines, what codec-selection or bitrate-ladder logic runs, or how the pipeline handles retries and partial failures. This is not a claim that YouTube lacks such a system — obviously it has one, since every uploaded video ends up available in multiple resolutions — only that Google has not published an engineering account of it comparable to the Vitess documentation this module has spent five sections on. Nothing in &#167;1 through &#167;5 should be read as describing transcoding in any way; it does not.</p>
+<p><strong>Recommendations.</strong> Here the gap is not total silence but a single, dated data point. Google published "Deep Neural Networks for YouTube Recommendations" at ACM RecSys in 2016, describing a two-stage system: a candidate-generation deep network that narrows hundreds of millions of videos to a few hundred candidates, followed by a separate ranking network that orders those candidates for a specific user and context<a class="cite" href="#ref-14">14</a>. That paper is a real, citable, Google-authored primary source — but it is a decade old at this module's as-of date, predates the transformer architectures that reshaped ranking and retrieval systems industry-wide since, and Google has not published a comparably detailed account of whatever runs in its place today. Citing it as "how YouTube's recommendation system works" in 2026 would overstate what one nine-page conference paper from 2016 can tell you about a system that has had a decade to change underneath it.</p>
+<p><strong>CDN and delivery.</strong> This is the gap with the most nuance, because Google does publish something here — just not at the level a systems reader wants. Google's own peering documentation describes the Google Global Cache (GGC) program: "Google Global Cache (GGC) allows ISPs to serve certain Google content from within their own networks," with caches placed as physical machines "inside ISP networks," and a stated hit rate where "typically between 70-90% of cacheable traffic can be served from GGC"<a class="cite" href="#ref-16">16</a>. Google also documents a failover property: "GGC provides resilience through multiple levels of redundancy, which are transparent to users. Google ensures that users are always served from the best available data location, even in the event of a temporary outage"<a class="cite" href="#ref-16">16</a> — a real, if generic, statement that the caching layer degrades gracefully rather than failing a viewer's request outright. A public 2017 talk by a Google Edge peering lead independently confirms that YouTube's traffic rides on this same infrastructure, listing "Youtube, Play" among the products Google serves alongside Search, Maps, and Gmail on the same slide that introduces GGC<a class="cite" href="#ref-18">18</a>. None of this is engineering depth — it is peering-integration documentation aimed at ISPs deciding whether to host a cache box, not an engineering account: it says nothing about which videos get cached where, how per-title or per-region popularity is estimated, what storage medium the boxes use, or how a specific video stream reaches a specific viewer's player. Whatever generic video-CDN mechanism actually applies — the tiered, edge-to-origin caching pattern Module 1 already covered for CDNs in general, or the adaptive-bitrate-switching mechanism the IETF's own HTTP Live Streaming specification documents generically ("clients should switch between different Variant Streams to adapt to network conditions," where "a Master Playlist provides a set of Variant Streams, each of which describes a different version of the same content" at different bitrates and resolutions<a class="cite" href="#ref-13">13</a>) — neither source is YouTube's own account of what YouTube's players and edge infrastructure actually do; both are stated here explicitly as generic industry mechanism, not YouTube fact. Module 14's treatment of Netflix's Open Connect is the contrast case: Netflix has published exactly the kind of throughput-progression, memory-versus-disk, and popularity-tail engineering detail about its CDN that no source in this module's map has found for YouTube's.</p>
+<p>The honest summary is a gradient, not a binary: Vitess is documented at the depth this whole module has used; GGC is documented at the depth of an ISP integration guide; recommendations have one aging academic paper; transcoding has nothing. Treating any of the last three as "documented" because a company blog post or a generic streaming-industry explainer exists for the general problem would be filling a gap with something that is not actually about YouTube — precisely the mistake this module's scope was written to avoid.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Vitess is one answer to a general question: once a relational workload outgrows one machine, do you keep the existing database engine and put a sharding-aware proxy in front of it, or do you move to a database that was built from the start to be distributed? YouTube's own history (&#167;1) is a real data point for the first path; Spanner, already established in Module 4/12 of this course, is a real data point for the second. Neither source in this module's map states the comparison as a debate directly, but the architectural trade-off is explicit in each system's own documented design choices, and it recurs constantly in practice — most consumer sharding-middleware projects (Vitess, ProxySQL-style layers, Citus's Postgres extension) are entries in the first camp; most NewSQL systems (Spanner, CockroachDB, YugabyteDB, TiDB) are entries in the second.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Middleware sharding over an unmodified relational engine</h4>
+    <p class="who">Vitess's own architecture and documented history<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-10">10</a></p>
+    <p>Keep MySQL exactly as it is — same storage engine, same replication, same operational tooling, same query language — and add a proxy layer (VTGate/VTTablet) that handles routing, pooling, and failover on top. YouTube's actual 2010 choice was this path: it had a large, already-working MySQL-based application and needed to remove shard-routing logic from that application without rewriting it onto a different database.</p>
+    <ul class="pros">
+      <li>Incremental: an existing application can adopt it without a storage-engine migration.</li>
+      <li>Reuses MySQL's mature operational ecosystem (backup tools, replication, monitoring) rather than replacing it.</li>
+      <li>Single-shard transactions stay fully ACID with zero added cost<a class="cite" href="#ref-10">10</a>.</li>
+    </ul>
+    <ul class="cons">
+      <li>Cross-shard transactions either risk partial commits in best-effort mode or pay a stated ~50% write-cost premium in 2PC mode<a class="cite" href="#ref-10">10</a>.</li>
+      <li>Shard-key design becomes a permanent, consequential decision the application must get right up front.</li>
+      <li>No default external consistency across shards the way TrueTime provides for Spanner<a class="cite" href="#ref-17">17</a> (Spanner itself is established in Module 4/12; cited here only for this comparison).</li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Natively-distributed SQL, built for sharding from the start</h4>
+    <p class="who">Spanner's own design, as established in Module 4 and Module 12<a class="cite" href="#ref-17">17</a></p>
+    <p>Replace the single-machine relational engine with a database whose storage layer was designed around Paxos-replicated shards (directories) from day one. Spanner "shards data across many sets of Paxos state machines in datacenters spread all over the world"<a class="cite" href="#ref-17">17</a>, moves a 50MB directory between Paxos groups in "a few seconds"<a class="cite" href="#ref-17">17</a>, and is "the first system to distribute data at global scale and support externally-consistent distributed transactions"<a class="cite" href="#ref-17">17</a> via the TrueTime API, with no separate proxy layer for an application to operate.</p>
+    <ul class="pros">
+      <li>Resharding and rebalancing are automatic and built into the storage layer, not a scheduled migration workflow.</li>
+      <li>Cross-shard transactions get the same external consistency guarantee as single-shard ones, without a stated write-cost penalty comparable to Vitess's 2PC mode.</li>
+      <li>No separate proxy tier (VTGate-equivalent) for an operator to run and reason about as its own failure domain.</li>
+    </ul>
+    <ul class="cons">
+      <li>Requires migrating off the existing relational engine entirely — a multi-year, high-risk project for an application already running at YouTube's 2010 scale.</li>
+      <li>The externally-consistent design depends on infrastructure (GPS and atomic clock references for TrueTime) that only a handful of operators build in-house, though Google now sells the result as a managed product.</li>
+    </ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Which path wins is mostly a function of what already exists. For an application already running at scale on an unmodified relational engine — YouTube's actual 2010 position — the middleware path is close to strictly better: it removes the immediate scaling pain (connection cost, shard-routing logic scattered across every client) without betting the product on a multi-year storage-engine migration, and it lets an operator defer the harder cross-shard-transaction question until the application's actual transaction pattern is known well enough to choose best-effort or 2PC mode deliberately. For a system built from scratch, or one whose workload is dominated by transactions that routinely span many shards, the calculus flips: paying Vitess's stated ~50% write-cost premium on every such transaction, indefinitely, is a worse trade than accepting a natively-distributed engine's steeper adoption cost once, up front. Neither source in this module's map publishes a head-to-head benchmark of the two approaches on the same workload; that comparison — Vitess in 2PC mode versus a Spanner-class system, same schema, same cross-shard transaction mix — is the evidence that would actually settle which one is faster rather than merely which one is architecturally cleaner.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>Vitess contributors. <em>What Is Vitess</em>. Vitess (CNCF graduated project) documentation, v24.0, 2026. <a href="https://vitess.io/docs/overview/whatisvitess/">https://vitess.io/docs/overview/whatisvitess/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: VTGate/VTTablet roles, topology service one-liner, YouTube's 5+ years of 100% database traffic, the 256KB-3MB per-connection memory overhead and connection-pooling quote, resharding's "few seconds of read-only downtime," and the query de-duping/transaction manager/query rewriting feature list.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>Vitess contributors. <em>History</em>. Vitess documentation, v24.0, 2026. <a href="https://vitess.io/docs/24.0/overview/history/">https://vitess.io/docs/24.0/overview/history/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 2010 origin story (primary/replica escalation, forced sharding, app-embedded routing logic), YouTube's 50x user-base growth since, and the Feb 2018 CNCF incubation / Nov 2019 CNCF graduation dates.</span></li>
+<li id="ref-3"><span class="ref-type">paper</span>Pang, R., Caceres, R., Burrows, M., et al. <em>Zanzibar: Google's Consistent, Global Authorization System</em>. USENIX Annual Technical Conference, 2019. <a href="https://www.usenix.org/system/files/atc19-pang.pdf">https://www.usenix.org/system/files/atc19-pang.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the abstract's statement that Zanzibar is used by "hundreds of client services... including Calendar, Cloud, Drive, Maps, Photos, and YouTube," the one other Google-authored primary source in this course's map that names YouTube directly.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>Vitess contributors. <em>Concepts: Topology Service</em>. Vitess documentation, v24.0, 2026. <a href="https://vitess.io/docs/24.0/concepts/topology-service/">https://vitess.io/docs/24.0/concepts/topology-service/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the global-vs-local topology split, the default etcd2 plugin, multi-cell quorum survivability for global topology, and the "no calls to the topology service are made in the critical path... at steady state" claim.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>Vitess contributors. <em>Concepts: Keyspace</em>. Vitess documentation, v24.0, 2026. <a href="https://vitess.io/docs/24.0/concepts/keyspace/">https://vitess.io/docs/24.0/concepts/keyspace/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the definition of a keyspace as a logical database that can map to one or many MySQL databases.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>Vitess contributors. <em>Concepts: Shard</em>. Vitess documentation, v24.0, 2026. <a href="https://vitess.io/docs/24.0/concepts/shard/">https://vitess.io/docs/24.0/concepts/shard/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the shard definition, hexadecimal keyrange notation (-80/80- worked examples), the xxhash-vindex example, and the resharding data-copy/catch-up/verify/cutover workflow.</span></li>
+<li id="ref-7"><span class="ref-type">official</span>Vitess contributors. <em>Concepts: Tablet</em>. Vitess documentation, v24.0, 2026. <a href="https://vitess.io/docs/24.0/concepts/tablet/">https://vitess.io/docs/24.0/concepts/tablet/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the tablet definition (mysqld + vttablet pair) and the six documented tablet types (primary, replica, rdonly, backup, restore, drained) in Table 1.</span></li>
+<li id="ref-8"><span class="ref-type">official</span>Vitess contributors. <em>Concepts: VSchema</em>. Vitess documentation, v24.0, 2026. <a href="https://vitess.io/docs/24.0/concepts/vschema/">https://vitess.io/docs/24.0/concepts/vschema/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the VSchema's role in describing per-table Vindex assignment and sequence generators for auto-increment-like ids.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>Vitess contributors. <em>Concepts: VTGate</em>. Vitess documentation, v24.0, 2026. <a href="https://vitess.io/docs/24.0/concepts/vtgate/">https://vitess.io/docs/24.0/concepts/vtgate/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: VTGate's protocol support (MySQL protocol and Vitess gRPC) and its routing inputs (sharding scheme, latency requirement, table/instance availability).</span></li>
+<li id="ref-10"><span class="ref-type">official</span>Vitess contributors. <em>Overview: Scalability Philosophy</em>. Vitess documentation, v24.0, 2026. <a href="https://vitess.io/docs/24.0/overview/scalability-philosophy/">https://vitess.io/docs/24.0/overview/scalability-philosophy/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 250GB-per-instance sizing recommendation, semi-sync replication and sync_binlog durability guidance, the best-effort-vs-2PC cross-shard transaction model and its ~50% write-cost premium, REPLICA/RDONLY/PRIMARY read-consistency levels, replica-lag-aware routing, and the no-active-active-replication design decision.</span></li>
+<li id="ref-11"><span class="ref-type">official</span>Oracle / MySQL. <em>MySQL 8.0 Reference Manual: 10.12.3.1 How MySQL Uses Memory</em>. 2026. <a href="https://dev.mysql.com/doc/refman/8.0/en/memory-use.html">https://dev.mysql.com/doc/refman/8.0/en/memory-use.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the per-thread memory breakdown (thread stack, connection buffer, result buffer growing to max_allowed_packet, sort/read buffers) that explains what Vitess's stated 256KB-3MB per-connection range is actually spent on.</span></li>
+<li id="ref-12"><span class="ref-type">official</span>Oracle / MySQL. <em>MySQL Bugs: Bug #71045, wrong default value displayed for "thread_stack" option on 64-bit OS</em>. bugs.mysql.com, 2026. <a href="https://bugs.mysql.com/bug.php?id=71045">https://bugs.mysql.com/bug.php?id=71045</a>. Accessed 2026-09-17. <span class="ref-use">Used for: confirming thread_stack's documented default of 262,144 bytes (256 KiB) on a 64-bit build, matching Vitess's stated per-connection memory floor.</span></li>
+<li id="ref-13"><span class="ref-type">standard</span>Pantos, R., May, W. <em>RFC 8216: HTTP Live Streaming</em>. IETF, August 2017. <a href="https://www.rfc-editor.org/rfc/rfc8216">https://www.rfc-editor.org/rfc/rfc8216</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the generic adaptive-bitrate mechanism (Master Playlist / Variant Streams / client-side switching on network conditions), cited explicitly as a generic industry mechanism, not a description of YouTube's own implementation.</span></li>
+<li id="ref-14"><span class="ref-type">paper</span>Covington, P., Adams, J., Sargin, E. <em>Deep Neural Networks for YouTube Recommendations</em>. Proceedings of the 10th ACM Conference on Recommender Systems (RecSys '16), 2016. <a href="https://doi.org/10.1145/2959100.2959190">https://doi.org/10.1145/2959100.2959190</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the one public, Google-authored, but decade-old account of YouTube's recommendation architecture (candidate generation followed by ranking), flagged as dated and not a description of the current production system.</span></li>
+<li id="ref-15"><span class="ref-type">official</span>YouTube. <em>Press</em>. blog.youtube, 2026. <a href="https://blog.youtube/press/">https://blog.youtube/press/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the "over 20 million videos uploaded daily" scale statistic.</span></li>
+<li id="ref-16"><span class="ref-type">official</span>Google. <em>Introduction to GGC</em>. Google Interconnect Help, support.google.com, 2026. <a href="https://support.google.com/interconnect/answer/9058809">https://support.google.com/interconnect/answer/9058809</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Google Global Cache program's placement of cache machines inside ISP networks and the stated 70-90% cacheable-traffic-served-locally figure, as the one official but peering-level (not engineering-level) source on YouTube's CDN delivery.</span></li>
+<li id="ref-17"><span class="ref-type">paper</span>Corbett, J.C., Dean, J., Epstein, M., et al. <em>Spanner: Google's Globally-Distributed Database</em>. OSDI 2012. <a href="https://research.google.com/archive/spanner-osdi2012.pdf">https://research.google.com/archive/spanner-osdi2012.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Paxos-sharded architecture, the 50MB-directory-in-a-few-seconds resharding claim, and the externally-consistent-transactions-via-TrueTime claim, as the natively-distributed-SQL comparison point in "Where experts disagree" (Spanner's full mechanism is established in Module 4/12).</span></li>
+<li id="ref-18"><span class="ref-type">talk</span>Volmer, T. <em>Google Global Cache - Enabling Content</em>. Google Edge lead, EMEA. AfPIF (Africa Peering and Interconnection Forum) 2017, Abidjan. <a href="https://www.afpif.org/wp-content/uploads/2017/10/06_Google-Global-Cache-Enabler-2017.pdf">https://www.afpif.org/wp-content/uploads/2017/10/06_Google-Global-Cache-Enabler-2017.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: slide 2's listing of "Youtube, Play" among the Google products served by the infrastructure GGC is built on, confirming YouTube traffic rides on GGC.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

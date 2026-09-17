@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Batch and Stream Processing: The MapReduce to Spark/Flink Lineage · System Design</title>
+<meta name="description" content="The map/reduce contract that made cluster-scale batch computation tractable, and why Spark's lineage-based fault tolerance replaced replication-based recovery for iterative and interactive workloads.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 9</p>
+  <h1>Batch and Stream Processing: The MapReduce to Spark/Flink Lineage</h1>
+  <p class="lede">MapReduce turned "write a distributed program" into "fill in two functions," and paid for that simplicity with an execution model that reruns a full job stage from disk on every failure and between every iteration. Spark's Resilient Distributed Datasets keep the same restricted, deterministic-transformation contract but replace disk-durable stage boundaries with an in-memory lineage graph, which is why the same iterative workload that took minutes per pass under MapReduce runs in seconds under Spark. After this module you can read the map/reduce type signature, the RDD lineage graph, and a Spark benchmark table and know exactly which mechanism produced which number.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>5</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 8</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f1t"><title id="f1t">MapReduce execution overview: input splits, master-assigned map and reduce workers, and the shuffle between them</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">One MapReduce job, six numbered steps</text>
+
+    <!-- master + user program -->
+    <rect x="330" y="40" width="140" height="34" rx="6" class="d-block-accent"/>
+    <text x="400" y="62" text-anchor="middle" class="d-text-inv d-bold">Master</text>
+    <path d="M280,44 L330,58" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <path d="M470,58 L520,44" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <text x="255" y="35" text-anchor="middle" class="d-small d-text-light">(1) fork</text>
+    <text x="545" y="35" text-anchor="middle" class="d-small d-text-light">(1) fork</text>
+
+    <!-- input splits -->
+    <g>
+      <rect x="20" y="110" width="90" height="18" class="d-outline"/>
+      <rect x="20" y="128" width="90" height="18" class="d-outline"/>
+      <rect x="20" y="146" width="90" height="18" class="d-fill-blue-soft d-stroke-blue"/>
+      <rect x="20" y="164" width="90" height="18" class="d-outline"/>
+      <rect x="20" y="182" width="90" height="18" class="d-outline"/>
+      <text x="65" y="104" text-anchor="middle" class="d-small d-text-light">input splits (16-64 MB)</text>
+    </g>
+
+    <!-- map workers -->
+    <rect x="180" y="100" width="110" height="34" rx="6" class="d-block"/>
+    <text x="235" y="122" text-anchor="middle" class="d-text-inv">map worker</text>
+    <rect x="180" y="150" width="110" height="34" rx="6" class="d-block"/>
+    <text x="235" y="172" text-anchor="middle" class="d-text-inv">map worker</text>
+    <rect x="180" y="200" width="110" height="34" rx="6" class="d-block"/>
+    <text x="235" y="222" text-anchor="middle" class="d-text-inv">map worker</text>
+    <path d="M112,155 L178,117" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M112,155 L178,167" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M112,155 L178,217" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="145" y="145" text-anchor="middle" class="d-small d-mono">(3) read</text>
+
+    <!-- intermediate local disk -->
+    <g>
+      <rect x="330" y="105" width="26" height="130" class="d-panel"/>
+      <rect x="330" y="105" width="26" height="43" class="d-fill-blue-soft d-stroke-blue"/>
+      <rect x="330" y="150" width="26" height="43" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <rect x="330" y="196" width="26" height="43" class="d-fill-orange-soft d-stroke-orange"/>
+      <text x="343" y="255" text-anchor="middle" class="d-small d-text-light">local</text>
+      <text x="343" y="268" text-anchor="middle" class="d-small d-text-light">disk</text>
+    </g>
+    <path d="M290,117 L328,120" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M290,167 L328,167" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M290,217 L328,220" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="308" y="100" text-anchor="middle" class="d-small d-mono">(4) local write</text>
+
+    <!-- shuffle: remote read into reduce workers -->
+    <path d="M356,115 Q 450,60 540,150" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <path d="M356,165 L 540,165" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <path d="M356,220 Q 450,270 540,190" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <text x="450" y="105" text-anchor="middle" class="d-small d-mono">(5) remote read (shuffle)</text>
+
+    <!-- reduce workers -->
+    <rect x="540" y="140" width="110" height="34" rx="6" class="d-block-2"/>
+    <text x="595" y="162" text-anchor="middle" class="d-text-inv">reduce worker</text>
+    <rect x="540" y="185" width="110" height="34" rx="6" class="d-block-2"/>
+    <text x="595" y="207" text-anchor="middle" class="d-text-inv">reduce worker</text>
+
+    <!-- output files -->
+    <rect x="700" y="140" width="80" height="34" rx="4" class="d-outline"/>
+    <text x="740" y="162" text-anchor="middle" class="d-small d-mono">output 0</text>
+    <rect x="700" y="185" width="80" height="34" rx="4" class="d-outline"/>
+    <text x="740" y="207" text-anchor="middle" class="d-small d-mono">output 1</text>
+    <path d="M650,157 L698,157" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M650,202 L698,202" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="675" y="145" text-anchor="middle" class="d-small d-mono">(6) write</text>
+
+    <text x="65" y="290" text-anchor="middle" class="d-small d-text-light">Input files</text>
+    <text x="235" y="290" text-anchor="middle" class="d-small d-text-light">Map phase</text>
+    <text x="343" y="290" text-anchor="middle" class="d-small d-text-light">Intermediate</text>
+    <text x="595" y="290" text-anchor="middle" class="d-small d-text-light">Reduce phase</text>
+    <text x="740" y="290" text-anchor="middle" class="d-small d-text-light">Global FS output</text>
+
+    <text x="400" y="330" text-anchor="middle" class="d-small d-text-light">(2) master assigns idle workers to M map tasks and R reduce tasks</text>
+    <text x="400" y="350" text-anchor="middle" class="d-small d-text-light">Every arrow after step 4 crosses the network; steps 3-4 stay local when the</text>
+    <text x="400" y="368" text-anchor="middle" class="d-small d-text-light">master can schedule a map task on a machine that already holds its input split.</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The seven numbered actions of one MapReduce execution, redrawn from the paper's own Figure 1: fork, assign, read, local write, shuffle (remote read), and write<a class="cite" href="#ref-1">1</a>. Everything in this module is a variation on this one shape — the question each later section answers is what happens to steps 3-6 when a machine dies mid-job, or when the same job has to run a hundred times in a row.</figcaption>
+</figure>
+<h2 id="mapreduce-contract">1. From ad hoc parallel code to a type contract</h2>
+<p>Before 2004, Google had already implemented hundreds of special-purpose programs to process the raw data crawling and logging produced: inverted indices, graph representations of the web's link structure, per-host summaries of the most frequent queries<a class="cite" href="#ref-1">1</a>. Each one was, in principle, a simple computation — count words, follow links, sum frequencies. In practice, each one also had to solve parallelization, distribution across hundreds or thousands of machines, load balancing, and failure handling from scratch, and that machinery obscured the simple computation underneath it<a class="cite" href="#ref-1">1</a>. Dean and Ghemawat's response was not a faster cluster or a smarter scheduler; it was a narrower interface. If the programmer would express the computation as two functions with a fixed type signature, the runtime could own parallelization, distribution, and fault tolerance completely, and the programmer would never see a socket, a thread, or a machine list<a class="cite" href="#ref-1">1</a>.</p>
+<p>This module's job is to derive that interface and its two implementations well enough that Module 32 can cite the result rather than re-deriving it: MapReduce's execution model and its specific failure-recovery asymmetry (§§2-3), and Spark's Resilient Distributed Dataset (RDD) abstraction, which keeps MapReduce's restricted, deterministic-transformation contract but replaces MapReduce's disk-durable stage boundaries with a lineage graph that is cheap to recompute from (§§5-7). Module 8 covered the log-structured message broker that often feeds these jobs; this module starts one layer up, with the compute framework that reads from a distributed file system (Module 7's GFS/HDFS) or a log (Module 8's Kafka) and turns bounded input into bounded output.</p>
+
+<h3 id="mapreduce-contract-types">1.1 The map/reduce type signature and word count</h3>
+<p>The interface has exactly two user-supplied functions, and the paper states their types precisely:</p>
+<p style="text-align:center">
+$$ \text{map}\ (k_1, v_1) \rightarrow \text{list}(k_2, v_2) $$
+$$ \text{reduce}\ (k_2, \text{list}(v_2)) \rightarrow \text{list}(v_2) $$
+</p>
+<p>Map takes one input key/value pair and produces a set of intermediate key/value pairs. The MapReduce library groups together all intermediate values associated with the same intermediate key and passes them to Reduce, which merges those values into a — typically smaller — set of output values<a class="cite" href="#ref-1">1</a>. Note the type discipline the paper is explicit about: the intermediate keys and values \(k_2, v_2\) are drawn from a domain that need not match the input domain \(k_1, v_1\), but the output domain matches the intermediate domain, because Reduce's output type is \(\text{list}(v_2)\), the same \(v_2\) it consumed<a class="cite" href="#ref-1">1</a>. Everything about MapReduce's execution model in §2 exists to implement exactly this grouping-by-intermediate-key step efficiently at cluster scale.</p>
+<p>The canonical example, word counting, makes the two functions concrete: <code>map</code> emits <code>(w, "1")</code> for every word <code>w</code> in a document; <code>reduce</code> receives a key <code>w</code> and the list of all the "1"s emitted for it across every document, and sums them<a class="cite" href="#ref-1">1</a>. The paper's other worked examples — distributed grep (map emits a matching line, reduce is the identity function), reverse web-link graph (map emits <code>(target, source)</code> for every link, reduce concatenates the sources per target), and building an inverted index (map emits <code>(word, docID)</code>, reduce sorts and emits <code>(word, list(docID))</code>) — are all the same shape: a per-record local transformation, followed by a grouping-and-merging step keyed on whatever the map phase decided mattered<a class="cite" href="#ref-1">1</a>. Nothing in this contract mentions machines, threads, or retries. That omission is the entire point, and §2 is about what the runtime has to do to honor it anyway.</p>
+<h2 id="execution-mechanics">2. Execution mechanics: splits, shuffle, locality</h2>
+<p>Figure 1 names the mechanism; this section derives why each step is shaped the way it is. The MapReduce library first splits the input files into <em>M</em> pieces, typically 16-64 MB each, a size the user can control<a class="cite" href="#ref-1">1</a>. One copy of the user's program becomes the <em>master</em>; the rest become <em>workers</em> that the master assigns to either a map task or a reduce task, picking idle workers as they become available<a class="cite" href="#ref-1">1</a>. A worker assigned a map task reads its input split, parses key/value pairs, and passes each pair to the user's <code>Map</code> function; the emitted intermediate pairs are buffered in memory, then periodically written to local disk, partitioned into <em>R</em> regions by a partitioning function — by default <code>hash(key) mod R</code> — and the locations of those regions are reported back to the master<a class="cite" href="#ref-1">1</a>.</p>
+<p>This is the step that decides which reduce worker will eventually see which key: the partitioning function is the shuffle's routing table, computed independently by every map task, with the master only relaying the resulting file locations. When a reduce worker is notified of these locations, it uses RPCs to pull ("remote read") the buffered data for its partition from every map worker's local disk, sorts the combined intermediate data by key so that all occurrences of the same key are grouped together — using an external sort if the data doesn't fit in memory — and then invokes the user's <code>Reduce</code> function once per unique intermediate key, appending each result to a per-partition output file<a class="cite" href="#ref-1">1</a>. This is also why MapReduce gives you a free ordering guarantee: within a given partition, the paper states, intermediate key/value pairs are processed in increasing key order, which is a direct consequence of the sort step every reduce task performs and is exposed because it is useful for producing a sorted output file per partition<a class="cite" href="#ref-1">1</a>.</p>
+<p>Two refinements matter for the arithmetic later in this module. First, the <em>combiner function</em>: when a reduce function is both commutative and associative — word counting again — the user can supply an optional combiner that runs on the map side and pre-aggregates values for a key before they cross the network, cutting the volume of the shuffle for any workload whose keys follow a skewed (for example Zipfian) distribution<a class="cite" href="#ref-1">1</a>. Second, <em>locality</em>: because the input lives on GFS, which stores several copies (typically 3) of each 64 MB block on different machines, the master takes chunk-location information into account and tries to schedule a map task on a machine that holds a replica of its input split, or failing that, on a machine on the same network switch<a class="cite" href="#ref-1">1</a>. The measured payoff is direct — on large MapReduce operations using a significant fraction of the workers in a cluster, most input data is read locally and consumes no network bandwidth at all<a class="cite" href="#ref-1">1</a>. This is the same locality-aware placement idea Module 7 introduced for GFS chunk placement, reused here on the compute side: the scheduler moves the computation to the data because moving 64 MB is expensive and moving a task descriptor is not.</p>
+
+<h3 id="execution-mechanics-granularity">2.1 Task granularity: why M and R must exceed the worker count</h3>
+<p>The paper's guidance on choosing <em>M</em> and <em>R</em> is not a rule of thumb; it is a memory-bounded design constraint you can compute directly. Ideally, <em>M</em> and <em>R</em> should be much larger than the number of worker machines, because giving each worker many small tasks improves dynamic load balancing and — crucially for §3 — speeds up recovery: if a worker fails, the many map tasks it had completed can be spread out across all the other idle workers rather than dumped onto one machine<a class="cite" href="#ref-1">1</a>.</p>
+<p>The upper bound on <em>M</em> and <em>R</em> comes from the master's own memory footprint. The master must make \(O(M+R)\) scheduling decisions and keeps \(O(M \cdot R)\) state in memory — one in-memory record of task state (idle, in-progress, or completed) and worker identity per map task, and, per completed map task, the locations of the <em>R</em> intermediate file regions it produced<a class="cite" href="#ref-1">1</a>. The paper states the constant factor directly: the \(O(M \cdot R)\) piece of state costs approximately one byte per map-task/reduce-task pair<a class="cite" href="#ref-1">1</a>. Google's own production choice, stated in the same section, is \(M = 200{,}000\) and \(R = 5{,}000\), run on 2,000 worker machines<a class="cite" href="#ref-1">1</a>. Plugging those numbers in:</p>
+<p style="text-align:center">
+$$ M \cdot R = 200{,}000 \times 5{,}000 = 1 \times 10^{9} \text{ pairs} \approx 954\ \text{MiB of master state at 1 byte/pair} $$
+</p>
+<p>Under one gigabyte, resident in a single master process's memory, for a job spanning 2,000 machines — a hundred map tasks and roughly two and a half reduce tasks per worker on average. That ratio (\(M/\text{workers} = 100\), \(R/\text{workers} \approx 2.5\)) is exactly the "much larger than the number of worker machines" guidance made concrete, and it is also why the practical upper bound on <em>R</em> is real: users are further constrained because each reduce task's output lands in its own separate file, so in practice the paper reports choosing <em>M</em> so each task is 16-64 MB of input (the same split size chosen for locality) and making <em>R</em> a small multiple of the expected worker count<a class="cite" href="#ref-1">1</a>. A single master architecture — the same simplifying choice Module 7 covered for GFS — only stays simple as long as its in-memory bookkeeping stays in the hundreds-of-megabytes range, not gigabytes; the \(M \cdot R\) arithmetic is the reason the paper's own recommended job sizes stay where they do.</p>
+<h2 id="mapreduce-fault-tolerance">3. Fault tolerance: the map/reduce recovery asymmetry</h2>
+<p>MapReduce runs on "hundreds or thousands of machines," so the library "must tolerate machine failures gracefully" as a baseline requirement, not an edge case<a class="cite" href="#ref-1">1</a>. The master pings every worker periodically; if a worker does not respond within a certain time, the master marks it failed<a class="cite" href="#ref-1">1</a>. What happens next is deliberately asymmetric between the two task types, and the asymmetry is the single most important fact this module carries forward to Spark's design in §5.</p>
+<p>Any map task or reduce task that was <em>in progress</em> on the failed worker is reset to idle and becomes eligible for rescheduling on another machine — that part is symmetric. The asymmetry is about <em>completed</em> tasks. A completed map task is re-executed on a failure, because its output was written to the local disk of the now-unreachable machine and is therefore inaccessible<a class="cite" href="#ref-1">1</a>. A completed reduce task is <em>not</em> re-executed after a failure, because its output was written to the global file system (GFS), which survives the loss of any single machine through its own replication<a class="cite" href="#ref-1">1</a>. Put in one sentence: map output durability is borrowed from whichever machine happened to compute it; reduce output durability is borrowed from the file system underneath the whole cluster. Recomputing a map task is cheap because its input split is still sitting, replicated, in GFS; recomputing a reduce task would be needed only if GFS itself lost the data, which the file system's own replication is designed to prevent.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Worker A fails: its completed map tasks are re-executed on worker B; its completed reduce output is untouched</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">Same failure, two different recovery costs</text>
+
+    <!-- worker A, crossed out -->
+    <rect x="40" y="60" width="160" height="60" rx="8" class="d-block-muted d-dashed"/>
+    <text x="120" y="85" text-anchor="middle" class="d-text-inv d-bold">Worker A</text>
+    <text x="120" y="105" text-anchor="middle" class="d-small d-text-inv">unreachable</text>
+    <path d="M45,65 L195,115" class="d-arrow" style="stroke-width:1.5"/>
+    <path d="M195,65 L45,115" class="d-arrow" style="stroke-width:1.5"/>
+
+    <rect x="40" y="150" width="160" height="34" rx="6" class="d-panel"/>
+    <text x="120" y="171" text-anchor="middle" class="d-small">local disk: map output (2 done)</text>
+    <path d="M120,120 L120,148" class="d-arrow" style="stroke-width:1.5"/>
+    <text x="230" y="170" class="d-small d-text-light">-- gone with the machine</text>
+
+    <!-- master -->
+    <rect x="340" y="20" width="120" height="34" rx="6" class="d-block-accent"/>
+    <text x="400" y="42" text-anchor="middle" class="d-text-inv d-bold">Master</text>
+    <path d="M200,90 Q 280,60 340,40" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+    <text x="270" y="55" text-anchor="middle" class="d-small d-mono">no heartbeat</text>
+    <path d="M400,54 L400,90" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+    <text x="440" y="80" text-anchor="middle" class="d-small">re-execute A's 2 completed + any in-progress map tasks</text>
+
+    <!-- worker B -->
+    <rect x="340" y="100" width="160" height="60" rx="8" class="d-block"/>
+    <text x="420" y="125" text-anchor="middle" class="d-text-inv d-bold">Worker B</text>
+    <text x="420" y="145" text-anchor="middle" class="d-small d-text-inv">re-runs the 2 map tasks</text>
+
+    <!-- reduce workers reading from B, not A -->
+    <rect x="560" y="100" width="150" height="34" rx="6" class="d-block-2"/>
+    <text x="635" y="122" text-anchor="middle" class="d-text-inv">reduce worker</text>
+    <path d="M500,125 L558,117" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="530" y="105" text-anchor="middle" class="d-small d-mono">re-read</text>
+
+    <!-- completed reduce output, untouched -->
+    <rect x="560" y="180" width="150" height="34" rx="4" class="d-outline"/>
+    <text x="635" y="202" text-anchor="middle" class="d-small d-mono">reduce output (GFS)</text>
+    <text x="635" y="235" text-anchor="middle" class="d-small d-text-light">already written to the</text>
+    <text x="635" y="250" text-anchor="middle" class="d-small d-text-light">globally replicated file system --</text>
+    <text x="635" y="265" text-anchor="middle" class="d-small d-text-light">not re-executed on A's failure</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> When worker A stops responding to the master's pings, every map task A had completed is re-run — because that output lived only on A's local disk — while any reduce task the cluster had already finished is left alone, because its output already sits in GFS<a class="cite" href="#ref-1">1</a>. Reduce workers that had not yet finished reading A's data simply redirect their remote reads to worker B once B completes A's re-executed map tasks<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="mapreduce-stragglers">3.1 Backup tasks and the cost of not having them</h3>
+<p>A different failure mode does not involve any machine going down: a <em>straggler</em>, a machine that takes unusually long to finish one of the last few map or reduce tasks, for reasons ranging from a bad disk with degraded read throughput to resource contention with other jobs scheduled on the same box<a class="cite" href="#ref-1">1</a>. The paper reports one real instance where a bug disabling processor caches slowed affected machines' computations by over a factor of one hundred<a class="cite" href="#ref-1">1</a>. The general mitigation is backup execution: when a MapReduce operation is close to completion, the master schedules backup copies of whatever in-progress tasks remain; the task is marked complete whenever either the primary or the backup execution finishes first, and the mechanism is tuned to add no more than a few percent to the computational resources used<a class="cite" href="#ref-1">1</a>. RDDs will reuse this exact idea unmodified in §5 — it works because MapReduce's map and reduce operators are (almost always) deterministic functions of their input, so two executions of the same task produce equivalent output and racing them is safe<a class="cite" href="#ref-1">1</a>.</p>
+<p>The paper measures the effect directly on its ~1 TB sort benchmark (10<sup>10</sup> 100-byte records, <em>M</em>=15,000, <em>R</em>=4,000, ~1,700 machines): a normal execution completes in 891 seconds<a class="cite" href="#ref-1">1</a>. With backup tasks disabled, the same job takes 1,283 seconds — a 44% increase in elapsed time — entirely due to a handful of straggling reduce tasks that don't finish until 300 seconds after everything else<a class="cite" href="#ref-1">1</a>. A separate experiment on the same benchmark intentionally killed 200 of 1,746 worker processes several minutes into the computation; the underlying cluster scheduler restarted new workers immediately, the master re-executed the lost map work, and the whole job finished in 933 seconds — only a 5% increase over the failure-free run<a class="cite" href="#ref-1">1</a>. Read those two numbers together: a straggler that never fails outright costs the job more (44%) than losing over 10% of the workforce outright and recovering from it (5%). This is direct evidence that partial slowness, not outright failure, is the more expensive-to-tolerate condition in this architecture — the reason the backup-task mechanism exists as a separate feature from ordinary worker-failure handling.</p>
+<p>Master failure is handled differently again, and deliberately without the same machinery: the master could write periodic checkpoints of its data structures so a new master could resume from the last checkpoint, but because there is only one master, its failure is judged unlikely enough that the current implementation simply aborts the MapReduce job if the master fails, leaving the client to retry the whole operation<a class="cite" href="#ref-1">1</a>. This is the same single-master trade-off Module 3 and Module 7 already introduced for GFS: a single master vastly simplifies the design, and its low failure probability is treated as an acceptable cost of that simplicity rather than something worth building a second consensus-backed mechanism to survive.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> A representative slice of MapReduce jobs running inside Google in August 2004, from the paper's own production statistics<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Metric</th><th class="num">Value</th></tr></thead>
+<tbody>
+<tr><td>Number of jobs</td><td class="num">29,423</td></tr>
+<tr><td>Average job completion time</td><td class="num">634 s</td></tr>
+<tr><td>Machine-days used</td><td class="num">79,186</td></tr>
+<tr><td>Input data read</td><td class="num">3,288 TB</td></tr>
+<tr><td>Intermediate data produced</td><td class="num">758 TB</td></tr>
+<tr><td>Output data written</td><td class="num">193 TB</td></tr>
+<tr><td>Average worker machines per job</td><td class="num">157</td></tr>
+<tr><td>Average worker deaths per job</td><td class="num">1.2</td></tr>
+<tr><td>Average map tasks per job</td><td class="num">3,351</td></tr>
+<tr><td>Average reduce tasks per job</td><td class="num">55</td></tr>
+<tr><td>Unique <code>map</code> implementations</td><td class="num">395</td></tr>
+<tr><td>Unique <code>reduce</code> implementations</td><td class="num">269</td></tr>
+<tr><td>Unique map/reduce combinations</td><td class="num">426</td></tr>
+</tbody>
+</table>
+<p>Two numbers in Table 1 are worth holding onto for §4: 1.2 average worker deaths per job means that essentially every job of any size experiences at least one machine failure during its run — fault tolerance in this system is not a rare-event insurance policy, it is a per-job certainty being amortized — and 634 seconds of average job completion time is the per-job cost that iterative algorithms in §4 will end up paying on every single pass.</p>
+<h2 id="mapreduce-ceiling">4. Where the model runs out of road: iteration and interactivity</h2>
+<p>Everything in §§2-3 optimizes a single pass over bounded input, and MapReduce is very good at exactly that: Table 1's 634-second average job and the 79,186 machine-days it consumed in one month were mostly single-pass jobs — build an index, sort a dataset, extract a report. The model starts to strain on two classes of workload the Spark paper calls out by name: <em>iterative algorithms</em>, which apply the same operation to the same dataset over and over until convergence (gradient descent for logistic regression, PageRank's repeated contribution-and-update step), and <em>interactive data mining</em>, where an analyst runs several different ad-hoc queries against the same subset of data in a session<a class="cite" href="#ref-2">2</a>.</p>
+<p>Both classes share one property the map/reduce contract does not optimize for: data reuse across computations. In a stock MapReduce (or Hadoop) pipeline, the only way to share a dataset between two jobs is to write it to an external stable storage system — the distributed file system — and have the next job read it back<a class="cite" href="#ref-2">2</a>. For a genuinely one-shot job that is free: you were going to write the output somewhere durable anyway. For ten or a hundred iterations of the same gradient-descent step over the same points, it means paying full disk I/O, replication, and serialization cost on every single iteration to re-read data that has not changed since the last one<a class="cite" href="#ref-2">2</a>. Nothing about this is a bug in MapReduce's fault-tolerance design; the disk-durable stage boundary in Figure 1 is precisely what makes step 6 (reduce output landing in the global file system) survivable in §3. The cost is a direct, structural consequence of using job-to-job durability as the only mechanism for both fault tolerance <em>and</em> data sharing — the same mechanism is being asked to do two jobs, and paying the full cost of the first (durability against failure) on every use of the second (handing data to the next stage) even when no failure occurred.</p>
+<p>Specialized systems had already patched around this for narrow cases by 2012 — Pregel keeps iterative graph state in memory for graph-specific computations, HaLoop offers an iterative MapReduce interface that loops a series of MapReduce steps — but both only support one specific computation pattern and share data implicitly within that pattern, rather than providing a general abstraction a programmer can use for arbitrary reuse, such as loading several datasets into memory once and running ad-hoc queries across them<a class="cite" href="#ref-2">2</a>. The gap this module's second half addresses is that general case: a data-sharing abstraction that keeps intermediate results in memory across operations, without giving up the fault tolerance MapReduce gets for free from re-execution and GFS durability.</p>
+<h2 id="rdd-lineage">5. Resilient Distributed Datasets: lineage instead of replication</h2>
+<p>Spark's answer is a data structure, not a new scheduler: a Resilient Distributed Dataset (RDD) is a read-only, partitioned collection of records that can only be created through deterministic operations, called <em>transformations</em>, on either data in stable storage or another RDD — examples include <code>map</code>, <code>filter</code>, and <code>join</code><a class="cite" href="#ref-2">2</a>. An RDD does not need to be materialized at all times. Instead, it carries enough information about how it was derived from other datasets — its <em>lineage</em> — to compute its own partitions from data in stable storage whenever it needs to<a class="cite" href="#ref-2">2</a>. The paper states the consequence plainly: "in essence, a program cannot reference an RDD that it cannot reconstruct after a failure"<a class="cite" href="#ref-2">2</a>. If a partition of an RDD is lost, Spark does not restore it from a replica or replay a log — it re-derives it by re-running the recorded transformation chain on whichever ancestor partitions are still available<a class="cite" href="#ref-2">2</a>.</p>
+<p>The worked example the paper builds around is log mining. An operator loads error lines out of terabytes of logs sitting in HDFS, then wants to run several interactive queries against just those error lines:</p>
+<pre class="code" data-lang="scala" data-title="log-mining.scala"><code>lines = spark.textFile("hdfs://...")
+errors = lines.filter(_.startsWith("ERROR"))
+errors.persist()
+
+errors.count()
+errors.filter(_.contains("MySQL")).count()
+errors.filter(_.contains("HDFS"))
+      .map(_.split('\t')(3))
+      .collect()</code></pre>
+<p>The first line defines <code>lines</code>, an RDD backed by the HDFS file; the second derives <code>errors</code> by filtering it; the third calls <code>persist()</code>, which asks Spark to keep <code>errors</code>'s partitions in memory once they are computed, so that every later query against <code>errors</code> reuses them instead of re-filtering <code>lines</code> from scratch<a class="cite" href="#ref-2">2</a>. Note that <code>lines</code> itself is deliberately <em>not</em> forced into RAM — the base log file might be far larger than the error subset, so keeping only the derived, smaller RDD resident is the actual point of choosing what to <code>persist()</code><a class="cite" href="#ref-2">2</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">RDD lineage graph for the log-mining example, and recomputation of one lost partition of errors</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="22" text-anchor="middle" class="d-title d-bold">Lineage graph for the third query</text>
+
+    <rect x="60" y="45" width="140" height="34" rx="6" class="d-block"/>
+    <text x="130" y="67" text-anchor="middle" class="d-text-inv d-mono">lines</text>
+    <path d="M130,79 L130,109" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <text x="230" y="98" class="d-small d-mono">filter(startsWith(&quot;ERROR&quot;))</text>
+
+    <rect x="60" y="115" width="140" height="34" rx="6" class="d-hl"/>
+    <text x="130" y="137" text-anchor="middle" class="d-mono">errors</text>
+    <text x="130" y="160" text-anchor="middle" class="d-small d-text-light">persist()</text>
+    <path d="M130,149 L130,179" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <text x="250" y="168" class="d-small d-mono">filter(contains(&quot;HDFS&quot;))</text>
+
+    <rect x="60" y="185" width="140" height="34" rx="6" class="d-block"/>
+    <text x="130" y="207" text-anchor="middle" class="d-text-inv d-mono">HDFS errors</text>
+    <path d="M130,219 L130,249" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <text x="230" y="238" class="d-small d-mono">map(split('\t')(3))</text>
+
+    <rect x="60" y="255" width="140" height="34" rx="6" class="d-block"/>
+    <text x="130" y="277" text-anchor="middle" class="d-text-inv d-mono">time fields</text>
+
+    <!-- lost partition, recompute -->
+    <g>
+      <rect x="380" y="60" width="360" height="220" rx="8" class="d-panel"/>
+      <text x="560" y="82" text-anchor="middle" class="d-small d-text-light">One partition of errors is lost (node failure)</text>
+
+      <rect x="400" y="100" width="120" height="30" rx="4" class="d-outline"/>
+      <text x="460" y="120" text-anchor="middle" class="d-small d-mono">lines: p3</text>
+      <path d="M460,130 L460,158" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+      <text x="530" y="150" text-anchor="middle" class="d-small d-mono">re-filter</text>
+
+      <rect x="400" y="165" width="120" height="30" rx="4" class="d-fill-red d-dashed"/>
+      <text x="460" y="185" text-anchor="middle" class="d-small d-mono">errors: p3</text>
+      <text x="460" y="205" text-anchor="middle" class="d-small d-text-light">(recomputed, not restored)</text>
+
+      <text x="620" y="120" class="d-small">Only partition p3 of</text>
+      <text x="620" y="138" class="d-small"><code>errors</code> is rebuilt.</text>
+      <text x="620" y="160" class="d-small">Partitions p1, p2, p4...</text>
+      <text x="620" y="178" class="d-small">are untouched and are</text>
+      <text x="620" y="196" class="d-small">not re-derived at all.</text>
+      <text x="620" y="220" class="d-small d-text-light">No replica read, no</text>
+      <text x="620" y="238" class="d-small d-text-light">log replay, no rollback</text>
+      <text x="620" y="256" class="d-small d-text-light">of the whole program.</text>
+    </g>
+  </svg>
+  <figcaption><b>Figure 3.</b> Lineage graph redrawn from the paper's own Figure 1 for its third console-log query<a class="cite" href="#ref-2">2</a>. Boxes are RDDs; arrows are the transformations Spark records but does not execute until an action forces it to. If one partition of the persisted <code>errors</code> RDD is lost, Spark rebuilds it by re-running the recorded <code>filter</code> on only the corresponding partition of <code>lines</code> — the rest of the dataset, and the rest of the pipeline, is untouched<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<h3 id="rdd-coarse-grained">5.1 Coarse-grained transformations: the restriction that makes lineage cheap</h3>
+<p>The design choice that makes this recovery cheap is a restriction, and the paper is explicit that it is a deliberate trade rather than an oversight. RDDs can only be <em>written</em> through coarse-grained transformations — the same operation applied to every element of a dataset — while a general distributed shared memory (DSM) system allows reads and writes to arbitrary individual memory locations<a class="cite" href="#ref-2">2</a>. This restricts RDDs to applications that perform bulk writes, but in exchange it allows for dramatically more efficient fault tolerance<a class="cite" href="#ref-2">2</a>. The paper's own Table 1 lays out the comparison point by point: RDD fault recovery is "fine-grained and low-overhead using lineage," where a DSM system "requires checkpoints and program rollback"; RDD reads can still be fine-grained (an application can treat an RDD as a large read-only lookup table) even though writes cannot<a class="cite" href="#ref-2">2</a>.</p>
+<p>The reason coarse-grained writes are the enabling restriction, not an arbitrary one, is that logging one high-level operation ("filter all lines starting with ERROR") is orders of magnitude cheaper than logging or replicating the fine-grained mutations a general key-value store or DSM would need to survive failure on. A system like Piccolo, which exposes a shared, mutable, distributed hash table, must implement fault tolerance by checkpointing that table's contents or replicating individual updates across machines — both of which cost network bandwidth and storage proportional to the size of the data itself<a class="cite" href="#ref-2">2</a>. RDDs, being immutable and built only from bulk transformations, need only log the transformation, not the data:</p>
+<details class="more">
+<summary>Worked derivation: lineage graph size vs. replicating the data</summary>
+<p>The paper reports two concrete numbers from its own fault-recovery experiment (§6.3, detailed with real timings in §7): the lineage graphs for the RDDs in its examples were all under 10 KB in size, while the working sets they describe were on the order of 100 GB<a class="cite" href="#ref-2">2</a>. Contrast that with what a checkpoint-based recovery scheme would need to pay instead: to survive a node failure with the same recovery guarantee via checkpointing, the system would need to replicate the application's full working set across the network, which would either consume twice Spark's memory to hold two full in-RAM copies, or force the system to write the entire multi-gigabyte-to-terabyte working set to disk before it could call itself durable<a class="cite" href="#ref-2">2</a>. The ratio is not a small constant-factor win — it is metadata (kilobytes) standing in for data (gigabytes), a difference of five to seven orders of magnitude, and it is the reason a lost RDD partition is "recovered, often quite quickly, without requiring costly replication," as the paper's introduction puts it<a class="cite" href="#ref-2">2</a>.</p>
+</details>
+<p>This is also why RDDs explicitly do not try to be a general-purpose mutable store. The paper is direct about where the abstraction stops fitting: applications that make fine-grained asynchronous updates to shared state — a storage system for a web application, or an incremental web crawler — are a poor fit for RDDs, and the paper recommends traditional update-logging and checkpointing systems (databases, RAMCloud, Percolator, Piccolo) for exactly that class of problem instead<a class="cite" href="#ref-2">2</a>. RDDs are for batch analytics over bulk data, deliberately leaving asynchronous fine-grained mutation to specialized systems built for it.</p>
+
+<h3 id="rdd-dependencies">5.2 Narrow vs wide dependencies and where recovery gets expensive</h3>
+<p>Not every lost partition is equally cheap to recompute, and the distinction is exactly which parent partitions a child partition depends on. The paper classifies dependencies between RDDs into two types. A <em>narrow</em> dependency is one where each partition of the parent RDD is used by at most one partition of the child RDD — <code>map</code> and <code>filter</code> are narrow, because each output partition is computed purely from the one input partition at the same index. A <em>wide</em> dependency is one where multiple child partitions may depend on the same parent partition — <code>groupByKey</code> is wide, and so is a <code>join</code> whose inputs are not already partitioned the same way<a class="cite" href="#ref-2">2</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 290" role="img" aria-labelledby="f4t"><title id="f4t">Narrow dependencies map one parent partition to one child partition; wide dependencies fan many parents into one child and force a stage boundary</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="200" y="22" text-anchor="middle" class="d-title d-bold">Narrow (map, filter)</text>
+    <text x="600" y="22" text-anchor="middle" class="d-title d-bold">Wide (groupByKey, join without co-partitioning)</text>
+
+    <!-- narrow: 4 parent partitions -> 4 child partitions, 1:1 -->
+    <g>
+      <rect x="90" y="55" width="34" height="34" class="d-fill-blue-soft d-stroke-blue"/>
+      <rect x="134" y="55" width="34" height="34" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <rect x="178" y="55" width="34" height="34" class="d-fill-orange-soft d-stroke-orange"/>
+      <rect x="222" y="55" width="34" height="34" class="d-fill-green-soft d-stroke-green"/>
+      <text x="173" y="45" text-anchor="middle" class="d-small d-text-light">parent partitions</text>
+
+      <path d="M107,89 L107,120" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <path d="M151,89 L151,120" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <path d="M195,89 L195,120" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <path d="M239,89 L239,120" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+      <rect x="90" y="125" width="34" height="34" class="d-fill-blue-soft d-stroke-blue"/>
+      <rect x="134" y="125" width="34" height="34" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <rect x="178" y="125" width="34" height="34" class="d-fill-orange-soft d-stroke-orange"/>
+      <rect x="222" y="125" width="34" height="34" class="d-fill-green-soft d-stroke-green"/>
+      <text x="173" y="175" text-anchor="middle" class="d-small d-text-light">child partitions</text>
+      <text x="173" y="200" text-anchor="middle" class="d-small">1 parent partition -&gt; 1 child partition</text>
+      <text x="173" y="220" text-anchor="middle" class="d-small d-bold">recompute one lost partition in isolation</text>
+    </g>
+
+    <!-- wide: 4 parent -> 2 child, many:many -->
+    <g>
+      <rect x="480" y="55" width="30" height="30" class="d-fill-blue-soft d-stroke-blue"/>
+      <rect x="518" y="55" width="30" height="30" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <rect x="556" y="55" width="30" height="30" class="d-fill-orange-soft d-stroke-orange"/>
+      <rect x="594" y="55" width="30" height="30" class="d-fill-green-soft d-stroke-green"/>
+      <text x="552" y="45" text-anchor="middle" class="d-small d-text-light">parent partitions</text>
+
+      <path d="M495,85 L525,135" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <path d="M533,85 L525,135" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <path d="M571,85 L580,135" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <path d="M609,85 L580,135" class="d-arrow" marker-end="url(#f4-arr)"/>
+      <path d="M495,85 L580,135" class="d-arrow d-dim" style="stroke-width:1"/>
+      <path d="M609,85 L525,135" class="d-arrow d-dim" style="stroke-width:1"/>
+
+      <rect x="510" y="140" width="30" height="30" class="d-hl"/>
+      <rect x="565" y="140" width="30" height="30" class="d-hl"/>
+      <text x="552" y="190" text-anchor="middle" class="d-small d-text-light">child partitions</text>
+      <text x="552" y="215" text-anchor="middle" class="d-small">many parents -&gt; each child (shuffle)</text>
+      <text x="552" y="235" text-anchor="middle" class="d-small d-bold">losing one child needs all parent</text>
+      <text x="552" y="253" text-anchor="middle" class="d-small d-bold">ancestors: a full re-execution</text>
+    </g>
+    <text x="400" y="270" text-anchor="middle" class="d-small d-text-light">A wide dependency is also where Spark's scheduler cuts a stage boundary and materializes intermediate data, much like MapReduce's shuffle<a class="cite" href="#ref-2">2</a>.</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Narrow dependencies (<code>map</code>, <code>filter</code>, <code>union</code>) let Spark pipeline execution on one node and recompute a lost partition by touching only the one parent partition it needed. Wide dependencies (<code>groupByKey</code>, an un-co-partitioned <code>join</code>) require data from every parent partition to compute one child partition, so recovering after a node failure can require recomputing partitions from every ancestor RDD — closer to a full re-execution<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<p>The distinction earns its place in the interface for two separate reasons the paper states directly. First, narrow dependencies allow pipelined execution on one cluster node, which can compute all the parent partitions it needs without any data leaving the machine; wide dependencies, by contrast, require data from all parent partitions to be available and shuffled across the nodes in a MapReduce-like operation before the child can be computed at all<a class="cite" href="#ref-2">2</a>. Second — the recovery-cost point Figure 4 draws — recovery after a node failure is far more efficient with a narrow dependency, because only the lost parent partitions need to be recomputed, and they can be recomputed in parallel on different nodes; with a wide dependency, a single failed node can cause the loss of some partition from <em>every one</em> of an RDD's ancestors, which can require a complete re-execution of the lineage chain up to that point<a class="cite" href="#ref-2">2</a>. This same narrow/wide split is what determines Spark's job-stage boundaries at scheduling time: the scheduler builds pipelined stages out of chains of narrow-dependency transformations, and starts a new stage only where a wide dependency forces a shuffle or where an already-computed, persisted partition lets it short-circuit a parent RDD's computation entirely<a class="cite" href="#ref-2">2</a>.</p>
+<h2 id="persistence-checkpointing">6. Persistence, checkpointing, and when lineage isn't enough</h2>
+<p>Spark gives programmers three storage options for a persisted RDD: as deserialized Java objects in memory, which is fastest because the JVM can access each element natively; as serialized data in memory, which is more space-efficient at some CPU cost to deserialize; and on disk, for RDDs too large to keep resident but too costly to recompute on every use<a class="cite" href="#ref-2">2</a>. When a new RDD partition needs space and there isn't enough, Spark evicts a partition from the least-recently-accessed RDD, using an LRU policy at the RDD level, unless the new partition belongs to the same RDD as the one being considered for eviction, in which case the old partition is kept to avoid cycling partitions of the same RDD in and out of memory<a class="cite" href="#ref-2">2</a>. Users get a further override for their own memory-priority tuning via a persistence-priority flag<a class="cite" href="#ref-2">2</a>.</p>
+<p>Lineage-based recovery can always reconstruct a lost RDD, but §5.2 already showed that "always possible" and "always cheap" are different claims once wide dependencies are involved. The paper is explicit that checkpointing — writing an RDD's data, not its lineage, out to stable storage — is useful specifically for RDDs with long lineage graphs containing wide dependencies, such as the <code>ranks</code> dataset in the PageRank example, where a node failure could force recomputation from every ancestor partition<a class="cite" href="#ref-2">2</a>. For RDDs built entirely from narrow dependencies on data already in stable storage — the <code>points</code> RDD in the logistic-regression example, or the static <code>links</code> RDD in PageRank — checkpointing may never be worth it: if a node fails, the lost partitions can be recomputed in parallel on other nodes at a fraction of the cost of replicating the whole RDD<a class="cite" href="#ref-2">2</a>.</p>
+<p>Spark's checkpointing API at the time of the paper was manual: a <code>REPLICATE</code> flag passed to <code>persist()</code>, leaving the decision of which RDDs to checkpoint entirely to the programmer<a class="cite" href="#ref-2">2</a>. The paper flags automatic checkpoint-set selection as future work, noting that because the scheduler already knows each dataset's size and the time it originally took to compute, it should in principle be able to choose an optimal checkpoint set to minimize expected recovery time — but that optimization was not implemented in the system the paper measures<a class="cite" href="#ref-2">2</a>. One property makes checkpointing itself cheaper here than in a general DSM system: because RDDs are read-only, checkpointing can run in the background without requiring the application to pause or take a consistent distributed snapshot, since there is no concurrent mutation to a checkpointed RDD to race against<a class="cite" href="#ref-2">2</a>.</p>
+<h2 id="measured-speedups">7. The measured case for Spark</h2>
+<p>The paper's headline claims are stated in its abstract and then backed with specific benchmarks: Spark is up to 20x faster than Hadoop for iterative applications, speeds up a real-world data analytics report by 40x, and can be used interactively to scan a 1 TB dataset with 5-7 second latency<a class="cite" href="#ref-2">2</a>. The benchmarks that produce the "20x" figure compare three systems on a 100-node EC2 cluster running 10 iterations over 100 GB of data: stock Hadoop 0.20.2; "HadoopBinMem," a variant that pre-converts the input to a low-overhead binary format and serves it from an in-memory HDFS instance, isolating the cost of text parsing from the cost of the Hadoop stack itself; and Spark<a class="cite" href="#ref-2">2</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f5t"><title id="f5t">Hadoop vs Spark per-iteration time for logistic regression and k-means, 100-node cluster, 100 GB</title>
+    <line x1="70" y1="250" x2="740" y2="250" class="d-axis"/>
+    <line x1="70" y1="30" x2="70" y2="250" class="d-axis"/>
+    <text x="30" y="45" class="d-small d-text-light">120s</text>
+    <line x1="70" y1="40" x2="740" y2="40" class="d-grid"/>
+    <text x="30" y="145" class="d-small d-text-light">60s</text>
+    <line x1="70" y1="145" x2="740" y2="145" class="d-grid"/>
+    <text x="30" y="245" class="d-small d-text-light">0s</text>
+
+    <!-- Logistic regression group -->
+    <rect x="140" y="90" width="60" height="160" class="d-fill-blue"/>
+    <text x="170" y="82" text-anchor="middle" class="d-mono d-small">76</text>
+    <text x="170" y="268" text-anchor="middle" class="d-small">Hadoop</text>
+
+    <rect x="220" y="118" width="60" height="132" class="d-fill-cyan"/>
+    <text x="250" y="110" text-anchor="middle" class="d-mono d-small">62</text>
+    <text x="250" y="268" text-anchor="middle" class="d-small">HadoopBM</text>
+
+    <rect x="300" y="242" width="60" height="8" class="d-fill-orange"/>
+    <text x="330" y="234" text-anchor="middle" class="d-mono d-small">3</text>
+    <text x="330" y="268" text-anchor="middle" class="d-small">Spark</text>
+
+    <text x="250" y="295" text-anchor="middle" class="d-bold d-small">Logistic Regression &mdash; 25.3x / 20.7x faster</text>
+
+    <!-- K-means group -->
+    <rect x="480" y="34" width="60" height="216" class="d-fill-blue"/>
+    <text x="510" y="26" text-anchor="middle" class="d-mono d-small">106</text>
+    <text x="510" y="268" text-anchor="middle" class="d-small">Hadoop</text>
+
+    <rect x="640" y="181" width="60" height="69" class="d-fill-orange"/>
+    <text x="670" y="173" text-anchor="middle" class="d-mono d-small">33</text>
+    <text x="670" y="268" text-anchor="middle" class="d-small">Spark</text>
+
+    <text x="590" y="295" text-anchor="middle" class="d-bold d-small">K-Means &mdash; 3.2x faster</text>
+    <text x="400" y="18" text-anchor="middle" class="d-small d-text-light">Average time per iteration after the first (seconds)</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Later-iteration time for logistic regression and k-means, 100-node cluster, 100 GB of data, redrawn from the paper's Figure 7<a class="cite" href="#ref-2">2</a>. Logistic regression is I/O- and deserialization-bound, so avoiding repeated HDFS reads and object deserialization is worth 25.3x against Hadoop and 20.7x against the in-memory-binary HadoopBinMem variant<a class="cite" href="#ref-2">2</a>. K-means is compute-bound — most of its iteration time is spent on the clustering arithmetic itself, not I/O — so the same change in storage layer is worth only 3.2x, matching the paper's stated 1.9-3.2x range for k-means across cluster sizes<a class="cite" href="#ref-2">2</a>. The abstract's "up to 20x" is a conservative summary of the first number, not an average of both.</figcaption>
+</figure>
+
+<p>The paper's own explanation for why Spark beats even HadoopBinMem by a wide margin — despite HadoopBinMem already avoiding text parsing and serving data from RAM — is threefold: a minimum fixed overhead in the Hadoop software stack itself (measured at at least 25 seconds just for job setup, task startup, and cleanup on a no-op job); overhead in HDFS while serving data, including multiple in-memory copies and a checksum computed for every block served; and the cost of deserializing binary records into usable in-memory Java objects, which the paper measured at about 3 seconds on top of a 2-second HDFS-read overhead for 256 MB of input, comparable to the cost of the logistic-regression computation itself<a class="cite" href="#ref-2">2</a>. Spark avoids all three because RDD elements already sit in memory as native Java objects between operations; there is no HDFS layer, no checksum, and no deserialization step in the hot loop after the first read.</p>
+<p>Three more results round out the case, and each isolates a different mechanism. On PageRank over a 54 GB Wikipedia dump (roughly 4 million articles, 10 iterations), in-memory storage alone gives Spark a 2.4x speedup over Hadoop at 30 machines; additionally controlling the <em>partitioning</em> of the RDDs so it stays consistent across iterations — hash-partitioning the static <code>links</code> RDD once so every <code>join</code> against the per-iteration <code>ranks</code> RDD needs no shuffle — improves that to 7.4x, and the result scales nearly linearly out to 60 machines<a class="cite" href="#ref-2">2</a>. On fault recovery, a 75-node, 10-iteration k-means run with a machine killed at the start of iteration 6 shows iteration times holding steady at about 58 seconds for iterations 1-5, jumping to 80 seconds for iteration 6 while Spark re-runs the lost tasks and reconstructs the affected RDD partitions via lineage, then returning to 58 seconds for the remaining iterations<a class="cite" href="#ref-2">2</a> — a 22-second, one-time cost to lose and rebuild one node's share of the data, not a job-wide restart. And on interactive querying, scanning an entire 1 TB in-memory Wikipedia page-view-log dataset across 100 <code>m2.4xlarge</code> instances returns query results in 5-7 seconds, more than an order of magnitude faster than the 170 seconds the same query takes reading the same 1 TB file from disk<a class="cite" href="#ref-2">2</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> MapReduce and Spark/RDD compared on the mechanisms this module derived<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Property</th><th>MapReduce</th><th>Spark / RDD</th></tr></thead>
+<tbody>
+<tr><td class="row">Durability of intermediate output</td><td>Map output: local disk (ephemeral). Reduce output: GFS (replicated)</td><td>Lineage graph (metadata, &lt;10 KB typical); data optionally checkpointed</td></tr>
+<tr><td class="row">Fault-tolerance mechanism</td><td>Re-execute the failed task from its input</td><td>Recompute only the lost partition from its lineage</td></tr>
+<tr><td class="row">Unit of recovery on node loss</td><td>Every map/reduce task that was on that node</td><td>The lost partitions only &mdash; whole ancestors only if a wide dependency is involved</td></tr>
+<tr><td class="row">Straggler mitigation</td><td>Backup tasks near job completion<a class="cite" href="#ref-1">1</a></td><td>Backup tasks, same mechanism, reused directly<a class="cite" href="#ref-2">2</a></td></tr>
+<tr><td class="row">Data reuse across jobs/queries</td><td>Write to GFS/HDFS, re-read by the next job</td><td><code>persist()</code> keeps partitions resident in memory across actions</td></tr>
+<tr><td class="row">Programming restriction</td><td>Two typed functions, map and reduce</td><td>Coarse-grained transformations only (map, filter, join, ...); no fine-grained writes</td></tr>
+<tr><td class="row">Iterative workload, 100 GB, 100 nodes</td><td data-worst>76 s/iteration (logistic regression)<a class="cite" href="#ref-2">2</a></td><td data-best>3 s/iteration (logistic regression)<a class="cite" href="#ref-2">2</a></td></tr>
+<tr><td class="row">Best fit</td><td>One-shot batch jobs over data used once</td><td>Iterative algorithms and interactive queries reusing the same data</td></tr>
+</tbody>
+</table>
+<h2 id="batch-vs-stream">8. Batch and stream processing after MapReduce: micro-batch vs continuous dataflow</h2>
+<p>Everything so far assumes bounded input: a fixed set of files sitting in GFS or HDFS, known in advance, that a job reads once from beginning to end. A general textbook framing of the alternative is useful here: batch processing takes a finite input and produces a finite output; stream processing treats its input as unbounded, a series of events that keeps arriving and is never "done"<a class="cite" href="#ref-3">3</a>. Module 8 covered the log (Kafka) that supplies unbounded input in practice; this section is about what a compute framework does with it, because the RDD paper itself already names the resulting fork.</p>
+<p>The RDD paper's own related-work section calls out "batched stream processing" as an adjacent, not-yet-unified problem: systems were being proposed at the time that periodically update a result with new data — recomputing a report every 15 minutes by combining intermediate state from the previous window with newly arrived logs — performing bulk operations similar to Dryad but storing application state in distributed filesystems, where placing that intermediate state in RDDs instead would speed the processing up<a class="cite" href="#ref-2">2</a>. That description is, almost exactly, Spark Streaming: a stream is discretized into a sequence of small, bounded RDDs, each covering a short time window, and the exact same map/reduce-lineage machinery from §§5-7 runs on each one in turn. Spark's current production successor to that design, Structured Streaming, states its own execution model directly: "by default, Structured Streaming queries are processed using a micro-batch processing engine, which processes data streams as a series of small batch jobs," and reports end-to-end latencies as low as 100 milliseconds with exactly-once fault-tolerance guarantees, inherited from the same lineage-based recovery this module derived for batch RDDs<a class="cite" href="#ref-4">4</a>.</p>
+<p>Flink starts from the opposite direction. A Flink program is a dataflow: sources read input, transformations are applied by calling methods that add operators to the graph, and sinks consume the resulting stream and forward it to files, sockets, or external systems<a class="cite" href="#ref-5">5</a>. Flink programs execute lazily — the data loading and transformations described in a program's code do not run when the code runs; instead, each operation is added to a dataflow graph, and the graph as a whole is triggered as one holistically planned, continuously running unit only when execution is explicitly requested<a class="cite" href="#ref-5">5</a>. There is no discretization step: a record that arrives is processed by the operator graph as it arrives, not batched up into a window first and handed to a scheduler that treats each window as an independent job. Spark itself offers a matching continuous-processing option — since Spark 2.3, an experimental Continuous Processing mode achieves end-to-end latencies as low as 1 millisecond, but only with at-least-once guarantees rather than the micro-batch engine's exactly-once<a class="cite" href="#ref-4">4</a>, which is the tell that record-at-a-time execution and the lineage-replay recovery this module spent §§5-7 deriving are not free to combine: give up the discrete, replayable batch boundary and you give up exactly-once for free, too.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Section 8 already surfaced the live fork: once a compute framework has to process unbounded input rather than the bounded input §§1-7 assumed, should it reuse the batch engine's job-and-scheduler machinery by discretizing the stream into small batches, or should it be built ground-up as a continuously running dataflow that processes one record at a time? This is not a resolved question with one side simply wrong — it is a genuine architectural fork that two widely deployed systems answer differently, and the answer changes what a downstream engineer gets for free and what they have to build themselves.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Discretize into micro-batches, reuse the batch engine</h4>
+    <p class="who">Apache Spark / Structured Streaming<a class="cite" href="#ref-4">4</a>, and implicitly the RDD paper's own related-work framing of "batched stream processing" as an extension of bulk operations rather than a separate execution model<a class="cite" href="#ref-2">2</a></p>
+    <p>Treat a stream as a sequence of small, bounded RDDs (or DataFrames), one per short time window, and run the identical scheduling, lineage-tracking, and lazy-transformation machinery derived in §§5-7 on each one. Fault tolerance, exactly-once semantics, and the programming model are the same code path as batch Spark, not a second system with a second set of failure modes to learn.</p>
+    <ul class="pros">
+      <li>One fault-tolerance and consistency story for both batch and streaming jobs on the same platform<a class="cite" href="#ref-4">4</a></li>
+      <li>Exactly-once end-to-end by default, because each micro-batch is a replayable, lineage-tracked unit<a class="cite" href="#ref-4">4</a></li>
+      <li>Reuses a mature scheduler and the same operational tooling as every other Spark job on the cluster</li>
+    </ul>
+    <ul class="cons">
+      <li>Latency is bounded below by the batch interval; the default micro-batch engine's floor is around 100 ms<a class="cite" href="#ref-4">4</a></li>
+      <li>Spark's own lower-latency alternative (Continuous Processing, ~1 ms) trades away exactly-once for at-least-once, showing the discretization boundary is load-bearing for the stronger guarantee<a class="cite" href="#ref-4">4</a></li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Build a continuous dataflow engine from the ground up</h4>
+    <p class="who">Apache Flink<a class="cite" href="#ref-5">5</a></p>
+    <p>Represent the whole program as one dataflow graph of sources, operators, and sinks that runs continuously once triggered, with no discrete per-window job boundary at all<a class="cite" href="#ref-5">5</a>. Records are processed as they arrive rather than being collected into a window first, and the fault-tolerance mechanism (periodic distributed snapshots of operator state, not lineage replay of a bounded RDD) is designed around that continuity rather than adapted from a batch engine.</p>
+    <ul class="pros">
+      <li>No batch-interval floor on latency — records are handled individually, not accumulated into a window first</li>
+      <li>One execution model for genuinely unbounded streams, without borrowing a job abstraction designed for bounded input</li>
+    </ul>
+    <ul class="cons">
+      <li>A different checkpointing and backpressure mechanism from the batch engine's lineage-and-re-execution story this module derived, so an operator moving between Spark-style batch and Flink-style streaming systems is learning a second failure model, not reusing the first</li>
+      <li>Cannot lean on the arithmetic in §5.1's derivation (kilobytes of lineage standing in for gigabytes of data) in the same direct way, because there is no discrete RDD boundary at which to draw a lineage graph</li>
+    </ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Neither position is wrong; they are optimizing for different constraints, and the RDD paper's own text is the tell — it describes the micro-batch idea as a natural extension of the bulk-operation, lineage-based world it had just built, not as a concession<a class="cite" href="#ref-2">2</a>. Micro-batching wins whenever a pipeline already lives on Spark/RDD lineage (which, per Module 32, most training-data batch pipelines do) and a few hundred milliseconds of latency is acceptable: it is one system, one fault-tolerance model, and one operational surface for both the batch jobs this module derived and the streaming jobs built on top of them. A ground-up continuous dataflow engine wins when the workload's own latency budget is sub-100ms end to end, or when correctness depends on exactly-once state that spans arbitrarily many records rather than resetting at each micro-batch boundary — a case where a replayable, bounded unit of work is the wrong abstraction to begin with. What would settle it for a specific workload is not a benchmark of the engines in the abstract, but measuring where that workload's own latency requirement sits relative to the ~100ms micro-batch floor Spark's own documentation states as its default engine's achievable range<a class="cite" href="#ref-4">4</a>: above that floor, the reuse argument for micro-batching dominates; below it, the case for a purpose-built continuous engine does.</p></div>
+</section>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">paper</span>Dean, J., Ghemawat, S. <em>MapReduce: Simplified Data Processing on Large Clusters</em>. OSDI 2004. <a href="https://research.google.com/archive/mapreduce-osdi04.pdf">https://research.google.com/archive/mapreduce-osdi04.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the map/reduce type contract (§2.2), execution overview and Figure 1 (§3.1), master data structures and task-granularity arithmetic (§3.2, §3.5), worker/master failure handling (§3.3), locality optimization (§3.4), combiner functions (§4.3), backup tasks/stragglers (§3.6, §5.4), and the August 2004 production statistics (Table 1).</span></li>
+<li id="ref-2"><span class="ref-type">paper</span>Zaharia, M., Chowdhury, M., Das, T., Dave, A., Ma, J., McCauley, M., Franklin, M. J., Shenker, S., Stoica, I. <em>Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing</em>. USENIX NSDI 2012. <a href="https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final138.pdf">https://www.usenix.org/system/files/conference/nsdi12/nsdi12-final138.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the RDD abstraction and lineage graph (§2.1, Fig.1), the RDD-vs-DSM comparison and Table 1 (§2.3), narrow vs wide dependencies (§4, Fig.4/5), persistence/LRU eviction and checkpointing (§5.3/§5.4), and all benchmark figures (§6, Figs.7-14).</span></li>
+<li id="ref-3"><span class="ref-type">textbook</span>Kleppmann, M., Riccomini, C. <em>Designing Data-Intensive Applications</em>. 2nd ed., O'Reilly Media, 2026. <a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the general bounded-input (batch) vs. unbounded-input (stream) framing (no specific chapter cited — the publisher's table-of-contents page returned HTTP 403 to automated fetch, and 2nd-edition chapter numbering relative to the well-known 1st-edition Batch Processing/Stream Processing chapters is unconfirmed).</span></li>
+<li id="ref-4"><span class="ref-type">official</span>The Apache Software Foundation. <em>Structured Streaming Programming Guide</em>. Apache Spark v3.5.6 docs. <a href="https://spark.apache.org/docs/3.5.6/structured-streaming-programming-guide.html">https://spark.apache.org/docs/3.5.6/structured-streaming-programming-guide.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the default micro-batch processing engine and its ~100ms end-to-end latency with exactly-once guarantees, and the experimental Continuous Processing mode's ~1ms latency with at-least-once guarantees (Overview section).</span></li>
+<li id="ref-5"><span class="ref-type">official</span>The Apache Software Foundation. <em>DataStream API — Anatomy of a Flink Program</em>. Apache Flink 1.19 docs. <a href="https://nightlies.apache.org/flink/flink-docs-release-1.19/docs/dev/datastream/overview/">https://nightlies.apache.org/flink/flink-docs-release-1.19/docs/dev/datastream/overview/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the dataflow-graph program model (sources, transformations, sinks) and lazy, continuously-executing dataflow graph semantics.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

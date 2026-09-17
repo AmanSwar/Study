@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consistency Models: Linearizability, CAP, and PACELC · System Design</title>
+<meta name="description" content="Why CAP is the wrong question and PACELC is the right one: what a system gives up during a partition, and what it gives up every day when there isn't one.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 5</p>
+  <h1>Consistency Models: Linearizability, CAP, and PACELC</h1>
+  <p class="lede">CAP proves an impossibility that only applies during a network partition; it says nothing about the far more common case where the network is fine. PACELC fixes that by making the every-day latency-versus-consistency trade a first-class, separate decision. After this module you can classify any storage system in this course — Bigtable, Dynamo, Spanner, ZooKeeper, PNUTS — as PA/EL, PC/EC, or PC/EL, and predict its behavior both during and absent a partition.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>11</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 3, Module 4</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 460" role="img" aria-labelledby="f1t"><title id="f1t">PACELC decision tree with Dynamo, Spanner, and PNUTS placed on it</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="300" y="10" width="200" height="50" rx="8" class="d-block"/>
+    <text x="400" y="30" text-anchor="middle" class="d-text-inv d-bold">Is there a</text>
+    <text x="400" y="48" text-anchor="middle" class="d-text-inv d-bold">partition right now?</text>
+    <path d="M370,60 L220,110" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="270" y="90" text-anchor="middle" class="d-mono d-small">yes (P)</text>
+    <path d="M430,60 L580,110" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="530" y="90" text-anchor="middle" class="d-mono d-small">no (E, else)</text>
+
+    <rect x="120" y="110" width="200" height="50" rx="8" class="d-block-2"/>
+    <text x="220" y="130" text-anchor="middle" class="d-text-inv d-bold">Availability (A)</text>
+    <text x="220" y="148" text-anchor="middle" class="d-text-inv d-bold">or Consistency (C)?</text>
+
+    <rect x="480" y="110" width="200" height="50" rx="8" class="d-block-2"/>
+    <text x="580" y="130" text-anchor="middle" class="d-text-inv d-bold">Latency (L)</text>
+    <text x="580" y="148" text-anchor="middle" class="d-text-inv d-bold">or Consistency (C)?</text>
+
+    <path d="M170,160 L100,210" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="110" y="188" text-anchor="middle" class="d-mono d-small">A</text>
+    <path d="M270,160 L300,210" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="300" y="188" text-anchor="middle" class="d-mono d-small">C</text>
+    <path d="M530,160 L470,210" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="480" y="188" text-anchor="middle" class="d-mono d-small">L</text>
+    <path d="M630,160 L680,210" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="670" y="188" text-anchor="middle" class="d-mono d-small">C</text>
+
+    <rect x="20" y="210" width="160" height="46" rx="8" class="d-fill-orange"/>
+    <text x="100" y="238" text-anchor="middle" class="d-text-inv d-bold">PA/EL</text>
+    <rect x="220" y="210" width="160" height="46" rx="8" class="d-fill-cyan"/>
+    <text x="300" y="238" text-anchor="middle" class="d-text-inv d-bold">PC/EL</text>
+    <rect x="400" y="210" width="160" height="46" rx="8" class="d-fill-cyan"/>
+    <text x="480" y="238" text-anchor="middle" class="d-text-inv d-bold">PC/EL</text>
+    <rect x="600" y="210" width="160" height="46" rx="8" class="d-fill-blue"/>
+    <text x="680" y="238" text-anchor="middle" class="d-text-inv d-bold">PC/EC</text>
+
+    <line x1="20" y1="280" x2="780" y2="280" class="d-grid"/>
+    <rect x="20" y="300" width="220" height="66" rx="8" class="d-surface d-stroke-orange"/>
+    <text x="130" y="322" text-anchor="middle" class="d-bold">Dynamo</text>
+    <text x="130" y="340" text-anchor="middle" class="d-text-light d-small">Cassandra, Riak</text>
+    <text x="130" y="356" text-anchor="middle" class="d-mono d-small">always writeable</text>
+
+    <rect x="290" y="300" width="220" height="66" rx="8" class="d-surface d-stroke-cyan"/>
+    <text x="400" y="322" text-anchor="middle" class="d-bold">PNUTS</text>
+    <text x="400" y="340" text-anchor="middle" class="d-text-light d-small">record-level mastering</text>
+    <text x="400" y="356" text-anchor="middle" class="d-mono d-small">async replicate, CP on partition</text>
+
+    <rect x="560" y="300" width="220" height="66" rx="8" class="d-surface d-stroke-blue"/>
+    <text x="670" y="322" text-anchor="middle" class="d-bold">Spanner</text>
+    <text x="670" y="340" text-anchor="middle" class="d-text-light d-small">Megastore, VoltDB/H-Store</text>
+    <text x="670" y="356" text-anchor="middle" class="d-mono d-small">TrueTime + 2PC over Paxos</text>
+
+    <path d="M130,300 L100,256" class="d-dashed d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M400,300 L370,256" class="d-dashed d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M670,300 L680,256" class="d-dashed d-arrow" marker-end="url(#f1-arr)"/>
+
+    <text x="400" y="410" text-anchor="middle" class="d-text-light d-small">Two independent axes: what a system gives up during a partition (P), and what it gives up the rest of the time (E, "else")</text>
+    <text x="400" y="430" text-anchor="middle" class="d-text-light d-small">PA/EC is empirically near-absent — trading availability away during a partition but latency away absent one has little motivation</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> PACELC asks two separate questions instead of CAP's one: during a partition (P), does the system choose availability (A) or consistency (C); absent a partition (E, "else"), does it choose latency (L) or consistency (C)<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>. Dynamo is PA/EL by explicit design target<a class="cite" href="#ref-7">7</a>; Spanner is PC/EC, paying TrueTime commit-wait and cross-group consensus on every write whether or not anything is partitioned<a class="cite" href="#ref-6">6</a>; PNUTS defaults to PC/EL — it trades consistency for latency in normal operation but reverts to protecting consistency, not availability, once a partition actually occurs<a class="cite" href="#ref-8">8</a>.</figcaption>
+</figure>
+
+<h2 id="linearizability">1. Linearizability: the guarantee CAP's "C" actually means</h2>
+<p>Every discussion of CAP and PACELC leans on a word — "consistency" — that means something different in every other context you have encountered it. It is not ACID consistency (Module 4's invariant-preservation property) and it is not the "eventual consistency" marketing term. The consistency in CAP is <b>linearizability</b>, a precise correctness condition for a single object shared by concurrent processes, defined by Herlihy and Wing in 1990 specifically so it could be reasoned about with the same techniques used for sequential programs<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="linearizability-definition">1.1 The formal definition: L1 and L2</h3>
+<p>Herlihy and Wing model a concurrent system as a <i>history</i>: a sequence of operation invocation and response events, each tagged with a process<a class="cite" href="#ref-1">1</a>. A history induces a partial order \(<_H\) on operations: \(e_0 <_H e_1\) if the response of \(e_0\) precedes the invocation of \(e_1\)<a class="cite" href="#ref-1">1</a> — this is the "real-time" precedence the rest of this section keeps referring to. A history \(H\) is <b>linearizable</b> if it can be extended, by appending zero or more pending responses, to a history \(H'\) such that two conditions hold<a class="cite" href="#ref-1">1</a>:</p>
+<ul>
+<li><b>L1:</b> complete(\(H'\)) is equivalent to some legal sequential history \(S\) — i.e., there exists <i>some</i> valid reordering of the completed operations that respects the object's own sequential semantics.</li>
+<li><b>L2:</b> \(<_H \subseteq <_S\) — that reordering does not violate any real-time ordering already present in \(H\): if operation A finished (in real time) before operation B started, S must not place B before A.</li>
+</ul>
+<p>Read informally, this says exactly what the intuitive story about linearizability always says — "each operation appears to take effect instantaneously at some point between its invocation and its response"<a class="cite" href="#ref-1">1</a> — but L1/L2 is the version you can actually prove things about. The paper's own FIFO-queue and register examples are worth internalizing because CAP's proof (§2) reuses exactly this apparatus: a history where B reads the value 1 after A already read a 1 that B itself wrote is <i>not</i> acceptable, because to be consistent with real-time order, B's write of 1 must be placed before A's read of 1 in any legal serialization, yet C's later write of 0 (concurrent with B's write) must still come after A's read — over-constraining the reordering until no legal sequential history satisfies both conditions<a class="cite" href="#ref-1">1</a>.</p>
+<p>Two properties of linearizability matter for everything that follows in this module. It is <b>local</b>: a system composed of several linearizable objects is itself linearizable, so you can reason about one key at a time<a class="cite" href="#ref-1">1</a>. And it is <b>nonblocking</b> in the sense that a pending invocation is never required to wait for a later operation to be issued before it can be linearized — "processes invoking totally-defined operations are never forced to wait," which the authors note makes it "an appropriate condition for systems for which real-time response is critical"<a class="cite" href="#ref-1">1</a>. Neither property is optional scaffolding; both are exactly what a distributed implementation has to reproduce to call itself linearizable, and both are what start to break the moment you replicate the object across machines that cannot instantaneously agree on order.</p>
+
+<h3 id="linearizability-vs-serializability">1.2 Why it is a different axis from the serializability Module 4 covered</h3>
+<p>Module 4 covered isolation levels — read committed, snapshot isolation, serializable — as properties of <i>multi-operation transactions</i> touching possibly many objects, concerned with which anomalies (dirty reads, write skew, phantoms) a given level still permits. Linearizability is orthogonal: it is a property of <i>individual operations on a single object</i>, concerned only with whether those operations respect real-time order. A system can be serializable (transactions behave as if run one at a time, in some order) without being linearizable (that order can disagree with real, wall-clock arrival order) — this is exactly why Module 4's isolation ladder and this module's consistency ladder are two different papers' worth of vocabulary, not one relabeled. A single-key read in a linearizable store is the strongest possible guarantee for that one key: whatever the most recent completed write was, in real time, a subsequent read must see it or something newer. This is the guarantee Gilbert and Lynch chose to formalize CAP's "C" around, and the reason: it is the guarantee that is hardest to keep during a partition, so it makes the strongest, cleanest theorem<a class="cite" href="#ref-2">2</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Two operation histories on a register, one linearizable and one not</title>
+    <text x="20" y="30" class="d-bold">History H&#8321; — linearizable</text>
+    <line x1="20" y1="60" x2="760" y2="60" class="d-axis"/>
+    <text x="770" y="64" class="d-mono d-small">t</text>
+    <rect x="60" y="45" width="140" height="26" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="130" y="62" text-anchor="middle" class="d-mono d-small">W(0)&#160;A</text>
+    <rect x="260" y="45" width="140" height="26" rx="4" class="d-fill-cyan-soft d-stroke-cyan"/>
+    <text x="330" y="62" text-anchor="middle" class="d-mono d-small">R(0)&#160;B</text>
+    <text x="420" y="100" class="d-text-light d-small">B's read starts after A's write finished — real-time order forces R to see 0. It does. Legal.</text>
+
+    <text x="20" y="150" class="d-bold">History H&#8322; — not linearizable</text>
+    <line x1="20" y1="180" x2="760" y2="180" class="d-axis"/>
+    <text x="770" y="184" class="d-mono d-small">t</text>
+    <rect x="60" y="165" width="140" height="26" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="130" y="182" text-anchor="middle" class="d-mono d-small">W(1)&#160;A</text>
+    <rect x="260" y="165" width="140" height="26" rx="4" class="d-fill-cyan-soft d-stroke-cyan"/>
+    <text x="330" y="182" text-anchor="middle" class="d-mono d-small">R(0)&#160;B</text>
+    <text x="420" y="220" class="d-text-light d-small">B's read starts after A's write of 1 finished, but returns the stale value 0.</text>
+    <text x="420" y="240" class="d-text-light d-small">No sequential reordering can satisfy L2: A's write must precede B's read (real-time),</text>
+    <text x="420" y="260" class="d-text-light d-small">yet B's read result (0) requires the opposite. Not linearizable — the shape of a</text>
+    <text x="420" y="280" class="d-text-light d-small">stale-replica read after a partition heals.</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> A linearizable history (top) versus one that violates real-time order (bottom), following Herlihy and Wing's history-and-partial-order apparatus<a class="cite" href="#ref-1">1</a>. The bottom pattern — a read that starts after a write's real-time completion but returns the pre-write value — is exactly the anomaly a replica lagging behind a leader, or a client reading from the wrong side of a healed partition, produces.</figcaption>
+</figure>
+
+<h2 id="cap-theorem">2. The CAP theorem: what Gilbert and Lynch actually proved</h2>
+<p>Eric Brewer conjectured, in an invited talk at PODC 2000, that a web service cannot simultaneously provide consistency, availability, and partition tolerance<a class="cite" href="#ref-2">2</a>. Gilbert and Lynch's 2002 note gave that conjecture a formal model and a proof<a class="cite" href="#ref-2">2</a>. The proof is short, and it is worth walking through directly, because almost every misunderstanding of CAP traces back to skipping it and working from the "2 of 3" slogan instead.</p>
+
+<h3 id="cap-formal-model">2.1 The formal model: three definitions, precisely stated</h3>
+<p>Gilbert and Lynch define their three terms as narrowly as possible, on purpose<a class="cite" href="#ref-2">2</a>:</p>
+<ul>
+<li><b>Consistency</b> is atomic consistency, which they note is equivalent to linearizability<a class="cite" href="#ref-2">2</a> — Section 1's L1/L2, applied to a read/write register: "there must exist a total order on all operations such that each operation looks as if it were completed at a single instant," with the property that "any read operation that begins after a write operation completes must return that value, or the result of a later write operation"<a class="cite" href="#ref-2">2</a>.</li>
+<li><b>Availability</b> means "every request received by a non-failing node in the system must result in a response"<a class="cite" href="#ref-2">2</a> — eventually, with no bound on how long, which the authors call a weak definition in isolation but a strong one once partition tolerance is also required, "since even when severe network failures occur, every request must terminate"<a class="cite" href="#ref-2">2</a>.</li>
+<li><b>Partition tolerance</b> is modeled by allowing the network to lose arbitrarily many messages between two disjoint, non-empty node sets, with "any pattern of message loss" reducible to this model<a class="cite" href="#ref-2">2</a>.</li>
+</ul>
+<p>Notice what is <i>not</i> in these definitions: nothing about latency, nothing about how the system behaves when the network is fine, and nothing weaker than 100% availability — Brewer's original talk allowed "almost all" requests to succeed, but Gilbert and Lynch simplify to 100% because allowing probabilistic availability does not change the result under arbitrary failures<a class="cite" href="#ref-2">2</a>. Every one of PACELC's later refinements (Section 4) comes from restoring one of these deliberately narrowed corners.</p>
+
+<h3 id="cap-proof">2.2 The impossibility proof, sketched</h3>
+<p>Theorem 1 states it plainly: "It is impossible in the asynchronous network model to implement a read/write data object that guarantees... availability [and] atomic consistency... in all fair executions (including those in which messages are lost)"<a class="cite" href="#ref-2">2</a>. The proof is a contradiction built on a partition into two groups \(G_1\) and \(G_2\)<a class="cite" href="#ref-2">2</a>:</p>
+<ol>
+<li>Let \(\alpha_1\) be an execution prefix in which a single write (of a value \(\neq v_0\)) happens in \(G_1\) and completes — by the availability requirement, it must complete, since no messages from \(G_1\) reach \(G_2\) during this prefix and vice versa.</li>
+<li>Let \(\alpha_2\) be a separate execution prefix in which a single read happens in \(G_2\), with no write having occurred in \(G_2\) — by availability, this read also completes, and because no write has occurred in this prefix, it must return the initial value \(v_0\).</li>
+<li>Concatenate \(\alpha_1\) then \(\alpha_2\) into one execution \(\alpha\). To the nodes in \(G_2\), \(\alpha\) is indistinguishable from \(\alpha_2\) alone, because every message from \(G_1\) to \(G_2\) is lost in both. So the read in \(\alpha\) still returns \(v_0\) — even though, in real time, it started after \(\alpha_1\)'s write had already completed.</li>
+<li>That is a direct violation of atomic consistency's real-time requirement (Section 1.1's L2): a read that starts after a write's completion returned the pre-write value. Contradiction — no such algorithm exists<a class="cite" href="#ref-2">2</a>.</li>
+</ol>
+<p>The proof depends on nothing about clocks, quorums, or specific algorithms — it depends only on the fact that in the asynchronous model, a node in \(G_2\) has no way to distinguish "the message from \(G_1\) was lost" from "the message from \(G_1\) hasn't arrived yet, but will." That is precisely why a system with an unbounded number of possible network delays cannot use a timeout to safely tell the two cases apart, and why Corollary 1.1 extends the result even to executions where messages are merely delayed, not actually dropped<a class="cite" href="#ref-2">2</a>.</p>
+
+<h3 id="cap-three-pairs">2.3 The three pairwise-achievable systems</h3>
+<p>Because the theorem only rules out all three simultaneously, Gilbert and Lynch also show each pair is separately easy<a class="cite" href="#ref-2">2</a>:</p>
+<ul>
+<li><b>CP</b> (consistent, partition-tolerant, not always available): a single designated node holds the value; if it becomes unreachable, requests to it simply do not get a response. "Many distributed databases provide this type of guarantee, especially algorithms based on distributed locking or quorums"<a class="cite" href="#ref-2">2</a>.</li>
+<li><b>CA</b> (consistent, available, not partition-tolerant): the same centralized algorithm works fine as long as no partition actually happens — "systems that run on intranets and LANs are an example"<a class="cite" href="#ref-2">2</a>. This is the quadrant traditional single-datacenter relational databases occupy: they are not proven wrong by CAP, they simply never faced the partition CAP is about.</li>
+<li><b>AP</b> (available, partition-tolerant, not consistent): if there are no consistency requirements at all, the trivial service that always answers with the last value it has, or even the initial value \(v_0\), is available and partition-tolerant<a class="cite" href="#ref-2">2</a>. Real AP systems, obviously, do much better than the trivial case — Dynamo's whole design (Section 7) is the engineering required to make "available, partition-tolerant, not linearizable" still useful.</li>
+</ul>
+<p>The theorem's actual content, stated precisely, is this: <i>if</i> a partition occurs, <i>then</i> a system relying on linearizable reads/writes must choose between answering (and risking inconsistency) or refusing to answer (and losing availability) for the affected data. It says nothing at all about what a system should do the other 99.9%+ of the time when the network has not partitioned — and that silence is exactly Section 3's subject.</p>
+
+<h2 id="cap-blind-spot">3. CAP's blind spot: what the theorem is silent about</h2>
+<p>Twelve years after his conjecture, Brewer published a retrospective making the same point this module is building toward: the "2 of 3" framing "was always misleading because it tended to oversimplify the tensions among properties," and "CAP prohibits only a tiny part of the design space: perfect availability and consistency in the presence of partitions, which are rare"<a class="cite" href="#ref-3">3</a>. Practitioners who read CAP as license to design their steady-state system around whichever letter they dropped were reading it for a claim it never made.</p>
+
+<h3 id="two-of-three-misleading">3.1 Why "2 of 3" is a misreading</h3>
+<p>Brewer gives three specific reasons the binary framing breaks down<a class="cite" href="#ref-3">3</a>:</p>
+<ul>
+<li><b>Partitions are rare, so there is little reason to forfeit C or A when the system is not partitioned.</b> The theorem is a statement about a contingency, not a permanent posture.</li>
+<li><b>The choice between C and A can happen many times within the same system, at fine granularity</b> — "not only can subsystems make different choices, but the choice can change according to the operation or the specific data or user involved"<a class="cite" href="#ref-3">3</a>. A store that refuses writes to an unreachable shard while continuing to serve reads from a healthy one is not cleanly "CP" or "AP"; it is both, at different granularity.</li>
+<li><b>All three properties are more continuous than binary.</b> Availability is a percentage, not a bit; consistency has "many levels... including disagreement within the system about whether a partition exists" at all<a class="cite" href="#ref-3">3</a> — a claim that maps directly onto Module 11's SLO vocabulary two modules ahead.</li>
+</ul>
+<p>Brewer's own recommended discipline is to treat a partition as a first-class event with three explicit phases: <b>detect</b> the start of a partition, <b>enter an explicit partition mode</b> that may limit some operations, and <b>initiate recovery</b> when communication is restored, which must both merge the states that diverged on each side and "compensate for any mistakes made during the partition"<a class="cite" href="#ref-3">3</a>. His own diagram of this process — consistent state \(S\), diverging into inconsistent \(S_1\)/\(S_2\) once partition mode begins, merging back into consistent \(S'\) once recovery completes<a class="cite" href="#ref-3">3</a> — is the template every AP system in this course quietly implements: Dynamo's vector clocks (Module 3) are exactly the bookkeeping needed to make the \(S_1\)/\(S_2\) merge in that diagram well-defined instead of a guess.</p>
+
+<h3 id="two-cp-systems">3.2 Two systems, both "CP," behaving differently absent a partition</h3>
+<p>Here is the blind spot made concrete. Classify a system as CP if, when a minority of replicas becomes unreachable, that minority refuses to serve linearizable reads or writes rather than risk returning a stale or divergent answer. By that test, <b>Spanner and ZooKeeper are both CP</b>: a Spanner Paxos group that has lost its majority cannot commit a write (or serve an up-to-date read) on the affected data<a class="cite" href="#ref-6">6</a>, and ZooKeeper's write path is explicitly linearizable via its Zab atomic-broadcast protocol, which likewise requires a majority<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-10">10</a>. During an actual partition, an outside observer watching only the minority side cannot tell these two systems apart: both simply stop answering for the affected keys.</p>
+<p>Absent a partition, they could not be more different. Spanner assigns every read-write transaction a commit timestamp and then makes the coordinator wait — <b>commit-wait</b>, detailed in Section 5 — until that timestamp is definitely in the past, guaranteeing external consistency on every single write, all the time, not only when something is wrong<a class="cite" href="#ref-6">6</a>. ZooKeeper takes the opposite stance on the read path specifically: "We show for the target workloads, 2:1 to 100:1 read to write ratio, that ZooKeeper can handle tens to hundreds of thousands of transactions per second," which is only possible because "reads are served locally by any server and are not linearized"<a class="cite" href="#ref-8">8</a> — a client can read a value from a follower that a write has already superseded elsewhere, deliberately, to keep read latency at the cost of a single local hop rather than a quorum round trip. CAP's binary label calls both systems "CP." PACELC's second axis tells you Spanner is PC/EC (pays for consistency always) while ZooKeeper's read path is closer to PC/EL (pays for consistency only on writes, trades it for latency on reads) — the distinction the first theorem cannot express at all.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f3t"><title id="f3t">Spanner and ZooKeeper both classified CP by CAP, diverging under PACELC's else-branch</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="400" y="26" text-anchor="middle" class="d-title">During a partition — CAP sees these as identical</text>
+    <rect x="60" y="45" width="300" height="60" rx="8" class="d-panel"/>
+    <text x="210" y="68" text-anchor="middle" class="d-bold">Spanner, minority Paxos group</text>
+    <text x="210" y="90" text-anchor="middle" class="d-mono d-small">no quorum &#8594; write/strong-read refused</text>
+    <rect x="440" y="45" width="300" height="60" rx="8" class="d-panel"/>
+    <text x="590" y="68" text-anchor="middle" class="d-bold">ZooKeeper, minority side</text>
+    <text x="590" y="90" text-anchor="middle" class="d-mono d-small">no Zab quorum &#8594; write refused</text>
+    <text x="400" y="122" text-anchor="middle" class="d-bold d-fill-blue">both: CP</text>
+
+    <line x1="20" y1="150" x2="780" y2="150" class="d-grid"/>
+    <text x="400" y="174" text-anchor="middle" class="d-title">Absent a partition — PACELC's else-branch tells them apart</text>
+
+    <rect x="60" y="195" width="300" height="110" rx="8" class="d-surface d-stroke-blue"/>
+    <text x="210" y="218" text-anchor="middle" class="d-bold">Spanner: every write</text>
+    <text x="210" y="238" text-anchor="middle" class="d-mono d-small">2PC across Paxos groups</text>
+    <text x="210" y="256" text-anchor="middle" class="d-mono d-small">+ TrueTime commit-wait</text>
+    <text x="210" y="274" text-anchor="middle" class="d-mono d-small">every read: externally consistent</text>
+    <text x="210" y="294" text-anchor="middle" class="d-bold d-fill-cyan">EC — pays latency always</text>
+
+    <rect x="440" y="195" width="300" height="110" rx="8" class="d-surface d-stroke-cyan"/>
+    <text x="590" y="218" text-anchor="middle" class="d-bold">ZooKeeper: reads</text>
+    <text x="590" y="238" text-anchor="middle" class="d-mono d-small">served locally by any replica</text>
+    <text x="590" y="256" text-anchor="middle" class="d-mono d-small">not linearized (writes still are)</text>
+    <text x="590" y="274" text-anchor="middle" class="d-mono d-small">tens-hundreds of thousands ops/sec</text>
+    <text x="590" y="294" text-anchor="middle" class="d-bold d-fill-orange">EL on reads — trades C for latency</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Spanner and ZooKeeper are indistinguishable under CAP's binary test during a partition — both refuse service to a minority side rather than risk an inconsistent answer<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-8">8</a>. Absent a partition, PACELC's else-branch separates them: Spanner pays cross-group consensus plus TrueTime commit-wait on every operation to stay externally consistent at all times<a class="cite" href="#ref-6">6</a>; ZooKeeper deliberately serves reads from any single replica, unlinearized, to sustain the 2:1-to-100:1 read-heavy throughput its target workloads need<a class="cite" href="#ref-8">8</a>.</figcaption>
+</figure>
+
+<h2 id="pacelc">4. PACELC: the framework that fills the gap</h2>
+<p>Daniel Abadi named the gap in a 2010 blog post — "if there is a partition (P) how does the system tradeoff between availability and consistency (A and C); else (E) when the system is running as normal in the absence of partitions, how does the system tradeoff between latency (L) and consistency (C)?"<a class="cite" href="#ref-4">4</a> — and formalized it two years later in a peer-reviewed article<a class="cite" href="#ref-5">5</a>. The acronym is pronounced "pass-elk"<a class="cite" href="#ref-5">5</a>, and Figure 1 already showed its shape: two independent binary choices, not one three-way impossibility.</p>
+
+<h3 id="pacelc-definition">4.1 The formal definition and why it needed a second axis</h3>
+<p>Abadi's central argument is that CAP has been blamed for a design decision it never made: "it is wrong to assume that DDBSs that reduce consistency in the absence of any partitions are doing so due to CAP-based decision-making. In fact, CAP allows the system to make the complete set of ACID... guarantees alongside high availability when there are no partitions. Therefore, the theorem does not completely justify the default configuration of DDBSs that reduce consistency"<a class="cite" href="#ref-5">5</a>. The real reason systems like Dynamo, Cassandra, and PNUTS reduce consistency even when nothing is partitioned is a separate, always-present tradeoff: "this tradeoff exists even when there are no network partitions, and is thus completely separate from the tradeoffs CAP describes"<a class="cite" href="#ref-5">5</a> — the consistency/latency tradeoff, which Abadi treats as arguably more influential on real DDBS design than CAP itself, "because it has a more direct effect on the systems' baseline operations," whereas a network partition is comparatively rare<a class="cite" href="#ref-5">5</a>.</p>
+
+<h3 id="pacelc-mechanics">4.2 Where the else-branch tradeoff actually comes from</h3>
+<p>The mechanism is replication, and Abadi walks through exactly three ways to send an update to multiple replicas, each with its own latency cost<a class="cite" href="#ref-5">5</a>:</p>
+<ol>
+<li><b>Send updates to all replicas at the same time.</b> Done synchronously (wait for every replica to acknowledge before returning), this "increase[s] latency due to the requirement to pass messages between... entities and the fact that latency is limited by the slowest entity"<a class="cite" href="#ref-5">5</a> — and over a WAN, that slowest entity can be a continent away. Done asynchronously with no ordering agreement, replicas can diverge outright unless updates happen to be commutative.</li>
+<li><b>Send updates to an agreed-upon master node first.</b> The master resolves the order, then propagates. If replication onward is synchronous, you get consistency but every write pays at least one extra network hop to reach the master, and reads that must reach the master to avoid staleness inherit that same round trip even from a nearby replica — "even if there is a replica close to the read-request initiator, the system must still route the request to the master node, which potentially could be physically much farther away"<a class="cite" href="#ref-5">5</a>. If replication onward is asynchronous, reads can be served from any replica for lower latency, at the cost of possibly stale answers.</li>
+<li><b>Send updates to whichever node the client happens to reach first,</b> then propagate — the most decentralized option, and the one most exposed to conflicting concurrent updates initiated at two different locations simultaneously, which is exactly Dynamo's normal case (Section 7).</li>
+</ol>
+<p>Abadi's conclusion from walking every combination: "for data replication over a WAN, there is no way around the consistency/latency tradeoff"<a class="cite" href="#ref-5">5</a>. This is why the else-branch is not a footnote to CAP — it is a second, independent theorem-shaped constraint that applies to <i>every</i> geographically replicated system, whether or not it has ever seen a partition.</p>
+
+<h3 id="pacelc-classification">4.3 Classifying real systems</h3>
+<p>Abadi classifies the well-known DDBSs of 2012 directly, and every system named below already appears somewhere in this course:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> System classification under PACELC, per Abadi's 2012 formal treatment<a class="cite" href="#ref-5">5</a> and the primary papers for each system<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-9">9</a>.</caption>
+<thead><tr><th>System</th><th>Partition (P)</th><th>Else (E)</th><th>Class</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td class="row">Dynamo, Cassandra, Riak</td><td>availability</td><td>latency</td><td data-best>PA/EL</td><td>always-writeable design target<a class="cite" href="#ref-7">7</a>; tunable R+W, typically &lt; N</td></tr>
+<tr><td class="row">VoltDB/H-Store, Megastore</td><td>consistency</td><td>consistency</td><td>PC/EC</td><td>fully ACID; pay availability and latency costs to get it<a class="cite" href="#ref-5">5</a></td></tr>
+<tr><td class="row">Bigtable, HBase</td><td>consistency</td><td>consistency</td><td>PC/EC</td><td>single-master-per-tablet, Chubby quorum required to elect it<a class="cite" href="#ref-9">9</a></td></tr>
+<tr><td class="row">Spanner</td><td>consistency</td><td>consistency</td><td>PC/EC</td><td>2PC over Paxos groups plus TrueTime commit-wait on every write<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">PNUTS</td><td>consistency</td><td>latency</td><td data-best>PC/EL</td><td>async cross-region replication for latency; refuses writes to an unreachable master rather than resolve conflicting masters<a class="cite" href="#ref-5">5</a></td></tr>
+<tr><td class="row">MongoDB (default)</td><td>availability</td><td>consistency</td><td>PA/EC</td><td>elects a new master on failure (A), but old/new master states can briefly diverge and must reconcile via rollback — an unusual quadrant<a class="cite" href="#ref-5">5</a></td></tr>
+<tr><td class="row">ZooKeeper (writes / reads)</td><td>consistency</td><td>consistency / latency</td><td>PC/EC &amp; PC/EL</td><td>Zab-linearized writes require quorum; reads served locally, unlinearized<a class="cite" href="#ref-8">8</a></td></tr>
+</tbody>
+</table>
+<p>The empirically missing quadrant is PA/EC — give up availability during a partition <i>and</i> latency absent one, for no consistency benefit at all. Abadi notes MongoDB's default configuration is the closest real example to a non-obvious quadrant (PA/EC), precisely because "giving up Cs in PACELC makes the design simpler; once a system is configured to handle inconsistencies, it makes sense to give up consistency for both availability and lower latency" — meaning most systems that give up one C tend to give up the other too, which is exactly Abadi's original 2010 observation restated<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>. Sections 5 and 6 now take Spanner's and PNUTS's rows in Table 1 and show the actual mechanism behind each classification.</p>
+
+<h2 id="spanner-truetime">5. Spanner's answer: TrueTime and externally consistent commit-wait</h2>
+<p>Module 4 already introduced Spanner's two-phase commit over Paxos groups as the mechanism behind general cross-row transactions<a class="cite" href="#ref-6">6</a>. This section covers the piece that makes those transactions <i>externally consistent</i> — Spanner's own, stronger term for a linearizability guarantee that spans the whole database, not just one object — rather than merely serializable: "if the start of a transaction \(T_2\) occurs after the commit of a transaction \(T_1\), then the commit timestamp of \(T_2\) must be greater than the commit timestamp of \(T_1\)"<a class="cite" href="#ref-6">6</a>. Enforcing that invariant across machines that do not share a clock is what TrueTime is for.</p>
+
+<h3 id="truetime-api">5.1 The TrueTime API: an interval, not an instant</h3>
+<p>A normal clock API returns a single timestamp and hides its own error. TrueTime does the opposite: <code>TT.now()</code> returns a <code>TTinterval</code> — a pair \([\mathit{earliest}, \mathit{latest}]\) — guaranteed to bracket the true absolute time at which the call happened<a class="cite" href="#ref-6">6</a>. Formally, for an invocation \(tt = TT.now()\), Spanner guarantees \(tt.earliest \le t_{abs}(e_{now}) \le tt.latest\)<a class="cite" href="#ref-6">6</a>. Two convenience wrappers, <code>TT.after(t)</code> and <code>TT.before(t)</code>, answer "has \(t\) definitely passed" and "has \(t\) definitely not yet arrived"<a class="cite" href="#ref-6">6</a>.</p>
+<p>The width of that interval is driven by \(\epsilon\), the instantaneous error bound (half the interval's width), which Spanner keeps small using two independent physical time references — GPS receivers and atomic clocks — specifically because they fail in uncorrelated ways: "GPS reference-source vulnerabilities include antenna and receiver failures, local radio interference... Atomic clocks can fail in ways uncorrelated to GPS... and over long periods of time can drift significantly due to frequency error"<a class="cite" href="#ref-6">6</a>. A set of <i>time master</i> machines per datacenter hold these references (most with dedicated GPS antennas; the rest, called Armageddon masters, hold atomic clocks alone), and every machine's local <i>timeslave</i> daemon polls a cross-checked sample of masters every 30 seconds, applying Marzullo's algorithm to reject outliers<a class="cite" href="#ref-6">6</a>. Between polls, \(\epsilon\) grows: "\(\epsilon\) is typically a sawtooth function of time, varying from about 1 to 7 ms over each poll interval... \(\bar\epsilon\) is therefore 4 ms most of the time," with the sawtooth's 0-to-6ms climb coming from a conservatively applied worst-case local clock drift rate of 200 microseconds per second of elapsed time, and the remaining roughly 1ms from communication delay to the masters themselves<a class="cite" href="#ref-6">6</a>.</p>
+
+<h3 id="commit-wait-arithmetic">5.2 Commit-wait: the arithmetic</h3>
+<p>TrueTime alone only tells you an interval containing the truth. Turning that into an ordering guarantee requires one more rule, which Spanner calls <b>commit wait</b>: "the coordinator leader ensures that clients cannot see any data committed by \(T_i\) until \(TT.after(s_i)\) is true," where \(s_i\) is the transaction's assigned commit timestamp<a class="cite" href="#ref-6">6</a>. The proof that this preserves external consistency is a four-line chain<a class="cite" href="#ref-6">6</a>:</p>
+<p>$$s_1 < t_{abs}(e_1^{commit}) \quad\text{(commit wait)}$$
+$$t_{abs}(e_1^{commit}) < t_{abs}(e_2^{start}) \quad\text{(assumption: }T_2\text{ starts after }T_1\text{ commits)}$$
+$$t_{abs}(e_2^{start}) \le t_{abs}(e_2^{server}) \quad\text{(causality)}$$
+$$t_{abs}(e_2^{server}) \le s_2 \quad\text{(start rule: coordinator assigns }s_2 \ge TT.now().latest\text{ at that moment)}$$
+$$\Rightarrow s_1 < s_2 \quad\text{(transitivity)}$$</p>
+<p>The practical consequence: because the coordinator picks \(s_i\) from \(TT.now().latest\) and then must wait until it is certain \(s_i\) is in the past, "the expected wait is typically overlapped with Paxos communication" but is "at least \(2 \bar\epsilon\)"<a class="cite" href="#ref-6">6</a>. With \(\bar\epsilon \approx 4\)ms, that puts commit-wait at roughly 8ms on a healthy cluster — consistent with the paper's own headline claim that TrueTime "keeps uncertainty small (generally less than 10ms)"<a class="cite" href="#ref-6">6</a>. The paper's own microbenchmark corroborates the order of magnitude directly: on a single-replica configuration with commit wait disabled (labeled "1D" in the paper's Table 3), write latency measures 9.4ms; with commit wait enabled on one real replica, write latency rises to 14.4ms — a roughly 5ms difference attributable to commit-wait, in the same range as the \(2\bar\epsilon \approx 8\)ms estimate<a class="cite" href="#ref-6">6</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f4t"><title id="f4t">TrueTime uncertainty interval shrinking and triggering commit-wait release</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="60" y1="260" x2="740" y2="260" class="d-axis"/>
+    <text x="750" y="264" class="d-mono d-small">t</text>
+    <text x="60" y="280" class="d-mono d-small">commit request</text>
+
+    <rect x="150" y="80" width="420" height="26" rx="4" class="d-fill-cyan-soft d-stroke-cyan"/>
+    <text x="360" y="98" text-anchor="middle" class="d-mono d-small">TT.now() at commit: [earliest, latest], &#949; &#8776; 4-7ms</text>
+    <line x1="150" y1="106" x2="150" y2="260" class="d-dashed d-line"/>
+    <line x1="570" y1="106" x2="570" y2="260" class="d-dashed d-line"/>
+    <circle cx="570" cy="106" r="4" class="d-fill-orange"/>
+    <text x="570" y="130" text-anchor="middle" class="d-mono d-small">s&#8321; = latest</text>
+
+    <path d="M150,150 Q360,130 570,150" class="d-line d-stroke-blue" fill="none"/>
+    <text x="360" y="128" text-anchor="middle" class="d-small d-text-light">interval narrows as time advances toward "latest"</text>
+
+    <rect x="570" y="200" width="140" height="26" rx="4" class="d-hl"/>
+    <text x="640" y="218" text-anchor="middle" class="d-mono d-small">commit-wait &#8805; 2&#603;&#772;</text>
+    <path d="M570,260 L710,260" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+    <circle cx="710" cy="260" r="5" class="d-fill-green"/>
+    <text x="710" y="245" text-anchor="middle" class="d-mono d-small">TT.after(s&#8321;) true</text>
+    <text x="710" y="280" text-anchor="middle" class="d-mono d-small">release commit</text>
+
+    <text x="360" y="300" text-anchor="middle" class="d-text-light d-small">&#603;&#772; &#8776; 4ms typical (sawtooth 1-7ms between 30-second polls) &#8658; commit-wait &#8776; 8ms, matching Spanner's measured ~5ms 1-replica overhead and its &lt;10ms design target</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> A Spanner coordinator assigns commit timestamp \(s_1\) at \(TT.now().latest\), then blocks until \(TT.after(s_1)\) is true — waiting out the shrinking uncertainty interval before letting any client observe the commit<a class="cite" href="#ref-6">6</a>. With average error bound \(\bar\epsilon \approx 4\)ms, commit-wait is at least \(2\bar\epsilon \approx 8\)ms<a class="cite" href="#ref-6">6</a>, which is why Spanner's design target is "generally less than 10ms" and its measured single-replica write overhead is about 5ms<a class="cite" href="#ref-6">6</a>.</figcaption>
+</figure>
+
+<h3 id="spanner-pays-always">5.3 Why Spanner pays the EC cost even absent a partition</h3>
+<p>Nothing about commit-wait depends on whether any Paxos group is currently partitioned. Every read-write transaction pays it, on every healthy commit, because the guarantee being sold is external consistency for the whole database, not merely "consistency during trouble." That is the concrete referent behind Table 1's PC/EC classification for Spanner: partitioned, it chooses consistency over availability exactly like Gilbert and Lynch's CP quadrant predicts<a class="cite" href="#ref-2">2</a>; unpartitioned, it still chooses consistency over the lowest possible latency, because the commit-wait rule and the cross-group two-phase commit round trip are structural, not conditional on failure. The measured cost is not hidden or accidental — Spanner's own evaluation reports it directly, and the paper is explicit that the target market is applications for which this cost is worth paying, not a universal recommendation.</p>
+
+<h2 id="pnuts-record-mastering">6. PNUTS's answer: record-level mastering, PC/EL by design</h2>
+<p>PNUTS is the system Abadi cites as the clearest evidence that reduced consistency in normal operation is a latency decision, not a CAP-forced one: "PNUTS offers the clearest evidence that CAP is not a major reason for reduced consistency levels in these systems"<a class="cite" href="#ref-5">5</a>. Yahoo built it to back web applications with strict response-time SLAs across geographically dispersed users, where "the database portion of a web request is only 50-100 milliseconds," a budget synchronous cross-continent replication cannot meet<a class="cite" href="#ref-8">8</a>.</p>
+
+<h3 id="record-level-mastering">6.1 Per-record timeline consistency and the read API ladder</h3>
+<p>PNUTS's core design decision is to make "all high latency operations asynchronous, and to support record-level mastering. Synchronously writing to multiple copies around the world can take hundreds of milliseconds or more... Asynchrony allows us to satisfy this budget despite geographic distribution, and record-level mastering allows most requests, including writes, to be satisfied locally"<a class="cite" href="#ref-8">8</a>. Concretely: one replica of a given record — not the whole table, a single record — is designated its <b>master</b>, and all writes to that record are forwarded there; the master assigns each write a monotonically increasing sequence number (generation and version), then publishes the update asynchronously to a pub/sub system (the Yahoo Message Broker) for delivery to other regions<a class="cite" href="#ref-8">8</a>. Every replica applies updates to a given record strictly in that record's published order — <b>per-record timeline consistency</b> — so "a read of any replica will return a consistent version from this timeline, and replicas always move forward in the timeline"<a class="cite" href="#ref-8">8</a>, even though different replicas may be at different points along it.</p>
+<p>PNUTS exposes that staleness explicitly through a ladder of read calls rather than hiding it behind one "consistency level" knob:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> PNUTS's read/write API, ordered from lowest latency to strongest guarantee<a class="cite" href="#ref-8">8</a>.</caption>
+<thead><tr><th>Call</th><th>Guarantee</th><th>Latency position</th></tr></thead>
+<tbody>
+<tr><td class="row">Read-any</td><td>a valid but possibly stale version from the record's history</td><td data-best>lowest — any replica, no check</td></tr>
+<tr><td class="row">Read-critical(v)</td><td>a version &ge; the given version <code>v</code> (e.g. the version you just wrote)</td><td>higher if local replica is behind</td></tr>
+<tr><td class="row">Read-latest</td><td>the most recent version that has committed anywhere</td><td>highest read latency of the three</td></tr>
+<tr><td class="row">Write</td><td>routed to the record's master; ACID for that single write</td><td>local if requester is near the master, else a WAN hop</td></tr>
+<tr><td class="row">Test-and-set-write(v)</td><td>write succeeds only if current version equals <code>v</code> (optimistic concurrency)</td><td data-worst>same as write; serializes concurrent increments</td></tr>
+</tbody>
+</table>
+<p>The read-any call is the deliberate, named escape hatch for the latency/consistency tradeoff: it "provides a way for the application to explicitly indicate, on a per-read basis, that performance matters more than consistency"<a class="cite" href="#ref-8">8</a> — PACELC's else-branch, exposed as an API parameter rather than a global system setting.</p>
+
+<h3 id="pnuts-partition-behavior">6.2 Why the default configuration is CP during a partition but EL absent one</h3>
+<p>PNUTS's own measurement of its production workload found extremely high write locality: "a one week trace of updates to 9.8 million user records in Yahoo!'s user database showed that on average, 85 percent of the writes to a given record originated in the same datacenter"<a class="cite" href="#ref-8">8</a> — which is exactly the empirical fact that justifies mastering by record rather than by table or by partition: most records rarely need their master to move at all. But mastership assignment is adaptive, not static: "the replica receiving the majority of write requests for a particular record becomes the master for that record"<a class="cite" href="#ref-8">8</a>, and a record's ownership migrates when the write load shifts, tracked in a hidden metadata field.</p>
+<p>Now place PNUTS on Table 1's grid using its own default behavior. Absent a partition, PNUTS chooses latency over consistency: reads default to the ladder above, and even read-latest only chases the most recent committed version, not a synchronously-agreed one — this is the EL half. During an actual partition that makes a record's master region unreachable, PNUTS does not attempt to elect a new master and risk two masters accepting conflicting writes; per Abadi's classification, "the PNUTS default configuration is actually CP: in the case of a partition, the system chooses consistency over availability to avoid the problem of resolving conflicting updates initiated at different master nodes"<a class="cite" href="#ref-5">5</a> — writes to that record simply fail until the partition heals, even though reads (which can still be served from any non-master replica) remain available. That combination — availability sacrificed for writes specifically, consistency never further compromised — is why PNUTS is PC/EL rather than PA/EL: unlike Dynamo, it never accepts a write it cannot place correctly on the one true per-record timeline.</p>
+
+<h2 id="dynamo-revisited">7. Dynamo revisited through PACELC</h2>
+<p>Modules 3 and 4 already covered Dynamo's mechanism in depth: consistent hashing with virtual nodes, vector clocks for reconciling concurrent writes, quorum-parameterized reads and writes, and its explicit refusal to offer isolation or cross-key transactions<a class="cite" href="#ref-7">7</a>. PACELC gives that mechanism a second, independent axis to sit on, which the mechanism-level treatment did not need to separate out.</p>
+<p>Dynamo exposes its else-branch tradeoff as three tunable integers per table: \(N\) (replicas), \(R\) (replicas that must respond to a read), \(W\) (replicas that must acknowledge a write)<a class="cite" href="#ref-7">7</a>. Configuring \(R + W > N\) buys quorum overlap and therefore stronger read-your-writes-style consistency, at the cost of waiting on more replicas per operation; configuring \(R + W \le N\), Amazon's actual common case, lowers latency at the cost of a read potentially missing the most recent write<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-7">7</a>. That is the else-branch decision, made independently of any partition, purely to hit a 99.9th-percentile latency SLA<a class="cite" href="#ref-7">7</a>.</p>
+<p>The partition-branch decision is a separate mechanism entirely: sloppy quorums and hinted handoff. When enough of a key's designated \(N\) replicas are unreachable, Dynamo routes the write to other, non-designated healthy nodes instead of blocking, then hands the data off to the correct replica once it recovers<a class="cite" href="#ref-7">7</a>. Nothing about \(R\), \(W\), or \(N\) prevents this — the availability-over-consistency choice during a partition and the latency-over-consistency choice absent one are implemented by entirely different pieces of Dynamo's design, which is itself evidence that PACELC's two axes are not merely a notational convenience: a real system's engineering literally forks into two separate mechanisms along exactly that boundary.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Modules 3 and 4 already showed that Spanner and Dynamo encode opposite bets about which failure is worse. PACELC does not resolve that disagreement — it sharpens it, by forcing each side to state a position on <i>two</i> questions instead of one, and by adding a third position, PNUTS, that neither pure camp anticipated: sacrifice availability during a partition (like Spanner) while still sacrificing consistency for latency the rest of the time (like Dynamo). The disagreement below restates Module 3's positions in PACELC's vocabulary and asks which of the three quadrants actually represents in the field's practice, not just in theory.</p>
+<div class="positions">
+  <article class="position">
+    <h4>PC/EC is the only defensible default: pay for consistency everywhere</h4>
+    <p class="who">Spanner's design team<a class="cite" href="#ref-6">6</a>, and the fully-ACID camp (VoltDB/H-Store, Megastore) Abadi groups with it<a class="cite" href="#ref-5">5</a></p>
+    <p>If an application cannot enumerate every invariant that weak consistency might silently violate, the only safe default is to violate none of them, ever — during a partition or not. Spanner's own commit-wait mechanism (Section 5.2) is the concrete cost of this position: roughly 8ms of deliberate, unconditional waiting on every write, justified because the alternative is asking every application team to reason correctly about which reads might be stale by how much, forever. Bigtable's designers effectively conceded this position from the other direction: application teams kept building Megastore on top of Bigtable specifically for its stronger consistency "despite its relatively low performance"<a class="cite" href="#ref-4">4</a>, evidence that real engineers, given the choice, often pay for EC even when nothing forces them to.</p>
+    <ul class="pros"><li>One mental model for every read and write, at every layer, forever — no per-call decision about which staleness is tolerable.</li><li>External consistency composes: a system built this way never needs a later audit to discover an invariant it silently violated under load.</li></ul>
+    <ul class="cons"><li>Every write pays commit-wait and a cross-group consensus round trip unconditionally, even for data that never needed the guarantee (a page view counter, a UI preference).</li><li>PC/EC's availability cost is not hypothetical: a genuinely partitioned minority group is unavailable for both reads and writes on its data, full stop.</li></ul>
+  </article>
+  <article class="position">
+    <h4>PA/EL is correct for the workloads that actually dominate a large service's request volume</h4>
+    <p class="who">Dynamo's design team at Amazon<a class="cite" href="#ref-7">7</a>, and the Dynamo-lineage systems (Cassandra, Riak, Voldemort) that inherited the model</p>
+    <p>Most operations against most keys in a large consumer service are not funds transfers; they are session state, shopping-cart contents, presence, and view counters, where "an add-to-cart operation can never be forgotten or rejected"<a class="cite" href="#ref-7">7</a> and a merge function is a completely adequate answer to "what happens when two writers disagree." Paying Spanner's unconditional EC tax on every one of those operations, at Amazon's or Cassandra's request volumes, is waste with no corresponding correctness benefit — the PA/EL choice on both axes is not a compromise forced by scale, it is the economically correct answer for this class of data, made twice (once for P, once for E) because both times the answer to "is strict consistency worth the cost here" is the same no.</p>
+    <ul class="pros"><li>The R+W&lt;N tuning that buys low latency absent a partition and the sloppy-quorum/hinted-handoff mechanism that buys availability during one are separate, independently justified engineering decisions (Section 7) — not one blanket sacrifice.</li><li>SLAs measured at the 99.9th percentile<a class="cite" href="#ref-7">7</a> are met by construction, because no operation ever waits on a slow or unreachable quorum member beyond R or W.</li></ul>
+    <ul class="cons"><li>Every genuine cross-key invariant is now the application's permanent responsibility, with no in-storage escalation path.</li><li>PA/EL is a bet about the workload, not a law — apply it to a ledger and the "merge function" the store hands you back is not a coherent answer to a double-spend.</li></ul>
+  </article>
+  <article class="position">
+    <h4>PC/EL is underrated: most services want strict correctness only when it is cheap to give</h4>
+    <p class="who">PNUTS's design team at Yahoo!<a class="cite" href="#ref-8">8</a>, implicitly endorsed by Abadi's own preference for the framework that lets a system say this explicitly<a class="cite" href="#ref-5">5</a></p>
+    <p>Both prior positions treat the P-axis and E-axis choice as coupled — pick strong or weak and apply it everywhere. PNUTS's record-level mastering shows they need not be: give every record exactly one master so that, absent a partition, the vast majority of writes (85% by PNUTS's own measurement<a class="cite" href="#ref-8">8</a>) are already local and cheap, and reads can explicitly opt into read-any for latency when an application says staleness is fine. But when a partition actually strands a record's master, do not improvise a second master and risk an unresolvable conflict — simply refuse the write. This gets Dynamo's everyday latency behavior without ever accepting Dynamo's central cost: an application-visible divergent version that something must reconcile later.</p>
+    <ul class="pros"><li>Never produces a conflicting-write anomaly that requires reconciliation logic in the application, unlike PA/EL — every record has exactly one order of updates, always<a class="cite" href="#ref-8">8</a>.</li><li>Read-any/read-critical/read-latest exposes the latency/consistency choice per call, so an application is never forced into one system-wide answer<a class="cite" href="#ref-8">8</a>.</li></ul>
+    <ul class="cons"><li>A record's write availability during a partition is exactly as fragile as Spanner's — worse, in one sense, since a single unreachable region can strand a record with no automatic failover at all<a class="cite" href="#ref-8">8</a>.</li><li>Mastership migration and per-record metadata add real operational complexity that a stateless, symmetric design like Dynamo's avoids entirely<a class="cite" href="#ref-7">7</a>.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>None of the three quadrants is a universal answer, and the industry's actual trajectory across this course's sources is evidence for a workload-by-workload split rather than a winner. The deciding question is not "how much scale" but "does this data have exactly one natural owner most of the time, and does a merge function exist for the cases where it doesn't." A funds transfer, a unique-username registration, or a globally-numbered schema change has no natural per-record owner and no acceptable merge — Spanner's PC/EC is correct there, and the roughly 8ms commit-wait tax (Section 5.2) is cheap next to the cost of a reconciliation bug in a ledger. A shopping cart, a view counter, or session state has an obvious, cheap merge function for the rare conflict case — Dynamo's PA/EL is correct there, and paying for global consensus on every write would be waste with no offsetting benefit. Data with a natural single owner most of the time, but no acceptable automatic merge when that owner is unreachable — a user's own profile record, a page's edit history — is PNUTS's PC/EL case, and it is underused in practice mostly because record-level mastership is genuinely more operationally complex to build than either of the other two models, not because it is theoretically worse. What would settle a specific system's classification is not more benchmarking of the three designs against each other in the abstract, but writing down, per table, whether a conflict has a well-defined merge (favors PA/EL), a well-defined single owner (favors PC/EL), or neither (favors PC/EC) — exactly the audit Module 4's disagreement section already recommended, now extended to state which of PACELC's two axes each answer actually constrains.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Brewer's 2012 retrospective already pointed at where the field's energy has gone since CAP's proof: not toward relitigating the theorem, but toward making a partition's consequences explicit and automatically reversible rather than ad hoc. His own examples — Bayou's replicated calendar coloring tentative entries during disconnection, Google Docs restricting operations to commutative edits during a partition so state converges automatically on recovery, and Marc Shapiro's commutative replicated data types (CRDTs), which "provably converge after a partition" by construction<a class="cite" href="#ref-3">3</a> — are the applied answer to a question CAP and PACELC only pose: given that a system has chosen A during a partition, how do you make the eventual reconciliation mechanical instead of bespoke. CRDTs are now the standard reference point for any AP system's conflict-resolution layer, in a way vector clocks alone (Module 3) were not, precisely because a CRDT's convergence guarantee is proven once, generically, rather than re-argued per data type.</p>
+<p>The consistency/latency literature Abadi's paper opened has also kept moving past the three-option replication taxonomy in Section 4.2: causal consistency and session/read-your-writes guarantees sit between PNUTS's read-any and read-latest calls, offering a cheaper middle rung than "chase the master" without giving up ordering guarantees a pure read-any call drops. Separately, the field's own reference synthesis is itself mid-revision: the second edition of <cite>Designing Data-Intensive Applications</cite>, published February 2026, restructures how replication, partitioning, and consistency are presented as one continuous spectrum rather than a small set of named levels<a class="cite" href="#ref-11">11</a> — a framing this module's PA/EL–PC/EC–PC/EL grid is compatible with but does not depend on. What has not changed since 2002 is the proof itself: no system has found a loophole in Gilbert and Lynch's asynchronous-model result, because none exists within that model<a class="cite" href="#ref-2">2</a>; what keeps changing is how much of the resulting cost engineers are willing to make automatic rather than manual.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">paper</span>Herlihy, M.P., Wing, J.M. <em>Linearizability: A Correctness Condition for Concurrent Objects</em>. ACM Transactions on Programming Languages and Systems 12(3), July 1990, pp. 463-492. <a href="https://cs.brown.edu/people/mph/HerlihyW90/p463-herlihy.pdf">https://cs.brown.edu/people/mph/HerlihyW90/p463-herlihy.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: formal L1/L2 definition of linearizability (§2.2), history/partial-order model (§2.1), locality and nonblocking properties (§3.1), FIFO-queue and register examples (§1.2).</span></li>
+<li id="ref-2"><span class="ref-type">paper</span>Gilbert, S., Lynch, N. <em>Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services</em>. ACM SIGACT News 33(2), June 2002, pp. 51-59. <a href="https://www.cs.princeton.edu/courses/archive/spr22/cos418/papers/cap.pdf">https://www.cs.princeton.edu/courses/archive/spr22/cos418/papers/cap.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: formal definitions of atomic consistency, availability, and partition tolerance (§2.1-2.3), Theorem 1 impossibility proof (§3.1), Corollary 1.1, the three pairwise-achievable systems CA/CP/AP (§3.2).</span></li>
+<li id="ref-3"><span class="ref-type">paper</span>Brewer, E. <em>CAP Twelve Years Later: How the "Rules" Have Changed</em>. IEEE Computer 45(2), February 2012, pp. 23-29. <a href="https://sites.cs.ucsb.edu/~rich/class/cs293b-cloud/papers/brewer-cap.pdf">https://sites.cs.ucsb.edu/~rich/class/cs293b-cloud/papers/brewer-cap.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: "2 of 3 is misleading" critique, partitions-are-rare argument, three-step partition-mode/detect/recover process and Figure 1 state diagram, Chubby/Megastore wide-area Paxos example, PNUTS/Facebook master-locality contrast, CRDT convergence discussion (What is changing).</span></li>
+<li id="ref-4"><span class="ref-type">blog</span>Abadi, D.J. <em>Problems with CAP, and Yahoo's little known NoSQL system</em>. DBMS Musings, 23 Apr 2010. <a href="http://dbmsmusings.blogspot.com/2010/04/problems-with-cap-and-yahoos-little.html">http://dbmsmusings.blogspot.com/2010/04/problems-with-cap-and-yahoos-little.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: original PACELC statement and informal PA/EL, PC/EC, PC/EL definitions.</span></li>
+<li id="ref-5"><span class="ref-type">paper</span>Abadi, D.J. <em>Consistency Tradeoffs in Modern Distributed Database System Design: CAP is Only Part of the Story</em>. IEEE Computer 45(2), February 2012, pp. 37-42. <a href="http://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf">http://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: formal PACELC definition (§PACELC), CAP-is-for-failures argument, three replication mechanisms and the consistency/latency tradeoff derivation (§Data Replication, §Tradeoff Examples), system classification table (Dynamo/Cassandra/Riak=PA/EL, VoltDB/H-Store/Megastore/Bigtable=PC/EC, PNUTS=PC/EL, MongoDB=PA/EC).</span></li>
+<li id="ref-6"><span class="ref-type">paper</span>Corbett, J.C., Dean, J., Epstein, M., et al. <em>Spanner: Google's Globally-Distributed Database</em>. OSDI 2012. <a href="https://research.google.com/archive/spanner-osdi2012.pdf">https://research.google.com/archive/spanner-osdi2012.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: external-consistency invariant (§2), TrueTime API and Table 1 (§3), time-master/timeslave architecture and epsilon sawtooth (§3), commit-wait rule and four-line proof (§4.1.2), Table 3 microbenchmarks (§5.1).</span></li>
+<li id="ref-7"><span class="ref-type">paper</span>DeCandia, G., Hastorun, D., Jampani, M., et al. <em>Dynamo: Amazon's Highly Available Key-value Store</em>. SOSP 2007. <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: always-writeable design target (§2.3), N/R/W quorum tunability (§4.2), sloppy quorums and hinted handoff (§4.5), 99.9th-percentile SLA framing (§2.2).</span></li>
+<li id="ref-8"><span class="ref-type">paper</span>Cooper, B.F., Ramakrishnan, R., Srivastava, U., Silberstein, A., Bohannon, P., Jacobsen, H.A., Puz, N., Weaver, D., Yerneni, R. <em>PNUTS: Yahoo!'s Hosted Data Serving Platform</em>. Proceedings of the VLDB Endowment 1(2), VLDB 2008, pp. 1277-1288. <a href="https://people.mpi-sws.org/~druschel/courses/ds/papers/cooper-pnuts.pdf">https://people.mpi-sws.org/~druschel/courses/ds/papers/cooper-pnuts.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: record-level mastering and per-record timeline consistency (§2.2), read-any/read-critical/read-latest/write/test-and-set-write API (§2.2), 50-100ms latency budget and asynchronous-replication rationale (§1), 85% write-locality measurement and adaptive mastership (§3.2.2), architecture (§3, Fig. 1).</span></li>
+<li id="ref-9"><span class="ref-type">paper</span>Chang, F., Dean, J., Ghemawat, S., Hsieh, W.C., Wallach, D.A., Burrows, M., Chandra, T., Fikes, A., Gruber, R.E. <em>Bigtable: A Distributed Storage System for Structured Data</em>. OSDI 2006. <a href="https://www.usenix.org/legacy/event/osdi06/tech/chang/chang.pdf">https://www.usenix.org/legacy/event/osdi06/tech/chang/chang.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Chubby lock service, five-replica Paxos quorum for master election (§4), PC/EC classification basis (Table 1).</span></li>
+<li id="ref-10"><span class="ref-type">paper</span>Hunt, P., Konar, M., Junqueira, F.P., Reed, B. <em>ZooKeeper: Wait-free Coordination for Internet-scale Systems</em>. USENIX ATC 2010. <a href="https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf">https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Zab-based linearizable writes vs. unlinearized local reads (§1, Abstract), 2:1-100:1 read/write target ratio and throughput (Abstract) — the CAP-blind-spot contrast with Spanner (§3.2).</span></li>
+<li id="ref-11"><span class="ref-type">textbook</span>Kleppmann, M., Riccomini, C. <em>Designing Data-Intensive Applications</em>. 2nd ed., O'Reilly Media, 2026. <a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/">https://www.oreilly.com/library/view/designing-data-intensive-applications/9781098119058/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: general framing of consistency models as a continuous spectrum (What is changing) — no specific chapter cited, since the publisher's table-of-contents page returned HTTP 403 to automated fetch.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

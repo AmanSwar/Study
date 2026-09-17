@@ -91,6 +91,15 @@ for (const m of mainHtml.matchAll(/<figcaption>([\s\S]*?)<\/figcaption>/gi)) if 
 const markerIds = [...mainHtml.matchAll(/<marker\b[^>]*\bid="([^"]+)"/g)].map(m => m[1]);
 for (const d of new Set(markerIds.filter((v, i, a) => a.indexOf(v) !== i))) err(`duplicate <marker id="${d}"> across figures — prefix marker ids per figure (e.g. f3-arrow)`);
 if (/<svg[\s\S]*?(fill|stroke)="#[0-9a-fA-F]{3,8}"[\s\S]*?<\/svg>/.test(mainHtml) || /<svg[\s\S]*?style="[^"]*(fill|stroke):\s*#[0-9a-fA-F]{3,8}/.test(mainHtml)) warn('hard-coded hex colour inside <svg> — use d-* classes / CSS variables so dark mode works');
+// right-anchored SVG labels that would run past the left edge of their viewBox (≈6.3px per char at 11–13px)
+for (const svg of mainHtml.matchAll(/<svg\b([^>]*)>([\s\S]*?)<\/svg>/gi)) {
+  const minX = parseFloat((svg[1].match(/viewBox="(-?[\d.]+)/) || [, '0'])[1]);
+  for (const t of svg[2].matchAll(/<text\b([^>]*)text-anchor="end"([^>]*)>([^<]*)<\/text>/gi)) {
+    const x = parseFloat(((t[1] + t[2]).match(/\bx="(-?[\d.]+)"/) || [, '0'])[1]);
+    const w = t[3].replace(/&[a-z#0-9]+;/g, 'x').length * 6.3;
+    if (x - w < minX - 2) { warn(`SVG label likely clipped at the left edge (x=${x}, ~${Math.round(w)}px wide): "${t[3].slice(0, 40)}" — widen the viewBox (e.g. viewBox="-60 0 860 H") or move the label`); break; }
+  }
+}
 const tables = (mainHtml.match(/<table class="tbl/gi) || []).length;
 for (const m of mainHtml.matchAll(/<table\b[^>]*>([\s\S]*?)<\/table>/gi)) {
   if (!/<caption>/.test(m[1])) warn('table without <caption><b>Table N.</b> …</caption>');

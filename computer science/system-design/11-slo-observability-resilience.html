@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reliability Engineering: SLOs, Observability, and Resilience Patterns · System Design</title>
+<meta name="description" content="SLI/SLO/SLA and the consequence test, the metrics/logs/traces observability triad, and the timeout/retry/circuit-breaker/bulkhead patterns that keep one slow dependency from taking down everything behind it.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">System Design · Module 11</p>
+<h1>Reliability Engineering: SLOs, Observability, and Resilience Patterns</h1>
+<p class="lede">Before you can decide whether a system is reliable, you need a number, a target for that number, and a rule for what happens if you miss it — three different things people habitually collapse into one word. Before you can survive a dependency that has stopped cooperating, you need to bound how long you wait for it, isolate its failure from everything else sharing your process, and stop calling it at all once it is clearly unwell. This module builds both vocabularies from Google's SRE book and Netflix's Hystrix design so that every later case study can name the mechanism instead of re-deriving it.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>38 min</b> read</span>
+<span class="chip"><b>9</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 6</b></span>
+<span class="chip">Prerequisite: <b>Module 10</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f1t"><title id="f1t">SLI to SLO to SLA ladder with the consequence-if-missed test</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="30" width="230" height="110" rx="10" class="d-block"/>
+<text x="135" y="65" text-anchor="middle" class="d-text-inv d-bold d-title">SLI</text>
+<text x="135" y="90" text-anchor="middle" class="d-text-inv d-small">A measured quantity</text>
+<text x="135" y="108" text-anchor="middle" class="d-text-inv d-mono d-small">e.g. Get RPC latency</text>
+<text x="135" y="124" text-anchor="middle" class="d-text-inv d-small">"what is happening"</text>
+
+<path d="M250,85 L300,85" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="300" y="30" width="230" height="110" rx="10" class="d-block-2"/>
+<text x="415" y="65" text-anchor="middle" class="d-text-inv d-bold d-title">SLO</text>
+<text x="415" y="90" text-anchor="middle" class="d-text-inv d-small">A target for that SLI</text>
+<text x="415" y="108" text-anchor="middle" class="d-text-inv d-mono d-small">99% &lt; 100 ms</text>
+<text x="415" y="124" text-anchor="middle" class="d-text-inv d-small">"what we are aiming for"</text>
+
+<path d="M530,85 L580,85" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="580" y="30" width="200" height="110" rx="10" class="d-block-accent"/>
+<text x="680" y="65" text-anchor="middle" class="d-text-inv d-bold d-title">SLA</text>
+<text x="680" y="90" text-anchor="middle" class="d-text-inv d-small">An SLO plus a contract</text>
+<text x="680" y="108" text-anchor="middle" class="d-text-inv d-mono d-small">99.95% or refund</text>
+<text x="680" y="124" text-anchor="middle" class="d-text-inv d-small">"what we owe you"</text>
+
+<rect x="20" y="180" width="760" height="110" rx="10" class="d-panel"/>
+<text x="400" y="205" text-anchor="middle" class="d-bold d-small">The test: "what happens if the target is missed?"</text>
+<path d="M135,140 L135,180" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+<path d="M415,140 L200,180" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+<path d="M680,140 L680,180" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+<text x="200" y="235" text-anchor="middle" class="d-small">No consequence defined</text>
+<text x="200" y="252" text-anchor="middle" class="d-bold d-small">&#8594; it was only an SLO</text>
+<text x="600" y="235" text-anchor="middle" class="d-small">Explicit consequence (rebate,</text>
+<text x="600" y="252" text-anchor="middle" class="d-small">penalty, contract breach)</text>
+<text x="600" y="269" text-anchor="middle" class="d-bold d-small">&#8594; it is an SLA</text>
+</svg>
+<figcaption><b>Figure 1.</b> An SLI is a measurement, an SLO is a target for that measurement, and an SLA is an SLO wrapped in a contract with a stated consequence for missing it. Google's own test for telling an SLO from an SLA is to ask what happens if it is missed: no explicit consequence means it is an SLO, not an SLA<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<h2 id="sli-slo-sla">1. Reliability is a measurement problem before it is an engineering problem</h2>
+<p>"Is the service reliable?" is not answerable until three separate questions are answered in order: what, exactly, are you measuring; what value of that measurement counts as good enough; and what happens to whoever made that promise if it is not met. Google's Site Reliability Engineering book gives each question its own term precisely because engineers otherwise use "SLA" to mean all three at once, which hides the one fact that actually matters — whether missing the number costs anyone anything.</p>
+
+<h3 id="sli">1.1 SLI: the quantitative measure</h3>
+<p>A service level indicator (SLI) is "a carefully defined quantitative measure of some aspect of the level of service that is provided"<a class="cite" href="#ref-1">1</a>. It is a number you can compute from telemetry, nothing more — request latency, error rate, throughput, or availability are the canonical examples. An SLI on its own carries no judgment: "p99 latency is 340 ms" is neither good nor bad until something else says what it should be. The choice of SLI is itself a design decision with teeth — Amazon's Dynamo paper makes the same point from the other direction, noting that Amazon's internal SLAs are expressed at the 99.9th percentile rather than the mean, specifically because "these metrics are not good enough if the goal is to build a system where all customers have a good experience"<a class="cite" href="#ref-2">2</a>, and a mean can look fine while one customer in a thousand has a terrible one.</p>
+
+<h3 id="slo">1.2 SLO: the target, and why never 100%</h3>
+<p>A service level objective (SLO) is "a target value or range of values for a service level that is measured by an SLI"<a class="cite" href="#ref-1">1</a>, typically written as an SLI-with-a-threshold over a stated window: "99% (averaged over 1 minute) of <code>Get</code> RPC calls will complete in less than 100 ms" is Google's own worked example<a class="cite" href="#ref-1">1</a>. Two things about that sentence are load-bearing and easy to miss on a first read. First, the target is a percentile-and-window pair, not a single latency number — 99% at 1-minute granularity behaves very differently from 99% at 1-day granularity, because a short, sharp spike that would blow the 1-minute window averages away inside a full day. Second, the target is deliberately short of 100%. No published SLO targets perfect reliability, because the last increment toward 100% costs disproportionately more than every increment before it — chasing five nines instead of four nines is not "20% more effort," it is regularly an order of magnitude more infrastructure, process, and engineering time for a fraction of a percent of additional measured reliability. Google Compute Engine's own published target is "three and a half nines" — 99.95% availability<a class="cite" href="#ref-1">1</a> — a number chosen, not derived, to balance user-visible reliability against the cost and velocity lost pursuing more of it.</p>
+
+<div class="calc">
+<p class="calc-title">Allowed downtime from an availability SLO</p>
+<div class="calc-row"><label for="k1">Availability target</label><select id="k1" name="pct"><option value="99">99% (two nines)</option><option value="99.9">99.9% (three nines)</option><option value="99.95" selected>99.95% (three and a half nines — GCE)</option><option value="99.99">99.99% (four nines)</option><option value="99.999">99.999% (five nines)</option></select></div>
+<div class="calc-row"><label for="k2">Window (days)</label><input type="range" id="k2" name="days" min="1" max="365" step="1" value="30"></div>
+<div class="calc-out">
+<div>Allowed downtime<output data-expr="days * 24 * 60 * (1 - pct/100)" data-format="fixed:2"></output> <span class="small muted">minutes</span></div>
+</div>
+<p class="calc-note">Formula: allowed downtime (minutes) \( = \text{window (days)} \times 1440 \times (1 - \text{target}) \). At the default 99.95% target over a 30-day window this is \( 30 \times 1440 \times 0.0005 = 21.6 \) minutes<a class="cite" href="#ref-1">1</a> — the arithmetic behind "three and a half nines," not a number Google publishes directly.</p>
+</div>
+
+<h3 id="sla">1.3 SLA: the consequence test</h3>
+<p>A service level agreement (SLA) is "an explicit or implicit contract with your users that includes consequences of meeting (or missing) the SLOs" it contains<a class="cite" href="#ref-1">1</a>. The SRE book gives a one-line test that resolves almost every real-world ambiguity: "ask 'what happens if the SLOs aren't met?': if there is no explicit consequence, then you are almost certainly looking at an SLO"<a class="cite" href="#ref-1">1</a>. A dashboard promising "99.9% uptime" with no stated remedy is an SLO with a marketing font. A cloud contract promising the same number with a defined service credit for every tier of shortfall is an SLA. The distinction matters operationally, not just contractually: an SLA is a business commitment that has to be kept with margin, so a well-run team sets its internal SLOs stricter than any external SLA built on top of them — the SLA is what you promised a customer; the SLO is the number engineering actually manages to, and it should have room to breathe above the contractual floor.</p>
+
+<h3 id="error-budget">1.4 Error budgets: spending reliability like a resource</h3>
+<p>An SLO of 99.9% is, read the other way, a budget: 0.1% of requests (or of time, depending on how the SLI is defined) are allowed to fail before the target is missed. The SRE book's framing is to track that allowance directly rather than only watching the raw SLI: "it is better to allow an error budget — a rate at which the SLOs can be missed — and track that on a daily or weekly basis"<a class="cite" href="#ref-1">1</a>. Once reliability is a budget instead of an absolute, it can be spent deliberately: a risky deploy, an experimental feature flag, or a planned maintenance window all draw down the same budget that an unplanned outage would, and a team that has already spent its budget for the week has a mechanical, pre-agreed reason to freeze risky changes rather than an argument about it after the fact. This module treats the error budget only at this conceptual level — as the operational unit that connects an SLO's abstract percentage to a concrete "can we ship this today" decision — because the mechanics of budget policy (burn-rate alerting, multi-window budgets) are a refinement on top of the definition, not a new primitive.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> SLI, SLO, and SLA are three different objects, not synonyms<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Term</th><th>What it is</th><th>Worked example</th><th>Consequence if missed</th></tr></thead>
+<tbody>
+<tr><td class="row">SLI</td><td>A measured quantity</td><td>p99 latency of <code>Get</code> RPCs, averaged per minute</td><td>None — it is just a number</td></tr>
+<tr><td class="row">SLO</td><td>A target for that SLI, over a window</td><td>99% of <code>Get</code> RPCs &lt; 100 ms (1-minute window)</td><td>None stated externally; internally, may trigger a release freeze via the error budget</td></tr>
+<tr><td class="row">SLA</td><td>An SLO plus a binding consequence</td><td>99.95% monthly availability<a class="cite" href="#ref-1">1</a> or a service credit is issued</td><td>Contractual — financial penalty, credit, or breach</td></tr>
+</tbody>
+</table>
+
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Every SLA is built on an SLO, but almost no SLO is an SLA. The one-line test — "what happens if this is missed?" — is the entire module's worth of vocabulary compressed into a question you can ask of any reliability document in this course, including the ones cited by name in the case studies that follow.</p></aside>
+<h2 id="observability-triad">2. Seeing whether you are meeting it: metrics, logs, and traces</h2>
+<p>An SLO is worthless without a way to compute the SLI it depends on continuously, in production, at the volume the real service runs at. Three kinds of telemetry do that job, and they are not interchangeable — each is the right tool for a different question, and each has a different cost structure that determines how much of it you can afford to keep. The Borg paper's own operational experience makes the cost side concrete: Google's cluster manager stores time-series data for every task and machine specifically because per-task and per-machine dashboards, aggregate reports, and an alerting subsystem all read from the same underlying monitoring data<a class="cite" href="#ref-6">6</a> — one collection system serving three different consumption patterns, which is exactly the shape the metrics/logs/traces split takes at the application layer.</p>
+
+<h3 id="metrics">2.1 Metrics: cheap, aggregated, what pages someone</h3>
+<p>A metric is a number tagged with a small number of dimensions (service, region, status code) and pre-aggregated over a time window — a counter, a gauge, or a histogram bucket. Because a metric drops the identity of any individual request the moment it is recorded, its storage cost is bounded by the number of distinct dimension combinations, not by traffic volume: a service doing ten requests per second and a service doing ten million requests per second can produce the same number of time series if they have the same cardinality of labels. This is what makes metrics cheap enough to keep at full resolution for months and to evaluate every few seconds for alerting — the SLO's SLI is, in practice, almost always computed from a metric, because only a metric is cheap enough to check continuously against a threshold and fire a page.</p>
+
+<h3 id="logs">2.2 Logs: expensive, per-event, what explains root cause</h3>
+<p>A log is a discrete record of one event, with as much context as the code that emitted it chose to attach — a request ID, a stack trace, a user ID, a full payload. Logs preserve exactly what a metric throws away: the identity and detail of one specific occurrence. That is also why they are expensive at scale — storage cost grows with request volume, not with a fixed set of label combinations, so a service doing ten million requests per second either samples aggressively, retains logs for a short window, or pays for storage that scales linearly with traffic. Logs answer "why did this one request fail," a question a metric cannot answer because a metric has already discarded which request it was.</p>
+
+<h3 id="traces">2.3 Traces: causality across service boundaries</h3>
+<p>A trace stitches together the individual spans — one per hop — that a single request generated as it crossed service boundaries, using a propagated identifier so that a span emitted by service C can be attributed to the same request that entered at gateway A and passed through service B. A trace answers a question neither a metric nor an isolated log can: not "is latency elevated" (a metric) and not "why did this one span fail" (a log), but "which of the eleven services this request touched is where the extra 400 ms actually went." This is the tool for exactly the failure mode Section 5 and 6 of this module describe — a slow dependency two or three hops away from the request that a caller sees — and it is the reason a trace, not a metric or a log alone, is what an on-call engineer opens once a metric-triggered alert has said something is wrong but not what.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Metrics, logs, and traces answer different questions and have correspondingly different cost profiles.</caption>
+<thead><tr><th>Signal</th><th>Granularity</th><th>Cost driver</th><th>Question it answers</th></tr></thead>
+<tbody>
+<tr><td class="row">Metric</td><td>Aggregated over a window and a small label set</td><td>Cardinality of label combinations, not traffic volume</td><td>Is the SLI inside its SLO right now?</td></tr>
+<tr><td class="row">Log</td><td>One record per event, full context</td><td>Traffic volume — grows linearly with requests</td><td>Why did this one request fail?</td></tr>
+<tr><td class="row">Trace</td><td>One record per span, linked across hops by a request ID</td><td>Traffic volume, but usually sampled</td><td>Which hop, of many, is where the latency or error actually originated?</td></tr>
+</tbody>
+</table>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f2t"><title id="f2t">An incident flowing through the observability triad</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="30" width="220" height="90" rx="10" class="d-block"/>
+<text x="130" y="65" text-anchor="middle" class="d-text-inv d-bold">Metric</text>
+<text x="130" y="85" text-anchor="middle" class="d-text-inv d-small">SLI crosses SLO threshold</text>
+<text x="130" y="102" text-anchor="middle" class="d-text-inv d-small">&#8594; alert fires, on-call paged</text>
+
+<path d="M240,75 L300,75" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+<rect x="300" y="30" width="220" height="90" rx="10" class="d-block-2"/>
+<text x="410" y="65" text-anchor="middle" class="d-text-inv d-bold">Trace</text>
+<text x="410" y="85" text-anchor="middle" class="d-text-inv d-small">Which of N hops holds</text>
+<text x="410" y="102" text-anchor="middle" class="d-text-inv d-small">the extra latency/error</text>
+
+<path d="M520,75 L580,75" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+<rect x="580" y="30" width="200" height="90" rx="10" class="d-block-accent"/>
+<text x="680" y="65" text-anchor="middle" class="d-text-inv d-bold">Logs</text>
+<text x="680" y="85" text-anchor="middle" class="d-text-inv d-small">Full context for that</text>
+<text x="680" y="102" text-anchor="middle" class="d-text-inv d-small">one span: why it failed</text>
+
+<path d="M130,120 Q130,180 400,200" class="d-arrow d-dashed" marker-end="url(#f2-arr)"/>
+<text x="250" y="215" text-anchor="middle" class="d-small d-text-light">A metric alone tells you "something is wrong," not "what" or "why" — it lacks the per-request detail traces and logs keep</text>
+</svg>
+<figcaption><b>Figure 2.</b> The three signals form a narrowing funnel during an incident: a metric detects the SLO breach and pages someone, a trace localizes the breach to one hop among many, and a log at that hop explains the specific cause<a class="cite" href="#ref-6">6</a>.</figcaption>
+</figure>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>Metrics tell you an SLO is at risk; they almost never tell you which of a dozen dependencies is the reason. Skipping straight from a metric alert to grepping logs works for a single-service failure and stops working the moment the request path fans out across services — which is precisely why distributed tracing exists as a category, and why Module 30 revisits this triad with per-token metrics and cross-system traces specific to a multi-node LLM-serving path, rather than re-deriving the triad itself.</p></aside>
+<h2 id="timeouts-retries-backoff">3. When a dependency stops cooperating: timeouts, retries, and backoff with jitter</h2>
+<p>A dependency almost never fails as a clean, single event. It fails partially — a percentage of requests succeed, the rest hang — or transiently — requests fail for a short window and then recover on their own. Amazon's own house guidance frames the whole category this way: "the types of systems that we build don't often fail as a single unit. Rather, they suffer partial or transient failures"<a class="cite" href="#ref-3">3</a>. Three mechanisms, used together rather than independently, are how a caller survives that: a timeout bounds how long it waits, a retry gives a transient failure a second chance, and backoff with jitter keeps the retries themselves from becoming the next outage.</p>
+
+<h3 id="timeouts">3.1 Timeouts: bounding how long you hold a resource</h3>
+<p>Whenever a client waits on a slow call, it holds on to whatever resources that call is using — memory, a thread, a connection, an ephemeral port — for the duration of the wait<a class="cite" href="#ref-3">3</a>. A dependency that has gone from "healthy" to "very slow" does not free those resources any faster than a dependency that is fully down; the caller's own resource pool is what actually runs out first, and it runs out because nothing told the client to stop waiting. A timeout is that "stop waiting" signal, and setting the value is a genuine trade-off: too high, and a client keeps consuming resources for a call that was never going to succeed anyway; too low, and correctly-slow-but-successful calls get killed and retried, which raises backend traffic and can itself tip a marginal service into an outage<a class="cite" href="#ref-3">3</a>. Amazon's stated house heuristic is to pick an acceptable false-timeout rate (their example is 0.1%) and set the timeout at the corresponding latency percentile of the downstream service — a 0.1% false-timeout budget implies setting the client's timeout at the downstream's own p99.9 latency<a class="cite" href="#ref-3">3</a>. The heuristic breaks down in two documented cases: over a network with substantial variance (e.g., across the public internet, where a global client base means factoring in a much larger worst-case latency), and for a dependency whose latency distribution is already tight enough that p99.9 sits close to p50, where the fix is to pad the timeout rather than set it at the bare percentile<a class="cite" href="#ref-3">3</a>.</p>
+
+<p>A concrete, cited failure mode shows why the value alone is not enough — a timeout also has to cover the right work. Amazon's own account describes a service with a timeout set to 20 ms that saw occasional timeouts specifically "immediately following deployments," even though the same 20 ms value produced no timeouts the rest of the time<a class="cite" href="#ref-3">3</a>. The cause was that the 20 ms timer, as implemented, covered establishing a new secure connection in addition to the request it protected; once that connection was warm it was reused on later requests, but a freshly-deployed server had to pay a TLS handshake that itself exceeded 20 ms before the timed request could even start<a class="cite" href="#ref-3">3</a>. The first fix — raising the timeout to cover a possible new-connection cost — is a workaround; the fix Amazon settled on was to establish those connections when the process starts up, before it takes any traffic, so the timeout only ever has to cover the request itself<a class="cite" href="#ref-3">3</a>. The general lesson is that a timeout's value is only half the specification — the other half is exactly which work, from which starting state, it is timing.</p>
+
+<h3 id="retries-amplification">3.2 Retries are selfish: the amplification problem</h3>
+<p>A retry is a request for more of the callee's time paid for by the caller's impatience — Amazon's own framing is blunt about this: "retries are 'selfish.' In other words, when a client retries, it spends more of the server's time to get a higher chance of success"<a class="cite" href="#ref-3">3</a>. When failures are genuinely rare or transient, this trade is a good one: a small number of retried requests buys a large increase in apparent availability. The trade inverts the moment the failure is caused by overload rather than by a one-off glitch, because a retry storm adds exactly the traffic an already-overloaded dependency cannot absorb, and — worse — "can even delay recovery by keeping the load high long after the original issue is resolved"<a class="cite" href="#ref-3">3</a>.</p>
+
+<p>The failure mode compounds specifically because production request paths are layered, and each layer that retries independently multiplies the layer beneath it. Amazon's own worked example: a request path five services deep, ending in a database query, with three retries configured independently at each of the five layers. If the database starts failing under load, "the load on the database will increase 243x"<a class="cite" href="#ref-3">3</a> — because the retries at each layer multiply: \(3^1 = 3\) at the layer directly above the database, \(3^2 = 9\) two layers up, and so on to \(3^5 = 243\) at the top.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f3t"><title id="f3t">Retry amplification compounding across a five-layer service stack</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<line x1="70" y1="220" x2="770" y2="220" class="d-axis"/>
+<g>
+<rect x="60" y="205" width="80" height="15" class="d-fill-blue"/>
+<text x="100" y="200" text-anchor="middle" class="d-mono d-small">3&#215;</text>
+<text x="100" y="238" text-anchor="middle" class="d-small">Layer 5 &#8594; 4</text>
+
+<rect x="180" y="185" width="80" height="35" class="d-fill-blue"/>
+<text x="220" y="180" text-anchor="middle" class="d-mono d-small">9&#215;</text>
+<text x="220" y="238" text-anchor="middle" class="d-small">&#8594; Layer 3</text>
+
+<rect x="300" y="150" width="80" height="70" class="d-fill-blue"/>
+<text x="340" y="145" text-anchor="middle" class="d-mono d-small">27&#215;</text>
+<text x="340" y="238" text-anchor="middle" class="d-small">&#8594; Layer 2</text>
+
+<rect x="420" y="95" width="80" height="125" class="d-fill-blue"/>
+<text x="460" y="90" text-anchor="middle" class="d-mono d-small">81&#215;</text>
+<text x="460" y="238" text-anchor="middle" class="d-small">&#8594; Layer 1</text>
+
+<rect x="560" y="30" width="100" height="190" class="d-fill-orange"/>
+<text x="610" y="24" text-anchor="middle" class="d-mono d-bold">243&#215;</text>
+<text x="610" y="238" text-anchor="middle" class="d-small d-bold">&#8594; database</text>
+</g>
+<text x="400" y="20" text-anchor="middle" class="d-small d-text-light">Load multiplier on the database, 3 retries configured independently at each of 5 layers</text>
+</svg>
+<figcaption><b>Figure 3.</b> Three independent retries at each of five stacked service layers compound multiplicatively: \(3^5 = 243\times\) the original load reaches the database if every layer retries independently and none coordinates with the others<a class="cite" href="#ref-3">3</a>. Amazon's stated mitigation is to retry at a single point in the stack rather than at every layer<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<p>Amazon's stated response to this specific failure mode is architectural, not just tunable: "for low-cost control-plane and data-plane operations, our best practice is to retry at a single point in the stack"<a class="cite" href="#ref-3">3</a>, accepting that retrying only at the top may waste some work already done by intermediate layers, in exchange for never multiplying load at every hop. A second, complementary mitigation is to cap how many retries a client is allowed to issue locally regardless of how the rest of the stack behaves, which Section 4's circuit breaker and the "Where experts disagree" section both return to from different angles.</p>
+
+<h3 id="backoff-jitter">3.3 Backoff with jitter: decorrelating retries so they do not resynchronize</h3>
+<p>Even a single retrying layer can still cause harm if every client backs off by the same fixed amount, because "if all the failed calls back off to the same time, they cause contention or overload again when they are retried"<a class="cite" href="#ref-3">3</a> — a synchronized wave of retries hitting the backend at the same instant is barely different from no backoff at all. The standard fix compounds two independent ideas. Exponential backoff increases the wait between successive retries geometrically, typically capped at a maximum so the wait does not grow without bound (Amazon calls the capped version, unsurprisingly, "capped exponential backoff"<a class="cite" href="#ref-3">3</a>). Jitter then adds randomness on top of that schedule specifically to break the synchronization between different clients' retry timers, spreading what would otherwise be a single spike of re-arriving requests over a wider window<a class="cite" href="#ref-3">3</a>. Amazon applies the same jitter idea beyond retries — to periodic jobs and scheduled work in general — because traffic that looks smooth in aggregate metrics is often a sequence of short, synchronized bursts that only jitter, not backoff alone, spreads out<a class="cite" href="#ref-3">3</a>.</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Backoff and jitter reduce the odds that retries resynchronize; they do not bound how much extra load retries add in aggregate. Amazon's own additional safeguard is a local token bucket per client: calls may retry freely while tokens remain, then fall back to a fixed, deliberately low retry rate once the bucket is empty<a class="cite" href="#ref-3">3</a> — a second, independent circuit against exactly the amplification Figure 3 shows, and the mechanism this module's "Where experts disagree" section contrasts directly against Hystrix's circuit breaker.</p></aside>
+<h2 id="circuit-breaker">4. The circuit breaker: closed, open, half-open</h2>
+<p>A timeout stops one caller from waiting forever on one slow call. It does nothing to stop that same caller from making the next call, and the next, to a dependency that is now reliably failing — every one of those calls still pays the full timeout before giving up, and the caller's resources are consumed at the same rate as before. Netflix's Hystrix library, built to "isolate points of access to remote systems, services and 3rd party libraries, stop cascading failure and enable resilience in complex distributed systems where failure is inevitable"<a class="cite" href="#ref-4">4</a>, adds the missing piece: a state machine, per dependency, that stops issuing calls at all once that dependency has demonstrably become unhealthy, and periodically tests whether it has recovered.</p>
+
+<p>The breaker has exactly three states. In <b>CLOSED</b>, calls pass through normally and their outcomes are recorded. The breaker trips to <b>OPEN</b> once two conditions are both satisfied within a rolling window: enough call volume has occurred to make the error rate statistically meaningful, and the error percentage among those calls exceeds a configured threshold<a class="cite" href="#ref-4">4</a>. While OPEN, calls to that dependency fail immediately without even attempting the network call — this is the entire point: a caller that is already in trouble no longer spends time or resources discovering that the dependency is still down. After a configured sleep window, the breaker moves to <b>HALF-OPEN</b> and lets exactly one trial request through<a class="cite" href="#ref-4">4</a>; if that call succeeds, the breaker resets to CLOSED, and if it fails, the breaker returns to OPEN and the sleep window starts again.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f4t"><title id="f4t">Hystrix circuit breaker state machine: closed, open, half-open</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="40" y="40" width="200" height="90" rx="20" class="d-block"/>
+<text x="140" y="80" text-anchor="middle" class="d-text-inv d-bold d-title">CLOSED</text>
+<text x="140" y="100" text-anchor="middle" class="d-text-inv d-small">Calls pass through</text>
+
+<rect x="560" y="40" width="200" height="90" rx="20" class="d-block-accent"/>
+<text x="660" y="80" text-anchor="middle" class="d-text-inv d-bold d-title">OPEN</text>
+<text x="660" y="100" text-anchor="middle" class="d-text-inv d-small">Calls fail fast, no network hop</text>
+
+<rect x="300" y="220" width="200" height="90" rx="20" class="d-block-2"/>
+<text x="400" y="260" text-anchor="middle" class="d-text-inv d-bold d-title">HALF-OPEN</text>
+<text x="400" y="280" text-anchor="middle" class="d-text-inv d-small">One trial request allowed</text>
+
+<path d="M240,70 Q400,20 560,70" class="d-arrow" marker-end="url(#f4-arr)"/>
+<text x="400" y="35" text-anchor="middle" class="d-mono d-small">volume &#8805; 20 &amp; errors &#8805; 50%</text>
+
+<path d="M660,130 Q660,180 500,240" class="d-arrow" marker-end="url(#f4-arr)"/>
+<text x="640" y="180" text-anchor="middle" class="d-mono d-small">sleep window 5000&#160;ms</text>
+
+<path d="M300,255 Q160,180 140,130" class="d-arrow" marker-end="url(#f4-arr)"/>
+<text x="180" y="185" text-anchor="middle" class="d-mono d-small">trial succeeds</text>
+
+<path d="M500,255 Q640,210 660,130" class="d-arrow" marker-end="url(#f4-arr)"/>
+<text x="620" y="255" text-anchor="middle" class="d-mono d-small">trial fails</text>
+</svg>
+<figcaption><b>Figure 4.</b> Hystrix's default thresholds: the breaker trips CLOSED &#8594; OPEN once at least 20 requests have occurred in the rolling window and at least 50% of them have errored, waits a 5,000 ms sleep window, then allows one HALF-OPEN trial request before returning to CLOSED or back to OPEN<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<p>The defaults are worth stating exactly because they show how coarse this mechanism is meant to be: <code>circuitBreaker.requestVolumeThreshold</code> defaults to 20 requests in the rolling window, <code>circuitBreaker.errorThresholdPercentage</code> defaults to 50%, and <code>circuitBreaker.sleepWindowInMilliseconds</code> defaults to 5,000 ms<a class="cite" href="#ref-5">5</a>. None of these numbers is derived from queueing theory or from a per-dependency latency distribution — they are round, memorable, and deliberately conservative, because a breaker that trips too eagerly on a healthy dependency is merely an availability bug you can find in testing, while a breaker that trips too late has already let a cascading failure through. The volume threshold specifically exists so that a dependency's first few calls of the day, or a low-traffic dependency that happens to get three failures out of three attempts, do not trip a breaker on statistically meaningless noise.</p>
+
+<p>A breaker that fails a call fast still has to return something to the code that made the call, and Hystrix's answer is to make a fallback a first-class part of the same command, not an afterthought bolted on separately. The same fallback path fires from four distinct triggers: "when an exception is thrown by <code>construct()</code> or <code>run()</code>..., when the command is short-circuited because the circuit is open..., when the command's thread pool and queue or semaphore are at capacity..., or when the command has exceeded its timeout length"<a class="cite" href="#ref-4">4</a> — a normal error, an OPEN breaker, a full isolation pool, and a timeout all funnel into one recovery path, so the calling code does not need four separate cases. Hystrix's own guidance on what that fallback should actually do is specific: "write your fallback to provide a generic response, without any network dependency, from an in-memory cache or by means of other static logic"<a class="cite" href="#ref-4">4</a> — a fallback that itself makes a network call has simply relocated the original failure mode one level down, rather than eliminating it. If no fallback is implemented, or the fallback itself throws, Hystrix does not silently invent a value; the call terminates with an explicit failure signal all the way up to the caller<a class="cite" href="#ref-4">4</a>, which keeps "the dependency failed and there was nothing safe to substitute" distinguishable from "the dependency succeeded."</p>
+
+<p>The breaker's binary nature is a deliberate design choice, not an oversight: CLOSED and OPEN are the only two states in which calls actually happen normally or not at all, and HALF-OPEN exists purely to probe for recovery with the minimum possible cost — one request, not a gradually ramping fraction of traffic. That simplicity is exactly what Section "Where experts disagree" below returns to, because it is also the property critics of this design point to directly.</p>
+<h2 id="isolation-bulkhead">5. Isolation: thread-pool vs. semaphore, and the bulkhead pattern</h2>
+<p>A circuit breaker decides whether to call a dependency at all. It says nothing about what happens to the calling thread while a call it does allow through is executing — and that gap is where a single slow dependency, protected by no breaker yet or still CLOSED because its failures have not crossed the volume/error-rate threshold, can still take down everything sharing the caller's process. Hystrix's answer is to isolate every dependency's calls from the caller's own request-handling threads, and it offers two distinct mechanisms for doing that, with genuinely different failure characteristics.</p>
+
+<h3 id="thread-pool-isolation">5.1 Thread-pool isolation</h3>
+<p>With thread-pool isolation, "clients (libraries, network calls, etc) execute on separate threads. This isolates them from the calling thread (Tomcat thread pool)"<a class="cite" href="#ref-4">4</a>. Each dependency gets its own small, fixed-size pool of worker threads — Hystrix's own default is 10 threads per dependency<a class="cite" href="#ref-5">5</a> — and a call to that dependency runs on one of those threads while the calling thread waits, but waits with an enforceable timeout: Hystrix's default execution timeout is 1,000 ms<a class="cite" href="#ref-5">5</a>, applied regardless of what the underlying network call itself is configured to do. If the dependency's thread pool fills up because too many calls are in flight and running long, the next call to that same dependency is rejected immediately rather than queued — the caller finds out it is being throttled without waiting at all.</p>
+
+<h3 id="semaphore-isolation">5.2 Semaphore isolation</h3>
+<p>With semaphore isolation, there is no separate worker thread at all: the calling thread itself executes the dependency call directly, and a semaphore only limits how many callers may be inside that call concurrently — Hystrix's default is 10 concurrent permits<a class="cite" href="#ref-5">5</a>. This is far cheaper per call, since there is no thread hand-off, no separate pool to size, and no context-switch overhead — but it buys that cheapness by giving up exactly the property thread-pool isolation provided: "if a dependency is isolated with a semaphore and then becomes latent, the parent threads will remain blocked until the underlying network calls timeout... [semaphores] do not allow for timing out"<a class="cite" href="#ref-4">4</a>. A semaphore can reject a caller before it starts (once the permit count is exhausted), but it has no mechanism to reach into an in-flight call and pull the calling thread back out early. Hystrix's own documented recommendation reflects this asymmetry directly: "the default, and the recommended setting, is to run HystrixCommands using thread isolation," reserving semaphore isolation for calls cheap and frequent enough that thread hand-off overhead dominates, or for calls into in-process, non-network code where a hung call is not actually a realistic failure mode<a class="cite" href="#ref-5">5</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Thread-pool vs. semaphore isolation in Hystrix, with the library's own default values<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Property</th><th>Thread-pool isolation</th><th>Semaphore isolation</th></tr></thead>
+<tbody>
+<tr><td class="row">Default concurrency limit</td><td class="num">10 threads<a class="cite" href="#ref-5">5</a></td><td class="num">10 permits<a class="cite" href="#ref-5">5</a></td></tr>
+<tr><td class="row">Enforces a timeout on a hung call</td><td data-best>Yes — default 1,000&#160;ms<a class="cite" href="#ref-5">5</a></td><td data-worst>No — blocks until the network call itself times out<a class="cite" href="#ref-4">4</a></td></tr>
+<tr><td class="row">Per-call overhead</td><td data-worst>Thread hand-off and context switch</td><td data-best>None — runs on the calling thread</td></tr>
+<tr><td class="row">Hystrix's recommended default</td><td data-best>Yes, for network calls<a class="cite" href="#ref-5">5</a></td><td>Only for cheap, high-volume, or non-network calls</td></tr>
+</tbody>
+</table>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f5t"><title id="f5t">A slow dependency's effect on the calling thread under thread-pool vs semaphore isolation</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="200" y="25" text-anchor="middle" class="d-bold d-small">Thread-pool isolation</text>
+<rect x="40" y="45" width="120" height="40" rx="6" class="d-block"/>
+<text x="100" y="69" text-anchor="middle" class="d-text-inv d-small">Caller thread</text>
+<path d="M160,65 L220,65" class="d-arrow" marker-end="url(#f5-arr)"/>
+<rect x="220" y="45" width="140" height="40" rx="6" class="d-block-2"/>
+<text x="290" y="69" text-anchor="middle" class="d-text-inv d-small">Dependency pool (10)</text>
+<rect x="40" y="100" width="320" height="30" class="d-panel"/>
+<text x="200" y="120" text-anchor="middle" class="d-small">Timeout fires at 1,000&#160;ms &#8594; caller thread freed<a class="cite" href="#ref-5">5</a></text>
+
+<text x="620" y="25" text-anchor="middle" class="d-bold d-small">Semaphore isolation</text>
+<rect x="440" y="45" width="140" height="40" rx="6" class="d-block-accent"/>
+<text x="510" y="69" text-anchor="middle" class="d-text-inv d-small">Caller thread = worker</text>
+<path d="M580,65 Q620,65 620,45" class="d-arrow d-dashed"/>
+<rect x="440" y="100" width="320" height="30" class="d-panel"/>
+<text x="600" y="120" text-anchor="middle" class="d-small">No enforced timeout &#8594; caller blocks until the network call itself gives up<a class="cite" href="#ref-4">4</a></text>
+
+<rect x="40" y="160" width="720" height="80" rx="8" class="d-hl"/>
+<text x="400" y="190" text-anchor="middle" class="d-bold d-small">A caller thread pool has only so many threads.</text>
+<text x="400" y="210" text-anchor="middle" class="d-small">Under semaphore isolation, every thread that calls a hung dependency stays blocked indefinitely,</text>
+<text x="400" y="228" text-anchor="middle" class="d-small">so the caller's own thread pool can exhaust even though the caller's code never "hangs" itself.</text>
+</svg>
+<figcaption><b>Figure 5.</b> Thread-pool isolation gives the calling thread an enforceable exit at a fixed timeout; semaphore isolation leaves the calling thread at the mercy of whatever timeout (if any) the underlying network client enforces<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h3 id="bulkhead">5.3 The bulkhead pattern and cascading failure</h3>
+<p>Isolating one dependency's calls onto their own pool is only half the pattern — the other half is making sure that pool is genuinely separate from every other dependency's pool, and from the pool that serves unrelated requests. A ship's bulkheads are watertight partitions that keep a hull breach in one compartment from flooding the whole vessel; the software pattern borrows the name directly because the failure it prevents has the same shape. Without per-dependency isolation, every outbound call a service makes — to a database, a cache, three different downstream services — commonly shares one thread pool with every other kind of work that service does, including handling requests that have nothing to do with the slow dependency at all.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f6t"><title id="f6t">Cascading failure without a bulkhead: one slow dependency exhausts a shared thread pool</title>
+<defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="40" y="40" width="260" height="220" rx="10" class="d-panel"/>
+<text x="170" y="65" text-anchor="middle" class="d-bold d-small">Shared thread pool (e.g. 50 threads)</text>
+<g>
+<rect x="60" y="80" width="40" height="26" class="d-fill-red"/>
+<rect x="105" y="80" width="40" height="26" class="d-fill-red"/>
+<rect x="150" y="80" width="40" height="26" class="d-fill-red"/>
+<rect x="195" y="80" width="40" height="26" class="d-fill-red"/>
+<rect x="240" y="80" width="40" height="26" class="d-fill-red"/>
+<rect x="60" y="112" width="40" height="26" class="d-fill-red"/>
+<rect x="105" y="112" width="40" height="26" class="d-fill-red"/>
+<rect x="150" y="112" width="40" height="26" class="d-fill-red"/>
+<rect x="195" y="112" width="40" height="26" class="d-fill-red"/>
+<rect x="240" y="112" width="40" height="26" class="d-fill-red"/>
+<rect x="60" y="144" width="40" height="26" class="d-fill-red"/>
+<rect x="105" y="144" width="40" height="26" class="d-fill-red"/>
+<rect x="150" y="144" width="40" height="26" class="d-fill-red"/>
+<rect x="195" y="144" width="40" height="26" class="d-fill-red"/>
+<rect x="240" y="144" width="40" height="26" class="d-fill-red"/>
+</g>
+<text x="170" y="200" text-anchor="middle" class="d-small d-bold">All threads blocked calling</text>
+<text x="170" y="216" text-anchor="middle" class="d-small d-bold">the one slow dependency</text>
+<text x="170" y="240" text-anchor="middle" class="d-small">Unrelated requests queue behind them</text>
+
+<path d="M300,150 L360,150" class="d-arrow-active" marker-end="url(#f6-arr)"/>
+
+<rect x="360" y="120" width="200" height="60" rx="8" class="d-block-accent"/>
+<text x="460" y="145" text-anchor="middle" class="d-text-inv d-small">Slow dependency</text>
+<text x="460" y="163" text-anchor="middle" class="d-text-inv d-small">(never responds)</text>
+
+<rect x="600" y="40" width="180" height="220" rx="10" class="d-outline d-dashed"/>
+<text x="690" y="65" text-anchor="middle" class="d-bold d-small">Unrelated request</text>
+<text x="690" y="82" text-anchor="middle" class="d-small">e.g. "get my profile" —</text>
+<text x="690" y="99" text-anchor="middle" class="d-small">no call to the slow</text>
+<text x="690" y="116" text-anchor="middle" class="d-small">dependency at all</text>
+<text x="690" y="150" text-anchor="middle" class="d-bold d-small d-fill-red">Fails anyway:</text>
+<text x="690" y="168" text-anchor="middle" class="d-small">no free thread left in</text>
+<text x="690" y="185" text-anchor="middle" class="d-small">the shared pool to</text>
+<text x="690" y="202" text-anchor="middle" class="d-small">handle it</text>
+</svg>
+<figcaption><b>Figure 6.</b> Without a bulkhead separating each dependency's calls onto its own pool, a single dependency that never responds can occupy every thread in a shared pool, so requests that never touch that dependency fail purely for lack of a free thread<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<p>Thread-pool isolation is what makes the bulkhead concrete in Hystrix: giving each dependency its own small, separately-sized pool means the failure in Figure 6 is contained to the threads assigned to the one dependency that misbehaved — a caller can still serve every request that does not depend on the failing service, at full capacity, because those requests were never competing for the same pool in the first place. This is also why thread-pool isolation's per-call overhead (the cost Table 3 charges against it) is usually the right trade: the alternative is not "no cost," it is the entire shared pool's worth of unrelated requests failing during exactly the window when the service most needs to keep serving the ones it still can.</p>
+<h2 id="defense-in-depth">6. Defense in depth: admission control upstream, and chaos engineering as the verification discipline</h2>
+<p>Everything so far in this module acts after a request has already been admitted — a timeout, a retry, a breaker, and a bulkhead all operate on calls the system has already agreed to attempt. The cheapest failure to survive is the one you never admit in the first place, and Module 10 covers the general mechanics of backpressure and rate limiting that do exactly this at the boundary between services. This module only needs one specific precedent from that machinery, because it recurs throughout the rest of this course: Google's Borg cluster manager checks quota strictly at admission time, not at scheduling time — "quota-checking is part of admission control, not scheduling: jobs with insufficient quota are immediately rejected upon submission"<a class="cite" href="#ref-6">6</a>. The design reason is the same one Section 3 gave for retrying at a single point in the stack: a rejection that happens before any resource has been committed is cheap and immediate, while a rejection (or worse, a slow failure) that happens after a job has already been partially scheduled has already spent the resources it was trying to conserve. Every mechanism in Sections 3 through 5 is a defense that activates once a call is already in flight; admission control by quota is the defense that tries to make sure the call never gets that far when the answer was always going to be "no."</p>
+
+<h3 id="chaos-engineering">6.1 Chaos engineering: verifying resilience by breaking things on purpose</h3>
+<p>Every mechanism this module has described — timeouts sized correctly, breakers that trip at the right threshold, bulkheads that actually isolate what they claim to isolate — is a claim about what the system will do under a failure that, by construction, has not happened yet in the environment where the claim is being tested. Chaos engineering, formalized by the Netflix engineers who built Chaos Monkey and the wider "Simian Army," is "the discipline of experimenting on a system in order to build confidence in the system's capability to withstand turbulent conditions in production"<a class="cite" href="#ref-7">7</a> — the direct answer to "how do you know the breaker actually trips before the outage happens, instead of during it."</p>
+
+<p>The discipline's baseline method is to build a hypothesis around a system's steady-state behavior — "focus on the measurable output of a system, rather than internal attributes of the system"<a class="cite" href="#ref-7">7</a> — and then inject a failure and check whether that measurable output holds. Four further principles describe how to run that experiment credibly rather than as a toy. Chaos variables should reflect real-world events, prioritized by potential impact or estimated frequency, rather than arbitrary faults chosen for convenience<a class="cite" href="#ref-7">7</a>. Experiments should run directly on production traffic wherever possible, because "chaos strongly prefers to experiment directly on production traffic" — a staging environment's traffic pattern, cache state, and dependency graph are never quite the production ones, and an experiment run somewhere else is a claim about a different system<a class="cite" href="#ref-7">7</a>. Running experiments manually does not scale, so mature practice automates them to run continuously rather than as a one-off exercise<a class="cite" href="#ref-7">7</a>. Finally, and non-negotiably, "it is the responsibility and obligation of the Chaos Engineer to ensure the fallout from experiments are minimized and contained"<a class="cite" href="#ref-7">7</a> — some short-term negative impact is an accepted cost of the method, but an uncontained one is a self-inflicted outage, not an experiment.</p>
+
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>Chaos engineering verifies resilience mechanisms; it does not replace them. Injecting a dependency failure into a service with no timeout, no breaker, and no bulkhead does not teach you anything you could not already predict from Figure 6 — it only becomes informative once there is a specific claim (a timeout value, a threshold, a pool size) to check against real production behavior. Module 15 picks this up directly: Netflix's own chaos-engineering practice, run against a dependency graph instrumented with Hystrix breakers exactly like the ones in Section 4, is the worked example this module deliberately leaves for that case study rather than repeating here.</p></aside>
+
+<p>Taken together, Sections 1 through 6 form a single defense-in-depth stack, read from the outside in: an SLO defines what "working" means and an error budget says how much failure is tolerable before it matters (Section 1); metrics, logs, and traces let you tell whether you are inside that budget and, if not, why (Section 2); admission control rejects what you already know you cannot serve before committing any resource to it (Section 6); timeouts, retries with bounded amplification, and jittered backoff bound how long and how aggressively you wait on what you did admit (Section 3); a circuit breaker stops calling a dependency once it is statistically clear that waiting is pointless (Section 4); and bulkheads make sure that even total failure of one dependency cannot exhaust the resources every other request needs (Section 5). Chaos engineering is the discipline that checks, deliberately and on purpose, that every layer of that stack does what its design says it does — which is also exactly the vocabulary Module 30 needs already built when it turns to what "reliable" and "observable" mean specifically for a multi-node LLM-serving path.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Section 4 and Section 3's closing callout both point at the same open question from different directions: should a dependency's health be governed by a fixed, hand-set rule — a circuit breaker with numeric thresholds an operator chose in advance — or by a mechanism that continuously re-measures capacity and adjusts itself? Both camps have shipped production systems at large scale, and, notably, one of them is Netflix's own answer to its earlier answer.</p>
+<div class="positions">
+<article class="position">
+<h4>Fixed-threshold circuit breakers are the safer default</h4>
+<p class="who">Hystrix's design, and the resilience4j-style libraries Netflix itself now points new projects toward<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-8">8</a></p>
+<p>A breaker with numeric thresholds — 20 requests, 50% error rate, a 5,000&#160;ms sleep window<a class="cite" href="#ref-5">5</a> — is a small, fully specified state machine: three states, two guard conditions, testable by forcing each transition directly. Once configured for a dependency, its behavior is legible to whoever operates it and does not depend on the library correctly inferring anything about the dependency's normal capacity. It also composes uniformly: the same three-state machine wraps a database call, a third-party API call, or an internal RPC, regardless of what each one's underlying latency distribution looks like.</p>
+<ul class="pros"><li>Deterministic, easy to test by forcing each state transition directly</li><li>No per-dependency capacity model required — just volume and error-rate counts</li><li>Uniform across heterogeneous dependencies, which matters at a gateway or mesh boundary talking to many unrelated backends</li></ul>
+<ul class="cons"><li>Thresholds are static and go stale as traffic patterns and dependency capacity change, requiring manual retuning per dependency</li><li>Binary trip/no-trip behavior is exactly the "modal behavior" critics point to as hard to test end-to-end and slow to recover from<a class="cite" href="#ref-3">3</a></li><li>Netflix's own Hystrix README states the project is in maintenance mode and that "we are beginning to recommend others" move toward libraries that "react to an application's real time performance rather than pre-configured settings"<a class="cite" href="#ref-8">8</a></li></ul>
+</article>
+<article class="position">
+<h4>Replace static thresholds with continuously adaptive limits</h4>
+<p class="who">AWS's house guidance on retries<a class="cite" href="#ref-3">3</a>; Netflix's own successor library, concurrency-limits<a class="cite" href="#ref-9">9</a></p>
+<p>AWS's Builders' Library is explicit that Amazon avoids circuit breakers as the primary defense against retry-driven overload: "circuit breakers... are widely promoted to solve this problem. Unfortunately, circuit breakers introduce modal behavior into systems that can be difficult to test, and can introduce significant addition[al] time to recovery"<a class="cite" href="#ref-3">3</a>. Amazon's preferred mechanism instead is a local token bucket that throttles retries to a fixed rate once exhausted, with no separate breaker state at all<a class="cite" href="#ref-3">3</a>. Separately, and for a different reason, Netflix's own follow-up to Hystrix computes a concurrency ceiling continuously from measured round-trip time using an algorithm derived from TCP Vegas congestion control, rather than a hand-set error-rate percentage: the limit rises when observed latency tracks its own minimum and falls as observed latency diverges from that minimum, self-tuning to the dependency's actual, currently-available capacity without an operator setting a threshold at all<a class="cite" href="#ref-9">9</a>.</p>
+<ul class="pros"><li>No manual per-dependency threshold to retune as traffic or backend capacity shifts</li><li>Avoids the binary mode-flip a breaker introduces; the limit moves continuously instead of stepping between two states</li><li>Responds automatically to real capacity changes such as autoscaling or a noisy multi-tenant neighbor</li></ul>
+<ul class="cons"><li>Manages concurrency, not availability — it does not replace the need for a hard fallback path when a dependency is unambiguously, fully down</li><li>A continuously-changing limit is harder to reason about and to test deterministically than a fixed threshold with two guard conditions</li><li>Less battle-tested as a uniform, off-the-shelf, cross-language pattern than a Hystrix-style breaker — which is also why Netflix's own README still points new <i>internal</i> projects at resilience4j, an explicit-threshold breaker library, rather than at a Vegas-style limiter for every case<a class="cite" href="#ref-8">8</a></li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The two positions are not actually competing for the same slot. A fixed-threshold breaker is the right default at a boundary that talks to many heterogeneous dependencies an operator cannot individually capacity-model — a gateway or service-mesh sidecar in front of dozens of unrelated backends is exactly this case, which is also why breaker-style configuration (not adaptive limiting) is what shows up as the default surface in that layer. Adaptive concurrency limiting is the better fit inside a single, high-QPS, latency-sensitive service boundary that one team controls end-to-end and whose real capacity genuinely fluctuates — Netflix's own edge, the system the concurrency-limits library was built for, is precisely that case, not a general-purpose replacement for every breaker in a large dependency graph. What would settle the general question more conclusively than either camp's own account: a controlled chaos experiment (Section 6.1) injecting the same dependency-failure pattern against the same request path once behind a Hystrix-style breaker and once behind an adaptive limiter, measuring mean-time-to-detect and mean-time-to-recover under each — a head-to-head comparison no source in this map has published.</p></div>
+</section>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">textbook</span>Jones, C., Wilkes, J., Murphy, N., Smith, C. (ed. Beyer, B.) <em>Site Reliability Engineering</em>, Chapter 4: Service Level Objectives. Google / O'Reilly, 2016. <a href="https://sre.google/sre-book/service-level-objectives/">https://sre.google/sre-book/service-level-objectives/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: SLI/SLO/SLA definitions, the "what happens if missed" consequence test, the 99% Get-RPC-under-100ms example, Google Compute Engine's 99.95% availability target, and the error-budget framing.</span></li>
+<li id="ref-2"><span class="ref-type">paper</span>DeCandia, G., Hastorun, D., Jampani, M., et al. <em>Dynamo: Amazon's Highly Available Key-value Store</em>. Amazon, SOSP '07. <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Amazon SLAs expressed at the 99.9th percentile rather than the mean (§2.2).</span></li>
+<li id="ref-3"><span class="ref-type">blog</span>Brooker, M. <em>Timeouts, retries, and backoff with jitter</em>. The Amazon Builders' Library, Amazon Web Services. <a href="https://web.archive.org/web/20231225054225/https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/">https://web.archive.org/web/20231225054225/https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/</a> (Wayback Machine capture of the original article, whose live URL now redirects to builder.aws.com). Accessed 2026-09-17. <span class="ref-use">Used for: partial/transient failure framing, timeout sizing at a downstream latency percentile, retries as "selfish," the 3-retries-&#215;-5-layers = 243&#215; amplification example, retry-at-a-single-point mitigation, capped exponential backoff, jitter to decorrelate retries, the local-token-bucket mitigation, and the explicit critique of circuit breakers as introducing modal, hard-to-test behavior.</span></li>
+<li id="ref-4"><span class="ref-type">repo</span>Netflix. <em>Hystrix Wiki: How it Works</em>. v1.5.18. <a href="https://github.com/Netflix/Hystrix/wiki/How-it-Works">https://github.com/Netflix/Hystrix/wiki/How-it-Works</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Hystrix's stated purpose, the CLOSED/OPEN/HALF-OPEN trip and recovery conditions, thread-pool isolation's calling-thread separation, and semaphore isolation's inability to enforce a timeout.</span></li>
+<li id="ref-5"><span class="ref-type">repo</span>Netflix. <em>Hystrix Wiki: Configuration</em>. v1.5.18. <a href="https://github.com/Netflix/Hystrix/wiki/Configuration">https://github.com/Netflix/Hystrix/wiki/Configuration</a>. Accessed 2026-09-17. <span class="ref-use">Used for: default values — circuitBreaker.requestVolumeThreshold=20, circuitBreaker.errorThresholdPercentage=50, circuitBreaker.sleepWindowInMilliseconds=5000, execution.isolation.strategy default THREAD, execution.isolation.thread.timeoutInMilliseconds=1000, execution.isolation.semaphore.maxConcurrentRequests=10, and thread-pool coreSize=10.</span></li>
+<li id="ref-6"><span class="ref-type">paper</span>Verma, A., Pedrosa, L., Korupolu, M., Oppenheimer, D., Tune, E., Wilkes, J. <em>Large-scale cluster management at Google with Borg</em>. Google, EuroSys '15. <a href="https://research.google.com/pubs/archive/43438.pdf">https://research.google.com/pubs/archive/43438.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: one monitoring data store serving dashboards, reports, and alerting (§2.5-adjacent operational description), and quota checked at admission time rather than scheduling time (§2.5).</span></li>
+<li id="ref-7"><span class="ref-type">official</span>principlesofchaos.org (Netflix Chaos Team and community). <em>Principles of Chaos Engineering</em>. v1, 2019. <a href="https://principlesofchaos.org/">https://principlesofchaos.org/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the definition of chaos engineering, the steady-state-hypothesis baseline method, and the four advanced principles (vary real-world events, run experiments in production, automate experiments to run continuously, minimize blast radius).</span></li>
+<li id="ref-8"><span class="ref-type">repo</span>Netflix. <em>Hystrix README</em> (project status). <a href="https://github.com/Netflix/Hystrix">https://github.com/Netflix/Hystrix</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Hystrix's maintenance-mode status, the statement that focus has shifted toward implementations reacting to real-time performance rather than pre-configured settings, and the recommendation to use resilience4j for new internal projects.</span></li>
+<li id="ref-9"><span class="ref-type">repo</span>Netflix. <em>concurrency-limits</em> GitHub repository. <a href="https://github.com/Netflix/concurrency-limits">https://github.com/Netflix/concurrency-limits</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the TCP-Vegas-derived gradient algorithm that computes a concurrency limit continuously from measured round-trip time instead of a pre-configured error-rate threshold.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool Use, Agent Harnesses, and Sandboxes for Code Execution · System Design</title>
+<meta name="description" content="How to design the harness that runs an agent loop and the sandbox layer underneath it: isolation-mechanism trade-offs (microVM, gVisor, container, Wasm, OS-level), snapshot/restore warm pools, egress and secrets policy, session/thread state, approval pauses, and execution-time billing, grounded in Anthropic, OpenAI/Codex, E2B, and Modal's own specs.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">System Design · Module 27</p>
+<h1>Tool Use, Agent Harnesses, and Sandboxes for Code Execution</h1>
+<p class="lede">An agent harness is the runtime that owns a conversation across many turns of model output and tool calls; a sandbox is the isolated place where the tool calls that touch a filesystem or a shell actually run. This module designs both layers from first principles -- which isolation mechanism a sandbox should use and why, how snapshot/restore trades startup latency against isolation strength, how egress and secrets policy get enforced, and how a harness tracks session state, streams events, and pauses for approval -- then checks the design against what Anthropic, OpenAI/Codex, E2B, and Modal actually built. After it, you have the vocabulary Module 37 needs to treat a sandbox as an RL training verifier.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>40 min</b> read</span>
+<span class="chip"><b>15</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-18</span>
+<span class="chip">Prerequisite: <b>Module 26</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 380" role="img" aria-labelledby="f1t"><title id="f1t">Three layers: harness, sandbox, isolation mechanism, sitting between the streaming session layer below and RL verifiers above</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="15" width="760" height="50" rx="8" class="d-block-muted"/>
+<text x="400" y="36" text-anchor="middle" class="d-text-inv d-bold d-small">Gateway, session, streaming transport (Module 21, Module 26)</text>
+<text x="400" y="52" text-anchor="middle" class="d-text-inv d-small">SSE deltas, sequence-number resumption -- this module sits above it</text>
+<path d="M400,66 L400,90" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="20" y="94" width="760" height="72" rx="10" class="d-panel"/>
+<text x="40" y="114" class="d-title d-bold">Harness (this module, section 6-8)</text>
+<rect x="40" y="122" width="170" height="34" rx="6" class="d-block"/>
+<text x="125" y="143" text-anchor="middle" class="d-text-inv d-small">Thread/turn/item state</text>
+<rect x="222" y="122" width="170" height="34" rx="6" class="d-block"/>
+<text x="307" y="143" text-anchor="middle" class="d-text-inv d-small">Context compaction</text>
+<rect x="404" y="122" width="170" height="34" rx="6" class="d-block"/>
+<text x="489" y="143" text-anchor="middle" class="d-text-inv d-small">Tool discovery/validation</text>
+<rect x="586" y="122" width="174" height="34" rx="6" class="d-block"/>
+<text x="673" y="143" text-anchor="middle" class="d-text-inv d-small">Approval pauses</text>
+<path d="M400,166 L400,190" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="20" y="194" width="760" height="72" rx="10" class="d-panel"/>
+<text x="40" y="214" class="d-title d-bold">Sandbox (this module, section 3-5, 9)</text>
+<rect x="40" y="222" width="170" height="34" rx="6" class="d-block-2"/>
+<text x="125" y="243" text-anchor="middle" class="d-text-inv d-small">Snapshot/restore</text>
+<rect x="222" y="222" width="170" height="34" rx="6" class="d-block-2"/>
+<text x="307" y="243" text-anchor="middle" class="d-text-inv d-small">Egress/secrets policy</text>
+<rect x="404" y="222" width="170" height="34" rx="6" class="d-block-2"/>
+<text x="489" y="243" text-anchor="middle" class="d-text-inv d-small">Per-tenant limits</text>
+<rect x="586" y="222" width="174" height="34" rx="6" class="d-block-2"/>
+<text x="673" y="243" text-anchor="middle" class="d-text-inv d-small">Execution-time billing</text>
+<path d="M400,266 L400,290" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="20" y="294" width="760" height="50" rx="8" class="d-outline d-dashed"/>
+<text x="400" y="315" text-anchor="middle" class="d-bold d-small">Isolation mechanism (section 2)</text>
+<text x="400" y="331" text-anchor="middle" class="d-small d-text-light">container | microVM | gVisor | Wasm | OS-level sandbox</text>
+<text x="400" y="365" text-anchor="middle" class="d-small d-text-light">Module 37 reuses this whole stack as an RL rollout verifier</text>
+</svg>
+<figcaption><b>Figure 1.</b> This module's three layers -- harness, sandbox, and isolation mechanism -- sit above the streaming transport Module 26 covers and underneath the RL verifier use Module 37 makes of the same stack<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<h2 id="harness-sandbox-split">1. The harness/sandbox split</h2>
+<p>An agent that can write and run code needs two things a chat-only model does not: a place to keep running for many turns while a task unfolds, and a place to actually execute the shell commands, file edits, and scripts the model asks for. The first is the job of an <b>agent harness</b>: the runtime that owns the loop between user input, model reasoning, and tool execution across a whole session, not just one request<a class="cite" href="#ref-1">1</a>. The second is the job of a <b>sandbox</b>: an isolated execution environment that runs untrusted, model-generated code without letting it read another tenant's data, reach the internet unexpectedly, or damage the host it runs on<a class="cite" href="#ref-2">2</a>.</p>
+<p>The distinction matters because the two layers fail differently and get designed by different teams. A harness bug loses conversation state or double-executes a tool call; a sandbox bug leaks another customer's files or lets code escape to the host kernel. OpenAI's own account of building the Codex App Server draws this line explicitly: the harness is "the agent loop and logic that underlies all Codex experiences," and inside it, "Codex executes shell/file tools in a sandbox and wires up integrations... so they can participate in the agent loop under a consistent policy model"<a class="cite" href="#ref-1">1</a> -- the sandbox is one thing the harness calls into, not the harness itself. Anthropic's code execution tool documentation is organized the same way: the tool-use protocol (how Claude decides to run code, how results stream back) is described separately from the "secure, sandboxed container" the code actually runs in, with its own resource limits, network policy, and lifecycle<a class="cite" href="#ref-2">2</a>.</p>
+<p>This module builds both layers from the ground up and checks the design against what four organizations actually shipped: Anthropic's code execution tool (a hosted container behind the Claude API), OpenAI's Codex harness and its Code Interpreter container (two different products with two different sandboxing stories), and two sandbox-as-a-product vendors, E2B and Modal, whose entire business is being the sandbox layer for someone else's harness. The comparison is deliberately not a product-sheet listing of one vendor's exact limits -- the spine is the design problem every one of these systems has to solve: which isolation mechanism to trust, how to make a cold sandbox start fast without weakening that isolation, how to police what a sandbox can reach on the network and what secrets it can see, how to keep a fleet of sandboxes from stepping on each other or on the operator's budget, and how a harness above the sandbox tracks state across turns that may pause, disconnect, or run for longer than one request-response cycle.</p>
+<p>Two boundaries mark where this module stops. Below it, Module 26 already covers the SSE event taxonomy, cancellation, and sequence-number-based stream resumption that this module's harness sessions ride on top of -- this module does not re-derive how a token stream survives a disconnect, only how a <em>turn</em> pauses for approval, which is a different event (section 7). Above it, Module 37 (RL training infrastructure) treats a sandbox as a reward-computing verifier: an environment that executes a model's proposed action and returns a scalar signal. Prime Intellect's Environments Hub frames an "environment" for that purpose as "the world, rules, and feedback loop of state, action, and reward," explicitly built so that "sandboxes plug directly into Verifier Environments for secure code execution"<a class="cite" href="#ref-3">3</a> -- the same isolation-mechanism and resource-limit questions this module answers for a chat agent's code-execution tool reappear, unchanged in kind, as the substrate for a training-time reward function. This module gives you the general vocabulary; Module 37 gives you the RL-specific use.</p>
+<p>Everything else in this module -- warm pools, egress policy, resource limits, billing -- is a consequence of one earlier decision: which isolation mechanism the sandbox rests on. Get that choice right and the rest is bookkeeping; get it wrong and no amount of network policy fixes a kernel escape. Five mechanisms are in production use today, and each trades startup latency, isolation strength, host density, and code compatibility against the others.</p>
+
+<h2 id="isolation-mechanisms">2. Isolation mechanisms and their trade-offs</h2>
+<p>Firecracker's own NSDI 2020 paper frames the choice as a spectrum with two historical poles: "containers, in which all workloads share a kernel and some combination of kernel mechanisms are used to isolate them," and "virtualization, in which workloads run in their own VMs under a hypervisor"<a class="cite" href="#ref-4">4</a>. Two more mechanisms have since filled in the middle and an extreme end of that spectrum: a user-space kernel (gVisor) that intercepts syscalls without full hardware virtualization, and compile-time software fault isolation (WebAssembly) that needs no kernel boundary at all because the isolation is built into the binary. A fifth case -- OS-level sandboxing for code that runs on the user's own machine rather than a multi-tenant host -- answers a different question entirely (protecting the user from their own agent, not tenant A from tenant B) and is worth keeping distinct from the first four.</p>
+
+<h3 id="isolation-mechanisms-containers">2.1 Shared-kernel containers</h3>
+<p>A Linux container is not a kernel feature by itself; it is a combination of three separate kernel mechanisms used together: <em>cgroups</em> for CPU/memory resource accounting and throttling, <em>namespaces</em> to give each container its own view of process IDs, users, and network interfaces, and <em>seccomp-bpf</em> to restrict which syscalls a process may issue<a class="cite" href="#ref-4">4</a>. All three still route through one shared host kernel. That is the whole security model and its whole weakness: "the fact that containers rely on syscall limitations for their security represents a tradeoff between security and compatibility," and the attack surface is the entire set of syscalls the kernel exposes, not some smaller subset built for the purpose -- a "trivial Linux application requires 15 unique syscalls," but a "typical Ubuntu Linux 15.04 installation requires 224 syscalls and 52 unique ioctl calls to run without problems"<a class="cite" href="#ref-4">4</a>. Every one of those is a potential kernel bug away from a host compromise. Containers are the cheapest mechanism on the list -- essentially free CPU overhead, near-instant startup -- and the weakest isolation boundary, because "untrusted code calls the host kernel directly."</p>
+
+<h3 id="isolation-mechanisms-microvm">2.2 Hardware-virtualized microVMs</h3>
+<p>The opposite pole is full virtualization: each sandbox gets its own guest kernel, and the boundary is enforced by the CPU's hardware virtualization extensions (Intel VT-x and equivalents) plus a hypervisor, not by the guest's own syscall discipline<a class="cite" href="#ref-4">4</a>. The classical objection to this approach was cost: general-purpose VMMs like QEMU carry "more than 1.4 million lines of code" and emulate dozens of legacy devices the sandbox workload never needs<a class="cite" href="#ref-4">4</a>. Firecracker's answer was to keep KVM (the kernel's virtualization infrastructure) but replace the rest of the stack with a minimal, purpose-built VMM written in Rust: "approximately 50k lines of Rust code (96% fewer lines than QEMU)," emulating only network and block devices, a serial console, and a keyboard controller -- no USB, no GPU, no BIOS<a class="cite" href="#ref-4">4</a>. The measured result: memory overhead of "around 3MB" per microVM (under 5MB by design target), boot-to-application-code in "as little as 150ms," and a creation rate of "up to 150 MicroVMs per second per host"<a class="cite" href="#ref-4">4</a>. Firecracker has run in production inside AWS Lambda and Fargate since 2018, processing "trillions of requests per month"<a class="cite" href="#ref-4">4</a>. This is the isolation floor E2B builds its sandbox product on: "every session receives a hardware-isolated Firecracker microVM rather than a shared-kernel container"<a class="cite" href="#ref-5">5</a>.</p>
+
+<h3 id="isolation-mechanisms-gvisor">2.3 User-space kernels: gVisor</h3>
+<p>gVisor takes a third position that its own documentation is careful to distinguish from both poles: "gVisor is not a syscall filter (e.g. seccomp-bpf), nor a wrapper over Linux isolation primitives," and "gVisor is also not a VM in the everyday sense"<a class="cite" href="#ref-6">6</a>. Its two components are Sentry, a from-scratch reimplementation of the Linux syscall interface, memory management, network stack, and process model, written in memory-safe Go and running in a restricted userspace process; and Gofer, a slightly more privileged sidecar that services the filesystem requests Sentry cannot handle itself<a class="cite" href="#ref-6">6</a>. Every syscall the sandboxed workload issues is intercepted by Sentry and reimplemented in Go -- "gVisor never passes through any system call to the host" -- so a kernel bug in the untrusted code's syscall path hits gVisor's own reimplementation, not the host kernel's<a class="cite" href="#ref-6">6</a>. gVisor's own framing of the trade-off is explicit: it provides "many of the security benefits of VMs while maintaining the lower resource footprint, fast startup, and flexibility of regular userspace applications," at the cost of "reduced application compatibility and higher per-system-call overhead" -- and gVisor's docs state plainly that "machine-level virtualization will face challenges achieving high density" where gVisor's userspace-kernel model does not, while gVisor "may provide poor performance for system-call-heavy workloads" where a microVM's real kernel would not<a class="cite" href="#ref-6">6</a>. Modal builds its default Sandbox product on exactly this trade-off: "Sandboxes are built on top of gVisor... [which] has custom logic to prevent Sandboxes from making malicious system calls, giving you stronger isolation than most other container runtimes"<a class="cite" href="#ref-7">7</a>.</p>
+
+<h3 id="isolation-mechanisms-wasm">2.4 Compile-time software fault isolation: WebAssembly</h3>
+<p>WebAssembly sits at a different point on the spectrum entirely: instead of interposing on syscalls at runtime (gVisor) or virtualizing hardware (Firecracker), it compiles the isolation boundary into the binary itself. A Wasm module's memory accesses are "bounds-checked at the region level" against a single linear memory region, function calls (direct and indirect) are type-checked against a fixed index space so a module cannot jump to arbitrary code, and a module has no ambient authority: it "must declare all accessible functions and their associated types at load time," so it can only call what it was explicitly given, never an arbitrary host syscall<a class="cite" href="#ref-8">8</a>. This is <em>software</em> fault isolation -- the guarantee comes from the compiler and the bytecode's verifier, not from a hardware ring transition or a second kernel -- which is why a Wasm module can start in microseconds rather than milliseconds, but also why it cannot run an unmodified Linux binary: the code has to target the Wasm instruction set (or a WASI-compatible runtime) in the first place. That compatibility cost is the reason none of the four vendor sandboxes surveyed in this module use Wasm as their default: an agent harness needs to run whatever the model writes -- arbitrary Python, arbitrary shell -- not a pre-compiled Wasm module.</p>
+
+<h3 id="isolation-mechanisms-os-level">2.5 OS-level sandboxing for local execution</h3>
+<p>The fifth mechanism answers a different threat model. When an agent runs as a CLI tool on the user's own laptop, there is no other tenant to protect against -- the isolation goal is to stop the agent's own mistakes (an errant <code>rm -rf</code>, an unintended network call) from touching the rest of the user's machine, using the OS security primitives already present rather than standing up a container or VM per invocation. OpenAI's Codex CLI does this per-platform: "macOS uses Seatbelt policies and runs commands using sandbox-exec with a profile," while "Linux uses bwrap [bubblewrap] plus seccomp by default" for namespace and syscall filtering, and by default "the agent runs with network access turned off" entirely<a class="cite" href="#ref-9">9</a>. This is a legitimate, cheaper answer to a narrower question -- single-tenant, trusted-operator, best-effort containment -- and should not be read as a weaker version of the multi-tenant mechanisms above; it is solving for a different attacker.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 420" role="img" aria-labelledby="f2t"><title id="f2t">Isolation strength versus startup latency and density for five sandboxing mechanisms</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<line x1="90" y1="360" x2="770" y2="360" class="d-axis"/>
+<line x1="90" y1="360" x2="90" y2="30" class="d-axis"/>
+<text x="430" y="395" text-anchor="middle" class="d-small d-text-light">isolation strength (shared kernel to hardware-virtualized) -&gt;</text>
+<text x="30" y="200" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 30 200)">startup latency (log) -&gt;</text>
+<line x1="150" y1="30" x2="150" y2="360" class="d-grid"/>
+<line x1="330" y1="30" x2="330" y2="360" class="d-grid"/>
+<line x1="510" y1="30" x2="510" y2="360" class="d-grid"/>
+<line x1="690" y1="30" x2="690" y2="360" class="d-grid"/>
+<circle cx="150" cy="330" r="9" class="d-fill-blue"/>
+<text x="150" y="349" text-anchor="middle" class="d-mono d-small">container</text>
+<text x="150" y="310" text-anchor="middle" class="d-small d-text-light">~ms, shared kernel</text>
+<circle cx="600" cy="280" r="9" class="d-fill-orange"/>
+<text x="600" y="299" text-anchor="middle" class="d-mono d-small">Wasm module</text>
+<text x="600" y="260" text-anchor="middle" class="d-small d-text-light">software fault isolation</text>
+<circle cx="330" cy="180" r="9" class="d-fill-green"/>
+<text x="330" y="199" text-anchor="middle" class="d-mono d-small">gVisor</text>
+<text x="330" y="160" text-anchor="middle" class="d-small d-text-light">user-space kernel</text>
+<circle cx="690" cy="90" r="10" class="d-fill-red"/>
+<text x="690" y="72" text-anchor="middle" class="d-mono d-small">Firecracker microVM</text>
+<text x="690" y="115" text-anchor="middle" class="d-small d-text-light">&lt;125ms boot, &lt;5MB ovh.</text>
+<circle cx="750" cy="60" r="10" class="d-fill-red"/>
+<text x="750" y="45" text-anchor="middle" class="d-mono d-small">full VM (QEMU)</text>
+<text x="430" y="420" text-anchor="middle" class="d-small d-text-light" style="font-style:italic">Positions are qualitative except Firecracker's cited figures; see Table 1 for mechanism detail.</text>
+</svg>
+<figcaption><b>Figure 2.</b> Startup latency rises and density falls as isolation strength moves from a shared host kernel (containers) toward a fully virtualized guest kernel (microVM/full VM); gVisor and WebAssembly occupy different middle grounds by trading a different pair of properties. Firecracker figures (boot time, memory overhead) are measured<a class="cite" href="#ref-4">4</a>; other positions reflect each mechanism's own stated design goals<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-8">8</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Five isolation mechanisms compared on what enforces the boundary, what the untrusted code can still directly touch, and where each is actually deployed<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-9">9</a>.</caption>
+<thead><tr><th>Mechanism</th><th>Boundary enforced by</th><th>Untrusted code touches host via</th><th>Compatibility</th><th>Production example</th></tr></thead>
+<tbody>
+<tr><td class="row">Container</td><td>cgroups + namespaces + seccomp-bpf</td><td>Shared host kernel directly</td><td>Any Linux binary</td><td>Docker/OCI generally</td></tr>
+<tr><td class="row">microVM</td><td>KVM + hardware VT-x, minimal VMM</td><td>Nothing (own guest kernel)</td><td>Any Linux binary</td><td>Firecracker (Lambda, Fargate); E2B</td></tr>
+<tr><td class="row">User-space kernel</td><td>Sentry syscall reimplementation</td><td>Sentry's Go-language kernel, not host</td><td>Most Linux binaries</td><td>gVisor; Modal Sandboxes (default)</td></tr>
+<tr><td class="row">Compile-time SFI</td><td>Bounds-checked linear memory, typed calls</td><td>Only explicitly imported functions</td><td>Code compiled to Wasm/WASI only</td><td>Browser/edge Wasm runtimes</td></tr>
+<tr><td class="row">OS-level sandbox</td><td>Seatbelt (macOS) / bwrap+seccomp (Linux)</td><td>Host kernel, but syscall/path-restricted</td><td>Any binary, single-tenant only</td><td>Codex CLI (local execution)</td></tr>
+</tbody>
+</table>
+
+<h2 id="snapshot-restore-warm-pools">3. Snapshot/restore and warm pools</h2>
+<p>Section 2's isolation mechanisms differ by an order of magnitude or more in startup latency: a container attaches to a running kernel in single-digit milliseconds; a Firecracker microVM boots a real kernel in under 125ms<a class="cite" href="#ref-4">4</a>; a full QEMU-style VM with a BIOS can take noticeably longer again. For an agent harness that wants to run a tool call the moment the model asks for one, none of those numbers are free, and every vendor surveyed here answers with the same general pattern: don't destroy a sandbox when a turn ends, checkpoint it and offer to restore the exact same state later, faster than a cold boot.</p>
+<p>Firecracker's own mechanism for this is snapshot/restore of the guest's memory and device state, and the paper's operational data shows why it matters at scale: production oversubscription ratios of "over 20x" on memory and "as high as 10x" on CPU, run "with no issues," precisely because most idle microVMs are not actually using the memory a naive placement would reserve for them<a class="cite" href="#ref-4">4</a>. Reusing a checkpointed sandbox instead of cold-booting a new one is the same idea applied at the level of one user's session rather than the whole host's memory budget.</p>
+<p>Every vendor in this survey implements some version of "pause instead of destroy," but the exact trigger and window differ:</p>
+<ul>
+<li><b>Anthropic</b> checkpoints a code-execution container "after about 5 minutes of inactivity," and a client can restore it by sending the container's ID again "within the 30-day window"; past that, "an expired container can't be reused" and a fresh one must be created<a class="cite" href="#ref-2">2</a>. The `expires_at` timestamp returned with each response is a shorter rolling value, not the 30-day ceiling itself<a class="cite" href="#ref-2">2</a>.</li>
+<li><b>OpenAI's</b> Code Interpreter container follows a single idle clock rather than a checkpoint-then-long-window model: "a container expires if it is not used for 20 minutes," full stop -- an expired container cannot be reactivated, and the client must create a new one and re-upload any files<a class="cite" href="#ref-10">10</a>.</li>
+<li><b>E2B</b> treats pausing as indefinite by default rather than time-boxed: "pausing a sandbox saves both its filesystem and its memory, and paused sandboxes are kept indefinitely until you kill them"<a class="cite" href="#ref-11">11</a>. E2B also supports forking a paused sandbox's saved state into up to 100 live copies<a class="cite" href="#ref-5">5</a> -- a warm-pool pattern where one expensively-prepared environment seeds many cheap ones.</li>
+<li><b>Modal</b> defaults a Sandbox's maximum lifetime to 5 minutes, configurable up to 24 hours, with an idle timeout that terminates it sooner if unused; workloads that need to outlive that window rely on an explicit Filesystem Snapshot rather than an indefinite pause<a class="cite" href="#ref-12">12</a>.</li>
+</ul>
+<p>The design axis underneath all four choices is the same: a longer restore window trades operator cost (holding checkpointed state, however cheap, for however many idle sessions exist) against harness simplicity (never having to explain to a user why yesterday's environment is gone). A 20-minute or 5-minute idle clock pushes that cost onto the harness, which must detect the expiry and re-provision transparently; a 30-day or indefinite window pushes it onto storage, betting that most users come back before the window closes.</p>
+
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 220" role="img" aria-label="Sandbox container lifecycle from creation through checkpoint to expiry">
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<g data-step="1">
+<rect x="20" y="70" width="130" height="60" rx="8" class="d-block"/>
+<text x="85" y="104" text-anchor="middle" class="d-text-inv d-bold d-small">Created</text>
+</g>
+<g data-step="1-6"><path d="M150,100 L185,100" class="d-arrow" marker-end="url(#f3-arr)"/></g>
+<g data-step="2">
+<rect x="186" y="70" width="130" height="60" rx="8" class="d-block-2"/>
+<text x="251" y="104" text-anchor="middle" class="d-text-inv d-bold d-small">Active</text>
+</g>
+<g data-step="2-6"><path d="M316,100 L351,100" class="d-arrow" marker-end="url(#f3-arr)"/></g>
+<g data-step="3">
+<rect x="352" y="70" width="130" height="60" rx="8" class="d-block-muted"/>
+<text x="417" y="97" text-anchor="middle" class="d-text-inv d-bold d-small">Idle</text>
+<text x="417" y="113" text-anchor="middle" class="d-text-inv d-small">5-20 min</text>
+</g>
+<g data-step="3-6"><path d="M482,100 L517,100" class="d-arrow" marker-end="url(#f3-arr)"/></g>
+<g data-step="4">
+<rect x="518" y="70" width="130" height="60" rx="8" class="d-hl"/>
+<text x="583" y="104" text-anchor="middle" class="d-bold d-small">Checkpointed</text>
+</g>
+<g data-step="4-6"><path d="M648,100 L683,100" class="d-arrow" marker-end="url(#f3-arr)"/></g>
+<g data-step="5">
+<rect x="684" y="70" width="96" height="60" rx="8" class="d-outline"/>
+<text x="732" y="97" text-anchor="middle" class="d-small">Restorable</text>
+<text x="732" y="113" text-anchor="middle" class="d-small">20min-30d</text>
+</g>
+<g data-step="5"><path d="M583,130 Q583,175 417,175 Q251,175 251,130" class="d-arrow d-dashed" marker-end="url(#f3-arr)" style="stroke-width:1.3"/><text x="417" y="192" text-anchor="middle" class="d-small d-text-light">restore = active again</text></g>
+<g data-step="6">
+<rect x="684" y="150" width="96" height="50" rx="8" class="d-block-muted"/>
+<text x="732" y="172" text-anchor="middle" class="d-text-inv d-bold d-small">Expired</text>
+<text x="732" y="187" text-anchor="middle" class="d-text-inv d-small">unrecoverable</text>
+</g>
+<g data-step="6"><path d="M732,130 L732,148" class="d-arrow" marker-end="url(#f3-arr)"/></g>
+</svg>
+<figcaption><b>Figure 3.</b> The general sandbox lifecycle: creation, use, a vendor-specific idle window, a checkpoint, a restore window, and eventual expiry. Timings are each vendor's own published numbers, not one universal schedule<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-10">10</a>.</figcaption>
+</figure>
+<ol class="steps">
+<li><b>Created.</b> A new sandbox is provisioned against the chosen isolation mechanism; cold-start latency is the boot time from section 2 (e.g. Firecracker's sub-125ms microVM boot<a class="cite" href="#ref-4">4</a>).</li>
+<li><b>Active.</b> The harness issues tool calls into the sandbox; files and interpreter state accumulate.</li>
+<li><b>Idle.</b> No tool call for a vendor-specific window: Anthropic's clock starts at about 5 minutes<a class="cite" href="#ref-2">2</a>; OpenAI's Code Interpreter container clock is 20 minutes<a class="cite" href="#ref-10">10</a>; Modal's default maximum lifetime is 5 minutes unless extended<a class="cite" href="#ref-12">12</a>.</li>
+<li><b>Checkpointed.</b> Memory and filesystem state are saved; the sandbox process itself is torn down to free the host's resources.</li>
+<li><b>Restorable.</b> A request bearing the saved sandbox's ID re-hydrates it into an active sandbox again -- the restore window is 30 days for Anthropic<a class="cite" href="#ref-2">2</a>, indefinite until explicitly killed for E2B<a class="cite" href="#ref-11">11</a>, and effectively the same 20-minute idle-timeout for OpenAI's container, i.e. no separate restorable phase at all<a class="cite" href="#ref-10">10</a>.</li>
+<li><b>Expired.</b> Past the window, the checkpoint is discarded; any request referencing that ID errors, and the client must provision a new sandbox from scratch<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-10">10</a>.</li>
+</ol>
+</div>
+<p class="small muted">OpenAI's Code Interpreter container collapses steps 4-5 into one boundary: at 20 minutes idle it is simply gone, with no intermediate checkpointed-but-restorable phase documented<a class="cite" href="#ref-10">10</a>. That is a real design difference, not an oversight this module is glossing over -- treat "checkpoint" as a spectrum from "explicit, long-lived, separately named" (Anthropic, E2B) to "implicit, short, and indistinguishable from deletion" (OpenAI's container) rather than a single universal step.</p>
+
+<h2 id="egress-secrets">4. Egress policy and secrets handling</h2>
+<p>A sandbox that isolates CPU, memory, and filesystem but leaves the network open has not finished the job: model-generated code that can reach the internet can exfiltrate whatever it can read, phone home to an attacker-controlled endpoint, or pull in a payload the harness never approved. The four systems here land on genuinely different defaults, which is worth noticing precisely because it is not a settled question.</p>
+<p><b>Default-deny, no exceptions.</b> Anthropic's code execution container has internet access "completely disabled for security," with "no outbound network requests permitted" -- the container ships with a fixed set of pre-installed libraries (pandas, numpy, scipy, matplotlib, and similar) precisely because code cannot reach a package index to install anything else at runtime<a class="cite" href="#ref-2">2</a>. There is no allowlist mechanism documented; the policy is binary.</p>
+<p><b>Default-deny, then a two-phase exception for setup.</b> OpenAI's Codex Cloud environments split a task into a setup phase and an agent phase: the setup phase "allows network access for dependency installation," then "the agent phase runs offline by default unless internet access is explicitly enabled for that environment"<a class="cite" href="#ref-9">9</a>. Critically, "secrets are purged before the agent phase begins"<a class="cite" href="#ref-9">9</a> -- the harness does not merely close the network after setup, it actively removes the credentials that made the setup phase's network access safe, so that even a later bug reopening egress cannot leak what is no longer present. This is the sharpest concrete answer in the survey to "how do you keep an agent from leaking a secret it needed five minutes ago": don't keep the secret around past the point it stopped being necessary.</p>
+<p><b>Default-allow with an opt-in restriction.</b> Modal takes the opposite default from Anthropic's: "by default, Sandboxes can make outbound connections to any public IP address," with the restriction available on request via "full blocking, CIDR allowlists, and domain allowlists"<a class="cite" href="#ref-7">7</a>. Inbound is the mirror image -- "a default Sandbox has no ability to accept incoming network connections" -- and a Sandbox is also denied access to the operator's own other cloud resources by default, unlike a first-party Modal Function<a class="cite" href="#ref-7">7</a>. The stated rationale is blast-radius containment: if the sandboxed code is compromised, the damage is "limited to the Sandbox container itself"<a class="cite" href="#ref-7">7</a>.</p>
+<p><b>Default-deny for the local, single-tenant case.</b> Codex CLI's local sandbox defaults to "network access turned off," with an optional proxy (`network_proxy`) that can allow specific domains while blocking local/private network destinations even when enabled<a class="cite" href="#ref-9">9</a> -- the same default-deny posture as Anthropic's cloud container, but enforced by the OS-level mechanism from section 2.5 rather than a hosted container's own network namespace.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Default egress posture and secrets handling across four sandbox implementations, each vendor's own documentation<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-9">9</a>.</caption>
+<thead><tr><th>System</th><th>Default outbound</th><th>Allowlist mechanism</th><th>Secrets handling</th></tr></thead>
+<tbody>
+<tr><td class="row">Anthropic code execution</td><td data-best>Fully disabled, no exception</td><td>None documented</td><td>Not applicable -- no runtime credentials in scope</td></tr>
+<tr><td class="row">OpenAI Codex Cloud</td><td>Disabled after setup phase</td><td>Per-environment opt-in for agent phase</td><td data-best>Purged before agent phase begins</td></tr>
+<tr><td class="row">Modal Sandboxes</td><td data-worst>Allowed to any public IP</td><td>Opt-in CIDR/domain allowlist or full block</td><td>Sandbox denied access to workspace resources by default</td></tr>
+<tr><td class="row">Codex CLI (local, OS-level)</td><td data-best>Disabled by default</td><td>Optional domain-scoped proxy</td><td>User's own machine; no separate secret-purge step documented</td></tr>
+</tbody>
+</table>
+<p>Modal's default-allow posture is not carelessness -- it is a bet that most agent code needs to reach package indexes, APIs, and webhooks to be useful at all, and that the isolation mechanism underneath (gVisor, section 2.3) plus workspace-resource denial is enough of a blast-radius limiter that egress does not need to be the primary control. Anthropic and OpenAI's default-deny postures make the opposite bet: that the harness, not the sandbox's network policy, should decide case by case when a tool call actually needs the internet, and that decision should default to no. Neither is obviously wrong; they are answers to different products (a general-purpose sandbox platform versus a specific code-execution tool with a fixed library set).</p>
+
+<h2 id="resource-limits-scheduling">5. Per-tenant resource limits and scheduling</h2>
+<p>Two separate limits protect an operator running many tenants' sandboxes on shared hardware: a cap on what any single sandbox can consume, and a cap on how much of the fleet's aggregate capacity one organization can draw on before the operator's own admission control says no. The first is a per-sandbox spec; the second is a scheduling and packing problem, and it is the same problem Module 24 covers for inference requests generally -- Borg's precedent of checking quota "at admission time (not scheduling time)" so an over-quota request is rejected immediately rather than accepted and left to compete for capacity later<a class="cite" href="#ref-13">13</a> applies just as directly to a sandbox-creation request as it does to a Borg job submission.</p>
+<p>Per-sandbox limits are the numbers that read like a product sheet, and they belong here, in a table, not as the spine of the argument:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> Per-sandbox resource limits, four implementations, each vendor's own documentation<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-10">10</a><a class="cite" href="#ref-12">12</a>.</caption>
+<thead><tr><th>System</th><th>Memory</th><th>Disk</th><th>CPU</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td class="row">Anthropic code execution</td><td class="num">5 GiB</td><td class="num">5 GiB</td><td class="num">1</td><td>Fixed; no tiers</td></tr>
+<tr><td class="row">OpenAI Code Interpreter</td><td class="num">1 / 4 / 16 / 64 GB</td><td>Not separately tiered</td><td>Scales with memory tier</td><td>Four selectable tiers</td></tr>
+<tr><td class="row">Modal VM Sandbox</td><td>Static, as requested</td><td>Per configuration</td><td>Elastic, billed on actual use</td><td>Memory fixed, CPU elastic<a class="cite" href="#ref-14">14</a></td></tr>
+</tbody>
+</table>
+<p>The more interesting number is what a per-sandbox cap costs at the host level once you multiply it by however many sandboxes a fleet operator wants running concurrently -- and this is where Firecracker's own density arithmetic is worth working through explicitly, because it is the clearest published account of why "overhead" has to be measured as a percentage of the sandbox's own entitlement, not as an absolute number.</p>
+<details class="more">
+<summary>Worked derivation: microVM density on one host</summary>
+<p>Firecracker's paper poses the problem directly: "modern commodity servers contain up to 1TB of RAM, and Lambda functions use as little as 128MB, requiring up to 8000 functions on a server to fill the RAM (or more with soft allocation)"<a class="cite" href="#ref-4">4</a>. Take that 128MB function size and Firecracker's own measured per-microVM memory overhead of "around 3MB"<a class="cite" href="#ref-4">4</a> (the paper's design target was 10% of the configured size; production came in lower):</p>
+$$ \text{overhead fraction} = \frac{3\ \text{MB}}{128\ \text{MB}} \approx 2.3\% $$
+<p>Packing the paper's own 8,000-function figure onto one host, the aggregate overhead is:</p>
+$$ 8000 \times 3\ \text{MB} = 24{,}000\ \text{MB} \approx 23.4\ \text{GiB} $$
+<p>against a 1 TB host -- roughly 2.3% of total capacity spent on VMM bookkeeping rather than tenant memory, which matches the paper's own claim of "overhead as low as 3% on memory and negligible overhead on CPU" at production scale<a class="cite" href="#ref-4">4</a>. Compare that to QEMU's measured overhead of "around 131MB per MicroVM" in the same paper's evaluation<a class="cite" href="#ref-4">4</a>:</p>
+$$ 8000 \times 131\ \text{MB} \approx 1.05\ \text{TB} $$
+<p>in VMM overhead alone -- more memory than the host has, before a single tenant workload runs. That gap is the entire economic argument for a purpose-built minimal VMM over a general-purpose one: at small sandbox sizes, VMM overhead as a percentage of the sandbox stops being a rounding error and starts being the dominant cost.</p>
+</details>
+<p>The paper's own oversubscription numbers push the same point further: "memory and CPU oversubscription ratios of over 20x" and "as high as 10x," tested in production "with no issues"<a class="cite" href="#ref-4">4</a>, because most sandboxes are idle most of the time -- exactly the same insight that makes Borg's ~10,000-machine median cell size<a class="cite" href="#ref-13">13</a> work as a shared pool rather than 10,000 dedicated single-tenant machines. A per-tenant quota (Anthropic's monthly free-hours pool, discussed in section 9, is one instance of this) is what turns "the host can oversubscribe" into "no single tenant can starve the others by using more than their share of that oversubscribed capacity" -- the admission-control layer and the density argument are two sides of the same design decision.</p>
+
+<h2 id="session-thread-state">6. Session and thread state</h2>
+<p>Module 26 covers how a single streamed response survives a disconnect. A harness has a longer-lived state problem sitting above that: a conversation that spans many turns, each of which may call the sandbox, needs an identity that outlives any one HTTP request, and the harness has to decide what of that conversation's history to keep, resume, branch, or discard.</p>
+<p>The sandbox side of that identity is the simplest piece. Anthropic's container object -- returned with `id` and `expires_at` on any response that used code execution -- is exactly a session handle: pass the same ID back on the next request and Claude "reuses the same container," including, with the newer tool version, the Python interpreter's variable bindings across requests<a class="cite" href="#ref-2">2</a>. E2B and Modal expose the same idea as an explicit sandbox ID a client holds and reconnects to<a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-12">12</a>. None of this is more sophisticated than a database primary key; what makes it worth naming is that it is the thing a harness must persist alongside everything else in this section, or a "resume the conversation" request has no sandbox to resume into.</p>
+<p>The harness's own state model is richer. OpenAI's Codex harness defines three nested primitives with explicit lifecycles<a class="cite" href="#ref-1">1</a>:</p>
+<ul>
+<li><b>Item</b> -- "the atomic unit of input/output in Codex": a typed user message, agent message, tool execution, approval request, or diff, each progressing through `item/started`, optional `item/*/delta` (for streaming content), and `item/completed`.</li>
+<li><b>Turn</b> -- "one unit of agent work initiated by user input," beginning when the client submits input and ending when the agent finishes producing outputs for it; a turn contains a sequence of items.</li>
+<li><b>Thread</b> -- "the durable container for an ongoing Codex session between a user and an agent," containing multiple turns. Threads "can be created, resumed, forked, and archived," and "thread history is persisted so clients can reconnect and render a consistent timeline"<a class="cite" href="#ref-1">1</a>.</li>
+</ul>
+<p>Forking is the operation worth pausing on, because it does not exist in the streaming-resumption vocabulary Module 26 covers: forking a thread means branching a new, independent conversation off an existing one's history at some point, so two different continuations can be explored without either overwriting the other. E2B exposes the identical operation at the sandbox layer -- forking a paused sandbox's saved state "into up to 100 copies"<a class="cite" href="#ref-5">5</a> -- and the two forks compose naturally: fork the thread to try two different approaches, and each forked thread can fork its own sandbox to get an independent, identical starting filesystem for each.</p>
+<p>Why does a thread need to persist across a client disconnect at all, rather than living only in the harness process's memory for the duration of one connection? Because the client and the harness are not the same lifetime. OpenAI's account of Codex Web makes the failure mode explicit: "because web sessions are ephemeral (tabs close, networks drop), the web app cannot be the source of truth for long-running tasks. Keeping state and progress on the server means work continues even if the tab disappears"<a class="cite" href="#ref-1">1</a>. Codex Web's worker "provisions a container with the checked-out workspace, launches the App Server binary inside it, and maintains a long-lived JSON-RPC over stdio channel," while the browser tab talks to that backend over HTTP and SSE -- so the thread, the running App Server process, and the sandboxed workspace all outlive any single browser connection<a class="cite" href="#ref-1">1</a>.</p>
+<p>One piece of this problem is documented only thinly across every source in this survey: deciding what context to drop or summarize once a long-running thread's history exceeds what fits in a model's context window. OpenAI's harness post mentions the existence of "auto-compaction in Codex core" only in passing, as an example of a server-side improvement a client can adopt without a client release<a class="cite" href="#ref-1">1</a>, and gives no mechanism detail -- what gets summarized, what is guaranteed to survive, or how compaction interacts with a forked thread's now-divergent history. Treat context compaction as a real, necessary piece of harness design that the public record for this module's sources simply does not specify in depth, rather than as a solved problem.</p>
+
+<h2 id="approval-pauses">7. Streaming events, approval pauses, and long-running turns</h2>
+<p>Module 26 covers the transport-level event stream -- SSE deltas, `created`/`in_progress`/`completed`, and reconnecting a dropped connection at a sequence-number cursor. A harness needs one more kind of pause that lives above that transport entirely: a turn can stop making progress not because the connection dropped, but because the agent is waiting on a human decision it is not allowed to make for itself. That is a control-flow event, not a transport event, and the two must not be confused -- a client that only knows how to reconnect a stream has no way to answer "do you want to allow me to run pnpm test."</p>
+<p>Both harnesses surveyed here expose exactly this pause, with slightly different mechanics:</p>
+<div class="tabs">
+<nav class="tabs-nav"><button data-tab="anthropic" class="is-active">Anthropic: pause_turn</button><button data-tab="codex">Codex: approval request</button></nav>
+<section class="tabs-panel" data-panel="anthropic">
+<p>Anthropic's API can return a `pause_turn` stop reason, which "indicates that the API paused a long-running turn." The caller has exactly two options: "provide the response back as-is in a subsequent request to let Claude continue its turn, or modify the content if you want to interrupt the conversation"<a class="cite" href="#ref-2">2</a>. There is no explicit allow/deny semantics here -- resubmitting as-is is an implicit "continue," and editing the content is how a caller injects a correction or new instruction before the turn resumes.</p>
+</section>
+<section class="tabs-panel" data-panel="codex">
+<p>Codex's App Server protocol is bidirectional JSON-RPC, so the server can itself initiate a request to the client rather than only responding to one. When the agent needs a human decision -- to run a shell command, for instance -- "the server may ask for client approval before it can run an action by sending a server request. The approval will pause the turn until the client replies with either 'allow' or 'deny'"<a class="cite" href="#ref-1">1</a>. Codex's approval policies (documented separately from the App Server protocol) range from `on-request` (approval required for actions outside the sandbox boundary, the default) to `never` (no prompts, non-interactive) to an `auto_review` mode that routes eligible requests through an automatic reviewer agent instead of a human<a class="cite" href="#ref-9">9</a>.</p>
+</section>
+</div>
+<p>The state machine underneath both is the same shape: a turn is running, something inside it needs an answer only the caller can give, the turn suspends with everything already-produced intact, and it resumes (or is abandoned) once that answer arrives.</p>
+
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 260" role="img" aria-label="Approval-pause state machine for a long-running turn">
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<g data-step="1">
+<rect x="30" y="30" width="160" height="60" rx="20" class="d-block"/>
+<text x="110" y="65" text-anchor="middle" class="d-text-inv d-bold d-small">Turn running</text>
+</g>
+<g data-step="1-4"><path d="M190,60 L235,60" class="d-arrow" marker-end="url(#f4-arr)"/></g>
+<g data-step="2">
+<rect x="236" y="30" width="180" height="60" rx="20" class="d-hl"/>
+<text x="326" y="58" text-anchor="middle" class="d-bold d-small">Action needs approval</text>
+<text x="326" y="76" text-anchor="middle" class="d-small">(tool call / long compute)</text>
+</g>
+<g data-step="2-4"><path d="M416,60 L461,60" class="d-arrow" marker-end="url(#f4-arr)"/></g>
+<g data-step="3">
+<rect x="462" y="30" width="180" height="60" rx="20" class="d-block-accent"/>
+<text x="552" y="58" text-anchor="middle" class="d-text-inv d-bold d-small">Paused</text>
+<text x="552" y="76" text-anchor="middle" class="d-text-inv d-small">pause_turn / approval request</text>
+</g>
+<g data-step="4">
+<path d="M552,90 Q552,140 400,140" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="240" y="150" width="160" height="55" rx="8" class="d-block-2"/>
+<text x="320" y="172" text-anchor="middle" class="d-text-inv d-bold d-small">Allow / resubmit</text>
+<text x="320" y="188" text-anchor="middle" class="d-text-inv d-small">as-is -&gt; resumes</text>
+<path d="M552,90 Q552,140 700,140" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="620" y="150" width="160" height="55" rx="8" class="d-block-muted"/>
+<text x="700" y="172" text-anchor="middle" class="d-text-inv d-bold d-small">Deny / modify</text>
+<text x="700" y="188" text-anchor="middle" class="d-text-inv d-small">-&gt; turn redirected</text>
+<path d="M320,150 Q320,110 190,90" class="d-arrow d-dashed" marker-end="url(#f4-arr)" style="stroke-width:1.2"/>
+</g>
+</svg>
+<figcaption><b>Figure 4.</b> Approval-pause state machine, generalized from Anthropic's <code>pause_turn</code> stop reason and Codex's server-initiated approval request: both suspend a turn mid-execution and resume it only once the caller answers<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+<ol class="steps">
+<li><b>Turn running.</b> The harness is executing the agent loop for one turn, streaming items as they complete (section 6).</li>
+<li><b>Action needs approval.</b> The agent selects an action the current policy does not auto-permit -- a shell command outside the sandbox boundary, a long-running computation Anthropic's API decides to interrupt rather than let block indefinitely.</li>
+<li><b>Paused.</b> The turn stops advancing. Anthropic surfaces this as a `pause_turn` stop reason on the response; Codex surfaces it as a server-initiated JSON-RPC request that blocks until answered<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</li>
+<li><b>Resolved.</b> Anthropic: resubmitting the paused response as-is resumes the turn; sending modified content interrupts it instead. Codex: the client replies "allow" or "deny," and the turn proceeds or is redirected accordingly<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</li>
+</ol>
+</div>
+<p>This mechanism composes with, but is not the same axis as, Module 26's stream resumption: a stream can disconnect and reconnect mid-turn with no approval pause involved at all, and a turn can pause for approval while the underlying connection stays perfectly healthy. A harness has to track both independently -- "is the transport still connected" and "is the turn waiting on a human" are different booleans, and conflating them means either resuming a turn a human never actually approved, or leaving a healthy connection sitting idle because the harness thinks it needs to reconnect something that never disconnected.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f5t"><title id="f5t">A harness's eight core responsibilities, layered from persistence up to verification</title>
+<rect x="20" y="20" width="360" height="50" rx="8" class="d-block"/>
+<text x="200" y="50" text-anchor="middle" class="d-text-inv d-bold d-small">Preserve / resume / fork / archive threads</text>
+<rect x="400" y="20" width="380" height="50" rx="8" class="d-block"/>
+<text x="590" y="50" text-anchor="middle" class="d-text-inv d-bold d-small">Decide what context to retain or compact</text>
+<rect x="20" y="82" width="360" height="50" rx="8" class="d-block-2"/>
+<text x="200" y="112" text-anchor="middle" class="d-text-inv d-bold d-small">Discover and validate tools</text>
+<rect x="400" y="82" width="380" height="50" rx="8" class="d-block-2"/>
+<text x="590" y="112" text-anchor="middle" class="d-text-inv d-bold d-small">Execute inside a sandbox (section 2-5)</text>
+<rect x="20" y="144" width="360" height="50" rx="8" class="d-block-accent"/>
+<text x="200" y="174" text-anchor="middle" class="d-text-inv d-bold d-small">Stream observable events (Module 26)</text>
+<rect x="400" y="144" width="380" height="50" rx="8" class="d-block-accent"/>
+<text x="590" y="174" text-anchor="middle" class="d-text-inv d-bold d-small">Pause for approval, recover after interruption</text>
+<rect x="20" y="206" width="760" height="42" rx="8" class="d-outline d-dashed"/>
+<text x="400" y="232" text-anchor="middle" class="d-bold d-small">Verify outcomes (feeds Module 37's RL verifiers)</text>
+</svg>
+<figcaption><b>Figure 5.</b> The harness responsibility list as OpenAI's own account of the Codex harness states it, grouped here into a stack: persistence and context management, tool integration and execution, and event/control flow<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="tool-discovery-validation">8. Tool discovery, validation, and execution inside the sandbox</h2>
+<p>A harness has to decide what set of tools an agent can call before it can decide anything about approvals or sandboxing. Two designs are visible in this survey, and they differ in where the tool surface comes from.</p>
+<p>Anthropic's code execution tool is fixed and auto-provided: adding the tool to a request automatically grants Claude two sub-tools, `bash_code_execution` and `text_editor_code_execution`, with no separate discovery step<a class="cite" href="#ref-2">2</a>. The harness's job here is narrow -- decide whether the tool is present at all, not which of many possible tools apply. Anthropic's own documentation flags a specific confusion this creates when a client also supplies its own execution tool (a client-side bash tool, for instance): Claude is then "operating in a multicomputer environment," where "the code execution tool runs in Anthropic's sandboxed container, while your client-provided tools run in a separate environment that you control," and the model "can sometimes confuse these environments, attempting to use the wrong tool or assuming state is shared between them"<a class="cite" href="#ref-2">2</a>. The documented mitigation is a system-prompt instruction telling the model explicitly that variables, files, and state do not persist between the two environments<a class="cite" href="#ref-2">2</a> -- a reminder that tool <em>validation</em> is not only "is this call allowed," it is also "does the model correctly understand which environment this call's effects will land in."</p>
+<p>Codex's tool surface is closer to open-ended: the harness "wires up integrations like MCP servers and skills so they can participate in the agent loop under a consistent policy model"<a class="cite" href="#ref-1">1</a>. That means tool discovery is a real step -- the harness enumerates whatever MCP servers and skills are configured for a given session -- and validation means applying the same approval policy (section 7) uniformly across a shell command, an MCP tool call, and a skill invocation, regardless of which one a given integration happens to be. The trade-off against Anthropic's fixed-tool design is the obvious one: an open tool surface is more capable and more work to secure, because every newly wired-in MCP server is a new thing the approval policy and the sandbox's egress policy (section 4) both have to cover correctly, not a fixed pair of sub-tools the vendor has already hardened.</p>
+<p>Either way, the sandbox from sections 2-5 is where validated tool calls actually execute, and nothing about tool discovery changes that boundary: a tool call that passes approval still runs inside whichever isolation mechanism the sandbox uses, still respects the resource limits from section 5, and still cannot reach the network beyond whatever section 4's egress policy permits. Tool validation decides <em>whether</em> a call happens; the sandbox decides what that call is capable of once it does.</p>
+
+<h2 id="execution-time-billing">9. The cost model: execution-time billing</h2>
+<p>A sandbox is a metered resource: it holds CPU, memory, and disk on real hardware for as long as it exists, whether or not the agent using it is actively computing. Both hosted-tool vendors in this survey bill for that holding time directly, rather than folding it into token pricing, and both use the same shape of meter -- a minimum billing increment plus a rate beyond some free allowance -- with different numbers.</p>
+<p>Anthropic's code execution tool, used without the web search or web fetch tools, is "billed by execution time, tracked separately from token usage": a 5-minute minimum per invocation, 1,550 free hours of usage per organization per month, and $0.05 USD per hour per container beyond that<a class="cite" href="#ref-2">2</a>. Two details make this more than a flat meter. First, the free-hours pool is scoped to the whole organization, not per API key or per user -- exactly the quota-pooling pattern section 5 connects to Borg's admission-by-quota precedent: many sessions draw down one shared allowance before the operator's own billing kicks in. Second, code execution is billed even when the tool is not explicitly called, if files are attached to the request, "because files are preloaded onto the container"<a class="cite" href="#ref-2">2</a> -- the meter starts at container provisioning, not at the first command run inside it. Third, there is a documented zero-cost exception: "code execution is free when used with web search or web fetch," beyond the standard token costs those tools already charge, covering both dynamic filtering inside the code execution environment and any code Claude runs directly<a class="cite" href="#ref-2">2</a>.</p>
+<p>OpenAI's Code Interpreter container is billed per session rather than per continuous hour, at a rate keyed to the memory tier chosen: $0.03, $0.12, $0.48, and $1.92 per 20-minute session for the 1 GB, 4 GB, 16 GB, and 64 GB tiers respectively, with sessions "billed by the minute" subject to the same 5-minute minimum Anthropic uses<a class="cite" href="#ref-15">15</a>.</p>
+<details class="more">
+<summary>Worked derivation: converting OpenAI's per-session pricing to a $/hour rate</summary>
+<p>OpenAI states its container prices per 20-minute session, which is not directly comparable to Anthropic's per-hour rate without converting. For the 1 GB tier:</p>
+$$ \frac{\$0.03}{20\ \text{min}} \times 60\ \frac{\text{min}}{\text{hr}} = \$0.09\ \text{/hr} $$
+<p>and for the 64 GB tier:</p>
+$$ \frac{\$1.92}{20\ \text{min}} \times 60\ \frac{\text{min}}{\text{hr}} = \$5.76\ \text{/hr} $$
+<p>Anthropic's fixed 5 GiB / 1 CPU container, once an organization has exhausted its 1,550 free hours, costs $0.05/hr flat regardless of how that 5 GiB compares to any of OpenAI's four tiers<a class="cite" href="#ref-2">2</a>. The two pricing shapes are not answering the same design question: Anthropic sells one fixed size at a low marginal per-hour rate behind a large monthly allowance, while OpenAI sells four sizes at a per-session rate that scales roughly linearly with memory (the $/hour figures above are within about 7% of exact linear scaling across all four tiers), giving the caller a knob Anthropic's single-tier model does not.</p>
+</details>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f6t"><title id="f6t">Execution-time billing timeline: minimum block, free-allowance pool, per-hour overage, and the zero-charge exception</title>
+<defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="20" y="28" class="d-title d-bold">Anthropic: per-organization pool</text>
+<rect x="20" y="40" width="640" height="40" rx="6" class="d-panel"/>
+<rect x="20" y="40" width="440" height="40" class="d-fill-blue-soft d-stroke-blue"/>
+<text x="240" y="65" text-anchor="middle" class="d-small">1,550 free hours / org / month</text>
+<rect x="460" y="40" width="200" height="40" class="d-fill-amber-soft d-stroke-amber"/>
+<text x="560" y="65" text-anchor="middle" class="d-small">overage: $0.05 / hr / container</text>
+<rect x="670" y="40" width="110" height="40" rx="6" class="d-outline d-dashed"/>
+<text x="725" y="60" text-anchor="middle" class="d-small">free if paired</text>
+<text x="725" y="74" text-anchor="middle" class="d-small">with web tools</text>
+<path d="M40,90 L40,110" class="d-dashed" style="stroke-width:1"/>
+<text x="40" y="104" class="d-mono d-small" text-anchor="middle">0</text>
+<path d="M100,90 L100,110" class="d-dashed" style="stroke-width:1"/>
+<text x="100" y="104" class="d-mono d-small" text-anchor="middle">5min</text>
+<text x="70" y="130" text-anchor="middle" class="d-small d-text-light">5-min minimum per invocation</text>
+
+<text x="20" y="168" class="d-title d-bold">OpenAI: per-session, tiered by memory</text>
+<rect x="20" y="180" width="180" height="34" rx="6" class="d-block-2"/>
+<text x="110" y="202" text-anchor="middle" class="d-text-inv d-small">1GB: $0.03/20min</text>
+<rect x="210" y="180" width="180" height="34" rx="6" class="d-block-2"/>
+<text x="300" y="202" text-anchor="middle" class="d-text-inv d-small">4GB: $0.12/20min</text>
+<rect x="400" y="180" width="180" height="34" rx="6" class="d-block-2"/>
+<text x="490" y="202" text-anchor="middle" class="d-text-inv d-small">16GB: $0.48/20min</text>
+<rect x="590" y="180" width="180" height="34" rx="6" class="d-block-2"/>
+<text x="680" y="202" text-anchor="middle" class="d-text-inv d-small">64GB: $1.92/20min</text>
+<text x="400" y="230" text-anchor="middle" class="d-small d-text-light">Same 5-minute minimum billing increment as Anthropic's model</text>
+<text x="400" y="250" text-anchor="middle" class="d-small d-text-light">No free-allowance pool documented; no web-tool exception documented</text>
+</svg>
+<figcaption><b>Figure 6.</b> Two shapes of execution-time billing: a fixed container size behind a large per-organization free-hours pool with a flat overage rate and a web-tool exception (Anthropic)<a class="cite" href="#ref-2">2</a>, versus four selectable memory tiers billed per session with no documented free pool (OpenAI)<a class="cite" href="#ref-15">15</a>.</figcaption>
+</figure>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Section 2 laid out five isolation mechanisms as a spectrum; the real disagreement in the industry is not about the spectrum's existence but about where the <em>default</em> should sit for a multi-tenant sandbox running arbitrary, model-generated code. Three positions are visible directly in what vendors shipped, and the disagreement is sharpened by the fact that two of them (E2B and Modal) sell essentially the same product -- a general-purpose code-execution sandbox for agents -- and chose differently.</p>
+<div class="positions">
+<article class="position">
+<h4>Hardware-virtualized isolation should be the default</h4>
+<p class="who">E2B, built on Firecracker microVMs<a class="cite" href="#ref-5">5</a>; the Firecracker paper's own design requirement that isolation must be "safe... against a broad range of attacks (including microarchitectural side-channel attacks)"<a class="cite" href="#ref-4">4</a></p>
+<p>Arbitrary, untrusted, model-generated code run on behalf of many different customers is exactly the threat model Firecracker was built for -- multi-tenant, adversarial, and running on hardware the operator does not fully trust the guest with. A microVM's guest kernel is a real kernel, so there is no host-kernel syscall reimplementation to get subtly wrong, and the boundary is enforced by the CPU's own virtualization hardware rather than by software the sandbox vendor wrote. E2B's marketing framing -- "hardware-isolated... rather than a shared-kernel container"<a class="cite" href="#ref-5">5</a> -- states the position as a binary: anything short of a real, separate kernel is a shared-kernel container by another name.</p>
+<ul class="pros"><li>Smallest trusted-computing-base delta versus a bare-metal instance's own kernel boundary; no new kernel implementation to audit.</li><li>Compatible with any unmodified Linux binary, matching what an agent actually needs to run.</li><li>Firecracker's own measured overhead (&lt;5MB, &lt;125ms boot) shows the historical density argument against virtualization no longer holds at this scale<a class="cite" href="#ref-4">4</a>.</li></ul>
+<ul class="cons"><li>Still pays a real second-kernel-boot cost that a user-space kernel or a container does not, even if that cost is small in absolute terms.</li><li>Needs KVM and hardware virtualization extensions available on the host, which is not a universal deployment constraint (nested virtualization, some serverless substrates).</li></ul>
+</article>
+<article class="position">
+<h4>A user-space kernel is the pragmatic default; reserve full VMs for the exception</h4>
+<p class="who">Modal, whose default Sandbox runs on gVisor and offers a full VM Sandbox only when a workload specifically needs a real kernel<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-14">14</a></p>
+<p>gVisor's Sentry gives most of the practical security benefit of a second kernel -- the untrusted workload never reaches the host kernel's syscall surface directly -- while keeping the density, elasticity, and startup profile of a userspace process, because there is no guest kernel to boot at all<a class="cite" href="#ref-6">6</a>. Modal's own reason for keeping a full VM Sandbox as a separate, opt-in product rather than the default is telling: it is needed specifically for workloads that require "custom init systems (such as systemd), eBPF, FUSE mounts," or Docker-in-Docker semantics<a class="cite" href="#ref-14">14</a> -- i.e., compatibility gaps, not security gaps. The implicit claim is that gVisor's isolation is adequate for the overwhelming majority of agent code-execution workloads, and paying the full-VM cost should be an exception justified by a specific compatibility need, not a blanket default.</p>
+<ul class="pros"><li>No guest kernel to boot; Modal's default lifetime and idle-timeout mechanics (section 3) are cheaper to operate at fleet scale as a result.</li><li>Escape hatch (VM Sandbox) exists for the minority of workloads that genuinely need a real kernel, so the trade-off is not all-or-nothing.</li></ul>
+<ul class="cons"><li>The isolation boundary still depends on Sentry's own Go reimplementation being correct; gVisor's own docs concede "higher per-system-call overhead" and admit gVisor "may provide poor performance for system-call-heavy workloads"<a class="cite" href="#ref-6">6</a>, which is also where a reimplementation bug is most likely to hide.</li><li>A single shared host kernel still sits underneath every gVisor sandbox on that host; a side-channel or Sentry-escape bug is a cross-tenant bug in a way a microVM's per-sandbox guest kernel structurally is not.</li></ul>
+</article>
+<article class="position">
+<h4>OS-level sandboxing is sufficient when there is no other tenant</h4>
+<p class="who">OpenAI's Codex CLI, using Seatbelt (macOS) and bubblewrap+seccomp (Linux) for locally-run agents<a class="cite" href="#ref-9">9</a></p>
+<p>The first two positions both assume the threat is one tenant's code against another tenant's data on shared infrastructure. That is not the problem a CLI agent running on a developer's own laptop has: there is exactly one tenant, and the isolation goal is to stop the agent's own mistakes from touching more of that one tenant's machine than intended, using the security primitives the OS already ships rather than provisioning a container or VM per invocation. A microVM or gVisor sandbox would not be wrong here, just unnecessary machinery for a threat model that does not include an adversarial second tenant.</p>
+<ul class="pros"><li>Zero additional infrastructure -- no container runtime, no hypervisor, no separate host fleet to operate.</li><li>Matches the actual threat model for a single-operator local tool rather than importing a multi-tenant answer to a single-tenant question.</li></ul>
+<ul class="cons"><li>Does not generalize to a hosted, multi-tenant product at all -- the moment a second tenant's code can run on the same host, this mechanism's own reasoning says it is the wrong tool.</li><li>Still shares the host kernel, so a Seatbelt or Landlock policy bug is a real (if lower-stakes, single-tenant) escape.</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>These positions are not actually competing for the same slot; each is close to correct for the threat model it names, and the disagreement mostly dissolves once "what is the tenancy model" is answered first. For a hosted platform running arbitrary code from many external customers with no ability to audit what they submit, the E2B/Firecracker position is the more defensible default: the cost of a hardware-virtualization boundary has fallen (Firecracker's own measured &lt;5MB overhead and &lt;125ms boot make this concrete<a class="cite" href="#ref-4">4</a>) faster than the cost of a Sentry-class syscall-reimplementation bug has fallen, and a microVM's failure mode under an unknown vulnerability is "the attacker gets their own guest kernel," not "the attacker gets the host kernel." Modal's gVisor-as-default bet is the more defensible choice specifically when the operator can tolerate a shared host kernel underneath a strong-but-not-hardware syscall boundary in exchange for meaningfully cheaper density and elasticity -- which is a real, not hypothetical, saving at the scale these platforms run at, and it is why Modal keeps a full-VM escape hatch rather than treating the trade-off as settled. Codex CLI's OS-level sandbox is simply answering a different question and should not be read as a weaker point on the same scale. What would settle the first two against each other is public, comparable data that neither vendor currently publishes: a multi-year record of confirmed sandbox-escape CVEs per isolation mechanism, normalized by workload volume, the way Firecracker's paper already normalizes overhead as a percentage of the guest's own memory rather than an absolute number. Until that exists, the choice between microVM-as-default and gVisor-as-default is a bet on which class of bug (hypervisor/KVM versus Sentry's Go reimplementation) an operator trusts more, not a settled engineering conclusion.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">blog</span>OpenAI. <em>Unlocking the Codex harness: how we built the App Server</em>. OpenAI, 2026. <a href="https://openai.com/index/unlocking-the-codex-harness/">https://openai.com/index/unlocking-the-codex-harness/</a>. Accessed 2026-09-18 (retrieved via r.jina.ai reader proxy after a direct fetch returned HTTP 403). <span class="ref-use">Used for: harness/App Server architecture, thread/turn/item lifecycle, approval-pause mechanics, Codex Web's container execution model, harness responsibility list.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>Anthropic. <em>Code execution tool</em>. Claude Developer Platform docs, 2026. <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool">https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool</a>. Accessed 2026-09-18. <span class="ref-use">Used for: container resource limits, networking policy, checkpoint/restore lifecycle and 30-day expiry, container-reuse/session-id mechanics, <code>pause_turn</code> stop reason, multicomputer-environment caveat, execution-time pricing and free-hours pool.</span></li>
+<li id="ref-3"><span class="ref-type">blog</span>Prime Intellect. <em>Environments Hub: A Community Hub To Scale RL To Open AGI</em>. Prime Intellect, 2026. <a href="https://www.primeintellect.ai/blog/environments">https://www.primeintellect.ai/blog/environments</a>. Accessed 2026-09-17. <span class="ref-use">Used for: forward reference to Module 37 -- sandboxes plugging into RL verifier environments.</span></li>
+<li id="ref-4"><span class="ref-type">paper</span>Agache, A., Brooker, M., Florescu, A., Iordache, A., Liguori, A., Neugebauer, R., Piwonka, P., Popa, D-M. <em>Firecracker: Lightweight Virtualization for Serverless Applications</em>. 17th USENIX Symposium on Networked Systems Design and Implementation (NSDI '20), 2020, pp. 419-434. <a href="https://www.usenix.org/system/files/nsdi20-paper-agache.pdf">https://www.usenix.org/system/files/nsdi20-paper-agache.pdf</a>. Accessed 2026-09-18. <span class="ref-use">Used for: container vs. virtualization isolation framing (&sect;2, &sect;2.1.1, &sect;2.1.3), Firecracker's minimal-VMM design and Rust line-count (&sect;3), memory overhead, boot-time, and microVM-creation-rate measurements (&sect;5.1-5.2), oversubscription and density results (&sect;5.4), the 1TB/128MB/8000-function density example (&sect;1.1).</span></li>
+<li id="ref-5"><span class="ref-type">official</span>E2B. <em>E2B homepage</em>. e2b.dev, 2026. <a href="https://e2b.dev/">https://e2b.dev/</a>. Accessed 2026-09-18. <span class="ref-use">Used for: "hardware-isolated Firecracker microVM rather than a shared-kernel container" claim, pause/resume snapshot mechanics, fork-up-to-100-copies capability.</span></li>
+<li id="ref-6"><span class="ref-type">official</span>Google / gVisor project. <em>Introduction to gVisor security</em> (architecture guide). gvisor.dev docs, 2026. <a href="https://gvisor.dev/docs/architecture_guide/intro/">https://gvisor.dev/docs/architecture_guide/intro/</a>. Accessed 2026-09-18. <span class="ref-use">Used for: Sentry/Gofer mechanism, syscall interception model, gVisor's own framing versus syscall filters and VMs, stated density/performance trade-offs.</span></li>
+<li id="ref-7"><span class="ref-type">official</span>Modal. <em>Networking and security</em>. Modal Docs, 2026. <a href="https://modal.com/docs/guide/sandbox-networking">https://modal.com/docs/guide/sandbox-networking</a>. Accessed 2026-09-18. <span class="ref-use">Used for: gVisor-based default isolation, default-allow outbound networking with opt-in CIDR/domain allowlists, default-deny inbound and workspace-resource access, blast-radius-containment rationale.</span></li>
+<li id="ref-8"><span class="ref-type">official</span>WebAssembly Community Group. <em>Security</em>. webassembly.org docs, 2026. <a href="https://webassembly.org/docs/security/">https://webassembly.org/docs/security/</a>. Accessed 2026-09-18. <span class="ref-use">Used for: linear-memory bounds checking, capability-based (no ambient authority) import model, control-flow integrity via typed calls, as the compile-time software-fault-isolation mechanism.</span></li>
+<li id="ref-9"><span class="ref-type">official</span>OpenAI. <em>Agent approvals &amp; security</em>. Codex docs, 2026. <a href="https://learn.chatgpt.com/docs/agent-approvals-security">https://learn.chatgpt.com/docs/agent-approvals-security</a> (redirected from developers.openai.com/codex/agent-approvals-security). Accessed 2026-09-18. <span class="ref-use">Used for: Seatbelt/bubblewrap+seccomp OS-level sandbox mechanisms, approval-policy modes, default network-off posture and domain-proxy exception, Codex Cloud's two-phase setup/agent network model and pre-agent-phase secret purge.</span></li>
+<li id="ref-10"><span class="ref-type">official</span>OpenAI. <em>Code Interpreter</em>. OpenAI API docs, 2026. <a href="https://developers.openai.com/api/docs/guides/tools-code-interpreter">https://developers.openai.com/api/docs/guides/tools-code-interpreter</a>. Accessed 2026-09-18. <span class="ref-use">Used for: auto vs. explicit container modes, four memory tiers, 20-minute idle expiry, non-reactivation of an expired container.</span></li>
+<li id="ref-11"><span class="ref-type">official</span>E2B. <em>E2B Documentation</em>. docs.e2b.dev, 2026. <a href="https://docs.e2b.dev/">https://docs.e2b.dev/</a>. Accessed 2026-09-18. <span class="ref-use">Used for: paused sandboxes retained indefinitely until explicitly killed.</span></li>
+<li id="ref-12"><span class="ref-type">official</span>Modal. <em>Sandboxes</em>. Modal Docs, 2026. <a href="https://modal.com/docs/guide/sandboxes">https://modal.com/docs/guide/sandboxes</a>. Accessed 2026-09-18. <span class="ref-use">Used for: default 5-minute maximum sandbox lifetime (configurable to 24 hours), idle timeout, Filesystem Snapshot mechanics for longer-lived workloads.</span></li>
+<li id="ref-13"><span class="ref-type">paper</span>Verma, A., Pedrosa, L., Korupolu, M., Oppenheimer, D., Tune, E., Wilkes, J. <em>Large-scale cluster management at Google with Borg</em>. EuroSys '15, 2015. <a href="https://research.google.com/pubs/archive/43438.pdf">https://research.google.com/pubs/archive/43438.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: quota-checked-at-admission cross-reference and median-cell-size oversubscription analogy (&sect;2.5, &sect;2.2).</span></li>
+<li id="ref-14"><span class="ref-type">official</span>Modal. <em>VM Sandboxes</em>. Modal Docs, 2026. <a href="https://modal.com/docs/guide/vm-sandboxes">https://modal.com/docs/guide/vm-sandboxes</a>. Accessed 2026-09-18. <span class="ref-use">Used for: why a full-VM sandbox is offered alongside the gVisor default (systemd/eBPF/FUSE/Docker-in-Docker compatibility), static-memory/elastic-CPU resource model.</span></li>
+<li id="ref-15"><span class="ref-type">official</span>OpenAI. <em>Pricing</em>. OpenAI API docs, 2026. <a href="https://developers.openai.com/api/docs/pricing">https://developers.openai.com/api/docs/pricing</a>. Accessed 2026-09-18. <span class="ref-use">Used for: per-memory-tier container session pricing ($0.03/$0.12/$0.48/$1.92 per 20 minutes) and the 5-minute minimum billing increment.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

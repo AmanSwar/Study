@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Replication and Routing: KV-Cache-Aware, Prefix-Aware, and SLO-Aware Request Placement · Multi-Node LLM Inference</title>
+<meta name="description" content="Why naive round-robin fails once every TP8 replica carries different private KV-cache state, and how approximate prefix-hashing routers and precise KVEvents-based routers score, filter, and select a replica.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 2</p>
+<h1>Replication and Routing: KV-Cache-Aware, Prefix-Aware, and SLO-Aware Request Placement</h1>
+<p class="lede">The moment you run N copies of a TP8 engine behind one endpoint, each copy accumulates its own private paged-KV-cache state, and a request routed to the wrong copy pays for prefill it didn't have to. This module works through the two mechanisms production routers use to see that state &#8212; approximate block-hashing with an LRU index, and precise event-streamed indexing over ZeroMQ &#8212; the layered filter-score-select pipeline that combines them with load and session signals, and where the four major open-source routers (llm-d, vLLM production-stack, sglang-router, and the Gateway API Inference Extension they build against) land on the cost/accuracy trade-off. After reading, you can trace exactly how a request's replica gets chosen, mechanism by mechanism, in any of these stacks.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>30 min</b> read</span>
+<span class="chip"><b>6</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 1</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">A single router in front of N independent TP8 replicas, each holding a different, private slice of cached KV blocks</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="400" y="18" text-anchor="middle" class="d-text-light d-small">client requests</text>
+<path d="M400,24 L400,38" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="300" y="40" width="200" height="50" rx="8" class="d-block"/>
+<text x="400" y="61" text-anchor="middle" class="d-text-inv d-bold">Router</text>
+<text x="400" y="79" text-anchor="middle" class="d-text-inv d-small">(Endpoint Picker)</text>
+<path d="M400,90 Q400,110 160,128" class="d-arrow" marker-end="url(#f1-arr)" fill="none"/>
+<path d="M400,90 L400,128" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M400,90 Q400,110 640,128" class="d-arrow" marker-end="url(#f1-arr)" fill="none"/>
+<!-- Replica 0 -->
+<rect x="60" y="130" width="200" height="180" rx="8" class="d-panel"/>
+<text x="160" y="154" text-anchor="middle" class="d-title d-bold">Replica 0</text>
+<text x="160" y="172" text-anchor="middle" class="d-text-light d-small">TP8 engine, 8&#215; GPU</text>
+<g class="d-mono d-small">
+<rect x="83" y="188" width="34" height="24" rx="3" class="d-fill-blue"/>
+<rect x="123" y="188" width="34" height="24" rx="3" class="d-fill-blue"/>
+<rect x="163" y="188" width="34" height="24" rx="3" class="d-fill-blue"/>
+<rect x="203" y="188" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="83" y="218" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="123" y="218" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="163" y="218" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="203" y="218" width="34" height="24" rx="3" class="d-outline"/>
+</g>
+<text x="160" y="266" text-anchor="middle" class="d-text-light d-small">private KV cache</text>
+<text x="160" y="284" text-anchor="middle" class="d-small">warm: 3 blocks of prefix A</text>
+<!-- Replica 1 -->
+<rect x="300" y="130" width="200" height="180" rx="8" class="d-panel"/>
+<text x="400" y="154" text-anchor="middle" class="d-title d-bold">Replica 1</text>
+<text x="400" y="172" text-anchor="middle" class="d-text-light d-small">TP8 engine, 8&#215; GPU</text>
+<g class="d-mono d-small">
+<rect x="323" y="188" width="34" height="24" rx="3" class="d-fill-cyan"/>
+<rect x="363" y="188" width="34" height="24" rx="3" class="d-fill-cyan"/>
+<rect x="403" y="188" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="443" y="188" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="323" y="218" width="34" height="24" rx="3" class="d-fill-blue"/>
+<rect x="363" y="218" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="403" y="218" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="443" y="218" width="34" height="24" rx="3" class="d-outline"/>
+</g>
+<text x="400" y="266" text-anchor="middle" class="d-text-light d-small">private KV cache</text>
+<text x="400" y="284" text-anchor="middle" class="d-small">warm: mixed prefix A/B blocks</text>
+<!-- Replica N-1 -->
+<rect x="540" y="130" width="200" height="180" rx="8" class="d-panel"/>
+<text x="640" y="154" text-anchor="middle" class="d-title d-bold">Replica N&#8722;1</text>
+<text x="640" y="172" text-anchor="middle" class="d-text-light d-small">TP8 engine, 8&#215; GPU</text>
+<g class="d-mono d-small">
+<rect x="563" y="188" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="603" y="188" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="643" y="188" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="683" y="188" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="563" y="218" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="603" y="218" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="643" y="218" width="34" height="24" rx="3" class="d-outline"/>
+<rect x="683" y="218" width="34" height="24" rx="3" class="d-outline"/>
+</g>
+<text x="640" y="266" text-anchor="middle" class="d-text-light d-small">private KV cache</text>
+<text x="640" y="284" text-anchor="middle" class="d-small">cold: newly joined pod</text>
+</svg>
+<figcaption><b>Figure 1.</b> Each replica behind the router is a complete, independent TP8 engine with its own private KV cache &#8212; not a shared pool. Replica 0 has cached prefix A, replica 1 has a mixed set overlapping A and a different prefix B, and a newly joined replica N&#8722;1 starts cold. A router that cannot see this state (plain round-robin or least-connections) cannot tell these three apart. Endpoint Picker as the routing component sitting in front of a pool of model-server replicas, per the Kubernetes Gateway API Inference Extension<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<h2 id="replication-stateful-placement">1. Replication turns placement into a stateful decision</h2>
+<h3 id="replica-model">1.1 The replica model: N private KV caches behind one entry point</h3>
+<p>Module 1 established the physical layer: NVLink inside a node, an ~8&#215; bandwidth cliff crossing to InfiniBand/RoCE between nodes, and NVL72 as a structurally different 72-GPU NVLink domain. This module starts from what that physical layer is carrying once you scale a serving fleet out rather than up: N independent copies of the same TP8 engine, each occupying its own 8-GPU node (or fraction of an NVL72 domain), each running its own continuous-batching loop, and &#8212; the fact that matters for this module &#8212; each holding its own paged KV cache in its own HBM. There is no shared cache across replicas unless something is built to make one (that something is Part 4 of this track). A request that lands on replica 3 can reuse only the blocks replica 3 happens to have resident; it gets no benefit from an identical prefix sitting warm on replica 7.</p>
+<p>This is a different situation from everything upstream of it. Inside one TP8 engine, KV-cache management, paged allocation, and continuous batching are all solved problems Aman already has working code for &#8212; a single scheduler owns a single cache and every request in flight sees the same allocator. The instant a second replica exists, the cache stops being one object. It becomes N objects, privately owned, diverging from the moment they boot, and the component that decides which object a given request talks to &#8212; the router, called the <b>Endpoint Picker (EPP)</b> in the Gateway API Inference Extension's terminology &#8212; is now making a decision with real consequences for that request's latency, not just a load-spreading decision<a class="cite" href="#ref-1">1</a>. The EPP is a data-plane component that sits behind the ingress gateway, communicates with it over Envoy's external-processing protocol, and is responsible for picking which of the pods behind an <code>InferencePool</code> a request goes to<a class="cite" href="#ref-1">1</a>. The CRD wiring that connects a gateway to an EPP (the <code>InferencePool</code> object, the Envoy ext-proc plumbing) is Kubernetes machinery covered in Module 10; what this module covers is the decision logic inside the EPP itself, independent of how it got invoked.</p>
+<h3 id="cache-blind-router-cost">1.2 What a cache-blind router costs</h3>
+<p>A stateless policy &#8212; round-robin, least-connections, random &#8212; treats the three replicas in Figure 1 as interchangeable. They are not: replica 0 can serve a request continuing prefix A without recomputing it, replica 1 can serve part of a request touching prefix A or B, and replica N&#8722;1 must recompute everything from scratch because it just joined the pool. A stateless policy sends roughly one-third of prefix-A traffic to each of the three replicas, so two-thirds of that traffic re-executes prefill for tokens that are already resident somewhere in the fleet. The router does not need to know the exact FLOPs or HBM-bandwidth cost of that redundant prefill &#8212; Aman already has that arithmetic from single-node serving &#8212; it needs a cheap way to know <i>where</i> a given prefix is likely to be cached before it picks a replica. Sections 2 and 3 cover the two mechanisms production routers use to get that information: one approximate and cheap, one precise and more expensive.</p>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Every mechanism in this module answers one question: given a prompt and a pool of N replicas with divergent private state, which replica minimizes recomputed work and queueing delay for this specific request? Everything else &#8212; hashing schemes, event streams, scorer weights &#8212; is instrumentation built to answer that question cheaply enough to run on every request.</p></aside>
+<h2 id="approximate-prefix-scoring">2. Approximate prefix-cache scoring</h2>
+<p>llm-d's default mechanism for guessing which replica has a request's prefix cached does not ask the model server anything. It infers cache state entirely from the router's own routing history, using a fixed-size block hash and an in-memory index &#8212; cheap, stateless with respect to the model server, and, by construction, approximate.</p>
+<h3 id="block-hashing-rolling-chain">2.1 Block hashing and the rolling hash chain</h3>
+<p>The <code>approx-prefix-cache-producer</code> plugin splits an incoming prompt into fixed-size blocks &#8212; llm-d's own documentation gives 16 tokens per block as the example granularity &#8212; and builds a rolling hash chain over them: each block's hash is a function of that block's content and the hash of the block before it, so block <i>k</i>'s hash changes if any earlier block in the prefix changes<a class="cite" href="#ref-2">2</a>. This is the same chaining idea used for content-addressed prefix caching inside a single engine (block hash depends on prefix, not just local content), extended here to become the router's own view of prefix identity, independent of what any individual model server's internal PagedAttention block table looks like.</p>
+<h3 id="lru-index">2.2 The in-memory LRU index of recently-routed prefixes</h3>
+<p>The router does not query replicas for their cache contents. Instead, the Endpoint Picker keeps an in-memory LRU index that records, for each prefix hash it has seen, which pod that prefix was last routed to<a class="cite" href="#ref-2">2</a>. When a new request arrives, the router hashes its prompt into the same block chain and looks each hash up in the LRU index: a hit means "the last time this router saw this prefix, it sent it to pod X, so pod X plausibly still has it cached." This is an inference from routing history, not a measurement of the pod's actual cache state &#8212; the index has no way to know if pod X evicted those blocks five minutes ago under memory pressure. That gap is exactly what precise indexing (section 3) closes, at a cost.</p>
+<h3 id="prefix-cache-scorer">2.3 The prefix-cache-scorer: matched/total block ratio</h3>
+<p>Given the LRU index, the <code>prefix-cache-scorer</code> plugin scores each candidate pod by the fraction of the prompt's blocks whose hash maps to that pod in the index: matched blocks divided by total blocks in the prompt<a class="cite" href="#ref-2">2</a>. A pod that (as far as the index knows) has all of a prompt's prefix blocks scores 1.0; a pod with none scores 0.0; a pod with a partial prefix overlap scores somewhere in between. This score is one input to the weighted scorer set described in section 5 &#8212; it does not, by itself, decide the winning pod, because load and session signals are layered on top of it (section 6).</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 380" role="img" aria-labelledby="f2t"><title id="f2t">Approximate indexing (rolling hash chain plus LRU lookup) versus precise indexing (KVEvents subscription) side by side</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="200" y="24" text-anchor="middle" class="d-title d-bold">Approximate (section 2)</text>
+<rect x="20" y="40" width="360" height="60" rx="6" class="d-block-2"/>
+<text x="200" y="63" text-anchor="middle" class="d-text-inv d-small">Prompt &#8594; 16-token blocks</text>
+<text x="200" y="83" text-anchor="middle" class="d-text-inv d-small">rolling hash chain h1, h2, h3&#8230;</text>
+<path d="M200,100 L200,120" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="20" y="122" width="360" height="60" rx="6" class="d-panel"/>
+<text x="200" y="145" text-anchor="middle" class="d-small">EPP in-memory LRU index</text>
+<text x="200" y="163" text-anchor="middle" class="d-small">hash &#8594; last pod routed</text>
+<path d="M200,182 L200,202" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="20" y="204" width="360" height="60" rx="6" class="d-panel"/>
+<text x="200" y="227" text-anchor="middle" class="d-small">prefix-cache-scorer</text>
+<text x="200" y="245" text-anchor="middle" class="d-small">score = matched / total blocks</text>
+<text x="200" y="292" text-anchor="middle" class="d-small d-text-light">no query to the model server</text>
+<text x="200" y="310" text-anchor="middle" class="d-small d-text-light">can be stale after eviction</text>
+<text x="600" y="24" text-anchor="middle" class="d-title d-bold">Precise (section 3)</text>
+<rect x="420" y="40" width="360" height="60" rx="6" class="d-block-2"/>
+<text x="600" y="63" text-anchor="middle" class="d-text-inv d-small">vLLM/SGLang/TensorRT-LLM engine</text>
+<text x="600" y="83" text-anchor="middle" class="d-text-inv d-small">block added/evicted in real KV cache</text>
+<path d="M600,100 L600,120" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="420" y="122" width="360" height="60" rx="6" class="d-panel"/>
+<text x="600" y="145" text-anchor="middle" class="d-small">KVEvent emitted over ZeroMQ (ZMQ)</text>
+<text x="600" y="163" text-anchor="middle" class="d-small">pub/sub, per model server</text>
+<path d="M600,182 L600,202" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="420" y="204" width="360" height="60" rx="6" class="d-panel"/>
+<text x="600" y="227" text-anchor="middle" class="d-small">KV-Cache Indexer</text>
+<text x="600" y="245" text-anchor="middle" class="d-small">exact block &#8594; pod map, all pods</text>
+<text x="600" y="292" text-anchor="middle" class="d-small d-text-light">correct as of last delivered event</text>
+<text x="600" y="310" text-anchor="middle" class="d-small d-text-light">needs tokenization round-trip (&#167;3.2)</text>
+<line x1="400" y1="30" x2="400" y2="330" class="d-dashed d-outline"/>
+</svg>
+<figcaption><b>Figure 2.</b> Both mechanisms answer the same question &#8212; which pod has this prefix cached &#8212; from opposite ends: the approximate path infers it from the router's own routing history, the precise path is told directly by the engine every time its cache changes. Mechanism per llm-d's prefix-cache-aware routing documentation<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<div class="calc">
+<p class="calc-title">Prefix-cache score for two candidate pods</p>
+<div class="calc-row"><label for="c1">Total blocks in prompt</label><input type="range" id="c1" name="total" min="1" max="16" step="1" value="8"></div>
+<div class="calc-row"><label for="c2">Matched blocks &#8212; Pod A</label><input type="range" id="c2" name="a" min="0" max="16" step="1" value="6"></div>
+<div class="calc-row"><label for="c3">Matched blocks &#8212; Pod B</label><input type="range" id="c3" name="b" min="0" max="16" step="1" value="2"></div>
+<div class="calc-out">
+<div>Score A (matched / total)<output data-expr="min(a,total) / total" data-format="fixed:2"></output></div>
+<div>Score B (matched / total)<output data-expr="min(b,total) / total" data-format="fixed:2"></output></div>
+</div>
+<p class="calc-note">Formula: score = matched blocks &#247; total prompt blocks, from the rolling hash chain's LRU lookup<a class="cite" href="#ref-2">2</a>. With an 8-block prompt (default above), a pod matching 6 blocks (0.75) outscores one matching 2 (0.25); the prefix-cache-scorer's output feeds into the weighted scorer set in section 5, so a higher prefix score does not automatically win if a competing pod is overloaded (section 6).</p>
+</div>
+<h2 id="precise-kv-indexing">3. Precise KV-cache indexing: KVEvents over ZeroMQ</h2>
+<h3 id="kvevents-mechanism">3.1 What triggers an event, what the indexer maintains</h3>
+<p>The precise path removes the inference step entirely. Model servers &#8212; llm-d's documentation names vLLM specifically &#8212; are configured to emit a <code>KVEvent</code> over ZeroMQ every time their internal KV cache changes: a block added, a block evicted<a class="cite" href="#ref-2">2</a>. A separate component, the <b>KV-Cache Indexer</b>, subscribes to these event streams from every pod in the pool and maintains a precise, globally consistent view of exactly which token blocks reside on which pods<a class="cite" href="#ref-2">2</a>. Where the approximate path's LRU index is a memory of what the router <i>told</i> pods to do, the precise path's index is a record of what the pods <i>actually did</i> to their own cache &#8212; it reflects real evictions, not just the passage of time since the last routing decision.</p>
+<p>This is a straightforward publish/subscribe architecture: each model-server process is a ZMQ publisher, the KV-Cache Indexer is a subscriber aggregating across all of them. It is not synchronous &#8212; the indexer's view is only as current as the last event it has processed, a point that matters for section 8's staleness discussion.</p>
+<h3 id="tokenization-roundtrip">3.2 Tokenization round-trip: the render endpoint</h3>
+<p>Block hashing, whether approximate or precise, has to operate on the same token boundaries the model server itself uses, or the hashes will not agree with what is actually cached. To get exact token IDs for an incoming prompt, llm-d's precise-mode <code>token-producer</code> plugin sends the prompt to vLLM's HTTP render endpoint, <code>/v1/completions/render</code>, before hashing it<a class="cite" href="#ref-2">2</a>. That is an extra network round trip to a model server &#8212; specifically, to some model server, since the router does not yet know which pod to send the request to when it needs the tokenization &#8212; on the way to deciding which pod to send the request to for actual generation. The approximate path avoids this entirely by hashing an approximation of the prompt (llm-d's own example: 16 tokens approximated as characters<a class="cite" href="#ref-2">2</a>), trading exact token-boundary alignment for zero extra round trips.</p>
+<h3 id="approx-precise-tradeoff">3.3 Cost/accuracy trade-off, summarized</h3>
+<p>Table 3 (section 7) compares the routers themselves; the table below isolates just this one design choice, since it recurs across every router in this module.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Approximate versus precise prefix-cache indexing, as implemented in llm-d's scheduler<a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Property</th><th>Approximate (block hash + LRU)</th><th>Precise (KVEvents + ZMQ)</th></tr></thead>
+<tbody>
+<tr><td class="row">Source of truth</td><td>router's own routing history</td><td class="d-mono" data-best>engine's actual cache state</td></tr>
+<tr><td class="row">Query to model server</td><td class="d-mono" data-best>none</td><td>tokenization round-trip (render endpoint)</td></tr>
+<tr><td class="row">Reflects evictions</td><td>no &#8212; only reflects time/LRU eviction of the index itself</td><td class="d-mono" data-best>yes &#8212; event fires on real eviction</td></tr>
+<tr><td class="row">Extra subsystem</td><td class="d-mono" data-best>none beyond the EPP process</td><td>ZMQ pub/sub, KV-Cache Indexer component</td></tr>
+<tr><td class="row">Token-boundary accuracy</td><td>approximate (character-block heuristic)</td><td class="d-mono" data-best>exact (real tokenizer)</td></tr>
+<tr><td class="row">Consistency window</td><td>stale as soon as a pod evicts without the router knowing</td><td>bounded by event delivery latency, not by staleness of a guess</td></tr>
+</tbody>
+</table>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>Both mechanisms are llm-d scheduler plugins selected by which producer/scorer combination is wired into the EPP's plugin chain, not a global on/off switch for the whole router &#8212; the pluggable design (section 5.1) is what makes it possible to run approximate scoring for most traffic and reserve precise indexing for pools where staleness is expensive enough to justify the extra round trip<a class="cite" href="#ref-3">3</a>.</p></aside>
+<h2 id="session-vs-prefix-affinity">4. Session affinity vs. prefix affinity</h2>
+<h3 id="session-id-producer">4.1 Sticky routing by session ID</h3>
+<p>Prefix affinity, as built in sections 2 and 3, routes on the <i>content</i> of the prompt: any two requests that share a prefix should land on the same pod, regardless of which client sent them or in what order. Session affinity is a different, simpler idea: route on an opaque session or conversation identifier, so that every request tagged with the same session ID lands on the same pod for the life of that session, independent of what the prompt content actually is. llm-d implements this as its own scheduler plugin, <code>session-id-producer</code>, which supplies session-affinity data as one more signal the scorer set can weight<a class="cite" href="#ref-3">3</a>. vLLM's production-stack router implements the same idea at the router level directly: its request router supports session-ID-based routing as one of its three routing modes, alongside round-robin and Kubernetes service discovery<a class="cite" href="#ref-4">4</a>.</p>
+<h3 id="when-they-agree-conflict">4.2 When they agree, when they conflict</h3>
+<p>For a single-turn request, session affinity and prefix affinity are nearly indistinguishable: a session's first request has no cache anywhere, so whichever pod session affinity happens to pick becomes the pod prefix affinity would also pick for every subsequent turn in that conversation &#8212; the two signals converge because the session <i>is</i> the growing prefix. This is the common case multi-turn chat routing optimizes for, and it is why session-ID routing is a defensible default even without any block-hashing machinery at all (vLLM production-stack's default routing modes do not require the LRU index or KVEvents subsystem of sections 2&#8211;3<a class="cite" href="#ref-4">4</a>).</p>
+<p>The two signals diverge in at least three situations a pure session-ID router cannot see. First, a shared system prompt or a shared retrieved document used across many independent sessions: prefix affinity would route all of them to whichever pod already has that shared prefix cached, while session affinity, keyed on a per-conversation ID, scatters them across the fleet exactly as a stateless policy would, gaining nothing from the shared prefix. Second, a session that resumes after the routing pod has been drained or has failed: session affinity has no fallback signal once its target pod is gone, whereas prefix-aware scoring can still find the next-best pod by content match. Third, load imbalance: a session pinned to a pod that happens to be overloaded stays pinned to it under pure session affinity, whereas a scorer set that layers load signals on top of affinity (section 6) can route the session elsewhere at the cost of a cold cache, trading a known recompute cost against an unknown queueing delay.</p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Session affinity and prefix affinity are not exclusive choices inside a single router &#8212; llm-d's plugin architecture allows a <code>session-id-producer</code> signal and a <code>prefix-cache-scorer</code> signal to feed the same weighted scorer set simultaneously (section 5), so a production deployment typically runs both and lets their weights, not an either/or configuration flag, decide which dominates for a given request<a class="cite" href="#ref-3">3</a>.</p></aside>
+<h2 id="layered-pipeline">5. The layered scheduling pipeline: filter, score, select</h2>
+<h3 id="llmd-scheduler-stages">5.1 llm-d's scheduler: Request Control, Filtering, Scoring, Selection</h3>
+<p>llm-d's inference scheduler documents its own pipeline as a sequential chain: a <b>Request Control</b> stage handles flow-control admission, where a global <i>Screener</i> component does preliminary endpoint filtering; a <b>Filtering</b> stage runs pods through a sequential chain of filters that can eliminate candidates outright (the <code>decode-filter</code> plugin, for example, filters out pods not currently in the decode stage); a <b>Scoring</b> stage runs the surviving pods through a weighted set of scorers &#8212; <code>prefix-cache-scorer</code> and any load- or session-affinity scorers configured &#8212; each contributing a weighted term; and a <b>Selection</b> stage where the highest-scored pod is chosen, via the <code>max-score-picker</code> plugin<a class="cite" href="#ref-3">3</a>. This is a filter-then-rank pipeline, not a single formula: filtering removes pods that are categorically wrong for this request (wrong lifecycle stage, admission-rejected) before scoring ever runs, and scoring only has to rank pods that already passed every hard constraint.</p>
+<p>The data underneath every scorer follows what llm-d calls a <b>Source &#8594; Extract &#8594; Attribute</b> lifecycle: raw signals (KVEvents, load metrics, session IDs) are sourced from wherever they originate, extracted into a normalized form, and attributed to specific endpoints in a shared datastore that the scoring stage reads from<a class="cite" href="#ref-3">3</a>. The scheduler's stated design principle is pluggability: new scorers or filters can be added without changing the pipeline's core code, which is exactly what lets a deployment mix and match the approximate producer, the precise indexer, session affinity, and load signals from sections 2&#8211;4 and 6 as separately configurable plugins rather than a monolithic policy<a class="cite" href="#ref-3">3</a>.</p>
+<h3 id="gaie-epp-contract">5.2 The Gateway API Inference Extension's EPP contract</h3>
+<p>llm-d's scheduler is one implementation of a pattern the Kubernetes Gateway API Inference Extension (GAIE) standardizes at the API level for any EPP, not just llm-d's. GAIE's own architecture proposal describes requests flowing through three layers: a <b>Routing Layer</b> that applies per-model routing rules and enriches the request with metadata; a <b>Flow Controller</b> that handles priority, fairness, and queueing; and a <b>Scheduling Layer</b>, described as "the load balancing algorithm that intelligently routes requests based on the current state of the InferencePool"<a class="cite" href="#ref-5">5</a>. The CRD-level plumbing that connects this to an actual Kubernetes gateway &#8212; the <code>InferencePool</code> object's fields, how an <code>HTTPRoute</code> references it, Envoy's ext-proc wiring &#8212; is Module 10's territory; what matters here is that GAIE's three-layer architecture and llm-d's four-stage pipeline describe the same computation from two altitudes.</p>
+<h3 id="mapping-pipelines">5.3 How the two map onto each other</h3>
+<p>GAIE's Flow Controller (priority, fairness, queueing) corresponds to llm-d's Request Control stage (flow-control admission, the Screener). GAIE's Scheduling Layer (load-balancing on current pool state) corresponds to llm-d's combined Filtering + Scoring + Selection stages &#8212; GAIE names the mechanism at the level of "an algorithm that routes based on pool state," llm-d specifies what that algorithm actually is: sequential hard filters, then a weighted soft-scoring pass, then arg-max selection. GAIE's Routing Layer (per-model rules, request enrichment) sits logically upstream of both, since it decides <i>which</i> InferencePool a request even reaches before any pod-level filter or scorer runs.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t">
+<title id="f3t">llm-d's four-stage scheduler pipeline mapped onto the Gateway API Inference Extension's three-layer EPP architecture</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="400" y="20" text-anchor="middle" class="d-title d-bold">llm-d scheduler stages</text>
+<rect x="20" y="34" width="170" height="60" rx="6" class="d-block"/><text x="105" y="58" text-anchor="middle" class="d-text-inv d-small">Request Control</text><text x="105" y="76" text-anchor="middle" class="d-text-inv d-small">Screener, admission</text>
+<path d="M190,64 L210,64" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="210" y="34" width="170" height="60" rx="6" class="d-block"/><text x="295" y="58" text-anchor="middle" class="d-text-inv d-small">Filtering</text><text x="295" y="76" text-anchor="middle" class="d-text-inv d-small">decode-filter, etc.</text>
+<path d="M380,64 L400,64" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="400" y="34" width="170" height="60" rx="6" class="d-block"/><text x="485" y="52" text-anchor="middle" class="d-text-inv d-small">Scoring</text><text x="485" y="70" text-anchor="middle" class="d-text-inv d-small">prefix-cache-scorer</text><text x="485" y="86" text-anchor="middle" class="d-text-inv d-small">+ load/session scorers</text>
+<path d="M570,64 L590,64" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="590" y="34" width="190" height="60" rx="6" class="d-block"/><text x="685" y="58" text-anchor="middle" class="d-text-inv d-small">Selection</text><text x="685" y="76" text-anchor="middle" class="d-text-inv d-small">max-score-picker</text>
+<path d="M105,94 L105,150" class="d-dashed d-outline"/>
+<path d="M295,94 L295,150 L295,150" class="d-dashed d-outline"/>
+<path d="M485,94 L485,150" class="d-dashed d-outline"/>
+<path d="M685,94 L685,150" class="d-dashed d-outline"/>
+<text x="400" y="172" text-anchor="middle" class="d-title d-bold">GAIE EPP layers (same computation, three levels)</text>
+<rect x="20" y="186" width="170" height="70" rx="6" class="d-panel"/><text x="105" y="210" text-anchor="middle" class="d-small">Flow Controller</text><text x="105" y="228" text-anchor="middle" class="d-small d-text-light">priority, fairness,</text><text x="105" y="244" text-anchor="middle" class="d-small d-text-light">queueing</text>
+<rect x="210" y="186" width="560" height="70" rx="6" class="d-panel"/><text x="490" y="210" text-anchor="middle" class="d-small">Scheduling Layer</text><text x="490" y="228" text-anchor="middle" class="d-small d-text-light">"load balancing algorithm that routes</text><text x="490" y="244" text-anchor="middle" class="d-small d-text-light">based on current InferencePool state"</text>
+</svg>
+<figcaption><b>Figure 3.</b> llm-d's Filtering, Scoring, and Selection stages are one concrete instantiation of what the Gateway API Inference Extension's architecture proposal calls, at the API level, the Scheduling Layer; Request Control maps to the Flow Controller. Pipeline per llm-d's scheduler architecture<a class="cite" href="#ref-3">3</a>; layer definitions per GAIE's EPP architecture proposal<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f4t">
+<title id="f4t">Sequence diagram of one request's path from client to selected replica</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="60" y="24" text-anchor="middle" class="d-small d-bold">Client</text>
+<line x1="60" y1="34" x2="60" y2="230" class="d-outline d-dashed"/>
+<text x="220" y="24" text-anchor="middle" class="d-small d-bold">Gateway</text>
+<line x1="220" y1="34" x2="220" y2="230" class="d-outline d-dashed"/>
+<text x="400" y="24" text-anchor="middle" class="d-small d-bold">EPP</text>
+<line x1="400" y1="34" x2="400" y2="230" class="d-outline d-dashed"/>
+<text x="590" y="24" text-anchor="middle" class="d-small d-bold">Candidate pods</text>
+<line x1="590" y1="34" x2="590" y2="230" class="d-outline d-dashed"/>
+<text x="750" y="24" text-anchor="middle" class="d-small d-bold">Selected pod</text>
+<line x1="750" y1="34" x2="750" y2="230" class="d-outline d-dashed"/>
+<path d="M60,54 L214,54" class="d-arrow" marker-end="url(#f4-arr)"/><text x="140" y="48" text-anchor="middle" class="d-small">HTTP request</text>
+<path d="M220,74 L394,74" class="d-arrow" marker-end="url(#f4-arr)"/><text x="310" y="68" text-anchor="middle" class="d-small">Envoy ext-proc call</text>
+<path d="M400,98 L584,98" class="d-arrow" marker-end="url(#f4-arr)"/><text x="490" y="92" text-anchor="middle" class="d-small">score request (filter)</text>
+<path d="M590,120 L406,120" class="d-arrow" marker-end="url(#f4-arr)"/><text x="490" y="114" text-anchor="middle" class="d-small">filtered candidates + scores</text>
+<rect x="360" y="132" width="80" height="26" rx="4" class="d-hl"/><text x="400" y="150" text-anchor="middle" class="d-small">select max</text>
+<path d="M400,164 L744,164" class="d-arrow" marker-end="url(#f4-arr)"/><text x="570" y="158" text-anchor="middle" class="d-small">forward request</text>
+<path d="M750,184 L406,184" class="d-arrow" marker-end="url(#f4-arr)"/><text x="580" y="178" text-anchor="middle" class="d-small">tokens (streamed)</text>
+<path d="M400,204 L226,204" class="d-arrow" marker-end="url(#f4-arr)"/><text x="310" y="198" text-anchor="middle" class="d-small">relay response</text>
+<path d="M220,224 L66,224" class="d-arrow" marker-end="url(#f4-arr)"/><text x="140" y="218" text-anchor="middle" class="d-small">HTTP response</text>
+</svg>
+<figcaption><b>Figure 4.</b> The EPP is invoked by the gateway over Envoy's external-processing protocol; it runs filtering and scoring against the InferencePool's candidate pods, selects the highest-scored one, and the gateway forwards the request there directly &#8212; the EPP itself does not sit on the token-streaming data path. Per GAIE's description of the Endpoint Picker as a data-plane component using Envoy ext-proc<a class="cite" href="#ref-1">1</a> and llm-d's filter/score/select pipeline<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+<h2 id="load-slo-scoring">6. Load- and SLO-aware scoring layered on prefix affinity</h2>
+<h3 id="decode-filter-inflight-load">6.1 decode-filter and inflight-load-producer</h3>
+<p>A pod with a perfect prefix-cache score is still a bad choice if it is already saturated: routing every request for a hot shared prefix to the one pod that happens to hold it would recreate, inside the cache-aware router, exactly the hot-spotting problem stateless load balancing was supposed to prevent. llm-d's scheduler ships two plugins that address this directly. <code>decode-filter</code> runs in the Filtering stage (section 5.1) and removes pods that are not currently in the decode stage from consideration &#8212; relevant once prefill/decode disaggregation (Module 3 onward) is in play, since a request needing decode service should never be filtered onto a prefill-only pod<a class="cite" href="#ref-3">3</a>. <code>inflight-load-producer</code> supplies a load signal &#8212; in-flight request count or queue depth &#8212; into the same data layer that feeds the Scoring stage, so it becomes one more attribute a load-aware scorer can weight alongside the prefix-cache score<a class="cite" href="#ref-3">3</a>.</p>
+<h3 id="weighted-combination">6.2 Weighted scorer combination</h3>
+<p>Because llm-d's Scoring stage runs a <i>weighted set</i> of scorers rather than a single formula (section 5.1), prefix affinity and load are combined, not chosen between: a pod's final score is a weighted sum across whichever scorers are configured &#8212; prefix-cache-scorer, a load-based scorer built on <code>inflight-load-producer</code>'s data, and optionally a session-affinity scorer &#8212; and <code>max-score-picker</code> selects the pod with the highest combined score<a class="cite" href="#ref-3">3</a>. The scheduler's own documentation does not publish default weight values for this combination, so the practical effect of raising or lowering any one scorer's weight is a deployment-specific tuning decision, not a fixed constant this module can give a number for; what is fixed is the mechanism &#8212; every scorer contributes an independent, weighted term, and the pluggable architecture (section 5.1) means new signals can be added as new scorer plugins without touching the combination logic itself<a class="cite" href="#ref-3">3</a>.</p>
+<p>The practical effect is that a pod with a high prefix-cache score does not automatically win: a heavily loaded pod holding a perfect prefix match can still lose to a lightly loaded pod holding a partial match, if the load scorer's weighted contribution outweighs the prefix scorer's. This is the mechanism that keeps the approximate/precise indexing of sections 2&#8211;3 from creating its own hot-spotting problem &#8212; the same weighted-sum architecture that lets prefix affinity and session affinity coexist (section 4.2) is what lets prefix affinity and load-awareness coexist here.</p>
+<p>The arithmetic itself is nothing more than a weighted sum, but it is worth writing out once because the crossover point &#8212; where a load penalty overtakes a prefix-cache advantage &#8212; is where the thundering-herd failure mode of section 8 actually originates. With a prefix-cache score \(s_{pfx} \in [0,1]\) (section 2.3), a normalized load score \(s_{load} \in [0,1]\) (1 = idle, 0 = saturated), and scorer weights \(w_{pfx}, w_{load}\) set by the deployer, a pod's combined score is</p>
+$$ s = w_{pfx}\, s_{pfx} + w_{load}\, s_{load} $$
+<p>Table 2 below plugs in illustrative weights (llm-d's documentation does not publish defaults<a class="cite" href="#ref-3">3</a>, so treat these as worked numbers, not a citation) to show the crossover concretely: at equal weights, a fully idle cold pod (\(s_{pfx}=0\), \(s_{load}=1\)) ties a fully warm but half-loaded pod (\(s_{pfx}=1\), \(s_{load}=0.5\)) at \(s = 0.5\), and beats any pod running above half load regardless of how much of the prefix it holds.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Illustrative combined scores at equal weights (\(w_{pfx}=w_{load}=0.5\)), showing where an idle cold pod overtakes a busier warm one &#8212; not sourced defaults, a worked instance of the section 6.2 formula.</caption>
+<thead><tr><th>Pod</th><th class="num">Prefix score</th><th class="num">Load score</th><th class="num">Combined score</th></tr></thead>
+<tbody>
+<tr><td class="row">Warm, lightly loaded</td><td class="num">1.00</td><td class="num">0.80</td><td class="num" data-best>0.90</td></tr>
+<tr><td class="row">Warm, half loaded</td><td class="num">1.00</td><td class="num">0.50</td><td class="num">0.75</td></tr>
+<tr><td class="row">Cold, idle (newly joined)</td><td class="num">0.00</td><td class="num">1.00</td><td class="num">0.50</td></tr>
+<tr><td class="row">Warm, nearly saturated</td><td class="num">1.00</td><td class="num">0.10</td><td class="num" data-worst>0.55</td></tr>
+</tbody>
+</table>
+<p>Read down the table: a fully warm pod only loses to the cold pod once its own load score drops below the cold pod's load score by more than its full prefix-score advantage divided by the weight ratio &#8212; at equal weights, once the warm pod is busier than the cold pod is idle. That crossover is unremarkable for one request. It becomes the thundering-herd failure mode of section 8 when many concurrent requests each independently cross it against the same cold pod at once, because the load scorer has no way to account for requests still in flight to that pod from other, concurrent scoring decisions <i>within</i> the same routing instant.</p>
+<h2 id="router-comparison">7. Three routers compared: llm-d, vLLM production-stack, sglang-router</h2>
+<p>The mechanisms above are llm-d's; they are not the only production router design in the open-source stack. vLLM's own reference deployment, production-stack, ships a simpler router, and SGLang ships a standalone Rust router built specifically for prefill/decode-aware routing. All three sit behind the same architectural slot &#8212; a request-routing layer in front of a pool of stateful engine replicas &#8212; but differ in how much KV-cache-awareness they build in versus assume the deployer will add separately.</p>
+<p>vLLM's production-stack README describes a three-component reference architecture &#8212; the serving engine (the vLLM instances themselves), a request router, and an observability stack (Prometheus and Grafana) &#8212; explicitly designed to scale from a single vLLM instance to a distributed deployment without application-code changes<a class="cite" href="#ref-4">4</a>. Its router supports round-robin routing, session-ID-based routing, and automatic Kubernetes service discovery<a class="cite" href="#ref-4">4</a>; KV-cache offloading is available as a separate integration via LMCache rather than as router-native prefix scoring<a class="cite" href="#ref-4">4</a> (LMCache itself is Module 8's subject). sglang-router is described on its package page as "a high-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support," currently at version 0.3.2, released 2026-01-15<a class="cite" href="#ref-6">6</a> &#8212; its distinguishing design goal, unlike either llm-d's Python/Go scheduler plugin chain or production-stack's router, is PD-aware routing built into a single dependency-light Rust binary. SGLang's own PD-disaggregation documentation (Module 12's subject) describes the deployment topology this router targets, not the router's internal scoring formula, which sglang-router's own package page does not itemize at the level of detail llm-d's scheduler documentation does.</p>
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 3.</b> Router feature comparison across the three routers this module can source in detail<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-6">6</a>.</caption>
+<thead><tr><th>Feature</th><th>llm-d scheduler / EPP</th><th>vLLM production-stack router</th><th>sglang-router</th></tr></thead>
+<tbody>
+<tr><td class="row">Implementation</td><td>Go/Python plugin chain behind an EPP</td><td>Python request router</td><td class="d-mono">Rust binary</td></tr>
+<tr><td class="row">Prefix-cache awareness</td><td class="d-mono" data-best>approximate (hash+LRU) and precise (KVEvents) modes</td><td>via separate LMCache integration, not router-native</td><td>not itemized in package metadata<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">Session affinity</td><td>session-id-producer plugin</td><td class="d-mono" data-best>session-ID routing, native mode</td><td>not itemized in package metadata<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">Load awareness</td><td>inflight-load-producer + weighted scorer</td><td>not a named routing mode<a class="cite" href="#ref-4">4</a></td><td>"multiple routing algorithms," unspecified in package metadata<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">PD-disaggregation awareness</td><td>decode-filter plugin</td><td>not native</td><td class="d-mono" data-best>native, stated design goal<a class="cite" href="#ref-6">6</a></td></tr>
+<tr><td class="row">Service discovery</td><td>InferencePool (Module 10)</td><td class="d-mono" data-best>automatic Kubernetes service discovery<a class="cite" href="#ref-4">4</a></td><td>not itemized in package metadata</td></tr>
+<tr><td class="row">Extensibility model</td><td class="d-mono" data-best>explicit plugin architecture, no core changes to add scorers<a class="cite" href="#ref-3">3</a></td><td>fixed set of three routing modes</td><td>fixed set of routing algorithms</td></tr>
+</tbody>
+</table>
+<p class="small muted">"Not itemized in package metadata" means sglang-router's PyPI page does not describe the property at the level of detail this table needs<a class="cite" href="#ref-6">6</a> &#8212; not that the feature is absent. SGLang's PD-disaggregation documentation (Module 12) covers its transfer-backend and deployment mechanics in more depth than the router package page alone.</p>
+<h2 id="cost-of-learning-state">8. What learning KV state costs: staleness and failure modes</h2>
+<p>Every mechanism in this module buys accuracy at some operational price, and every one of those prices shows up as a specific failure mode rather than a uniform "sometimes wrong." Three are worth naming precisely, because each has a different root cause and a different mitigation, and conflating them leads to fixing the wrong layer.</p>
+<p><b>Stale index after eviction.</b> The approximate path's LRU index (section 2.2) records where the router <i>sent</i> a prefix, not what the pod's cache <i>still holds</i>. If a pod evicts blocks under memory pressure &#8212; ordinary paged-KV-cache behavior Aman already knows from single-node serving &#8212; the router's index has no signal that the eviction happened until enough time passes for its own LRU policy to age the entry out independently. In the interim, the prefix-cache-scorer keeps awarding a high score to a pod that will, in fact, have to recompute the prefix it appears to have cached. This is precisely the gap precise indexing (section 3) closes: a real KVEvent fires the moment the engine evicts a block, so the KV-Cache Indexer's view corrects itself as fast as the event pipeline delivers the message, not as fast as an independent LRU-aging heuristic happens to catch up<a class="cite" href="#ref-2">2</a>.</p>
+<p><b>Event-delivery staleness window.</b> Precise indexing is not instantaneous either. ZMQ pub/sub (section 3.1) delivers events asynchronously; the KV-Cache Indexer's global view is correct as of the last event it has processed, not as of the current instant<a class="cite" href="#ref-2">2</a>. Under normal operation this window is small, but it is nonzero by construction &#8212; there is no synchronous barrier between a model server mutating its cache and the router's copy of that fact updating. A router that treats the precise index as a real-time oracle rather than an eventually-consistent replica is making the same category of mistake the approximate path makes, just with a much smaller error window.</p>
+<p><b>Thundering herd on a newly-warm replica.</b> Figure 1's replica N&#8722;1 illustrates the third failure mode. A pod that just joined the pool has an empty prefix-cache footprint by construction &#8212; the prefix-cache-scorer correctly scores it near zero for essentially every incoming prefix. But <code>inflight-load-producer</code> (section 6.1) also correctly reports that pod as having near-zero in-flight load, since it has served nothing yet. If the load scorer's weight is high relative to the prefix scorer's, the weighted combination (section 6.2) can rank the empty pod as the best choice for many requests simultaneously &#8212; each one individually a reasonable "route to the least-loaded pod" decision, collectively a burst of full-prefill traffic landing on one pod at once, the opposite of the gradual warm-up a newly joined replica actually needs. Neither scorer is wrong in isolation; the failure is an interaction between two correct signals under a specific weighting.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 4.</b> Three routing failure modes, their root cause, and how the mechanisms in this module bound them<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>.</caption>
+<thead><tr><th>Failure mode</th><th>Root cause</th><th>Bounded by</th></tr></thead>
+<tbody>
+<tr><td class="row">Stale prefix index after eviction</td><td>LRU index tracks routing history, not real cache state</td><td>precise KVEvents indexing (&#167;3)</td></tr>
+<tr><td class="row">Event-delivery staleness window</td><td>ZMQ pub/sub is asynchronous, not a synchronous barrier</td><td>event-pipeline latency (small, not zero)</td></tr>
+<tr><td class="row">Thundering herd on a cold-but-idle replica</td><td>load scorer and prefix scorer disagree, load wins by weight</td><td>scorer-weight tuning; no plugin eliminates it structurally</td></tr>
+</tbody>
+</table>
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Treating "KV-cache-aware routing" as a single feature that is either on or off. It is a stack of independently tunable signals &#8212; prefix affinity (approximate or precise), session affinity, load, and decode-stage filtering &#8212; combined by weights that the scheduler's own documentation deliberately leaves as a deployment-specific tuning surface rather than a fixed default<a class="cite" href="#ref-3">3</a>. Debugging a routing hot spot means asking which scorer's weight is dominating, not whether "the cache-aware router" is broken.</p></aside>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The disagreement in this module is not about whether KV-cache-aware routing helps &#8212; every source agrees it does &#8212; but about how much machinery is worth building to get it, and whether "cache-aware" should mean an approximate, cheap signal or a precise, more expensive one. Three positions show up across the sources this module draws on.</p>
+<div class="positions">
+<article class="position">
+<h4>Approximate hashing is the pragmatic default</h4>
+<p class="who">llm-d's own scheduler documentation, describing its default prefix-cache-aware mode<a class="cite" href="#ref-2">2</a></p>
+<p>Block hashing plus an in-memory LRU index requires no query to any model server, no extra subsystem beyond the EPP process itself, and no tokenization round trip. It is a router-local, stateless-with-respect-to-the-engine mechanism that scales to any fleet size the router itself can handle, and it is the mode llm-d documents first and treats as the baseline before introducing precise indexing as an alternative.</p>
+<ul class="pros"><li>Zero extra network calls to model servers per request.</li><li>No additional service (ZMQ broker, indexer process) to operate or fail independently.</li><li>Scales with router capacity alone, not with per-pod event throughput.</li></ul>
+<ul class="cons"><li>Can be stale after an eviction the router has no way to observe (&#167;8).</li><li>Character-approximated block boundaries (llm-d's own 16-token example) do not guarantee alignment with the engine's real tokenizer.</li></ul>
+</article>
+<article class="position">
+<h4>Precise event-streaming is worth the cost for exact correctness</h4>
+<p class="who">llm-d's precise-mode documentation, describing KVEvents/ZMQ indexing as the alternative to approximate scoring<a class="cite" href="#ref-2">2</a></p>
+<p>An index built from real eviction events, sourced directly from the engine, is correct as of the last delivered event rather than correct as of an inference about routing history. For deployments where a stale routing decision is expensive &#8212; large models where a wrong guess means re-executing a long, compute-heavy prefill &#8212; the tokenization round trip and the ZMQ subsystem are a small price for removing an entire class of silent mis-routing.</p>
+<ul class="pros"><li>Reflects the engine's actual cache state, not a heuristic proxy for it.</li><li>Staleness is bounded by event-delivery latency, not by an independent LRU-aging policy that has no relationship to real evictions.</li></ul>
+<ul class="cons"><li>Adds a tokenization round trip to vLLM's render endpoint before every routing decision (&#167;3.2).</li><li>Requires an additional always-on component (the KV-Cache Indexer) subscribing to every pod's event stream.</li></ul>
+</article>
+<article class="position">
+<h4>Skip cache-awareness in the router; use session or round-robin</h4>
+<p class="who">vLLM production-stack's default routing modes (round-robin, session-ID, Kubernetes service discovery)<a class="cite" href="#ref-4">4</a>, and sglang-router's framing around PD-aware rather than prefix-aware routing as its distinguishing feature<a class="cite" href="#ref-6">6</a></p>
+<p>Neither of the two other major open-source routers this module can source in detail ships llm-d's block-hashing-plus-LRU or KVEvents machinery as a router-native feature. vLLM production-stack routes on session ID or round-robin and treats prefix-cache reuse as LMCache's job (Module 8), a separate integration rather than router logic. sglang-router's stated distinguishing feature is PD-aware routing, not prefix-cache scoring. Read together, this implies at least part of the field does not consider router-level prefix-cache scoring worth the added complexity relative to simpler affinity signals plus a separate caching layer.</p>
+<ul class="pros"><li>Far less router-internal complexity; no scorer weights to tune.</li><li>Session-ID routing captures most of the benefit for the common multi-turn case (&#167;4.2).</li></ul>
+<ul class="cons"><li>Loses the shared-prefix-across-sessions case entirely (&#167;4.2) unless a separate caching layer compensates.</li><li>No native load-aware combination with cache affinity; scaling decisions and cache decisions are made by different components.</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>These are not really competing claims about the same fact; they are different bets about where in the stack cache-awareness should live. llm-d's position is defensible when the router is the natural place to make this decision because it already sits on every request's path and the fleet is large enough that redundant prefill is a real cost. Production-stack's simpler routing is defensible when LMCache or an equivalent caching layer (Module 8) already captures most of the reuse benefit independently of router sophistication, and the deployment values fewer moving parts over marginal routing precision. Within llm-d's own two modes, the approximate/precise choice is a genuine cost-accuracy trade-off rather than one option dominating the other: approximate is the safer default until a workload's redundant-prefill cost (measured, not assumed) exceeds the tokenization round-trip and indexer-operation cost of going precise. None of the sources in this module's scope publish a controlled throughput or TTFT comparison between the three routers under identical traffic, so the honest answer is that the choice is currently made on architectural fit and operational preference, not on a published benchmark that would let you rank them numerically; a study holding traffic pattern, model, and hardware fixed across all three routers would settle it.</p></div>
+</section>
+<h2 id="what-is-changing">What is changing</h2>
+<p>The Gateway API Inference Extension itself lists "prefix-cache aware load balancing" as a roadmap goal at the API-standard level, alongside KV-cache- and request-cost-aware scheduling and LoRA-adapter-aware routing<a class="cite" href="#ref-1">1</a> &#8212; meaning the pattern this module describes as llm-d's implementation choice is on a path toward becoming a Kubernetes-standard capability any EPP-based router can claim, not just llm-d's own scheduler. All three routers in Table 3 are under active development on the same 2026-09-17 snapshot this module cites; sglang-router's 0.3.2 release date (2026-01-15) is eight months old relative to that snapshot, and llm-d's scheduler documentation carries no version tag at all, describing itself only as the main branch<a class="cite" href="#ref-3">3</a> &#8212; both signals that the specific plugin names, default weights, and API surfaces in this module are more likely to shift than the underlying filter-score-select pattern itself.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">repo</span>Kubernetes SIG contributors. <em>kubernetes-sigs/gateway-api-inference-extension (README)</em>. Kubernetes SIGs, GA since v1.0.0, 2026. <a href="https://github.com/kubernetes-sigs/gateway-api-inference-extension">https://github.com/kubernetes-sigs/gateway-api-inference-extension</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Endpoint Picker as a data-plane component using Envoy ext-proc; KV-cache- and request-cost-aware scheduling goals; prefix-cache-aware load-balancing roadmap item.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>llm-d contributors. <em>Prefix-Cache Aware Routing (llm-d docs)</em>. llm-d, docs/dev (live), 2026. <a href="https://llm-d.ai/docs/dev/architecture/advanced/kv-management/prefix-cache-aware-routing">https://llm-d.ai/docs/dev/architecture/advanced/kv-management/prefix-cache-aware-routing</a>. Accessed 2026-09-17. <span class="ref-use">Used for: approximate block-hashing/rolling-hash-chain/LRU mechanism, precise KVEvents/ZMQ mechanism, tokenization round-trip via the render endpoint.</span></li>
+<li id="ref-3"><span class="ref-type">repo</span>llm-d contributors. <em>llm-d-inference-scheduler architecture.md</em>. llm-d (CNCF Sandbox; Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA), main branch, 2026. <a href="https://github.com/llm-d/llm-d-inference-scheduler/blob/main/docs/architecture.md">https://github.com/llm-d/llm-d-inference-scheduler/blob/main/docs/architecture.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: filter-score-select pipeline stages, named plugins (prefix-cache-scorer, decode-filter, max-score-picker, session-id-producer, inflight-load-producer), Source-Extract-Attribute data layer, pluggability design principle.</span></li>
+<li id="ref-4"><span class="ref-type">repo</span>vLLM Project contributors. <em>vllm-project/production-stack (README)</em>. vLLM Project, released 2026-01-22. <a href="https://github.com/vllm-project/production-stack">https://github.com/vllm-project/production-stack</a>. Accessed 2026-09-17. <span class="ref-use">Used for: three-component reference architecture, session-ID/round-robin/service-discovery routing modes, LMCache integration.</span></li>
+<li id="ref-5"><span class="ref-type">repo</span>Kubernetes SIG / Gateway API Inference Extension contributors. <em>EPP Architecture Proposal (0683-epp-architecture-proposal)</em>. Kubernetes SIGs, main branch proposal doc, 2026. <a href="https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/0683-epp-architecture-proposal/README.md">https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/0683-epp-architecture-proposal/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: three-layer EPP architecture (Routing Layer, Flow Controller, Scheduling Layer).</span></li>
+<li id="ref-6"><span class="ref-type">repo</span>SGLang contributors. <em>sglang-router (PyPI package page)</em>. SGLang / RadixArk, 0.3.2, 2026-01-15. <a href="https://pypi.org/project/sglang-router/">https://pypi.org/project/sglang-router/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Rust-based load balancer description, PD-disaggregation support, version number.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interconnect and Transport: The Physical Layer of Multi-Node Serving · Multi-Node LLM Inference</title>
+<meta name="description" content="The bandwidth/latency ladder from NVLink inside an 8-GPU node to InfiniBand/RoCE between nodes to the NVL72 fabric, and what GPUDirect RDMA and UCX/NIXL actually move.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N &#183; Module 1</p>
+<h1>Interconnect and Transport: The Physical Layer of Multi-Node Serving</h1>
+<p class="lede">Every later module in this course &#8212; routing, disaggregation, wide expert parallelism, tiered KV offload &#8212; assumes you can compute how long it takes to move a fixed number of bytes between two GPUs, and whether those GPUs are on the same NVLink domain or not. This module builds that arithmetic from vendor-published numbers: NVLink inside one 8-GPU node, the bandwidth cliff crossing into InfiniBand or RoCE, what GPUDirect RDMA and the UCX/NIXL transport stack actually do to a byte in flight, and why a GB200 NVL72 rack is a different regime rather than nine racked 8-GPU nodes. After reading, you can take a payload size and an interconnect and produce a transfer-time estimate from first principles.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>25 min</b> read</span>
+<span class="chip"><b>16</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="-60 0 860 400" role="img" aria-labelledby="f1t"><title id="f1t">Bandwidth ladder from intra-node NVLink to inter-node InfiniBand, XDR, and RoCE, log scale GB/s</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<line x1="190" y1="40" x2="190" y2="356" class="d-grid"/>
+<line x1="438" y1="40" x2="438" y2="356" class="d-grid"/>
+<line x1="685" y1="40" x2="685" y2="356" class="d-grid"/>
+<line x1="190" y1="356" x2="760" y2="356" class="d-axis"/>
+<text x="190" y="372" text-anchor="middle" class="d-mono d-small">10</text>
+<text x="438" y="372" text-anchor="middle" class="d-mono d-small">100</text>
+<text x="685" y="372" text-anchor="middle" class="d-mono d-small">1,000</text>
+<text x="475" y="390" text-anchor="middle" class="d-text-light d-small">GB/s per link or per rail, log scale</text>
+<text x="185" y="30" text-anchor="end" class="d-text-light d-small">intra-node (NVLink)</text>
+<rect x="190" y="54" width="484" height="28" rx="4" class="d-fill-blue"/>
+<text x="185" y="73" text-anchor="end" class="d-small">NVLink4, H100 (per GPU)</text>
+<text x="664" y="73" text-anchor="end" class="d-text-inv d-mono d-small">900 GB/s</text>
+<rect x="190" y="100" width="559" height="28" rx="4" class="d-fill-blue"/>
+<text x="185" y="119" text-anchor="end" class="d-small">NVLink5, B200 / NVL72 (per GPU)</text>
+<text x="739" y="119" text-anchor="end" class="d-text-inv d-mono d-small">1.8 TB/s</text>
+<line x1="190" y1="152" x2="760" y2="152" class="d-grid d-dashed"/>
+<text x="475" y="172" text-anchor="middle" class="d-text-light d-small">inter-node (scale-out fabric) &#8212; single rail</text>
+<rect x="190" y="186" width="173" height="28" rx="4" class="d-fill-orange"/>
+<text x="185" y="205" text-anchor="end" class="d-small">InfiniBand NDR, ConnectX-7 (per port)</text>
+<text x="369" y="205" text-anchor="start" class="d-mono d-small">50 GB/s</text>
+<rect x="190" y="232" width="248" height="28" rx="4" class="d-fill-orange"/>
+<text x="185" y="251" text-anchor="end" class="d-small">InfiniBand XDR, Quantum-X800 (per port)</text>
+<text x="428" y="251" text-anchor="end" class="d-text-inv d-mono d-small">100 GB/s</text>
+<rect x="190" y="278" width="173" height="28" rx="4" class="d-fill-orange"/>
+<text x="185" y="297" text-anchor="end" class="d-small">RoCEv2, 400GbE (per port)</text>
+<text x="369" y="297" text-anchor="start" class="d-mono d-small">50 GB/s</text>
+<rect x="190" y="324" width="236" height="28" rx="4" class="d-fill-amber"/>
+<text x="185" y="343" text-anchor="end" class="d-small">DeepEP measured, RDMA EP8&#215;2 dispatch</text>
+<text x="416" y="343" text-anchor="end" class="d-text-inv d-mono d-small">90 GB/s</text>
+</svg>
+<figcaption><b>Figure 1.</b> Per-link bandwidth on a log scale: two links inside an 8-GPU node (NVLink4 on H100 at 900 GB/s, NVLink5 on B200/NVL72 at 1.8 TB/s per GPU)<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>, against four inter-node rails &#8212; ConnectX-7 InfiniBand NDR at 400 Gb/s = 50 GB/s per port<a class="cite" href="#ref-3">3</a>, Quantum-X800 InfiniBand XDR at 800 Gb/s = 100 GB/s per port<a class="cite" href="#ref-4">4</a>, RoCEv2 over 400GbE at the same 50 GB/s per port<a class="cite" href="#ref-5">5</a>, and DeepEP's own measured RDMA dispatch bandwidth over two ConnectX-7 rails (EP8&#215;2) at 90 GB/s<a class="cite" href="#ref-6">6</a>. A single flow that stays inside the NVLink domain runs 9&#8211;36&#215; faster than the same flow crossing a node boundary on one rail.</figcaption>
+</figure>
+
+<h2 id="nvlink-nvswitch-baseline">1. The baseline: NVLink and NVSwitch inside one 8-GPU node</h2>
+<p>You already run TP8 on 8&#215;H100 or 8&#215;B200 and know the mechanics of tensor-parallel all-reduce over NVLink. This section exists only to pin down the numbers every later comparison in this course is measured against &#8212; the "how fast is intra-node, exactly" baseline.</p>
+<h3 id="nvlink-baseline-h100">1.1 H100 / NVLink 4: 900 GB/s per GPU</h3>
+<p>Each Hopper GPU carries fourth-generation NVLink at 900 GB/s of bidirectional GPU-to-GPU bandwidth<a class="cite" href="#ref-1">1</a>. An HGX H100 8-GPU baseboard reaches that bandwidth between any two GPUs through four third-generation NVSwitch chips, each switching 25.6 Tb/s (&#8776; 3.2 TB/s)<a class="cite" href="#ref-7">7</a>. The point that matters for later modules: 900 GB/s is a <em>per-GPU</em> figure, not an aggregate over the node, and it holds between any pair of the eight GPUs because the NVSwitch fabric gives full bisection bandwidth, not just neighbor-to-neighbor links as on pre-NVSwitch topologies.</p>
+<h3 id="nvlink-baseline-b200">1.2 B200 / NVLink 5: 1.8 TB/s per GPU, 14.4 TB/s aggregate</h3>
+<p>Blackwell doubles the per-link rate: fifth-generation NVLink delivers 1.8 TB/s of GPU-to-GPU bandwidth per GPU, twice the H100 figure<a class="cite" href="#ref-7">7</a>. An HGX B200 8-GPU system totals 14.4 TB/s of NVLink bandwidth across the node (8 &#215; 1.8 TB/s), switched by two NVSwitch chips<a class="cite" href="#ref-2">2</a>. Note the arithmetic checks out at the node level (8 &#215; 1.8 TB/s = 14.4 TB/s) but not at the rack level once you leave the 8-GPU node &#8212; see &#167;5 for what NVL72 changes.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Eight GPUs connected through an NVSwitch fabric inside one node, full bisection bandwidth between any pair</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="290" y="120" width="220" height="60" rx="8" class="d-panel d-outline"/>
+<text x="400" y="145" text-anchor="middle" class="d-bold d-small">NVSwitch fabric</text>
+<text x="400" y="163" text-anchor="middle" class="d-text-light d-small">4&#215;NVSwitch3 (H100) / 2&#215;NVSwitch5 (B200)</text>
+<g class="d-mono d-small">
+<rect x="20" y="20" width="90" height="44" rx="6" class="d-block"/><text x="65" y="47" text-anchor="middle" class="d-text-inv">GPU 0</text>
+<rect x="140" y="20" width="90" height="44" rx="6" class="d-block"/><text x="185" y="47" text-anchor="middle" class="d-text-inv">GPU 1</text>
+<rect x="260" y="20" width="90" height="44" rx="6" class="d-block"/><text x="305" y="47" text-anchor="middle" class="d-text-inv">GPU 2</text>
+<rect x="380" y="20" width="90" height="44" rx="6" class="d-block"/><text x="425" y="47" text-anchor="middle" class="d-text-inv">GPU 3</text>
+<rect x="20" y="236" width="90" height="44" rx="6" class="d-block"/><text x="65" y="263" text-anchor="middle" class="d-text-inv">GPU 4</text>
+<rect x="140" y="236" width="90" height="44" rx="6" class="d-block"/><text x="185" y="263" text-anchor="middle" class="d-text-inv">GPU 5</text>
+<rect x="260" y="236" width="90" height="44" rx="6" class="d-block"/><text x="305" y="263" text-anchor="middle" class="d-text-inv">GPU 6</text>
+<rect x="380" y="236" width="90" height="44" rx="6" class="d-block"/><text x="425" y="263" text-anchor="middle" class="d-text-inv">GPU 7</text>
+</g>
+<path d="M65,64 L390,120" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M185,64 L370,120" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M305,64 L410,120" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M425,64 L430,120" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M65,236 L390,180" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M185,236 L370,180" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M305,236 L410,180" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M425,236 L430,180" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="550" y="70" width="220" height="160" rx="8" class="d-surface"/>
+<text x="660" y="94" text-anchor="middle" class="d-bold d-small">Per-GPU bandwidth</text>
+<text x="660" y="122" text-anchor="middle" class="d-small">H100: NVLink4</text>
+<text x="660" y="140" text-anchor="middle" class="d-mono d-small">900 GB/s</text>
+<text x="660" y="168" text-anchor="middle" class="d-small">B200: NVLink5</text>
+<text x="660" y="186" text-anchor="middle" class="d-mono d-small">1.8 TB/s</text>
+<text x="660" y="212" text-anchor="middle" class="d-text-light d-small">to any other GPU</text>
+</svg>
+<figcaption><b>Figure 2.</b> The 8-GPU node baseline: every GPU reaches every other GPU through the NVSwitch fabric at the same per-GPU rate, 900 GB/s on H100 or 1.8 TB/s on B200<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-7">7</a>. This full-bisection property is what disappears the instant traffic has to leave the node.</figcaption>
+</figure>
+
+<h2 id="bandwidth-cliff">2. The bandwidth cliff: leaving the NVLink domain</h2>
+<p>The instant a request needs a GPU that is not on the local NVSwitch fabric &#8212; a second replica, a decode pool on another rack, an expert that lives on another node &#8212; the transport underneath switches from NVLink to a network fabric, and the achievable bandwidth per flow drops by more than an order of magnitude. This section pins down the numbers on the other side of that boundary.</p>
+<h3 id="ib-ndr-xdr">2.1 InfiniBand NDR and XDR</h3>
+<p>The standard scale-out NIC for H100/H200-generation clusters is the NVIDIA ConnectX-7, rated at a maximum total bandwidth of 400 Gb/s (= 50 GB/s) per adapter, IBTA-1.5 compliant, available in 1/2/4-port configurations, with a PCIe Gen5 host interface of up to 32 lanes<a class="cite" href="#ref-3">3</a>. Its RDMA message rate is 330&#8211;370 million messages per second, and it exposes hardware-based congestion control plus out-of-order RDMA with adaptive routing &#8212; both aimed at keeping a lossless fabric lossless under many-to-many collective traffic<a class="cite" href="#ref-3">3</a>. "Adaptive routing" and "out-of-order RDMA" are the same mechanism from two ends: the switch fabric is free to spray a flow's packets across whichever of the several physical paths between two endpoints is least congested at that instant, rather than pinning the whole flow to one static path, because the NIC on the receiving end can reassemble a message correctly even when its packets arrive out of sequence. Static routing (one flow, one path, fixed for the flow's lifetime) is simpler but lets a single congested link become a persistent bottleneck for every flow mapped onto it; adaptive routing trades a small amount of reassembly bookkeeping for load that spreads itself across the fabric automatically, which matters most exactly when many GPUs are doing an all-to-all pattern (expert dispatch, &#167;6) that stresses every link at once.</p>
+<p>The Blackwell-generation successor is Quantum-X800: a switch platform offering 800 Gb/s (= 100 GB/s) per port across 144 ports, for an aggregate switch capacity of 115.2 Tb/s, built for the ConnectX-8 SuperNIC generation<a class="cite" href="#ref-4">4</a>. NVIDIA pairs GB200 NVL72 racks with Quantum-X800 InfiniBand (or the Ethernet-based Spectrum-X800 alternative, &#167;5) specifically for scaling a job across hundreds to thousands of Blackwell GPUs beyond the 72-GPU NVLink domain<a class="cite" href="#ref-8">8</a>.</p>
+<h3 id="roce">2.2 RoCEv2: same PHY, different transport semantics</h3>
+<p>RoCE (RDMA over Converged Ethernet) puts the InfiniBand transport's RDMA semantics &#8212; queue pairs, kernel-bypass, zero-copy &#8212; on top of an Ethernet physical and link layer instead of a native InfiniBand one. The current, dominant revision, RoCEv2, additionally routes across Layer-3 IP networks rather than staying confined to a single Layer-2 segment, which is what makes it viable across a hyperscale data-center fabric rather than only within one rack<a class="cite" href="#ref-9">9</a>. NVIDIA ships ConnectX-7 in a dedicated 400GbE Ethernet SKU carrying the same silicon-level "advanced RoCE" support, accelerating NVMe-oF over both RoCE and TCP, at the same 400 Gb/s maximum bandwidth as the InfiniBand SKU<a class="cite" href="#ref-5">5</a>. The practical upshot: at matched NIC generation, RoCEv2 and InfiniBand deliver the same per-port bytes per second &#8212; the difference is in loss behavior, congestion-control mechanism, and operational ecosystem, not raw PHY rate (more on this in <a href="#where-experts-disagree">Where experts disagree</a>).</p>
+<h3 id="cliff-quantified">2.3 The cliff, quantified two ways</h3>
+<p>There are two honest ways to state "how much bandwidth do you lose leaving the node," and they give very different numbers because they answer different questions.</p>
+<p><strong>Single flow, single rail.</strong> One GPU pair talking over one NIC each is capped at that NIC's link rate: 50 GB/s on ConnectX-7 NDR/RoCE 400GbE, 100 GB/s on Quantum-X800 XDR. Against NVLink4's 900 GB/s, that is an 18&#215; drop; against NVLink5's 1.8 TB/s, up to 36&#215;.</p>
+<p><strong>Whole node, all rails, aggregate.</strong> A rail-optimized 8-GPU node with one NIC per GPU can spread traffic across all its NICs simultaneously if the traffic pattern actually uses all eight (an all-to-all pattern does; a single point-to-point flow does not). Splitwise's own hardware-delta table gives this aggregate figure directly: an A100-generation node with 8&#215;200Gb/s (HDR) NICs totals 200 GB/s of cross-node bandwidth, and an H100-generation node with 8&#215;400Gb/s (NDR) NICs totals 400 GB/s<a class="cite" href="#ref-10">10</a> &#8212; exactly 8 &#215; (link-rate/8), i.e. each NIC's Gb/s figure divided by 8 to get GB/s, summed over 8 NICs. Against NVLink4's 900 GB/s per GPU, the H100-generation node aggregate of 400 GB/s is only a 2.25&#215; drop, but that figure is only achievable when the workload actually fans traffic out across all eight rails at once (which DeepEP's all-to-all dispatch, &#167;6, is built to do; a single KV-cache handoff between two specific GPUs is not).</p>
+<p>Both numbers are real; which one applies depends on whether the traffic pattern is point-to-point (single-rail number) or genuinely all-to-all across the full node (aggregate number). Module 5 returns to this distinction for expert-parallel dispatch specifically.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Interconnect generations relevant to multi-node LLM serving, per-port/per-GPU figures unless noted<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-11">11</a>.</caption>
+<thead><tr><th>Interconnect</th><th class="num">Bandwidth</th><th class="num">Latency floor</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td class="row">NVLink4 (H100)</td><td class="num" data-best>900 GB/s</td><td class="num">sub-&#181;s, on-package fabric</td><td>Intra-node TP/PP, all-reduce</td></tr>
+<tr><td class="row">NVLink5 (B200 / NVL72)</td><td class="num" data-best>1.8 TB/s</td><td class="num">sub-&#181;s, on-package fabric</td><td>Intra-node and intra-rack (NVL72) TP/EP</td></tr>
+<tr><td class="row">InfiniBand NDR (ConnectX-7)</td><td class="num">50 GB/s</td><td class="num">&#8776;1.7 &#181;s (GPUDirect RDMA)</td><td>H100/H200-era scale-out</td></tr>
+<tr><td class="row">InfiniBand XDR (Quantum-X800)</td><td class="num">100 GB/s</td><td class="num">&#8776;1.7 &#181;s (GPUDirect RDMA)</td><td>GB200/GB300-era scale-out</td></tr>
+<tr><td class="row">RoCEv2 (400GbE)</td><td class="num">50 GB/s</td><td class="num">&#8776;1.7 &#181;s (GPUDirect RDMA)</td><td>Ethernet-fabric scale-out</td></tr>
+</tbody>
+</table>
+
+<h2 id="gpudirect-rdma">3. GPUDirect RDMA: bypassing the host</h2>
+<p>Every bandwidth number in &#167;2 is a link-layer ceiling. Whether a real transfer gets close to it depends on what happens at each end of the wire &#8212; specifically, whether the payload has to detour through host (CPU) memory on its way in or out of the GPU.</p>
+<h3 id="gpudirect-mechanism">3.1 The staged path vs. the direct path</h3>
+<p>Without GPUDirect RDMA, moving data from GPU A's memory to GPU B's memory over the network is a four-copy operation: GPU A copies into a pinned host staging buffer, the NIC on node A DMAs that buffer onto the wire, the NIC on node B DMAs the incoming bytes into a pinned host staging buffer, and the CPU on node B copies that buffer into GPU B's memory. Each of those four hops consumes PCIe bandwidth and adds latency, and the two host-side copies burn CPU cycles that would otherwise serve other requests. GPUDirect RDMA removes the two host copies: the NIC registers GPU memory directly (over PCIe peer-to-peer, or NVLink-C2C on Grace-Blackwell systems) and DMAs straight into or out of GPU memory, so the path becomes GPU A &#8594; NIC A &#8594; wire &#8594; NIC B &#8594; GPU B, with the CPU only involved in setting up the transfer descriptor, not moving bytes<a class="cite" href="#ref-11">11</a>. Both ConnectX-7 SKUs list GPUDirect RDMA as a first-class feature<a class="cite" href="#ref-3">3</a>, and it is the default assumption underneath NIXL, Mooncake's Messenger, and every other cross-node KV-transfer path covered later in this course.</p>
+<p>Mechanically, GPUDirect RDMA depends on the NIC being able to issue PCIe peer-to-peer reads and writes directly against GPU memory addresses instead of only host DRAM addresses, and on those addresses being safely translatable without a host-side bounce. ConnectX-7 lists PCIe Address Translation Services (ATS) and Process Address Space ID (PASID) among its PCIe features<a class="cite" href="#ref-3">3</a>: ATS lets the NIC cache a device's virtual-to-physical address translations locally instead of round-tripping through the host IOMMU on every DMA, and PASID lets a single physical device (the GPU) expose multiple independent address spaces to peer devices safely. Together they are what makes "the NIC DMAs GPU memory as if it were just another PCIe-addressable region" hold up under production traffic rather than only in a point benchmark &#8212; without ATS, every peer-to-peer DMA would need a full IOMMU page-table walk, adding exactly the kind of per-transfer host-path latency GPUDirect RDMA exists to remove.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f3t"><title id="f3t">Staged (bounce-buffer) transfer path with two host copies vs. GPUDirect RDMA's direct GPU-to-GPU path</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="400" y="20" text-anchor="middle" class="d-bold d-small">Staged path (no GPUDirect RDMA)</text>
+<rect x="20" y="34" width="110" height="44" rx="6" class="d-block"/><text x="75" y="61" text-anchor="middle" class="d-text-inv d-small">GPU A</text>
+<rect x="160" y="34" width="130" height="44" rx="6" class="d-block-muted"/><text x="225" y="61" text-anchor="middle" class="d-small">Host A pinned buf</text>
+<rect x="320" y="34" width="90" height="44" rx="6" class="d-block-2"/><text x="365" y="61" text-anchor="middle" class="d-text-inv d-small">NIC A</text>
+<rect x="440" y="34" width="90" height="44" rx="6" class="d-block-2"/><text x="485" y="61" text-anchor="middle" class="d-text-inv d-small">NIC B</text>
+<rect x="560" y="34" width="130" height="44" rx="6" class="d-block-muted"/><text x="625" y="61" text-anchor="middle" class="d-small">Host B pinned buf</text>
+<rect x="720" y="34" width="60" height="44" rx="6" class="d-block"/><text x="750" y="61" text-anchor="middle" class="d-text-inv d-small">GPU B</text>
+<path d="M130,56 L160,56" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M290,56 L320,56" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M410,56 L440,56" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M530,56 L560,56" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M690,56 L720,56" class="d-arrow" marker-end="url(#f3-arr)"/>
+<text x="400" y="110" text-anchor="middle" class="d-bold d-small">GPUDirect RDMA path</text>
+<rect x="20" y="124" width="110" height="44" rx="6" class="d-block"/><text x="75" y="151" text-anchor="middle" class="d-text-inv d-small">GPU A</text>
+<rect x="320" y="124" width="90" height="44" rx="6" class="d-block-2"/><text x="365" y="151" text-anchor="middle" class="d-text-inv d-small">NIC A</text>
+<rect x="440" y="124" width="90" height="44" rx="6" class="d-block-2"/><text x="485" y="151" text-anchor="middle" class="d-text-inv d-small">NIC B</text>
+<rect x="720" y="124" width="60" height="44" rx="6" class="d-block"/><text x="750" y="151" text-anchor="middle" class="d-text-inv d-small">GPU B</text>
+<path d="M130,146 L320,146" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+<path d="M410,146 L440,146" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+<path d="M530,146 L720,146" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+<text x="400" y="196" text-anchor="middle" class="d-text-light d-small">no host copy on either side &#8212; NIC DMAs GPU memory directly</text>
+<text x="400" y="228" text-anchor="middle" class="d-mono d-small">Host-to-GPU RDMA latency floor: &#8776;1.7 &#181;s (2014-era Ivy Bridge/K40 measurement)</text>
+</svg>
+<figcaption><b>Figure 3.</b> The staged path copies through pinned host buffers on both ends; GPUDirect RDMA lets the NIC DMA GPU memory directly, cutting two of four hops and the associated latency<a class="cite" href="#ref-11">11</a>.</figcaption>
+</figure>
+<h3 id="gpudirect-latency-crossover">3.2 The latency floor and the staging crossover</h3>
+<p>NVIDIA's own microbenchmark &#8212; run on 2014-era Ivy Bridge Xeon hosts with K40m GPUs and FDR InfiniBand &#8212; measured GPUDirect RDMA host-to-GPU latency at 1.7 &#181;s, against 1.3 &#181;s for a plain host-to-host RDMA ping-pong, and found GPUDirect RDMA faster than the staged approach for message sizes up to roughly 400&#8211;500 KB on that hardware<a class="cite" href="#ref-11">11</a>. <mark class="unverified" title="No primary source found for a current (2024-2026, NDR/XDR-generation) re-measurement of the GPUDirect-RDMA-vs-staging crossover size or bandwidth; the 2014 figures are two InfiniBand generations out of date for bandwidth and are cited here only for the latency-floor mechanism, not as a current number">The bandwidth figures from that 2014 benchmark (single- and dual-rail GB/s, not the 50&#8211;100 GB/s per-port figures in Table 1) are roughly two orders of magnitude below what ConnectX-7/Quantum-X800-class hardware delivers today, so treat them as illustrating the mechanism, not as a current bandwidth reference</mark>. The mechanism itself still holds: GPUDirect RDMA wins on latency and CPU offload at any message size, and it wins on throughput too once you are past the point where two extra PCIe host copies would have been the bottleneck &#8212; which, at today's 50&#8211;100 GB/s per-port link rates, is almost always. For the multi-megabyte-to-gigabyte KV-cache and expert-weight payloads this course is concerned with (&#167;8), the transfer is comfortably bandwidth-bound, and the 1.7 &#181;s latency floor is irrelevant next to a multi-millisecond bulk transfer; it matters for small control messages (metadata handshakes, KV block-hash lookups) where a microsecond-scale RTT is the dominant cost.</p>
+
+<h2 id="ucx-nixl">4. UCX and NIXL: the transport abstraction underneath</h2>
+<p>Neither NVLink nor InfiniBand nor RoCE is something a serving engine talks to directly. Two software layers sit between the collective/point-to-point call an engine makes and the wire: UCX, a general transport library that predates LLM serving by a decade, and NIXL, a newer library purpose-built for the point-to-point transfer patterns inference serving needs. Every KV-transfer connector and every wide-EP dispatch kernel referenced later in this course is built on one or both.</p>
+<h3 id="ucx-layers">4.1 UCX: UCP, UCT, UCS, UCM</h3>
+<p>UCX (Unified Communication X) is organized into four layers<a class="cite" href="#ref-12">12</a>:</p>
+<ul>
+<li><strong>UCP</strong> (Protocol) &#8212; high-level abstractions: tag-matching, streams, connection setup, multi-rail striping, and handling of different memory types.</li>
+<li><strong>UCT</strong> (Transport) &#8212; low-level primitives: active messages, remote memory access, atomic operations, mapped onto whatever hardware is present.</li>
+<li><strong>UCS</strong> (Services) &#8212; common data structures, algorithms, and system utilities.</li>
+<li><strong>UCM</strong> (Memory) &#8212; intercepts memory allocation/release events for the memory-registration cache, so repeated RDMA registration of the same buffer is cheap.</li>
+</ul>
+<p>UCT's transport plugins cover RDMA (InfiniBand, RoCE, Omni-Path), Cray Gemini/Aries interconnects, GPU memory (CUDA and ROCm), several shared-memory mechanisms (POSIX, SYSV, CMA, KNEM, XPMEM), and plain TCP<a class="cite" href="#ref-12">12</a> &#8212; which is precisely the set of physical layers &#167;1&#8211;2 walked through. This is why UCX shows up underneath so many unrelated-looking projects: it is the one library that already solved "pick the fastest available path between two memory addresses, wherever they are," and everything downstream reuses that solve rather than re-implementing it per transport.</p>
+<p>UCP's abstractions explicitly include multi-rail support<a class="cite" href="#ref-12">12</a>, which is the missing piece connecting &#167;2.3's two cliff numbers. A single-rail transfer binds to one NIC and is capped at that NIC's link rate (50&#8211;100 GB/s in Table 1); reaching the node-aggregate figure (400 GB/s on an 8-rail H100-generation node) for one large transfer requires UCX to explicitly stripe that transfer's bytes across all eight rails in parallel and reassemble them at the far end, rather than relying on eight independent flows each happening to use a different rail. Whether a given transfer gets striped is a property of how the calling library (NIXL, NCCL/RCCL) issues the request, not an automatic property of having eight NICs present &#8212; which is why the single-rail number, not the aggregate, is the safer default assumption for a single point-to-point KV-cache handoff (&#167;8) unless the calling code is known to stripe it.</p>
+<p>NCCL itself can be pointed at UCX instead of its default ibverbs-based point-to-point transport: the NCCL-RDMA-SHARP plugin replaces NCCL's internal inter-node communication with RDMA-based transports, and setting <code>NCCL_PLUGIN_P2P=ucx</code> selects the UCX-backed implementation for point-to-point transport specifically, while collective transport (CollNet, including switch-based SHARP in-network reduction) is a separate code path<a class="cite" href="#ref-13">13</a>. RCCL (AMD's NCCL-equivalent) has an analogous UCX plugin path. The point-to-point/collective split matters: UCX and NIXL both target point-to-point transfer, which is the pattern KV-cache handoff and expert dispatch need, not the ring/tree all-reduce pattern TP/PP all-reduces need &#8212; those two traffic shapes have historically been optimized by different code paths even when they share the same underlying UCX transport layer.</p>
+<h3 id="nixl-abstractions">4.2 NIXL: purpose-built for inference's point-to-point transfers</h3>
+<p>NIXL (NVIDIA Inference Xfer Library) is explicitly targeted at accelerating point-to-point communication in inference frameworks such as Dynamo, and it provides three abstractions on top of a transport layer like UCX<a class="cite" href="#ref-14">14</a>:</p>
+<ul>
+<li><strong>Memory Sections</strong> &#8212; unify different memory and storage types (GPU HBM, CPU DRAM, file, block, object store) behind one buffer-list primitive, so a transfer call doesn't need to know in advance whether the far end is HBM or an SSD.</li>
+<li><strong>Transfer Backend Interface</strong> &#8212; abstracts over different transfer backends and picks the one appropriate for a given source/destination pair.</li>
+<li><strong>Metadata Handler</strong> &#8212; establishes and caches agent-to-agent metadata needed to set up a transfer (addresses, registration handles) without a round-trip on every call.</li>
+</ul>
+<p>NIXL's actively supported backends today are UCX and NVIDIA Magnum IO GPUDirect Storage (GDS); other filesystem, block, and object-store backends are listed as in development<a class="cite" href="#ref-14">14</a>. Through those backends, NIXL reaches RoCE, InfiniBand, GPUDirect RDMA, NVMe-oF, TCP, and NVLink as wire-level transport protocols<a class="cite" href="#ref-14">14</a> &#8212; the same physical layers from &#167;1&#8211;3, now exposed through one uniform transfer API instead of one API per transport. Module 8 covers NIXL's own architecture and version history in full; here the point is narrower: NIXL is the layer that makes "move this KV block from GPU HBM on node A to GPU HBM, or CPU DRAM, or an SSD, on node B" a single call regardless of which physical fabric answers it.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">Layered stack: physical fabrics at the bottom, UCX as the transport-agnostic layer, NCCL/RCCL and NIXL as the two consumers above it, workloads on top</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="40" y="230" width="720" height="46" rx="6" class="d-block-muted"/>
+<text x="400" y="258" text-anchor="middle" class="d-small">NVLink &#183; InfiniBand (NDR/XDR) &#183; RoCEv2 &#183; TCP &#183; NVMe-oF</text>
+<path d="M400,224 L400,230" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="40" y="164" width="720" height="46" rx="6" class="d-block-2"/>
+<text x="400" y="192" text-anchor="middle" class="d-text-inv d-small">UCX &#8212; UCP / UCT / UCS / UCM (transport-agnostic)</text>
+<path d="M220,158 L220,164" class="d-arrow" marker-end="url(#f4-arr)"/>
+<path d="M580,158 L580,164" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="60" y="98" width="320" height="46" rx="6" class="d-block"/>
+<text x="220" y="126" text-anchor="middle" class="d-text-inv d-small">NCCL / RCCL (collective: all-reduce, all-gather)</text>
+<rect x="420" y="98" width="320" height="46" rx="6" class="d-block"/>
+<text x="580" y="126" text-anchor="middle" class="d-text-inv d-small">NIXL (point-to-point: Memory Sections, Backend I/F)</text>
+<path d="M220,92 L220,98" class="d-arrow" marker-end="url(#f4-arr)"/>
+<path d="M580,92 L580,98" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="60" y="32" width="320" height="46" rx="6" class="d-surface"/>
+<text x="220" y="60" text-anchor="middle" class="d-small">TP / PP / DP all-reduce (training, prefill)</text>
+<rect x="420" y="32" width="320" height="46" rx="6" class="d-surface"/>
+<text x="580" y="60" text-anchor="middle" class="d-small">KV-cache handoff, expert dispatch, weight streaming</text>
+</svg>
+<figcaption><b>Figure 4.</b> UCX abstracts every physical transport in &#167;1&#8211;3 behind one interface; NCCL/RCCL and NIXL both build on it, but target different traffic shapes &#8212; collective reductions vs. point-to-point transfer<a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-13">13</a><a class="cite" href="#ref-14">14</a>.</figcaption>
+</figure>
+
+<h2 id="nvl72-regime">5. NVL72: a structurally different regime</h2>
+<p>Everything in &#167;1&#8211;4 treats "the node" as the 8-GPU unit and the cliff in &#167;2 as the boundary at its edge. GB200 NVL72 moves that boundary from 8 GPUs to 72, and it is worth being precise about why that is a different <em>kind</em> of change, not just a bigger node.</p>
+<h3 id="nvl72-topology">5.1 Topology: 18 compute trays, 9 switch trays, one NVLink domain</h3>
+<p>A GB200 NVL72 rack is built from 18 1U compute trays, each holding 4 Blackwell GPUs, plus 9 1U NVLink switch trays &#8212; 18 &#215; 4 = 72 GPUs total, paired with 36 Grace CPUs<a class="cite" href="#ref-15">15</a><a class="cite" href="#ref-8">8</a>. The rack-wide NVLink bandwidth is 130 TB/s<a class="cite" href="#ref-8">8</a>. That figure is consistent with the per-GPU NVLink5 rate from &#167;1.2: 130 TB/s &#247; 72 GPUs &#8776; 1.8 TB/s per GPU, matching the HGX B200 per-GPU figure exactly<a class="cite" href="#ref-2">2</a> &#8212; the rack-scale switch fabric preserves the same per-GPU bandwidth that a single 8-GPU node gets, just across nine times as many GPUs. Memory scales with it: 13.4 TB of HBM3e across the rack at 576 TB/s aggregate bandwidth<a class="cite" href="#ref-8">8</a>.</p>
+<h3 id="nvl72-why-different">5.2 Why this is not nine racked 8-GPU nodes</h3>
+<p>Nine 8-GPU nodes networked together would still have the &#167;2 cliff at every node boundary: a GPU on node 3 reaching a GPU on node 7 pays the InfiniBand/RoCE tax (50&#8211;100 GB/s per rail) instead of the NVLink rate. NVIDIA's framing is that NVL72's switch fabric lets "all 72 GPUs act as a single GPU"<a class="cite" href="#ref-7">7</a> &#8212; concretely, this means any two of the 72 GPUs communicate over the NVLink switch fabric at the full per-GPU NVLink5 rate, with no RDMA hop, regardless of which of the 18 compute trays they physically sit on. An expert-parallel or tensor-parallel group that would have needed EP/TP degree &#8804; 8 to stay inside one node's NVLink domain can now use EP/TP degree up to 72 and still avoid the RDMA cliff entirely &#8212; which is exactly the condition Module 5 uses to explain why NVL72 changes viable expert-parallel degree for wide-EP MoE serving.</p>
+<p>The cliff does not disappear; it moves to the rack boundary. Scaling a job beyond one NVL72 rack still requires leaving the NVLink domain and crossing to Quantum-X800 InfiniBand or the Ethernet-based Spectrum-X800, paired with BlueField-3 DPUs, to reach "hundreds and thousands of Blackwell GPUs"<a class="cite" href="#ref-8">8</a> &#8212; i.e., the same &#167;2 InfiniBand/RoCE numbers apply again, just one level higher in the hierarchy.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f5t"><title id="f5t">GB200 NVL72 rack: 18 compute trays of 4 GPUs each and 9 NVLink switch trays, one flat NVLink domain, with Quantum-X800/Spectrum-X800 as the boundary to the next rack</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="40" y="20" width="380" height="220" rx="8" class="d-outline d-dashed"/>
+<text x="230" y="16" text-anchor="middle" class="d-text-light d-small">GB200 NVL72 rack &#8212; one NVLink domain</text>
+<g class="d-mono d-small">
+<rect x="56" y="34" width="80" height="30" rx="4" class="d-block"/><text x="96" y="54" text-anchor="middle" class="d-text-inv">4 GPU</text>
+<rect x="150" y="34" width="80" height="30" rx="4" class="d-block"/><text x="190" y="54" text-anchor="middle" class="d-text-inv">4 GPU</text>
+<rect x="244" y="34" width="80" height="30" rx="4" class="d-block"/><text x="284" y="54" text-anchor="middle" class="d-text-inv">4 GPU</text>
+<rect x="338" y="34" width="72" height="30" rx="4" class="d-block-muted"/><text x="374" y="54" text-anchor="middle" class="d-small">&#8230;18 trays</text>
+</g>
+<text x="230" y="86" text-anchor="middle" class="d-text-light d-small">18&#215;1U compute trays (4 GPU each) = 72 GPUs, 36 Grace CPUs</text>
+<rect x="80" y="106" width="300" height="46" rx="6" class="d-block-2"/>
+<text x="230" y="134" text-anchor="middle" class="d-text-inv d-small">9&#215;1U NVLink switch trays</text>
+<text x="230" y="168" text-anchor="middle" class="d-mono d-small">130 TB/s NVLink bandwidth, rack-wide</text>
+<text x="230" y="190" text-anchor="middle" class="d-mono d-small">13.4 TB HBM3e @ 576 TB/s</text>
+<text x="230" y="212" text-anchor="middle" class="d-text-light d-small">any GPU &#8596; any GPU at &#8776;1.8 TB/s, no RDMA hop</text>
+<path d="M420,130 L470,130" class="d-arrow" marker-end="url(#f5-arr)"/>
+<text x="445" y="118" text-anchor="middle" class="d-mono d-small">boundary</text>
+<rect x="480" y="80" width="280" height="100" rx="8" class="d-panel"/>
+<text x="620" y="106" text-anchor="middle" class="d-bold d-small">Next rack / cluster fabric</text>
+<text x="620" y="130" text-anchor="middle" class="d-small">Quantum-X800 InfiniBand (XDR)</text>
+<text x="620" y="150" text-anchor="middle" class="d-small">or Spectrum-X800 Ethernet</text>
+<text x="620" y="170" text-anchor="middle" class="d-mono d-small">100 GB/s per port, &#167;2 cliff applies again</text>
+</svg>
+<figcaption><b>Figure 5.</b> Inside the rack, 72 GPUs share one NVLink switch domain at the per-GPU rate from &#167;1; the &#167;2 bandwidth cliff reappears only at the rack's edge, now bounding clusters of racks instead of clusters of 8-GPU nodes<a class="cite" href="#ref-15">15</a><a class="cite" href="#ref-8">8</a>.</figcaption>
+</figure>
+
+<h2 id="deepep-measured">6. DeepEP: the cliff, measured</h2>
+<p>&#167;2's cliff numbers are link-layer ceilings. DeepEP &#8212; DeepSeek's open-source expert-parallel all-to-all communication library &#8212; publishes end-to-end measured dispatch/combine bandwidth under a realistic MoE workload, which is the closest this module gets to "what a real kernel actually achieves" rather than "what the wire is rated for." Module 5 covers DeepEP's kernel internals and placement algorithms in full; here the numbers matter only as evidence for the cliff.</p>
+<h3 id="deepep-kernel-modes">6.1 Two kernel modes, two traffic regimes</h3>
+<p>DeepEP ships high-throughput, low-latency all-to-all GPU kernels for MoE dispatch and combine, with FP8-precision support<a class="cite" href="#ref-6">6</a>. It provides two kernel modes for two different traffic regimes<a class="cite" href="#ref-6">6</a>:</p>
+<ul>
+<li><strong>Normal kernels</strong> &#8212; optimized for asymmetric-domain bandwidth forwarding: taking data across the NVLink domain and forwarding it into the RDMA domain. This is the mode used for training and prefill, where throughput matters more than per-token latency.</li>
+<li><strong>Low-latency kernels</strong> &#8212; pure RDMA, minimizing per-call delay rather than maximizing throughput. This is the mode used for decode, where every microsecond of dispatch latency adds directly to inter-token latency.</li>
+</ul>
+<h3 id="deepep-numbers">6.2 Measured bandwidth by configuration</h3>
+<p>DeepEP's published benchmark uses 8,192 tokens per batch, 7,168 hidden dimensions, top-8-of-however-many experts routing, FP8 dispatch and BF16 combine<a class="cite" href="#ref-6">6</a>. Under that workload:</p>
+<ul>
+<li>NVLink-domain dispatch/combine (SM100, EP8, intra-node): <strong>726 / 740 GB/s</strong> at 64 SMs (the max-performance configuration).</li>
+<li>RDMA-domain dispatch/combine (SM90, ConnectX-7, EP8&#215;2 &#8212; two 8-GPU nodes' worth of experts): <strong>90 / 81 GB/s</strong> at 12 SMs.</li>
+<li>RDMA-domain dispatch/combine (SM90, EP8&#215;4 &#8212; four nodes' worth): <strong>61 / 61 GB/s</strong> at 6 SMs<a class="cite" href="#ref-6">6</a>.</li>
+</ul>
+<p>726 &#247; 90 &#8776; 8.1&#215; for dispatch and 740 &#247; 81 &#8776; 9.1&#215; for combine &#8212; the manifest-level "~8&#215; cliff" this module set out to establish, now grounded in a measured kernel rather than a link-rate ceiling, and a bit worse than the link-rate-only comparison in &#167;2.3 because kernel and protocol overhead eat into the ceiling on both sides. Note also that EP8&#215;4 is <em>slower</em> than EP8&#215;2 in absolute GB/s despite spanning more GPUs in parallel: each rank's fixed NIC bandwidth budget has to reach more distinct remote destinations as the RDMA domain widens, so the per-destination share shrinks even though the aggregate number of experts reachable grows &#8212; a genuine trade-off between EP breadth and per-rank achieved bandwidth that Module 5's placement and load-balancing discussion returns to.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f6t"><title id="f6t">DeepEP measured dispatch and combine bandwidth by configuration: NVLink EP8 vs RDMA EP8x2 vs RDMA EP8x4</title>
+<defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<line x1="70" y1="20" x2="70" y2="240" class="d-axis"/>
+<line x1="70" y1="240" x2="740" y2="240" class="d-axis"/>
+<line x1="70" y1="180" x2="740" y2="180" class="d-grid"/>
+<line x1="70" y1="120" x2="740" y2="120" class="d-grid"/>
+<line x1="70" y1="60" x2="740" y2="60" class="d-grid"/>
+<text x="60" y="244" text-anchor="end" class="d-mono d-small">0</text>
+<text x="60" y="184" text-anchor="end" class="d-mono d-small">200</text>
+<text x="60" y="124" text-anchor="end" class="d-mono d-small">400</text>
+<text x="60" y="64" text-anchor="end" class="d-mono d-small">600</text>
+<text x="60" y="24" text-anchor="end" class="d-mono d-small">800</text>
+<text x="30" y="130" text-anchor="middle" class="d-text-light d-small" transform="rotate(-90 30 130)">GB/s</text>
+<rect x="120" y="88" width="60" height="152" class="d-fill-blue"/><text x="150" y="80" text-anchor="middle" class="d-mono d-small">726</text>
+<rect x="200" y="76" width="60" height="164" class="d-fill-blue"/><text x="230" y="68" text-anchor="middle" class="d-mono d-small">740</text>
+<text x="190" y="264" text-anchor="middle" class="d-small">NVLink EP8</text>
+<text x="190" y="280" text-anchor="middle" class="d-text-light d-small">(dispatch / combine)</text>
+<rect x="340" y="213" width="60" height="27" class="d-fill-orange"/><text x="370" y="205" text-anchor="middle" class="d-mono d-small">90</text>
+<rect x="420" y="219" width="60" height="21" class="d-fill-orange"/><text x="450" y="211" text-anchor="middle" class="d-mono d-small">81</text>
+<text x="410" y="264" text-anchor="middle" class="d-small">RDMA EP8&#215;2</text>
+<text x="410" y="280" text-anchor="middle" class="d-text-light d-small">(dispatch / combine)</text>
+<rect x="560" y="222" width="60" height="18" class="d-fill-amber"/><text x="590" y="214" text-anchor="middle" class="d-mono d-small">61</text>
+<rect x="640" y="222" width="60" height="18" class="d-fill-amber"/><text x="670" y="214" text-anchor="middle" class="d-mono d-small">61</text>
+<text x="630" y="264" text-anchor="middle" class="d-small">RDMA EP8&#215;4</text>
+<text x="630" y="280" text-anchor="middle" class="d-text-light d-small">(dispatch / combine)</text>
+</svg>
+<figcaption><b>Figure 6.</b> DeepEP's own measured dispatch/combine bandwidth: NVLink-domain EP8 sustains 726&#8211;740 GB/s; crossing into the RDMA domain drops to 81&#8211;90 GB/s at EP8&#215;2 and 61 GB/s at EP8&#215;4, an approximately 8&#8211;9&#215; cliff between the NVLink and RDMA domains<a class="cite" href="#ref-6">6</a>.</figcaption>
+</figure>
+
+<h2 id="tiering-preview">7. The offload hierarchy, previewed</h2>
+<p>Everything above describes moving a byte between two GPUs' HBM. Production serving systems also move KV-cache bytes to and from host DRAM, local SSD, and remote storage &#8212; a tiering hierarchy that trades capacity for bandwidth and latency at each step down: GPU HBM is fastest and smallest, host DRAM is attached over the same PCIe/NVLink-C2C link the GPU uses for everything else and is larger but far slower, local NVMe SSD is larger still and slower again, and remote storage reachable only over the network is the largest and slowest tier<a class="cite" href="#ref-14">14</a>. What makes this hierarchy usable at multi-node scale is exactly the machinery covered above: GPUDirect RDMA (&#167;3) means a remote tier doesn't have to detour through a CPU copy any more than a remote GPU does, and NIXL's Memory Sections abstraction (&#167;4.2) explicitly unifies GPU memory, CPU memory, and file/block/object storage behind one transfer call, with NVMe-oF and GPUDirect Storage (GDS) as backend protocols alongside RDMA<a class="cite" href="#ref-14">14</a>. This module stops at naming the tiers and the mechanism that connects them; Module 7 gives Mooncake's concrete architecture for treating the whole hierarchy as one KVCache-centric pool, and Module 8 covers LMCache's offload policy and NIXL's backend list in full, including the actual bandwidth numbers per tier.</p>
+
+<h2 id="worked-arithmetic">8. Worked arithmetic: moving a KV-cache block across the fabric</h2>
+<p>Put a number on all of the above. Take a representative KV-cache transfer block using the sizing arithmetic you already use for paged KV cache &#8212; \( \text{bytes} = 2 \times L \times H_{kv} \times d \times b \times T \), for \(L\) layers, \(H_{kv}\) KV heads, head dimension \(d\), \(b\) bytes per element, and \(T\) tokens in the block. For a representative 70B-class dense model (\(L=80\), \(H_{kv}=8\), \(d=128\), BF16 so \(b=2\)) and a 2,048-token transfer block:</p>
+$$ \text{bytes} = 2 \times 80 \times 8 \times 128 \times 2 \times 2{,}048 = 671{,}088{,}640 \text{ B} \approx 671 \text{ MB} $$
+<p>A pure bandwidth-bound transfer of that block takes \( \text{bytes} / \text{bandwidth} \), ignoring the microsecond-scale GPUDirect RDMA latency floor from &#167;3.2 (negligible against multi-millisecond bulk transfers):</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Time to move one 671 MB KV-cache block across each interconnect from this module, at the cited bandwidth<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-10">10</a>.</caption>
+<thead><tr><th>Path</th><th class="num">Bandwidth</th><th class="num">Transfer time</th></tr></thead>
+<tbody>
+<tr><td class="row">NVLink5, single GPU pair (B200 / NVL72)</td><td class="num" data-best>1.8 TB/s</td><td class="num" data-best>0.37 ms</td></tr>
+<tr><td class="row">NVLink4, single GPU pair (H100)</td><td class="num">900 GB/s</td><td class="num">0.75 ms</td></tr>
+<tr><td class="row">DeepEP measured, NVLink EP8 dispatch</td><td class="num">726 GB/s</td><td class="num">0.92 ms</td></tr>
+<tr><td class="row">8-rail node aggregate, NDR (all-to-all only)</td><td class="num">400 GB/s</td><td class="num">1.68 ms</td></tr>
+<tr><td class="row">InfiniBand XDR, single port (Quantum-X800)</td><td class="num">100 GB/s</td><td class="num">6.71 ms</td></tr>
+<tr><td class="row">DeepEP measured, RDMA EP8&#215;2 dispatch</td><td class="num">90 GB/s</td><td class="num">7.46 ms</td></tr>
+<tr><td class="row">DeepEP measured, RDMA EP8&#215;4 dispatch</td><td class="num">61 GB/s</td><td class="num">11.00 ms</td></tr>
+<tr><td class="row">InfiniBand NDR / RoCEv2, single port</td><td class="num" data-worst>50 GB/s</td><td class="num" data-worst>13.42 ms</td></tr>
+</tbody>
+</table>
+<p>The spread is roughly 36&#215; between the fastest single link (NVLink5, 0.37 ms) and the slowest single rail (NDR/RoCEv2 at one port, 13.42 ms) for the identical 671 MB payload &#8212; the same ladder as Figure 1, now expressed as wall-clock time for a payload size you'd actually see. The measured DeepEP numbers sit inside the link-rate bounds as expected, since real kernels never reach the theoretical ceiling.</p>
+<p>Compare that to a small control message &#8212; say a 4 KB NIXL Metadata Handler exchange or a KV block-hash lookup (&#167;4.2), not a bulk KV block. At 50 GB/s, moving 4 KB of payload takes \(4{,}096 / 5\times10^{10} \approx 0.082\ \mu\text{s}\) &#8212; roughly 21 times smaller than the &#8776;1.7 &#181;s GPUDirect RDMA latency floor from &#167;3.2. For that message, the wire time is noise and the round-trip is dominated by the fixed latency floor, not by bandwidth at all; for the 671 MB block above, the relationship inverts completely and the &#181;s-scale latency floor is noise against a millisecond-scale bandwidth-bound transfer. Whether a given cross-node operation is latency-bound or bandwidth-bound is entirely a function of message size relative to (bandwidth &#215; latency floor) &#8776; 50 GB/s &#215; 1.7 &#181;s &#8776; 85 KB on this hardware &#8212; below that, optimize for round-trips; above it, optimize for bytes moved. Use the calculator below to redo the bulk-transfer arithmetic for your own block size and model shape.</p>
+<div class="calc">
+<p class="calc-title">KV-cache block transfer time</p>
+<div class="calc-row"><label for="c1">Layers (L)</label><input type="range" id="c1" name="L" min="16" max="128" step="1" value="80"></div>
+<div class="calc-row"><label for="c2">KV heads (H_kv)</label><input type="range" id="c2" name="Hkv" min="1" max="16" step="1" value="8"></div>
+<div class="calc-row"><label for="c3">Head dim (d)</label><input type="range" id="c3" name="d" min="64" max="256" step="8" value="128"></div>
+<div class="calc-row"><label for="c4">KV dtype</label><select id="c4" name="b"><option value="2" selected>BF16 (2 B)</option><option value="1">FP8 (1 B)</option></select></div>
+<div class="calc-row"><label for="c5">Block size (tokens)</label><input type="range" id="c5" name="T" min="128" max="8192" step="128" value="2048" data-format="si"></div>
+<div class="calc-row"><label for="c6">Interconnect</label><select id="c6" name="bw"><option value="1800">NVLink5, B200/NVL72 (1.8 TB/s)</option><option value="900">NVLink4, H100 (900 GB/s)</option><option value="726">DeepEP measured, NVLink EP8 (726 GB/s)</option><option value="400">8-rail node aggregate, NDR (400 GB/s)</option><option value="100">IB XDR, single port (100 GB/s)</option><option value="90">DeepEP measured, RDMA EP8&#215;2 (90 GB/s)</option><option value="61">DeepEP measured, RDMA EP8&#215;4 (61 GB/s)</option><option value="50" selected>IB NDR / RoCEv2, single port (50 GB/s)</option></select></div>
+<div class="calc-out">
+<div>Block size<output data-expr="2 * L * Hkv * d * b * T" data-format="bytes"></output></div>
+<div>Transfer time<output data-expr="(2 * L * Hkv * d * b * T) / (bw * 1e9) * 1000" data-format="fixed:2" data-unit="ms"></output></div>
+</div>
+<p class="calc-note">Formula: \( t = \dfrac{2 L H_{kv} d\, b\, T}{\text{BW}} \). Bandwidth figures are the cited link/kernel rates from &#167;1&#8211;6 of this module; the GPUDirect RDMA latency floor (&#8776;1.7 &#181;s, &#167;3.2) is omitted as negligible at these block sizes.</p>
+</div>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Every bandwidth number in Table 1 assumes you have already decided which fabric to buy: InfiniBand or Ethernet (RoCEv2). At matched generation the two now deliver identical per-port link rates &#8212; 400 Gb/s NDR vs. 400GbE, 800 Gb/s XDR vs. 800GbE class Ethernet<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-5">5</a> &#8212; so the argument for one over the other is no longer really about raw bandwidth. It is about transport semantics and operational fit, and the field is genuinely split.</p>
+<div class="positions">
+<article class="position">
+<h4>InfiniBand is the reference fabric at extreme scale</h4>
+<p class="who">NVIDIA's own reference architecture for GB200 NVL72 scale-out<a class="cite" href="#ref-8">8</a>, ConnectX-7/Quantum-X800 product positioning<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a></p>
+<p>NVIDIA leads its NVL72 scale-out networking story with Quantum-X800 InfiniBand, not Spectrum-X800 Ethernet, even though it ships both<a class="cite" href="#ref-8">8</a>. The argument is that InfiniBand's native credit-based, lossless link-layer flow control and hardware-offloaded adaptive out-of-order RDMA routing<a class="cite" href="#ref-3">3</a> avoid the packet-loss and congestion pathologies that RDMA over a fundamentally best-effort Ethernet fabric has to solve with additional mechanisms (PFC, ECN-based congestion signalling) layered on afterward.</p>
+<ul class="pros"><li>Purpose-built lossless transport; no retrofit congestion-control layer</li><li>Hardware in-network reduction (SHARP) available for collective acceleration</li><li>The fabric NVIDIA itself validates first for each new GPU generation</li></ul>
+<ul class="cons"><li>Separate operational ecosystem (subnet manager, fabric tooling) from the rest of a data center's Ethernet</li><li>Fewer multi-vendor NIC/switch options than Ethernet</li></ul>
+</article>
+<article class="position">
+<h4>RoCEv2 Ethernet is sufficient, and preferred, at hyperscale</h4>
+<p class="who">Meta Engineering, production GenAI training backend<a class="cite" href="#ref-16">16</a></p>
+<p>Meta built its AI training backend network on RoCEv2, not InfiniBand, and operates it at a scale of numerous clusters each with thousands of GPUs, reaching hundreds of thousands of GPUs in aggregate across data centers and regions, over 400G links with congestion-control engineering delivering measured wins such as a 40% AllReduce improvement from an enhanced ECMP scheme<a class="cite" href="#ref-16">16</a>. The argument is operational: a hyperscaler with an existing Ethernet fabric, tooling, and networking organization gets RDMA performance close enough to InfiniBand's without maintaining a second, InfiniBand-specific network stack end to end.</p>
+<ul class="pros"><li>Reuses existing Ethernet tooling, vendors, and operational expertise</li><li>Demonstrated at hundreds-of-thousands-of-GPU aggregate scale in production</li><li>Same per-port link rate as InfiniBand at matched NIC generation</li></ul>
+<ul class="cons"><li>Congestion control (DCQCN-style ECN/PFC tuning) is harder to get right and more failure-prone under load than InfiniBand's native credit-based flow control</li><li>Requires more in-house networking engineering investment to reach parity</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Neither position is wrong; they answer different constraints. For a fully NVIDIA-integrated rack bought as a unit (DGX/HGX/NVL72), InfiniBand is the path of least resistance and the one NVIDIA validates first &#8212; it ships as the lead scale-out option for GB200 NVL72<a class="cite" href="#ref-8">8</a>. For an organization that already operates a large Ethernet fabric and networking team, RoCEv2 at matched link rate is a proven production choice at very large scale, not a compromise<a class="cite" href="#ref-16">16</a>. The open evidence gap: there is no public, symmetric benchmark of a DeepEP-style expert-dispatch workload run identically over InfiniBand NDR/XDR and over RoCEv2 at the same link rate and cluster scale &#8212; DeepEP's own published numbers (&#167;6) are measured on ConnectX-7 InfiniBand only<a class="cite" href="#ref-6">6</a>. Until that comparison exists publicly, "which fabric is faster for MoE dispatch specifically" remains an inference from separately-published numbers rather than a head-to-head measurement.</p>
+</div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The XDR generation is the current rollout front: Quantum-X800 switches and the ConnectX-8/800G SuperNIC generation double per-port bandwidth over NDR<a class="cite" href="#ref-4">4</a>, and GB200/GB300-class racks are the first to ship with it as the default scale-out option alongside NVL72's NVLink5 domain. Track the InfiniBand-vs-Ethernet balance from &#167;<a href="#where-experts-disagree">Where experts disagree</a> as a moving target rather than a settled question: it is a function of which hyperscalers publish their own backend-network choices next, not of a stable technical verdict. Within this stack specifically, expect the boundary this module draws at "8 GPUs" or "72 GPUs" to keep moving outward as NVLink domain sizes grow in future generations &#8212; each such move repeats the &#167;5 argument (the cliff doesn't disappear, it relocates) rather than requiring a new mechanism.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>NVIDIA. <em>H100 GPU</em> (product page). n/a, 2026. <a href="https://www.nvidia.com/en-us/data-center/h100/">https://www.nvidia.com/en-us/data-center/h100/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NVLink4 900 GB/s per-GPU bandwidth.</span></li>
+<li id="ref-2"><span class="ref-type">official</span>NVIDIA. <em>HGX</em> (product page). n/a, 2026. <a href="https://www.nvidia.com/en-us/data-center/hgx/">https://www.nvidia.com/en-us/data-center/hgx/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: HGX B200 NVLink5 1.8 TB/s per GPU, 14.4 TB/s node aggregate, 2&#215;NVSwitch.</span></li>
+<li id="ref-3"><span class="ref-type">official</span>NVIDIA. <em>NVIDIA ConnectX-7 NDR 400G InfiniBand Adapter Card</em> (datasheet). Apr21, 2021. <a href="https://www.nvidia.com/content/dam/en-zz/Solutions/networking/infiniband-adapters/infiniband-connectx7-data-sheet.pdf">https://www.nvidia.com/content/dam/en-zz/Solutions/networking/infiniband-adapters/infiniband-connectx7-data-sheet.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 400 Gb/s max bandwidth, RDMA message rate (330&#8211;370M msg/s), GPUDirect RDMA, hardware congestion control, adaptive routing.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>NVIDIA. <em>NVIDIA Quantum-X800 InfiniBand Platform</em> (product page). 2026. <a href="https://www.nvidia.com/en-us/networking/products/infiniband/quantum-x800/">https://www.nvidia.com/en-us/networking/products/infiniband/quantum-x800/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: XDR 800 Gb/s per port, 144 ports, 115.2 Tb/s aggregate switch capacity.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>NVIDIA. <em>NVIDIA ConnectX-7 400G Ethernet</em> (datasheet). Apr21. <a href="https://www.nvidia.com/content/dam/en-zz/Solutions/networking/ethernet-adapters/connectx-7-datasheet-Final.pdf">https://www.nvidia.com/content/dam/en-zz/Solutions/networking/ethernet-adapters/connectx-7-datasheet-Final.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 400GbE max bandwidth, advanced RoCE support, NVMe-oF over RoCE/TCP.</span></li>
+<li id="ref-6"><span class="ref-type">repo</span>DeepSeek-AI. <em>deepseek-ai/DeepEP</em> (README, main branch, v2 kernels). 2026. <a href="https://github.com/deepseek-ai/DeepEP/blob/main/README.md">https://github.com/deepseek-ai/DeepEP/blob/main/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: normal vs. low-latency kernel modes, FP8 dispatch/BF16 combine, measured bandwidth by EP configuration (performance table).</span></li>
+<li id="ref-7"><span class="ref-type">blog</span>NVIDIA Developer Blog. <em>NVIDIA NVLink and NVIDIA NVSwitch Supercharge Large Language Model Inference</em>. 2026. <a href="https://developer.nvidia.com/blog/nvidia-nvlink-and-nvidia-nvswitch-supercharge-large-language-model-inference/">https://developer.nvidia.com/blog/nvidia-nvlink-and-nvidia-nvswitch-supercharge-large-language-model-inference/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NVSwitch3 25.6 Tb/s per chip (4 chips, HGX H100/H200), NVLink4/NVLink5 bandwidth doubling, NVL72 "72 GPUs act as a single GPU" framing.</span></li>
+<li id="ref-8"><span class="ref-type">official</span>NVIDIA. <em>GB200 NVL72</em> (product page). n/a, 2026. <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">https://www.nvidia.com/en-us/data-center/gb200-nvl72/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 130 TB/s rack NVLink bandwidth, 13.4 TB HBM3e at 576 TB/s, Quantum-X800/Spectrum-X800/BlueField-3 scale-out networking.</span></li>
+<li id="ref-9"><span class="ref-type">standard</span>InfiniBand Trade Association. <em>IBTA Announces New RoCE Specification</em>. n/a. <a href="https://www.infinibandta.org/ibta-announces-new-roce-specification/">https://www.infinibandta.org/ibta-announces-new-roce-specification/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: RoCEv2's Layer-3 routing extension over the original RoCE specification.</span></li>
+<li id="ref-10"><span class="ref-type">paper</span>Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, I., Maleki, S., Bianchini, R. <em>Splitwise: Efficient Generative LLM Inference Using Phase Splitting</em>. ISCA 2024 / arXiv:2311.18677v2, 2023. <a href="https://arxiv.org/pdf/2311.18677">https://arxiv.org/pdf/2311.18677</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Table I hardware-delta figures (node-aggregate InfiniBand bandwidth, 200 GB/s A100/HDR vs. 400 GB/s H100/NDR); cross-node KV-cache transfer over back-end InfiniBand.</span></li>
+<li id="ref-11"><span class="ref-type">blog</span>NVIDIA. <em>Benchmarking GPUDirect RDMA on Modern Server Platforms</em>. NVIDIA Developer Blog, 2014. <a href="https://developer.nvidia.com/blog/benchmarking-gpudirect-rdma-on-modern-server-platforms/">https://developer.nvidia.com/blog/benchmarking-gpudirect-rdma-on-modern-server-platforms/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: GPUDirect RDMA mechanism, host-to-GPU latency floor (1.7 &#181;s), staging-vs-RDMA crossover (&#8776;400&#8211;500 KB); bandwidth figures cited only for mechanism, flagged as dated.</span></li>
+<li id="ref-12"><span class="ref-type">repo</span>openucx/ucx. <em>README.md</em>. 2026. <a href="https://github.com/openucx/ucx/blob/master/README.md">https://github.com/openucx/ucx/blob/master/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: UCP/UCT/UCS/UCM layer descriptions, supported transports (RDMA, TCP, shared memory, GPU).</span></li>
+<li id="ref-13"><span class="ref-type">official</span>NVIDIA. <em>NCCL-RDMA-SHARP Plugins</em> (HPC-X Software Toolkit docs). 2026. <a href="https://networking-docs.nvidia.com/hpcxum/212/NCCL-RDMA-SHARP+Plugins">https://networking-docs.nvidia.com/hpcxum/212/NCCL-RDMA-SHARP+Plugins</a>. Accessed 2026-09-17. <span class="ref-use">Used for: NCCL's UCX network plugin (NCCL_PLUGIN_P2P=ucx), point-to-point vs. CollNet/SHARP transport split.</span></li>
+<li id="ref-14"><span class="ref-type">official</span>NVIDIA (ai-dynamo). <em>NIXL Architecture</em> (nixl.md, main branch docs). 2026. <a href="https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md">https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Memory Sections / Transfer Backend Interface / Metadata Handler abstractions, actively supported backends (UCX, GDS), transport protocols (RoCE, InfiniBand, GPUDirect RDMA, NVMe-oF, TCP, NVLink).</span></li>
+<li id="ref-15"><span class="ref-type">official</span>NVIDIA. <em>Understanding Your Grace-Blackwell Systems</em> (multi-node-nvlink-systems tuning guide docs). 2026. <a href="https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/system.html">https://docs.nvidia.com/multi-node-nvlink-systems/multi-node-tuning-guide/system.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: GB200 NVL72 physical layout, 18&#215;1U compute trays (4 GPU each), 9&#215;1U NVLink switch trays.</span></li>
+<li id="ref-16"><span class="ref-type">blog</span>Meta Engineering. <em>RoCE networks for distributed AI training at scale</em>. Engineering at Meta, 2024. <a href="https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/">https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: RoCEv2 as Meta's production GenAI training backend transport, cluster scale (thousands of GPUs per cluster, hundreds of thousands aggregate), 40% AllReduce improvement from enhanced ECMP.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

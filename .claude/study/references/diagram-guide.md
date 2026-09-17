@@ -49,7 +49,7 @@ Do **not** draw: lists of features (table), a single number (KPI), org charts, o
 
 **Hierarchy (vertical stack inside a panel).** Panel `d-panel` 200×240; rows 40 tall with 15px gaps; capacity in the label, bandwidth on the arrow to the next level; annotate "per SM"/"per die" with `d-text-light d-small`.
 
-**Bar chart.** Axes: `<line class="d-axis">` at x=70 (y-axis) and y=220 (x-axis); gridlines `d-grid` every 50px; bars `rect` with `d-fill-blue` (highlight the one that matters with `d-fill-orange`); value labels above bars in `d-mono d-small`; axis titles in `d-text-light d-small`; state the unit in the y-axis title.
+**Bar chart.** Axes: `<line class="d-axis">` at x=70 (y-axis) and y=220 (x-axis); for *horizontal* bars with long category labels, reserve the left margin the labels need (≈ 6.5 px per character at 11 px — a 35-character label needs x ≥ 230) or start the viewBox at a negative x (`viewBox="-60 0 860 H"`); nothing may sit left of the viewBox's minimum x; gridlines `d-grid` every 50px; bars `rect` with `d-fill-blue` (highlight the one that matters with `d-fill-orange`); value labels above bars in `d-mono d-small`; axis titles in `d-text-light d-small`; state the unit in the y-axis title.
 
 **Line plot.** `<polyline points="x1,y1 x2,y2 …" class="d-line d-stroke-blue"/>` per series; legend box `d-label-bg` top-right with a 24px sample line and label; log axes labelled as such (`batch size (log)`).
 

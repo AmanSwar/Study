@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Netflix Resilience and Personalization: Chaos Engineering and the Offline/Nearline/Online Split · System Design</title>
+<meta name="description" content="Chaos engineering's four advanced principles and Netflix's Simian Army, Hystrix's circuit breakers and bulkheads applied to Netflix's own dependency graph, and the offline/nearline/online split that keeps recommendations both fresh and fast.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">System Design · Module 15</p>
+<h1>Netflix Resilience and Personalization: Chaos Engineering and the Offline/Nearline/Online Split</h1>
+<p class="lede">Netflix runs two disciplines that look unrelated but solve the same problem: what to do when a resource — a thread, a millisecond of latency budget, an uptime guarantee — is finite and something you don't control keeps trying to take more of it than you have. Chaos engineering and Hystrix are how Netflix decided, deliberately and in production, whether its systems actually survive that scarcity; the offline/nearline/online split is how Netflix decided which of its recommendation algorithms get to spend a request's worth of that same scarce latency and which have to work within a much longer, cheaper budget instead. This module reads both directly from Netflix's own engineering accounts.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>34 min</b> read</span>
+<span class="chip"><b>6</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 11</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">Two halves of Netflix's resilience discipline: surviving failure, and deciding what to compute within a latency budget</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="20" width="360" height="300" rx="12" class="d-panel"/>
+<text x="200" y="48" text-anchor="middle" class="d-bold d-title">Survive failure</text>
+
+<rect x="45" y="65" width="150" height="60" rx="8" class="d-block"/>
+<text x="120" y="90" text-anchor="middle" class="d-text-inv d-small d-bold">Chaos engineering</text>
+<text x="120" y="108" text-anchor="middle" class="d-text-inv d-small">inject real failure on purpose</text>
+
+<path d="M195,95 L235,95" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="235" y="65" width="120" height="60" rx="8" class="d-block-2"/>
+<text x="295" y="90" text-anchor="middle" class="d-text-inv d-small d-bold">Finds:</text>
+<text x="295" y="108" text-anchor="middle" class="d-text-inv d-small">weak dependencies</text>
+
+<path d="M120,125 L120,160" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="45" y="160" width="310" height="60" rx="8" class="d-block-accent"/>
+<text x="200" y="185" text-anchor="middle" class="d-text-inv d-small d-bold">Hystrix: breaker + bulkhead + fallback</text>
+<text x="200" y="203" text-anchor="middle" class="d-text-inv d-small">per dependency, on Netflix's own API traffic</text>
+
+<text x="200" y="250" text-anchor="middle" class="d-small d-text-light">Resource being protected:</text>
+<text x="200" y="268" text-anchor="middle" class="d-mono d-small d-bold">threads, connections, uptime</text>
+<text x="200" y="295" text-anchor="middle" class="d-small d-text-light">Sections 1-2</text>
+
+<rect x="420" y="20" width="360" height="300" rx="12" class="d-panel"/>
+<text x="600" y="48" text-anchor="middle" class="d-bold d-title">Decide what to compute</text>
+
+<rect x="445" y="65" width="310" height="60" rx="8" class="d-block"/>
+<text x="600" y="90" text-anchor="middle" class="d-text-inv d-small d-bold">Offline / nearline / online split</text>
+<text x="600" y="108" text-anchor="middle" class="d-text-inv d-small">trade algorithmic freedom against latency</text>
+
+<path d="M600,125 L600,160" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="445" y="160" width="310" height="60" rx="8" class="d-block-2"/>
+<text x="600" y="185" text-anchor="middle" class="d-text-inv d-small d-bold">Manhattan + Hermes</text>
+<text x="600" y="203" text-anchor="middle" class="d-text-inv d-small">connect the tiers via events and pub/sub</text>
+
+<text x="600" y="250" text-anchor="middle" class="d-small d-text-light">Resource being protected:</text>
+<text x="600" y="268" text-anchor="middle" class="d-mono d-small d-bold">request-time latency budget</text>
+<text x="600" y="295" text-anchor="middle" class="d-small d-text-light">Sections 3-4</text>
+
+</svg>
+<figcaption><b>Figure 1.</b> Both halves of this module answer the same question — what happens when a scarce resource meets demand you cannot fully predict — for two different resources: available threads/uptime on the left (Hystrix, built on chaos-engineering findings<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a>), and available request-time latency on the right (the offline/nearline/online compute split<a class="cite" href="#ref-5">5</a>).</figcaption>
+</figure>
+
+<h2 id="chaos-engineering">1. Chaos engineering: building confidence by breaking things on purpose</h2>
+<p>Module 11 §6.1 already gives chaos engineering's formal definition and its four advanced principles as a general verification discipline. This section applies that discipline to the company that invented it, with the specific tools Netflix built and the specific outage classes those tools were designed to surface — the worked example Module 11 deliberately left for this module.</p>
+
+<h3 id="four-principles">1.1 The four advanced principles, restated for what Netflix actually built</h3>
+<p>Chaos Engineering is, in the canonical definition co-authored by the Netflix engineers who built it, "the discipline of experimenting on a system in order to build confidence in the system's capability to withstand turbulent conditions in production"<a class="cite" href="#ref-1">1</a>. The baseline method is to state a hypothesis about a system's steady-state behavior — "focus on the measurable output of a system, rather than internal attributes of the system"<a class="cite" href="#ref-1">1</a> — and then check whether an injected failure changes that output. Four further principles, all drawn directly from the same document, describe how Netflix runs that experiment credibly rather than as a one-off drill: vary the injected events to reflect real-world failure classes, prioritized by likely impact or frequency, rather than arbitrary faults; run the experiment directly against production traffic wherever possible, because a staging environment's traffic pattern, cache state, and dependency graph are never quite the production ones; automate experiments so they run continuously rather than as an occasional exercise; and, non-negotiably, minimize and contain the blast radius of whatever fallout the experiment causes<a class="cite" href="#ref-1">1</a>.</p>
+
+<p>That last principle is the one Netflix's own practice took the longest to formalize, and reading its two chaos documents side by side against their publication dates makes the direction of travel explicit. The 2011 post introducing the Simian Army describes Chaos Monkey's method in blunt terms: "a tool that randomly disables our production instances"<a class="cite" href="#ref-2">2</a> — no stated targeting, no stated scope beyond "production." The 2019 Principles of Chaos document, written after nearly a decade of Netflix (and by then, the wider industry's) chaos-engineering practice, states blast-radius minimization as an explicit, load-bearing principle in its own right<a class="cite" href="#ref-1">1</a> — the same company's account of the same discipline, eight years later, making an implicit constraint an explicit one.</p>
+
+<h3 id="simian-army">1.2 The Simian Army: from Chaos Monkey to Chaos Gorilla</h3>
+<p>Netflix's own framing for why any of this was necessary is a physical-world analogy stated directly in the post that introduced it: "since no single component can guarantee 100% uptime... we have to design a cloud architecture where individual components can fail without affecting the availability of the entire system... we have to be stronger than our weakest link"<a class="cite" href="#ref-2">2</a>. Designing for that is necessary but not sufficient — a fault-tolerant architecture that has never actually been exercised against a real failure is, in Netflix's own words, like keeping a spare tire in the trunk without knowing if it is inflated or whether you remember how to change it<a class="cite" href="#ref-2">2</a>. Chaos Monkey is the automated version of poking a hole in that tire on a Sunday afternoon instead of finding out it was flat on the freeway at night: it "randomly disables our production instances to make sure we can survive this common type of failure without any customer impact," run deliberately "in the middle of a business day, in a carefully monitored environment with engineers standing by," so that "next time an instance fails at 3 am on a Sunday, we won't even notice"<a class="cite" href="#ref-2">2</a>.</p>
+
+<p>Chaos Monkey's success led Netflix to generalize the idea into a set of purpose-built tools, each targeting one specific class of failure or unhealthy state rather than one generic "kill something" action. Latency Monkey injects artificial delay into the RESTful client-server layer rather than killing an instance outright, which lets Netflix simulate a dependency's full unavailability — including cases where the failure is timing-based rather than an outright crash — "without physically bringing these instances down"<a class="cite" href="#ref-2">2</a>. Conformity Monkey and Security Monkey target configuration risk rather than runtime failure: Conformity Monkey shuts down instances that don't follow best practice (the stated example is an instance outside an auto-scaling group, which the post calls "trouble waiting to happen"<a class="cite" href="#ref-2">2</a>), and Security Monkey extends the same idea to security posture, finding "improperly configured AWS security groups" and expiring SSL/DRM certificates<a class="cite" href="#ref-2">2</a>. Doctor Monkey and Janitor Monkey handle degraded-but-not-failed and wasted-but-not-failed states respectively — Doctor Monkey removes instances that fail health checks or show abnormal signals like elevated CPU load, and Janitor Monkey disposes of unused cloud resources before they become clutter<a class="cite" href="#ref-2">2</a>. 10-18 Monkey (a numeronym for localization-internationalization) checks for configuration problems specific to serving customers across regions, languages, and character sets<a class="cite" href="#ref-2">2</a>. Chaos Gorilla scales Chaos Monkey's method up one level of granularity: instead of one instance, it "simulates an outage of an entire Amazon availability zone," specifically to verify that "services automatically re-balance to the functional availability zones without user-visible impact or manual intervention"<a class="cite" href="#ref-2">2</a> — the same steady-state-hypothesis method from Section 1.1, applied at the zone level instead of the instance level.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f2t"><title id="f2t">The chaos-experiment loop: steady-state hypothesis, event injection, measurement, and blast-radius minimization as a repeating cycle</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="60" y="30" width="220" height="90" rx="12" class="d-block"/>
+<text x="170" y="65" text-anchor="middle" class="d-text-inv d-bold d-small">1. Steady-state hypothesis</text>
+<text x="170" y="85" text-anchor="middle" class="d-text-inv d-small">measurable output, not internals</text>
+<text x="170" y="103" text-anchor="middle" class="d-text-inv d-small d-mono">e.g. checkout success rate</text>
+
+<rect x="520" y="30" width="220" height="90" rx="12" class="d-block-2"/>
+<text x="630" y="65" text-anchor="middle" class="d-text-inv d-bold d-small">2. Inject a real-world event</text>
+<text x="630" y="85" text-anchor="middle" class="d-text-inv d-small">on production traffic</text>
+<text x="630" y="103" text-anchor="middle" class="d-text-inv d-small d-mono">Chaos Monkey / Gorilla / Latency Monkey</text>
+
+<rect x="520" y="200" width="220" height="90" rx="12" class="d-block-accent"/>
+<text x="630" y="235" text-anchor="middle" class="d-text-inv d-bold d-small">3. Measure the output</text>
+<text x="630" y="255" text-anchor="middle" class="d-text-inv d-small">did the hypothesis still hold?</text>
+
+<rect x="60" y="200" width="220" height="90" rx="12" class="d-block-muted"/>
+<text x="170" y="235" text-anchor="middle" class="d-text-inv d-bold d-small">4. Minimize blast radius</text>
+<text x="170" y="255" text-anchor="middle" class="d-text-inv d-small">stop/contain if the hypothesis fails</text>
+<text x="170" y="273" text-anchor="middle" class="d-text-inv d-small">engineers standing by</text>
+
+<path d="M280,75 L520,75" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M630,120 L630,200" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M520,245 L280,245" class="d-arrow" marker-end="url(#f2-arr)"/>
+<path d="M170,200 L170,120" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+<text x="400" y="160" text-anchor="middle" class="d-small d-text-light">Hypothesis holds &#8594; run again, wider or more often. Hypothesis breaks &#8594; found a real dependency.</text>
+</svg>
+<figcaption><b>Figure 2.</b> Chaos Engineering's baseline method plus its four advanced principles, drawn as one repeating loop: define steady state as an output, inject a real-world failure directly on production traffic, measure whether the output held, and contain the fallout either way<a class="cite" href="#ref-1">1</a>. The specific tools in each step are Netflix's own<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>The Simian Army's tools are deliberately narrow-spectrum: each one tests one hypothesis about one failure class, rather than one generic tool testing everything. This is the same design instinct as Hystrix's per-dependency circuit breaker in Section 2 — isolate the unit of failure you are studying, so that a positive or negative result is attributable to something specific rather than to "the system" in general.</p></aside>
+<h2 id="hystrix-dependency-graph">2. Surviving what chaos finds: Hystrix on Netflix's own dependency graph</h2>
+<p>Chaos experiments are diagnostic — they tell you which dependency is a weak point, not what to do about it once you know. Module 11 §4 and §5 already build the general vocabulary for the answer: a circuit breaker's CLOSED/OPEN/HALF-OPEN state machine, and the choice between thread-pool and semaphore isolation as a bulkhead around each dependency<a class="cite" href="#ref-3">3</a>. This section does not re-derive that machinery. It applies it to the traffic numbers and the specific configuration Netflix's own engineering team published when Hystrix's predecessor — internally called the <code>DependencyCommand</code> pattern — first went into production, because the numbers are what make "circuit breaker" stop being an abstract state machine and start being a concrete answer to a concrete, measured problem.</p>
+
+<h3 id="compounding-arithmetic">2.1 The arithmetic that made fault tolerance mandatory</h3>
+<p>By 2012, the Netflix API was receiving more than 1 billion incoming calls per day, fanning out at an average ratio of 1:6 into several billion outgoing calls to dozens of underlying subsystems, with peaks exceeding 100,000 dependency requests per second, all running across thousands of EC2 instances<a class="cite" href="#ref-4">4</a>. At that volume, "intermittent failure is guaranteed... even if every dependency itself has excellent availability and uptime"<a class="cite" href="#ref-4">4</a> — a claim that is not rhetorical but arithmetic, and Netflix's own engineering post states the calculation directly:</p>
+
+$$ 0.9999^{30} \approx 0.997 $$
+
+<p>Thirty dependencies, each independently available 99.99% of the time, compound multiplicatively rather than additively, because the whole request fails if any one of the thirty fails. The result — roughly 99.7% combined availability — sounds close to the 99.99% each individual dependency promises, but translated into downtime the gap is large: "30 dependencies each with 99.99% uptime would result in 2+ hours downtime/month"<a class="cite" href="#ref-4">4</a>. Compare this to the allowed-downtime arithmetic Module 11 §1.2 builds for a single SLO: one dependency at 99.99% availability over a 30-day month allows about 4.3 minutes of downtime; thirty independent dependencies at that same individual target allow over 2 hours, a roughly 30-fold degradation purely from the multiplication, before any single dependency has gotten measurably worse. This is the reason Netflix's own post frames fault tolerance the way it does: "it is a requirement of high volume, high availability applications to build fault tolerance into their architecture and not expect infrastructure to solve it for them"<a class="cite" href="#ref-4">4</a> — no amount of individually well-run dependencies fixes a multiplicative problem; only isolating each dependency's failure from the others does.</p>
+
+<p>The failure mode this arithmetic predicts is specific, and Netflix's post names it precisely: "when a single API dependency fails at high volume with increased latency (causing blocked request threads) it can rapidly (seconds or sub-second) saturate all available Tomcat... request threads and take down the entire API"<a class="cite" href="#ref-4">4</a>. This is exactly the cascading-failure mechanism Module 11 Figure 6 draws for a shared thread pool with no bulkhead — Netflix's account is the production incident that mechanism is describing, not a hypothetical.</p>
+
+<h3 id="breaker-bulkhead-applied">2.2 One breaker, one bulkhead, per dependency</h3>
+<p>Netflix's <code>DependencyCommand</code> wraps every call to an external system in the same combination of mechanisms Module 11 §3-§5 names generically: network-level timeouts and retries, a per-dependency thread pool (or, for cheap in-process calls, a semaphore), and a circuit breaker<a class="cite" href="#ref-4">4</a>. What Netflix's own numbers add is the specific tuning behind each layer. The circuit trips "when a DependencyCommand has passed a certain threshold of error (such as 50% error rate in a 10 second period) and will then reject all requests until health checks succeed"<a class="cite" href="#ref-4">4</a> — the same 50% error-rate figure Module 11 Table 3 cites as Hystrix's later published default, here stated as Netflix's own production configuration a version earlier, evaluated over a 10-second rolling window rather than a raw request count. A tripped breaker "release[s] the pressure on underlying systems (i.e. shed load) when they are having issues and reduce[s] the user request latency by failing fast... instead of making every user request wait for the timeout to occur"<a class="cite" href="#ref-4">4</a> — the same fail-fast argument Module 11 §4 makes in the abstract, restated here as an explicit design goal rather than a side effect.</p>
+
+<p>The thread-pool sizing example Netflix published shows how conservative a working configuration actually looks in practice: "the threadpool is sized at 10 to handle a burst of 99th percentile requests, but when everything is healthy this threadpool will typically only have 1 or 2 threads active at any given time to serve mostly 40 ms median calls"<a class="cite" href="#ref-4">4</a>. Ten threads is not a capacity plan for the dependency's normal load — it is headroom for the tail, sized so that a burst of slow p99 requests does not exhaust the pool while the median case, which is what actually happens almost all the time, uses almost none of it. Moving each dependency's calls onto its own thread turned out to have a second, unrelated benefit Netflix's post is explicit about: once a call runs on a separate thread anyway, nothing stops several such calls from executing concurrently instead of serially, and Netflix used exactly that opening to add "request collapsing (automatic batching)," merging what would otherwise be several nearly-simultaneous calls to the same dependency into one, "to increase overall efficiency and reduce user request latencies"<a class="cite" href="#ref-4">4</a> — the isolation mechanism paying for its own thread-handoff overhead by also being the thing that makes concurrent dispatch possible in the first place. Semaphores, in the same architecture, are reserved for dependency calls known not to touch the network — in-memory cache lookups, for instance — "since the overhead of a separate thread is too high for these types of operations"<a class="cite" href="#ref-4">4</a>; Module 11 §5.2 already explains why that trade only makes sense when a hung call is not a realistic failure mode, and an in-process cache lookup is exactly that case. Netflix's post adds one further, easy-to-miss use of the same mechanism: a fallback function itself runs on the calling thread by contract, and rather than trusting every fallback implementation to honor that contract, "it too is protected by a semaphore so that if an implementation is done that involves a network call and becomes latent, the fallback itself won't be able to take down the entire app"<a class="cite" href="#ref-4">4</a> — the bulkhead pattern applied recursively to the thing that is supposed to be the safety net.</p>
+
+<p>Netflix's post also gives a worked example of how the network-level and thread-level timeouts in Module 11 §3.1 are meant to compose rather than duplicate each other, and it is worth reproducing because the arithmetic is not obvious from either layer alone. Take a dependency whose calls have no legitimate reason to sit near the tail of their own latency distribution: "cuts it short at the network timeout layer and immediately retries with the expectation to get median latency most of the time, and accomplish this all within the 300 ms thread timeout"<a class="cite" href="#ref-4">4</a> — a short network timeout, one retry, and a longer thread-level backstop, all sized so the retry itself still finishes inside the outer bound. Compare that to a dependency where hitting the tail is a legitimate, expected outcome — "cache miss with lazy generation" is Netflix's own example — and the configuration inverts: "the network timeout will be set higher than it, such as at 325 ms with 0 or 1 retries and the thread timeout set higher (350 ms+)"<a class="cite" href="#ref-4">4</a>. The lesson generalizes past Netflix's specific numbers: a network timeout should be set from the dependency's own latency distribution (Module 11 §3.1's percentile heuristic), a retry should only be attempted if the round trip plus the retry still fits under the thread-level timeout, and the thread-level timeout is the one number the calling application actually controls regardless of how the dependency's own client library is configured — "the timeouts at the DependencyCommand threading level are the first line of defense regardless of how the underlying dependency client is configured or behaving"<a class="cite" href="#ref-4">4</a>.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f3t"><title id="f3t">Hystrix circuit breakers and thread pools applied to three of the Netflix API's dependencies, one healthy and one tripped</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="330" y="20" width="140" height="70" rx="10" class="d-block"/>
+<text x="400" y="48" text-anchor="middle" class="d-text-inv d-bold d-small">Netflix API</text>
+<text x="400" y="66" text-anchor="middle" class="d-text-inv d-small">1B+ calls/day&#160;<a class="cite" href="#ref-4">4</a></text>
+
+<path d="M330,60 L150,140" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M400,90 L400,140" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M470,60 L650,140" class="d-arrow" marker-end="url(#f3-arr)"/>
+
+<rect x="60" y="140" width="180" height="60" rx="8" class="d-block-2"/>
+<text x="150" y="163" text-anchor="middle" class="d-text-inv d-small d-bold">Breaker: CLOSED</text>
+<text x="150" y="181" text-anchor="middle" class="d-text-inv d-small">Bookmarks pool (10 threads)</text>
+
+<rect x="310" y="140" width="180" height="60" rx="8" class="d-block-2"/>
+<text x="400" y="163" text-anchor="middle" class="d-text-inv d-small d-bold">Breaker: CLOSED</text>
+<text x="400" y="181" text-anchor="middle" class="d-text-inv d-small">Cache lookup (semaphore, 10)</text>
+
+<rect x="560" y="140" width="180" height="60" rx="8" class="d-block-accent"/>
+<text x="650" y="163" text-anchor="middle" class="d-text-inv d-small d-bold">Breaker: OPEN</text>
+<text x="650" y="181" text-anchor="middle" class="d-text-inv d-small">Ratings pool &#8212; 50% err/10s&#160;<a class="cite" href="#ref-4">4</a></text>
+
+<path d="M150,200 L150,230" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="60" y="230" width="180" height="50" rx="8" class="d-panel"/>
+<text x="150" y="258" text-anchor="middle" class="d-small">Call proceeds normally</text>
+
+<path d="M400,200 L400,230" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="310" y="230" width="180" height="50" rx="8" class="d-panel"/>
+<text x="400" y="258" text-anchor="middle" class="d-small">Call proceeds, no thread hand-off</text>
+
+<path d="M650,200 L650,230" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+<rect x="560" y="230" width="180" height="70" rx="8" class="d-hl"/>
+<text x="650" y="253" text-anchor="middle" class="d-bold d-small">Fails fast, no network hop</text>
+<text x="650" y="271" text-anchor="middle" class="d-small">&#8594; fallback chain (&#167;2.3)</text>
+<text x="650" y="289" text-anchor="middle" class="d-small">Other two pools unaffected</text>
+
+</svg>
+<figcaption><b>Figure 3.</b> Three of the Netflix API's dependencies, each behind its own breaker and its own isolation pool. One dependency's breaker has tripped after exceeding a 50% error rate within a 10-second window<a class="cite" href="#ref-4">4</a> and now fails every call immediately into the fallback chain of Table 1, while the other two dependencies — one thread-pool-isolated, one semaphore-isolated for a non-network call<a class="cite" href="#ref-4">4</a> — continue serving normally because their thread pools were never shared with the failing one. Dependency names (Bookmarks, Ratings) are illustrative of the kind of service the API fans out to, not quoted from the source.</figcaption>
+</figure>
+
+<h3 id="fallback-hierarchy">2.3 The fallback hierarchy: cache, eventual consistency, stubbed data, fail silent</h3>
+<p>A breaker that fails fast still has to return something. Netflix's <code>DependencyCommand</code> routes every failure — "timeout, rejection, short-circuited etc" — through the same fallback step regardless of which specific mechanism caught it, "to give a DependencyCommand the opportunity to do something other than 'fail fast'"<a class="cite" href="#ref-4">4</a>, mirroring the unified fallback path Module 11 §4 already describes for Hystrix's later, public version. What is new here is Netflix's own explicit ranking of what a fallback should try, ordered by impact on the user experience from least to most degraded<a class="cite" href="#ref-4">4</a>:</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Netflix's fallback hierarchy for a failed dependency call, ordered by increasing impact on the user-visible result<a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Fallback</th><th>Mechanism</th><th>What the user sees</th></tr></thead>
+<tbody>
+<tr><td class="row">Cache</td><td>Retrieve from a local or remote cache, even if the data ends up stale</td><td>Near-normal result, possibly a little out of date</td></tr>
+<tr><td class="row">Eventual consistency</td><td>Queue the write (e.g. via SQS) to persist once the dependency recovers</td><td>Action appears to succeed immediately; write lands later</td></tr>
+<tr><td class="row">Stubbed data</td><td>Revert to a default, non-personalized value</td><td>Generic result in place of a personalized one</td></tr>
+<tr><td class="row">Empty response ("fail silent")</td><td>Return null or an empty list for the UI to ignore</td><td>The feature is simply absent from the screen</td></tr>
+</tbody>
+</table>
+
+<p>The ordering encodes a real design principle, not just a list of options: "our goal is to have the fallbacks deliver responses as close to what the actual dependency would deliver"<a class="cite" href="#ref-4">4</a>, so a stale cached value is preferred over a generic stub, and a generic stub is preferred over showing nothing — but showing nothing is still preferred over blocking the page, or the whole API, on a dependency that has already demonstrated it cannot answer in time. Read against Table 1 in Module 11 (the SLI/SLO/SLA distinction), this hierarchy is what an SLO looks like once it has actually been missed: not a single binary success/failure outcome, but four different degrees of "we did not get the ideal answer," chosen so that the least important features degrade first and checkout, playback, and the rest of the core experience degrade last, if at all.</p>
+<h2 id="offline-nearline-online">3. The other constraint on resilience: freshness vs. latency in recommendations</h2>
+<p>Sections 1 and 2 protect a request that is already committed to running: something has agreed to answer, and the question is how to fail gracefully if a dependency cannot deliver. Netflix's recommendation architecture faces a different version of the same scarcity one step earlier — before any request has committed to an answer, someone has to decide which algorithm is even allowed to try, because the more sophisticated an algorithm is, the longer it usually takes to run, and a recommendation that has not been computed by the time the page needs to render is not a recommendation at all.</p>
+
+<h3 id="why-one-mode-fails">3.1 Why one computation mode cannot serve both goals</h3>
+<p>Netflix's own account of its recommendation architecture states the tension directly: "one of the key issues in a personalization architecture is how to combine and manage online and offline computation in a seamless manner"<a class="cite" href="#ref-5">5</a>. Purely online computation "can respond quickly to events and use the most recent data," but is "subject to an availability and response time Service Level Agreements (SLA)," which "can make it harder to fit complex and computationally costly algorithms in this approach"<a class="cite" href="#ref-5">5</a> — the same SLA-as-contract framing Module 11 §1.3 builds in the abstract, here appearing as the specific reason an algorithm gets vetoed from the request path, not because it produces a worse answer, but because it cannot produce any answer inside the time budget. Purely offline computation inverts every one of those constraints: it "allows for more choices in algorithmic approach... and less limitations on the amount of data that is used," and if a new experimental algorithm runs slower, the fix is simply to "deploy more Amazon EC2 instances to achieve the throughput required," rather than spend engineering time optimizing it<a class="cite" href="#ref-5">5</a>. The price of that freedom is staleness: offline computation, by construction, "does not have strong latency requirements," so "it will not react quickly to changes in context or new data," which "can lead to staleness that may degrade the member experience"<a class="cite" href="#ref-5">5</a>. Neither mode dominates the other — one buys speed and freshness at the cost of algorithmic complexity, the other buys complexity and cheap experimentation at the cost of staleness — which is exactly why Netflix runs a third mode between them rather than choosing one. Netflix's own examples make the contrast concrete rather than abstract: an online example is "a gallery of action movies sorted for the member using the current context," recomputed against whatever the member is doing right now; an offline example is periodically aggregating "statistics from millions of movie play events to compile baseline popularity metrics"<a class="cite" href="#ref-5">5</a> — a computation over a dataset far too large to touch inside a request, and one where nothing about "current context" matters at all.</p>
+
+<h3 id="three-tiers-defined">3.2 Offline, nearline, online</h3>
+<p>Nearline computation is Netflix's own name for that middle option: "computation is performed exactly like in the online case," but "we remove the requirement to serve results as soon as they are computed and can instead store them, allowing it to be asynchronous"<a class="cite" href="#ref-5">5</a>. It runs in response to individual events rather than on a fixed schedule, which "opens the door for potentially more complex processing to be done per event" than a hard online SLA would allow<a class="cite" href="#ref-5">5</a> — Netflix's stated example is updating a member's recommendations immediately after they begin watching a movie, rather than waiting for the next scheduled offline batch job to notice<a class="cite" href="#ref-5">5</a>. Because nearline computation writes its result to storage instead of returning it directly to a waiting request, it inherits none of the online tier's response-time SLA, but it reacts far faster than an offline batch job scheduled on a fixed cadence — a genuine third point on the trade-off, not merely an average of the other two.</p>
+
+<p>Netflix's own post is explicit that the three modes are not a menu to choose one from, but layers meant to be combined: "the choice of online/nearline/offline processing is not an either/or question. All approaches can and should be combined"<a class="cite" href="#ref-5">5</a>. The stated combination patterns include using an offline result as the fallback when an online computation cannot meet its SLA<a class="cite" href="#ref-5">5</a> — precisely the "cache" and "stubbed data" fallback levels from Table 1, applied here to a stale precomputed recommendation list instead of a stale API response — and splitting a single model's training into a large, offline global-model phase plus a lighter, online or nearline per-user update phase, which Netflix's post gives Matrix Factorization and clustering as concrete examples of: some factors precomputed in batch, others updated in real time to keep the result fresh<a class="cite" href="#ref-5">5</a>.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> The three recommendation-computation tiers Netflix names, compared on the axes that actually trade off against each other<a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Tier</th><th>Triggered by</th><th>Latency bound</th><th>Algorithmic freedom</th><th>Staleness risk</th></tr></thead>
+<tbody>
+<tr><td class="row">Offline</td><td>Scheduled batch job</td><td data-best>None — relaxed SLA</td><td data-best>Highest — arbitrary complexity, more EC2 instances instead of tuning</td><td data-worst>Highest — stale until the next batch run</td></tr>
+<tr><td class="row">Nearline</td><td>An individual event (e.g. a play started)</td><td>Asynchronous — no hard response deadline</td><td>Moderate — richer than online per-event, less than a full batch job</td><td>Moderate — reacts per event, not per request</td></tr>
+<tr><td class="row">Online</td><td>The user's request itself</td><td data-worst>Hard — availability + response-time SLA<a class="cite" href="#ref-5">5</a></td><td data-worst>Lowest — must fit inside the SLA</td><td data-best>Lowest — uses the freshest signals available</td></tr>
+</tbody>
+</table>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f4t"><title id="f4t">The offline/nearline/online triangle: latency budget traded against algorithmic freedom and staleness risk</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<line x1="80" y1="280" x2="720" y2="280" class="d-axis"/>
+<text x="400" y="310" text-anchor="middle" class="d-small d-text-light">Latency budget available to the computation &#8594; (tighter left, looser right)</text>
+
+<line x1="80" y1="280" x2="80" y2="40" class="d-axis"/>
+<text x="55" y="160" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 55 160)">Algorithmic freedom / staleness risk &#8594;</text>
+
+<rect x="110" y="215" width="150" height="55" rx="8" class="d-block-accent"/>
+<text x="185" y="238" text-anchor="middle" class="d-text-inv d-small d-bold">Online</text>
+<text x="185" y="256" text-anchor="middle" class="d-text-inv d-small">request-time SLA&#160;<a class="cite" href="#ref-5">5</a></text>
+
+<rect x="335" y="140" width="150" height="55" rx="8" class="d-block-2"/>
+<text x="410" y="163" text-anchor="middle" class="d-text-inv d-small d-bold">Nearline</text>
+<text x="410" y="181" text-anchor="middle" class="d-text-inv d-small">per-event, asynchronous&#160;<a class="cite" href="#ref-5">5</a></text>
+
+<rect x="560" y="60" width="150" height="55" rx="8" class="d-block"/>
+<text x="635" y="83" text-anchor="middle" class="d-text-inv d-small d-bold">Offline</text>
+<text x="635" y="101" text-anchor="middle" class="d-text-inv d-small">batch, no latency limit&#160;<a class="cite" href="#ref-5">5</a></text>
+
+<path d="M260,242 L335,167" class="d-arrow" marker-end="url(#f4-arr)"/>
+<path d="M485,167 L560,88" class="d-arrow" marker-end="url(#f4-arr)"/>
+
+<rect x="80" y="20" width="640" height="20" class="d-panel"/>
+<text x="400" y="34" text-anchor="middle" class="d-small">Same recommendation problem, three points on one trade-off &#8212; not three unrelated systems<a class="cite" href="#ref-5">5</a></text>
+</svg>
+<figcaption><b>Figure 4.</b> Moving right along the diagonal trades a tighter latency budget for more algorithmic freedom and higher staleness risk. Online sits at the strict-SLA end, offline at the no-limit end, and nearline occupies the deliberate middle Netflix built specifically because point solutions at either end left a gap<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>Netflix's stated fallback pattern — precompute offline, then let online post-processing add freshness with real-time signals<a class="cite" href="#ref-5">5</a> — is structurally the same move as Table 1's fallback hierarchy: a slower, safer, already-available answer sits behind a faster, riskier one, and the system falls back to it rather than blocking. The two halves of this module keep landing on the same shape because they are the same shape: bound the expensive path's worst case, and always have a cheaper answer ready when it is exceeded.</p></aside>
+
+<h3 id="signals-models-data">3.3 What an algorithm in any tier actually consumes: models, data, and signals</h3>
+<p>Every tier in Table 2 runs some machine-learning algorithm, and Netflix's own post draws a three-way distinction for what that algorithm reads, independent of which tier it runs in: "models are usually small files of parameters that have been previously trained offline"; "data is previously processed information that has been stored in some sort of database, such as movie metadata or popularity"; and signals are "fresh information we input to algorithms... obtained from live services," such as "what the member has watched recently, or context data such as session, device, date, or time"<a class="cite" href="#ref-5">5</a>. The three-way split maps directly onto the three tiers without being identical to them: a model is almost always the offline tier's output, consumed by all three; data is typically read from whichever result store Section 4.2 lands the offline pipeline's output in; and a signal is available only where a live service can still be reached synchronously, which by definition excludes anything computed further upstream than the online tier itself. This is also precisely why a full historical replay cannot exactly reproduce an online computation's original result even given the same model and the same data — an online decision that consumed a live signal has no equivalent signal available to a job replaying that same time window after the fact, only whatever signal value happened to be logged as data alongside it, if it was logged at all.</p>
+<h2 id="manhattan-hermes">4. Connecting the tiers: events, data, Manhattan, and Hermes</h2>
+<p>Table 2's three tiers only work as one system if something actually moves a result from wherever it was computed to wherever it is needed next — an offline batch job's output has to reach the online serving path, and a nearline computation triggered by one user action has to reach whatever subscriber cares about that result. Netflix names two specific internal systems for this, and draws a line between two kinds of thing that flow through them.</p>
+
+<h3 id="events-vs-data">4.1 Events vs. data: two distribution paths</h3>
+<p>Netflix's own architecture post draws a working distinction, admitted to be "blurry" at the edges, between events and data: "we think of events as small units of time-sensitive information that need to be processed with the least amount of latency possible... routed to trigger a subsequent action or process, such as updating a nearline result set," versus data, "more dense information units that might need to be processed and stored for later use," where "latency is not as important as the information quality and quantity"<a class="cite" href="#ref-5">5</a>. A single user action — starting to watch a movie — can be both at once, "sent to both flows"<a class="cite" href="#ref-5">5</a>: a low-latency event that should immediately nudge a nearline computation, and a data point that also belongs in the large aggregate dataset an offline job will eventually process. This split matters because it means Netflix does not route every user interaction through one pipeline sized for the strictest requirement — the event path is built to be fast and can afford to be lossier or less complete, and the data path is built to be complete and can afford to be slower.</p>
+
+<h3 id="manhattan-hermes-systems">4.2 Manhattan and Hermes</h3>
+<p>Manhattan is Netflix's name for the system that carries the event path: "our near-real-time event flow is managed through an internal framework called Manhattan. Manhattan is a distributed computation system that is central to our algorithmic architecture for recommendation. It is somewhat similar to Twitter's Storm, but it addresses different concerns and responds to a different set of internal requirements"<a class="cite" href="#ref-5">5</a>. Netflix's post does not spell out exactly which concerns differ — the comparison is offered as an orientation for a reader who already knows Storm's stream-processing model, not as a full specification — but the placement is precise: Manhattan is the mechanism that turns "a movie has been watched" into an actual nearline recomputation of that member's recommendations, the concrete implementation behind the nearline row of Table 2.</p>
+
+<p>The data path runs differently. Offline jobs process refined data "usually generated by running a database query," and because these queries run over large volumes, Netflix runs them "in a distributed fashion... on Hadoop via either Hive or Pig jobs"<a class="cite" href="#ref-5">5</a>, fed in turn by event and interaction logs collected "through Chukwa to Hadoop for the initial steps of the process"<a class="cite" href="#ref-5">5</a>. Once a batch query finishes, something has to tell every interested consumer that a fresh result exists, and to do that reliably Netflix built Hermes: "an internal tool named Hermes that provides all of these capabilities and integrates them into a coherent publish-subscribe framework. It allows data to be delivered to subscribers in near real-time"<a class="cite" href="#ref-5">5</a>. Hermes's own stated requirements are worth reading as a short spec for what a notification layer sitting downstream of a batch system needs: notify subscribers when a query result is ready, support multiple backing repositories rather than one ("not only HDFS, but also S3 or Cassandra"), and handle errors, monitoring, and alerting transparently<a class="cite" href="#ref-5">5</a>. Netflix's own comparison for Hermes is as pointed as the Manhattan-to-Storm one, and cuts the opposite way: "in some sense, it covers some of the same use cases as Apache Kafka, but it is not a message/event queue system"<a class="cite" href="#ref-5">5</a> — Module 8's log-structured broker model is explicitly not what Hermes is; Hermes is a notification layer over a query result, not a durable, offset-addressed stream of individual messages.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f5t"><title id="f5t">Manhattan and Hermes as the two data-flow paths connecting the offline, nearline, and online tiers</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="30" width="150" height="55" rx="8" class="d-block"/>
+<text x="95" y="53" text-anchor="middle" class="d-text-inv d-small d-bold">User event</text>
+<text x="95" y="71" text-anchor="middle" class="d-text-inv d-small">e.g. movie started</text>
+
+<path d="M170,50 L230,50" class="d-arrow" marker-end="url(#f5-arr)"/>
+<text x="200" y="40" text-anchor="middle" class="d-mono d-small">event path</text>
+
+<rect x="230" y="30" width="150" height="55" rx="8" class="d-block-2"/>
+<text x="305" y="53" text-anchor="middle" class="d-text-inv d-small d-bold">Manhattan</text>
+<text x="305" y="71" text-anchor="middle" class="d-text-inv d-small">nearline recompute&#160;<a class="cite" href="#ref-5">5</a></text>
+
+<path d="M380,50 L440,50" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+<rect x="440" y="30" width="150" height="55" rx="8" class="d-panel"/>
+<text x="515" y="53" text-anchor="middle" class="d-small d-bold">Result stored</text>
+<text x="515" y="71" text-anchor="middle" class="d-small">Cassandra / EVCache&#160;<a class="cite" href="#ref-5">5</a></text>
+
+<path d="M95,85 L95,150" class="d-arrow" marker-end="url(#f5-arr)"/>
+<text x="120" y="120" text-anchor="middle" class="d-mono d-small">data path</text>
+
+<rect x="20" y="150" width="150" height="55" rx="8" class="d-block-2"/>
+<text x="95" y="173" text-anchor="middle" class="d-text-inv d-small d-bold">Chukwa &#8594; Hadoop</text>
+<text x="95" y="191" text-anchor="middle" class="d-text-inv d-small">log aggregation&#160;<a class="cite" href="#ref-5">5</a></text>
+
+<path d="M170,177 L230,177" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+<rect x="230" y="150" width="150" height="55" rx="8" class="d-block"/>
+<text x="305" y="173" text-anchor="middle" class="d-text-inv d-small d-bold">Offline batch job</text>
+<text x="305" y="191" text-anchor="middle" class="d-text-inv d-small">Hive / Pig on Hadoop&#160;<a class="cite" href="#ref-5">5</a></text>
+
+<path d="M380,177 L440,177" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+<rect x="440" y="150" width="150" height="55" rx="8" class="d-block-accent"/>
+<text x="515" y="173" text-anchor="middle" class="d-text-inv d-small d-bold">Hermes</text>
+<text x="515" y="191" text-anchor="middle" class="d-text-inv d-small">notifies on query-ready&#160;<a class="cite" href="#ref-5">5</a></text>
+
+<path d="M590,177 L650,105" class="d-arrow" marker-end="url(#f5-arr)"/>
+<path d="M590,50 L650,105" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+<rect x="650" y="80" width="130" height="55" rx="8" class="d-panel"/>
+<text x="715" y="103" text-anchor="middle" class="d-small d-bold">Subscribers</text>
+<text x="715" y="121" text-anchor="middle" class="d-small">online serving path</text>
+
+<rect x="20" y="240" width="760" height="55" rx="8" class="d-hl"/>
+<text x="400" y="263" text-anchor="middle" class="d-small d-bold">Manhattan moves events; Hermes announces batch results. Neither is the other's substitute.</text>
+<text x="400" y="281" text-anchor="middle" class="d-small">Manhattan &#8776; Storm-like, but different concerns. Hermes &#8776; Kafka's use cases, but not a queue<a class="cite" href="#ref-5">5</a>.</text>
+</svg>
+<figcaption><b>Figure 5.</b> Two independent data-flow paths feed the online serving path: an event-triggered path through Manhattan for nearline recomputation, and a batch path through Hadoop and Hermes that announces when an offline query's result is ready, both landing in the same result stores (Cassandra, EVCache, or MySQL, per Netflix's own listing) that online requests read from<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<p>The choice of result store tracks the same trade-offs Module 4 already built for the general relational-vs-NoSQL split, applied to this specific problem: Netflix states plainly that "MySQL allows for storage of structured relational data... [but] the generality comes at the cost of scalability issues in distributed environments," while "Cassandra and EVCache both offer the advantages of key-value stores," with EVCache preferred specifically "in cases where we need intensive and constant write operations"<a class="cite" href="#ref-5">5</a>. None of the three is universally right — the post's own summary is that "the key issue... is not so much where to store them as to how to handle the requirements in a way that conflicting goals such as query complexity, read/write latency, and transactional consistency meet at an optimal point for each use case"<a class="cite" href="#ref-5">5</a>, which is Module 5's PACELC framing in different words: a store is chosen for what it gives up, not for what it claims to guarantee.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Netflix's offline/nearline/online split is, structurally, the same shape as the Lambda Architecture that Nathan Marz popularized for general big-data systems: a batch layer for completeness and reprocessing, a fast layer for freshness, and a serving layer that merges both. Section 3 treats that three-way split as settled, because that is how Netflix itself describes its own system. It is not settled in the wider stream-processing literature — the most direct challenge to the entire shape comes from inside the same company whose messaging model (Module 8) this course already leans on.</p>
+<div class="positions">
+<article class="position">
+<h4>Keep the batch and speed layers separate, and add an online tier on top</h4>
+<p class="who">Netflix's own recommendation architecture, as published<a class="cite" href="#ref-5">5</a></p>
+<p>Netflix's stated reason for three tiers instead of one is that offline and online computation are subject to genuinely different constraints, not just different latencies: offline has no SLA and can absorb arbitrary algorithmic complexity by adding EC2 instances, while online is contractually bound to respond inside a fixed window regardless of how much compute is thrown at it<a class="cite" href="#ref-5">5</a>. Nearline exists because neither extreme serves a per-event update well: too slow for a batch job's cadence, too complex for a hard-SLA request path. Every tier is kept because Netflix has evidence that collapsing any two of them costs something specific — algorithmic freedom, freshness, or a response-time guarantee.</p>
+<ul class="pros"><li>Each tier's constraints are independently real and independently documented — the response-time SLA is not fungible with the batch layer's throughput</li><li>Fallback composition across tiers (Section 3.2) reuses the same graceful-degradation pattern as Table 1's dependency fallbacks, giving the whole architecture one consistent failure-handling idea</li><li>Lets a team keep two very different engineering cultures — throughput-oriented batch and latency-oriented serving — cleanly separated by system boundary</li></ul>
+<ul class="cons"><li>Three tiers mean three codebases (or at least three deployment and monitoring surfaces) that all have to agree, eventually, on what "the recommendation" is</li><li>The nearline tier is where correctness bugs are hardest to see, because it is neither request-synchronous (so you notice immediately) nor a scheduled batch job (so you can diff against a known-good historical run)</li></ul>
+</article>
+<article class="position">
+<h4>Replace the batch layer with a replayable stream and one codebase</h4>
+<p class="who">Jay Kreps, co-creator of Apache Kafka, arguing for the Kappa Architecture<a class="cite" href="#ref-6">6</a></p>
+<p>Kreps's objection is not to freshness-versus-completeness as a real trade-off — it is to solving that trade-off with two separate systems that are each supposed to compute the same thing: "the problem with the Lambda Architecture is that maintaining code that needs to produce the same result in two complex distributed systems is exactly as painful as it seems like it would be," and he adds that the resulting operational complexity "is the one thing that seems to be universally agreed on by everyone doing it"<a class="cite" href="#ref-6">6</a>. His proposed alternative, the Kappa Architecture, keeps only a stream-processing layer backed by a log with enough retention to replay history: "when you want to do the reprocessing, start a second instance of your stream processing job that starts processing from the beginning of the retained data"<a class="cite" href="#ref-6">6</a>, and crucially, "unlike the Lambda Architecture, in this approach you only do reprocessing when your processing code changes"<a class="cite" href="#ref-6">6</a> — not on every fixed batch cadence. His underlying claim is that a mature stream processor does not need a separate batch system bolted on to get completeness: "stream processing systems already have a notion of parallelism; why not just handle reprocessing by increasing the parallelism and replaying history very, very fast?"<a class="cite" href="#ref-6">6</a></p>
+<ul class="pros"><li>One codebase computing one answer removes the entire class of bug where batch and streaming versions of the same feature quietly diverge</li><li>Reprocessing is triggered only by a code change, not on every scheduled batch run, which is strictly less wasted computation when nothing has changed</li><li>A sufficiently parallel replay can reprocess historical data fast enough that "batch" becomes an implementation detail of the streaming engine rather than a separate system</li></ul>
+<ul class="cons"><li>Requires a log with enough retention to hold the full reprocessing window, which for Netflix's multi-year viewing history is a materially larger and more expensive retained log than a typical Kafka retention window</li><li>Says nothing about the third, request-time-bound tier: a Kappa-style stream still has to hand its result to something that answers within an online SLA, which is a different problem than unifying batch and streaming</li><li>Assumes the same processing logic is genuinely reusable across a live event and a full historical replay, which is not automatic when the live path also depends on request-time signals (Section 3.3) that do not exist in historical replay</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The two positions are arguing about different halves of Netflix's own triangle. Kreps's critique lands squarely on the offline-versus-nearline boundary: both are, in effect, computation over the same events at different latencies, and if the nearline path is already a stream processor (Manhattan), the case for also maintaining a wholly separate Hadoop/Hive batch pipeline computing an overlapping result is exactly the duplicated-logic problem he describes. It does not touch the online tier at all, because the online tier's constraint is not staleness-versus-completeness but a contractual response-time SLA enforced against whatever request arrives right now (Module 11 §1.3) — no amount of stream-processing unification changes the fact that something has to answer inside a fixed budget or fall back. Read this way, Kreps is right that Netflix's own account gives no principled reason the offline and nearline tiers must be two different systems rather than one stream processor doing both incremental and replayed computation — and Netflix's post itself, published a year before Kreps's, already hedges here, presenting the three tiers as points on a spectrum to be "combined" rather than as three necessarily separate architectures. What would settle it: whether Manhattan (or its modern successor) can replay historical events fast enough, and cheaply enough, to match what the Hive/Pig batch jobs compute — a comparison neither publicly available Netflix source in this map states.</p></div>
+</section>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>principlesofchaos.org (Netflix Chaos Team and community). <em>Principles of Chaos Engineering</em>. v1, 2019. <a href="https://principlesofchaos.org/">https://principlesofchaos.org/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the definition of chaos engineering, the steady-state-hypothesis baseline method, and the four advanced principles (real-world events, production-traffic experiments, continuous automation, blast-radius minimization).</span></li>
+<li id="ref-2"><span class="ref-type">blog</span>Izrailevsky, Y., Tseitlin, A. (Netflix). <em>The Netflix Simian Army</em>. Netflix Technology Blog, 19 Jul 2011. <a href="https://netflixtechblog.com/the-netflix-simian-army-16e57fbab116">https://netflixtechblog.com/the-netflix-simian-army-16e57fbab116</a>. Accessed 2026-09-17 (retrieved via an archived mirror of the Netflix Technology Blog's Medium-hosted publication after the live page returned an automated-access block). <span class="ref-use">Used for: Chaos Monkey's original description and motivation, and the Latency Monkey, Conformity Monkey, Doctor Monkey, Janitor Monkey, Security Monkey, 10-18 Monkey, and Chaos Gorilla tools.</span></li>
+<li id="ref-3"><span class="ref-type">repo</span>Netflix. <em>Hystrix Wiki: How it Works</em>. v1.5.18. <a href="https://github.com/Netflix/Hystrix/wiki/How-it-Works">https://github.com/Netflix/Hystrix/wiki/How-it-Works</a>. Accessed 2026-09-17. <span class="ref-use">Used for: pointing to the general circuit-breaker/bulkhead state machine this module applies rather than re-derives (built out fully in Module 11 §4-5).</span></li>
+<li id="ref-4"><span class="ref-type">blog</span>Christensen, B. (Netflix). <em>Fault Tolerance in a High Volume, Distributed System</em>. Netflix Technology Blog, 29 Feb 2012. <a href="https://netflixtechblog.com/fault-tolerance-in-a-high-volume-distributed-system-91ab4faae74a">https://netflixtechblog.com/fault-tolerance-in-a-high-volume-distributed-system-91ab4faae74a</a>. Accessed 2026-09-17 (retrieved via an archived mirror of the Netflix Technology Blog's Medium-hosted publication after the live page returned an automated-access block). <span class="ref-use">Used for: the Netflix API's traffic scale (1B+ calls/day, 1:6 fan-out, 100k req/s peaks), the 30-dependency compounding-uptime arithmetic, the DependencyCommand thread-pool/semaphore design, the 50%-error/10-second trip condition, thread-pool sizing (10 threads, typically 1-2 active), and the ranked fallback hierarchy (cache, eventual consistency, stubbed data, fail silent).</span></li>
+<li id="ref-5"><span class="ref-type">blog</span>Amatriain, X., Basilico, J. (Netflix). <em>System Architectures for Personalization and Recommendation</em>. Netflix Technology Blog, 27 Mar 2013. <a href="https://netflixtechblog.com/system-architectures-for-personalization-and-recommendation-e081aa94b5d8">https://netflixtechblog.com/system-architectures-for-personalization-and-recommendation-e081aa94b5d8</a>. Accessed 2026-09-17 (retrieved via an archived mirror of the Netflix Technology Blog's Medium-hosted publication for full article text). <span class="ref-use">Used for: the offline/nearline/online definitions and trade-offs, the events-vs-data distinction, Manhattan (compared to Storm), Hermes (compared to Kafka), Chukwa/Hadoop/Hive/Pig as the batch pipeline, and Cassandra/EVCache/MySQL as result stores.</span></li>
+<li id="ref-6"><span class="ref-type">blog</span>Kreps, J. <em>Questioning the Lambda Architecture</em>. O'Reilly Radar, 2 Jul 2014. <a href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/">https://www.oreilly.com/radar/questioning-the-lambda-architecture/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Kappa Architecture critique of maintaining separate batch and streaming codebases, in "Where experts disagree."</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

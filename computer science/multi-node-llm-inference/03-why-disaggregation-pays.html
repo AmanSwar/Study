@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why Disaggregation Pays: Goodput, Interference, and the Ratio Decision · Multi-Node LLM Inference</title>
+<meta name="description" content="The queueing-theoretic and empirical case for splitting prefill and decode into separate pools: the interference mechanism DistServe measured, Splitwise's hardware-delta argument, Mooncake's own reconsideration under chunked prefill, and the InferenceMAX TCO crossover where disaggregation stops winning.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 3</p>
+<h1>Why Disaggregation Pays: Goodput, Interference, and the Ratio Decision</h1>
+<p class="lede">A colocated engine batches prefill and decode together because they share the same weights and the same KV cache pool &#8212; but the two workloads have opposite computational profiles, and continuous batching lets one stall the other. This module works through why that stall happens, the queueing-theoretic argument DistServe used to justify splitting the phases onto separate GPU pools, the production-trace evidence Splitwise and Mooncake bring to the same conclusion, and the TCO analysis that says the win is conditional, not universal. After reading, you can state, with the actual numbers, when a second (decode) pool is worth its operational cost and when it isn't.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>25 min</b> read</span>
+<span class="chip"><b>6</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 1</b></span>
+<span class="chip">Prerequisite: <b>Module 2</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f1t"><title id="f1t">One GPU pool serving prefill and decode together versus two independent pools, each scaled and scheduled for its own phase</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="205" y="24" text-anchor="middle" class="d-title d-bold">Colocated</text>
+<text x="595" y="24" text-anchor="middle" class="d-title d-bold">Disaggregated</text>
+<line x1="400" y1="10" x2="400" y2="310" class="d-outline d-dashed"/>
+<!-- Left: colocated -->
+<rect x="30" y="45" width="350" height="235" rx="10" class="d-panel"/>
+<text x="205" y="70" text-anchor="middle" class="d-small d-text-light">one shared queue, one parallelism plan</text>
+<g class="d-mono d-small">
+<circle cx="60" cy="120" r="6" class="d-fill-blue"/>
+<circle cx="90" cy="120" r="6" class="d-fill-blue"/>
+<rect x="112" y="105" width="90" height="30" rx="4" class="d-fill-orange"/>
+<text x="157" y="125" text-anchor="middle" class="d-text-inv d-small">prefill job</text>
+<circle cx="232" cy="120" r="6" class="d-fill-blue"/>
+<circle cx="262" cy="120" r="6" class="d-fill-blue"/>
+<circle cx="292" cy="120" r="6" class="d-fill-blue"/>
+<circle cx="322" cy="120" r="6" class="d-fill-blue"/>
+<circle cx="352" cy="120" r="6" class="d-fill-blue"/>
+</g>
+<path d="M60,150 L60,160 L352,160 L352,150" class="d-outline" fill="none"/>
+<text x="205" y="176" text-anchor="middle" class="d-small">decode ticks stall while the prefill job runs<a class="cite" href="#ref-1">1</a></text>
+<text x="205" y="230" text-anchor="middle" class="d-small d-text-light">per-GPU goodput at 90% SLO attainment</text>
+<text x="205" y="258" text-anchor="middle" class="d-mono d-bold">1.6 req/s<a class="cite" href="#ref-1">1</a></text>
+<text x="205" y="276" text-anchor="middle" class="d-small d-text-light">OPT-13B on one A100</text>
+<!-- Right: disaggregated -->
+<rect x="420" y="45" width="350" height="90" rx="10" class="d-block"/>
+<text x="595" y="80" text-anchor="middle" class="d-text-inv d-bold">Prefill pool</text>
+<text x="595" y="102" text-anchor="middle" class="d-text-inv d-small">own GPU count, own parallelism</text>
+<text x="595" y="122" text-anchor="middle" class="d-text-inv d-mono">5.6 req/s per GPU<a class="cite" href="#ref-1">1</a></text>
+<path d="M595,135 L595,158" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="660" y="150" class="d-small d-text-light">KV cache&#160;&#8594;&#160;module&#160;4</text>
+<rect x="420" y="160" width="350" height="90" rx="10" class="d-block-2"/>
+<text x="595" y="195" text-anchor="middle" class="d-text-inv d-bold">Decode pool</text>
+<text x="595" y="217" text-anchor="middle" class="d-text-inv d-small">own GPU count, own parallelism</text>
+<text x="595" y="237" text-anchor="middle" class="d-text-inv d-mono">10 req/s per GPU<a class="cite" href="#ref-1">1</a></text>
+<text x="595" y="272" text-anchor="middle" class="d-small d-text-light">each phase hits its own ceiling, uncontended</text>
+</svg>
+<figcaption><b>Figure 1.</b> The same OPT-13B model on the same A100 GPU class: colocated, a prefill job stalls the decode batch and per-GPU goodput at 90% SLO attainment caps at 1.6 requests/s; split into independent prefill and decode pools, each phase reaches its own ceiling &#8212; 5.6 and 10 requests/s &#8212; because it is no longer waiting behind the other's compute profile. Numbers: DistServe, Figure 1<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="one-engine-two-workloads">1. One engine, two incompatible workloads</h2>
+<p>A continuous-batching engine serving both phases treats every request the same way: it adds new prompt tokens (prefill) and in-flight generation steps (decode) to the same running batch, on the same GPUs, scheduled by the same loop. That is efficient for GPU utilization and is exactly what you already know from single-node serving. It is also the source of the entire disaggregation argument, because prefill and decode are not the same kind of work.</p>
+
+<h3 id="compute-vs-memory-bound">1.1 Compute-bound prefill, memory-bound decode</h3>
+<p>Prefill processes every token of a new prompt in parallel in one step, so its FLOP count and its memory-access count both scale with prompt length, but the FLOP count scales faster because attention and the MLP layers are dense matmuls over the whole sequence at once. DistServe's own numbers on a 13B model: computing the prefill of a 512-token sequence <q>makes an A100 near compute-bound</q><a class="cite" href="#ref-1">1</a>. Decode does the opposite: each step processes exactly one new token, but that one token still has to read the full set of model weights and the full KV cache for every prior token from HBM. The result, in DistServe's framing, is that decode <q>incurs a similar level of I/O to the prefill phase</q> despite doing a fraction of the compute, which is why it is <q>constrained by the GPU's memory bandwidth</q><a class="cite" href="#ref-1">1</a>. This is the same roofline asymmetry you already know from single-GPU decode &#8212; low arithmetic intensity, bandwidth-bound &#8212; but here it collides with a second workload that sits at the opposite end of the roofline and wants the same SMs.</p>
+
+<h3 id="what-a-prefill-job-does">1.2 What a prefill job does to a running decode batch</h3>
+<p>Continuous batching does not schedule these two profiles separately; it inserts a new prefill job into whatever decode batch is currently running, because that is how it keeps GPU utilization high. DistServe measured the consequence directly: <q>adding a single prefill job to a batch of decoding requests significantly slows down both processes, leading to a marked increase in TTFT and TPOT</q><a class="cite" href="#ref-1">1</a>. The mechanism is simple scheduling: <q>the decoding tasks in the batch must wait for lengthier prefill jobs to complete, thus extending TPOT</q>, and the reverse holds too &#8212; adding decode jobs to a prefill batch increases the prefill's own completion time, especially once the GPU is already near capacity<a class="cite" href="#ref-1">1</a>. Neither priority order fixes it: prioritizing decode delays prefill and inflates TTFT; prioritizing prefill delays decode and inflates TPOT. You cannot schedule your way out of it on one engine, because the interference is a property of sharing the SMs and the HBM bus between two workloads whose resource demands do not overlap in time the way continuous batching assumes.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f2t"><title id="f2t">A decode token cadence running uninterrupted, versus the same cadence with one prefill job inserted mid-batch</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="60" y="40" class="d-small d-bold">Decode-only batch</text>
+<line x1="60" y1="80" x2="740" y2="80" class="d-axis"/>
+<path d="M740,80 L740,80" class="d-arrow" marker-end="url(#f2-arr)"/>
+<g class="d-fill-blue">
+<circle cx="90" cy="80" r="7"/><circle cx="170" cy="80" r="7"/><circle cx="250" cy="80" r="7"/>
+<circle cx="330" cy="80" r="7"/><circle cx="410" cy="80" r="7"/><circle cx="490" cy="80" r="7"/>
+<circle cx="570" cy="80" r="7"/><circle cx="650" cy="80" r="7"/><circle cx="730" cy="80" r="7"/>
+</g>
+<path d="M90,95 L170,95" class="d-outline" fill="none"/>
+<text x="130" y="112" text-anchor="middle" class="d-mono d-small">TPOT &#8776; D</text>
+<text x="60" y="150" class="d-small d-bold">Same batch, one prefill job inserted</text>
+<line x1="60" y1="190" x2="740" y2="190" class="d-axis"/>
+<g class="d-fill-blue">
+<circle cx="90" cy="190" r="7"/><circle cx="170" cy="190" r="7"/><circle cx="250" cy="190" r="7"/>
+</g>
+<rect x="270" y="175" width="180" height="30" rx="4" class="d-fill-orange"/>
+<text x="360" y="195" text-anchor="middle" class="d-text-inv d-small">prefill job runs (compute-bound)</text>
+<g class="d-fill-blue">
+<circle cx="490" cy="190" r="7"/><circle cx="570" cy="190" r="7"/><circle cx="650" cy="190" r="7"/><circle cx="730" cy="190" r="7"/>
+</g>
+<path d="M250,215 L490,215" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+<text x="370" y="235" text-anchor="middle" class="d-mono d-small">stall = prefill execution time; that step's TPOT &#8811; D<a class="cite" href="#ref-2">2</a></text>
+</svg>
+<figcaption><b>Figure 2.</b> Decode emits tokens at a roughly constant cadence (TPOT &#8776; per-step decode time \(D\)) when it runs alone. When continuous batching inserts one prefill job, the decode steps waiting behind it are delayed by the prefill job's full execution time, extending that step's TPOT far beyond \(D\) &#8212; the mechanism DistServe documents in its Figure 2<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="chunked-prefill-mitigates">1.3 Chunked prefill mitigates, does not eliminate</h3>
+<p>The obvious fix, and the one every serving engine you already know (vLLM, SGLang, TensorRT-LLM) ships, is chunked prefill with piggybacking: split a long prefill into smaller chunks, each sized to leave room in the batch for a handful of decode steps, so decode is never blocked for longer than one chunk's execution time instead of the whole prefill. DistServe is explicit that this is a real mitigation and an incomplete one: <q>this technique alleviates the slowdown of the decoding job caused by the long prefill job, but it does not eliminate it</q><a class="cite" href="#ref-1">1</a>. Two costs remain. First, the residual stall &#8212; each chunk still occupies the batch and still delays whatever decode steps are queued behind it, just for a shorter interval than the unchunked case. Second, and less obvious, chunking has its own tax: every chunk of a prefill needs the KV cache of every preceding chunk already loaded from HBM to compute its attention, so splitting one prefill into \(N\) equal chunks requires reloading \(N + (N-1) + \dots + 1 = O(N^2)\) chunks of KV cache from HBM, versus \(O(N)\) for an unchunked prefill<a class="cite" href="#ref-1">1</a>.</p>
+<details class="more">
+<summary>Worked arithmetic: the chunking tax at N = 4</summary>
+<p>An unchunked prefill of length \(L\) does one attention pass over \(L\) tokens: it loads its own KV cache once, so the total KV-cache traffic is proportional to \(N=1\) unit (the whole sequence, once).</p>
+<p>Split into \(N\) equal chunks, chunk \(i\) must attend over its own tokens plus the KV cache of every chunk before it. Chunk 1 loads 1 chunk-worth of KV, chunk 2 loads 2 chunk-worths (itself + chunk 1), chunk 3 loads 3, chunk 4 loads 4:</p>
+$$ \text{total chunk-loads} = 1 + 2 + 3 + 4 = \frac{N(N+1)}{2} = \frac{4 \times 5}{2} = 10 $$
+<p>against 4 chunk-loads if the same 4 chunks' worth of KV cache were read once each in an unchunked pass &#8212; a 2.5&#215; increase in HBM traffic for the prefill's KV reads at \(N=4\), growing quadratically as the chunk count rises with longer contexts<a class="cite" href="#ref-1">1</a>. This is why chunked prefill is a real-time knob (smaller chunks reduce decode stall, larger chunks reduce KV re-read cost) rather than a free lunch, and it is the concrete reason a second, dedicated decode pool remains attractive even after chunked prefill ships everywhere.</p>
+</details>
+
+<h2 id="goodput-not-throughput">2. Goodput is the target, not throughput</h2>
+<p>Raw throughput &#8212; tokens generated per second, summed across all requests &#8212; hides SLO violations: a system can push huge throughput numbers by letting tail latency blow out for a fraction of requests. The metric that matters for a serving fleet is goodput, and the field has converged on a small vocabulary for it. Time to first token (TTFT) is the elapsed time between submitting a prompt and receiving the first output token; inter-token latency (ITL), also called time per output token (TPOT), is the average time between successive output tokens for one request, computed per request as \((\text{E2E latency} - \text{TTFT}) / (\#\text{output tokens} - 1)\)<a class="cite" href="#ref-2">2</a>. Goodput is then defined against an SLO on both: the percentage of requests that meet every defined SLO, \(\text{Goodput} = (\#\text{requests meeting all SLOs} / \text{total requests}) \times 100\%\)<a class="cite" href="#ref-2">2</a>. DistServe operationalizes the same idea per GPU: per-GPU goodput is <q>the maximum request rate that can be served adhering to the SLO attainment goal (say, 90%) for each GPU provisioned</q><a class="cite" href="#ref-1">1</a> &#8212; higher per-GPU goodput is lower cost per query at a fixed quality bar, which is the number a capacity plan actually needs.</p>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>TPOT (per request) and ITL are the same quantity computed differently across a batch of unequal-length requests: average TPOT is the mean of each request's own TPOT, while average ITL sums every inter-token gap across all requests and divides by total output tokens &#8212; they diverge whenever output lengths are unequal<a class="cite" href="#ref-2">2</a>. Both terms show up interchangeably across the papers and docs in this module; treat them as the same concept unless a source is explicit about which definition it means.</p></aside>
+
+<h2 id="distserve-queueing-case">3. DistServe: disaggregation as a queueing-theory result</h2>
+<p>DistServe (OSDI 2024) is the paper that turned the interference observation into a placement algorithm and measured its payoff<a class="cite" href="#ref-1">1</a>. Its central move: once prefill and decode run on separate GPUs, each phase's batching and parallelism strategy can be optimized against only its own SLO &#8212; TTFT for prefill, TPOT for decode &#8212; instead of a shared, compromised configuration that has to satisfy both.</p>
+
+<h3 id="mdd1-derivation">3.1 Why the colocated ceiling is so much lower</h3>
+<p>DistServe models a disaggregated instance's request latency with the M/D/1 queue (Poisson arrivals, deterministic service time \(D\), one server), because once a phase runs alone on its own GPU, per-request execution time is close to deterministic:</p>
+$$ \text{Avg\_TTFT} = D + \frac{RD^2}{2(1-RD)} $$
+<p>where \(D\) is the fixed per-request execution time and \(R\) is the arrival rate, so \(RD\) is utilization<a class="cite" href="#ref-1">1</a>. The first term is just compute time; the second is queueing delay, and it is the second term that explains why goodput collapses on a shared engine. Evaluate the queueing term at two utilizations:</p>
+<div class="grid-2">
+<div><p class="small muted">At \(RD = 0.8\):</p>
+$$ \frac{RD^2}{2(1-RD)} = \frac{0.8^2}{2 \times 0.2} = \frac{0.64}{0.4} = 1.6D $$
+<p class="small muted">Avg TTFT &#8776; 2.6\(D\) &#8212; queueing already more than doubles the wait.</p></div>
+<div><p class="small muted">At \(RD = 0.95\):</p>
+$$ \frac{RD^2}{2(1-RD)} = \frac{0.95^2}{2 \times 0.05} = \frac{0.9025}{0.1} = 9.0D $$
+<p class="small muted">Avg TTFT &#8776; 10\(D\) &#8212; the queue dominates almost entirely.</p></div>
+</div>
+<p>This is the standard M/D/1 blow-up as utilization approaches 1, and it is exactly what makes colocation expensive: on one engine, \(D\) itself is not fixed &#8212; it fluctuates every time a prefill job of unpredictable length gets folded into the batch, so the system either runs at low utilization to keep the queueing term small (wasting GPUs) or accepts periodic \(D\) spikes that blow out the SLO for whichever phase is waiting. Splitting the phases fixes \(D\) per pool (decode's \(D\) is now just its own memory-bound step time; prefill's \(D\) is its own compute-bound pass), so each pool can run close to its own saturation point without the other phase's variance leaking in. That is the mechanism behind the headline result on a 13B model on one A100 at 90% SLO attainment: colocated per-GPU goodput is about 1.6 requests/s, while phase-separated goodput is 5.6 requests/s for prefill-only and 10 requests/s for decode-only<a class="cite" href="#ref-1">1</a> &#8212; a 3.5&#215; and 6.25&#215; gap respectively, all on identical hardware, from removing one source of queueing variance.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">Bar chart of per-GPU goodput at 90% SLO attainment: colocated, prefill-only, and decode-only, OPT-13B on one A100</title>
+<line x1="70" y1="230" x2="740" y2="230" class="d-axis"/>
+<line x1="70" y1="230" x2="70" y2="30" class="d-axis"/>
+<text x="30" y="235" class="d-small d-text-light">0</text>
+<line x1="65" y1="176" x2="740" y2="176" class="d-grid"/><text x="30" y="180" class="d-small d-text-light">2</text>
+<line x1="65" y1="122" x2="740" y2="122" class="d-grid"/><text x="30" y="126" class="d-small d-text-light">4</text>
+<line x1="65" y1="68" x2="740" y2="68" class="d-grid"/><text x="30" y="72" class="d-small d-text-light">6</text>
+<line x1="65" y1="30" x2="740" y2="30" class="d-grid"/><text x="22" y="20" class="d-small d-text-light">req/s</text>
+<rect x="150" y="187" width="130" height="43" class="d-fill-blue"/>
+<text x="215" y="180" text-anchor="middle" class="d-mono d-small">1.6</text>
+<text x="215" y="252" text-anchor="middle" class="d-small">Colocated</text>
+<rect x="350" y="79" width="130" height="151" class="d-fill-cyan"/>
+<text x="415" y="72" text-anchor="middle" class="d-mono d-small">5.6</text>
+<text x="415" y="252" text-anchor="middle" class="d-small">Prefill-only pool</text>
+<rect x="550" y="41" width="130" height="189" class="d-fill-orange"/>
+<text x="615" y="34" text-anchor="middle" class="d-mono d-small">10</text>
+<text x="615" y="252" text-anchor="middle" class="d-small">Decode-only pool</text>
+<text x="405" y="278" text-anchor="middle" class="d-small d-text-light">per-GPU goodput at 90% SLO attainment, OPT-13B, one A100<a class="cite" href="#ref-1">1</a></text>
+</svg>
+<figcaption><b>Figure 3.</b> Per-GPU goodput on identical A100 hardware serving a 13B model: colocated tops out at 1.6 requests/s under a 90% SLO-attainment target; separated into their own pools, prefill reaches 5.6 requests/s and decode reaches 10 requests/s &#8212; 3.5&#215; and 6.25&#215; the colocated ceiling. Data: DistServe, Figure 1<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h3 id="placement-algorithm">3.2 The placement algorithm: how much cross-node bandwidth you have decides the strategy</h3>
+<p>Splitting phases means moving the KV cache computed by the prefill instance to whatever decode instance serves the rest of the request &#8212; the transfer mechanics themselves belong to Module 4, but the placement question is squarely part of the "does it pay" argument, because it decides whether disaggregation needs premium interconnect or can run on whatever you already have. DistServe defines two regimes. On a <b>high node-affinity cluster</b> &#8212; equipped with InfiniBand, where cross-node KV transmission overhead is negligible &#8212; DistServe can place a prefill instance and a decode instance on any two nodes in the cluster without constraint, then optimize each phase's parallelism plan independently before replicating to hit the target traffic rate<a class="cite" href="#ref-1">1</a>. On a <b>low node-affinity cluster</b> &#8212; where cross-node bandwidth is limited &#8212; DistServe instead colocates the prefill and decode instance segments that belong to the same pipeline stage on one physical node, forcing the KV-cache handoff onto intra-node NVLink instead of the slower fabric, at the cost of an added placement constraint that has to be co-optimized with the parallelism search<a class="cite" href="#ref-1">1</a>. For very large models this constraint can bind hard: at 175B parameters (350GB of weights), one 8-GPU A100 node's aggregate HBM (80GB &#215; 8 = 640GB) cannot even fit a single prefill-plus-decode instance pair (350GB &#215; 2 = 700GB), so the low-affinity placement algorithm has to search jointly over model parallelism and instance placement rather than treating them separately<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="headline-eval">3.3 What the numbers say end to end</h3>
+<p>DistServe evaluated against vLLM and DeepSpeed-MII (the latter shipping its own chunked-prefill mitigation) across three application shapes with distinct SLOs, on OPT models from 13B to 175B, on a 4-node, 32-GPU A100 cluster with 25 Gbps cross-node bandwidth<a class="cite" href="#ref-1">1</a>.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> DistServe's workload SLOs and end-to-end results at 90% SLO attainment, versus vLLM and DeepSpeed-MII, on OPT-13B/66B/175B<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Application</th><th>Model(s)</th><th>Dataset</th><th>TTFT SLO</th><th>TPOT SLO</th><th>Rate vs. vLLM</th><th>SLO-scale vs. vLLM</th></tr></thead>
+<tbody>
+<tr><td class="row">Chatbot</td><td>OPT-13B / 66B / 175B</td><td>ShareGPT</td><td class="num">0.25&#8211;4.0 s</td><td class="num">0.1&#8211;0.2 s</td><td class="num" data-best>2.0&#8211;4.6&#215;</td><td class="num" data-best>1.8&#8211;3.2&#215;</td></tr>
+<tr><td class="row">Code completion</td><td>OPT-66B</td><td>HumanEval</td><td class="num">0.125 s</td><td class="num">0.2 s</td><td class="num" data-best>5.7&#215;</td><td class="num" data-best>1.4&#215;</td></tr>
+<tr><td class="row">Summarization</td><td>OPT-66B</td><td>LongBench</td><td class="num">15 s</td><td class="num">0.15 s</td><td class="num" data-best>4.3&#215;</td><td class="num" data-best>12.6&#215;</td></tr>
+</tbody>
+</table>
+<p class="small muted">Against DeepSpeed-MII's chunked-prefill baseline the gaps narrow but do not close: 1.6&#8211;7.4&#215; higher rate and 1.7&#8211;1.8&#215; more stringent SLO on chatbot, 1.6&#215; rate and 1.4&#215; SLO on code completion, 1.8&#215; rate and 2.6&#215; SLO on summarization<a class="cite" href="#ref-1">1</a> &#8212; consistent with chunked prefill being a real but partial fix (§1.3).</p>
+
+<h3 id="communication-overhead">3.4 Why the cross-node tax doesn't erase the win</h3>
+<p>Disaggregation's obvious cost is that KV cache now has to move between GPUs instead of staying resident. DistServe's own latency breakdown on OPT-175B, the largest model in its evaluation (and therefore the one with the most KV cache to move), found KV-cache transmission accounts for less than 0.1% of total request latency, and over 95% of requests see a transfer delay under 30 ms, despite a cross-node fabric limited to 25 Gbps<a class="cite" href="#ref-1">1</a>. The reason is the placement algorithm from §3.2: a single 512-token request's KV cache on OPT-66B is about 1.13 GB; at an average arrival rate of 10 requests/s that is roughly 11.3 GB/s of transfer demand, or about 90 Gbps of required bandwidth &#8212; small next to the 600 GB/s of intra-node NVLink that the low-affinity placement algorithm routes the transfer over<a class="cite" href="#ref-1">1</a>. This is the load-bearing fact behind "disaggregation pays": the transfer tax is a placement-and-engineering problem with a small, bounded cost, not a fundamental one that scales against the goodput gain. (How that transfer is actually implemented &#8212; connectors, pipes, synchronous vs. overlapped handoff &#8212; is Module 4's subject, not this one's.)</p>
+
+<h2 id="splitwise-production-traces">4. Splitwise: the same conclusion from production traces and hardware economics</h2>
+<p>Splitwise (ISCA 2024, Microsoft/University of Washington) arrived at phase-splitting independently and around the same time as DistServe, motivated less by a queueing derivation and more by two Azure production traces &#8212; a coding service and a conversation service, both captured over a 20-minute window on November 11, 2023, and released publicly<a class="cite" href="#ref-3">3</a>.</p>
+
+<h3 id="isl-osl-medians">4.1 Prefill and decode are unevenly demanding, and unevenly so per workload</h3>
+<p>The two traces have very different prefill:decode ratios. The coding service has a median prompt size of 1,500 tokens against a median of only 13 generated tokens &#8212; almost entirely prefill-bound. The conversation service has a median prompt of 1,020 tokens but a near-bimodal output-length distribution with a median of 129 generated tokens &#8212; proportionally far more decode work<a class="cite" href="#ref-3">3</a>. This is the empirical version of the point Module 3's title makes: there is no single right prefill:decode pool ratio, because the ratio is set by the ISL:OSL shape of the traffic, and that shape is workload-specific, not a serving-stack constant.</p>
+
+<h3 id="a100-h100-table">4.2 The hardware delta the split has to be provisioned against</h3>
+<p>Splitwise's cluster-design argument is that prefill and decode benefit from different hardware, because they hit different bottlenecks (compute for prefill, memory bandwidth for decode) and A100-to-H100 improved those two axes by very different factors:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> A100 vs. H100 per-GPU deltas Splitwise uses to argue for phase-specific hardware provisioning<a class="cite" href="#ref-3">3</a>.</caption>
+<thead><tr><th>Metric</th><th class="num">A100</th><th class="num">H100</th><th class="num">Ratio</th></tr></thead>
+<tbody>
+<tr><td class="row">Peak TFLOPs</td><td class="num">19.5</td><td class="num" data-best>66.9</td><td class="num" data-best>3.43&#215;</td></tr>
+<tr><td class="row">HBM capacity</td><td class="num">80 GB</td><td class="num">80 GB</td><td class="num">1.00&#215;</td></tr>
+<tr><td class="row">HBM bandwidth</td><td class="num">2039 GB/s</td><td class="num" data-best>3352 GB/s</td><td class="num">1.64&#215;</td></tr>
+<tr><td class="row">Power (TDP)</td><td class="num">400 W</td><td class="num">700 W</td><td class="num">1.75&#215;</td></tr>
+<tr><td class="row">NVLink (per-lane)</td><td class="num">50 Gbps</td><td class="num">100 Gbps</td><td class="num">2.00&#215;</td></tr>
+<tr><td class="row">InfiniBand</td><td class="num">200 GB/s</td><td class="num">400 GB/s</td><td class="num">2.00&#215;</td></tr>
+<tr><td class="row">Cost per machine</td><td class="num">$17.6/hr</td><td class="num">$38/hr</td><td class="num">2.16&#215;</td></tr>
+</tbody>
+</table>
+<p>Note the mismatch that motivates phase splitting: H100 buys 3.43&#215; the compute (helps prefill, which is compute-bound) but only 1.64&#215; the HBM bandwidth (the axis decode is bound on), at 2.16&#215; the hourly cost. A fleet that colocates both phases on H100 everywhere pays the full 2.16&#215; premium on every GPU to get a compute upgrade that only the prefill half of the traffic actually uses efficiently; a fleet that disaggregates can put the expensive compute-heavy GPU generation where compute is the bottleneck and cheaper (or older) GPUs where memory bandwidth, not FLOPs, is the constraint. Splitwise's implementation moves state between the prompt-computation and token-generation machines over the datacenter's existing back-end InfiniBand interconnect, reporting this can be done "without any perceived performance loss"<a class="cite" href="#ref-3">3</a>.</p>
+
+<h3 id="splitwise-headline-result">4.3 The result</h3>
+<p>Built as Splitwise-HBM (prioritizing memory-bandwidth-matched hardware for decode) and Splitwise-Power (prioritizing power-matched provisioning) cluster designs, Splitwise-based clusters achieve up to 1.4&#215; higher throughput at 20% lower cost than a current non-disaggregated design, or alternatively up to 2.35&#215; more throughput under the same cost and power budgets<a class="cite" href="#ref-3">3</a>. Unlike DistServe's per-GPU-goodput framing, this is a fleet-level cost/throughput result, and it makes the same case through a different lens: not "here is the queueing mechanism," but "here is what a real production traffic mix, split onto the right hardware for each phase, actually buys you."</p>
+
+<h2 id="ratio-not-constant">5. The prefill:decode ratio is a function of workload shape, not a constant</h2>
+<p>Section 4.1 already showed this qualitatively from production traces; TensorRT-LLM's own disaggregation benchmarks on GB200 make it quantitative and show how wide the range is even for the same disaggregation mechanism on the same hardware generation. Testing across configurations from 4 to 32 GPUs per instance, NVIDIA measured disaggregation speedups over an aggregated (colocated) baseline that vary by more than 4&#215; depending purely on model and input:output length ratio<a class="cite" href="#ref-4">4</a>:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> TensorRT-LLM disaggregated-serving speedup over aggregated serving on GB200, by model and ISL:OSL configuration<a class="cite" href="#ref-4">4</a>.</caption>
+<thead><tr><th>Model</th><th>ISL:OSL</th><th>Configuration</th><th class="num">Speedup range</th></tr></thead>
+<tbody>
+<tr><td class="row">DeepSeek R1</td><td>4400:1200</td><td>MTP off</td><td class="num">1.4&#8211;1.8&#215;</td></tr>
+<tr><td class="row">DeepSeek R1</td><td>4400:1200</td><td>MTP on</td><td class="num" data-best>1.6&#8211;2.5&#215;</td></tr>
+<tr><td class="row">DeepSeek R1</td><td>8192:256</td><td>4-GPU generation unit</td><td class="num">up to 1.73&#215;</td></tr>
+<tr><td class="row">DeepSeek R1</td><td>8192:256</td><td>8-GPU generation unit</td><td class="num">up to 2.0&#215;</td></tr>
+<tr><td class="row">Qwen3</td><td>8192:1024</td><td>&#8212;</td><td class="num" data-best>1.7&#8211;6.11&#215;</td></tr>
+</tbody>
+</table>
+<p>With multi-token prediction (MTP) enabled, DeepSeek R1's disaggregation speedup at the 4400:1200 configuration averages 20&#8211;30% higher than with MTP off<a class="cite" href="#ref-4">4</a> &#8212; a reminder that the speculative-decoding knob you already know interacts with the disaggregation decision rather than sitting orthogonal to it, because MTP changes decode's compute intensity and therefore how much headroom a dedicated decode pool has left to exploit. Read a single "disaggregation gives N&#215;" number from any vendor benchmark as a workload-shape-dependent result, never as a hardware constant: the same mechanism on the same GB200 hardware spans 1.4&#215; to 6.11&#215; purely as a function of which model and which ISL:OSL ratio the request trace has<a class="cite" href="#ref-4">4</a>.</p>
+
+<h2 id="mooncake-reconsideration">6. Mooncake's own reconsideration: does chunked prefill make this moot?</h2>
+<p>Mooncake (FAST 2025 Best Paper, Moonshot AI's Kimi serving platform) is the most useful source on this question precisely because it is not making a case for disaggregation from a clean-room benchmark &#8212; it is a production system's authors explicitly asking themselves whether they still need the complexity they already built. Section 5 of the paper poses the question directly: given that chunked prefill lets a single colocated engine interleave prefill chunks with decode steps and thereby reduce interference, <q>it is worth discussing whether this separation is still necessary with the introduction of chunked prefill</q><a class="cite" href="#ref-5">5</a>.</p>
+<p>Their answer is yes, disaggregation stays, for two reasons that are not about interference at all:</p>
+<ul>
+<li><b>Cross-node parallelism for long context.</b> A single colocated instance's prefill throughput is bounded by however much of one node's compute and memory a long-context request can use; disaggregating lets the prefill cluster scale prefill-specific parallelism (including cross-node) independently of whatever the decode cluster is doing, which matters specifically for long-context workloads where a single prefill pass is itself large enough to benefit from more GPUs than one node has.</li>
+<li><b>VRAM savings.</b> Colocating both phases means every GPU has to reserve enough HBM for both the transient prefill working set and the long-lived decode KV cache; separating the pools lets the decode cluster dedicate its entire HBM budget to KV cache capacity (more concurrent sequences, longer contexts held) without competing against prefill's own memory footprint.</li>
+</ul>
+<p>This reasoning matters more than a vendor benchmark because Mooncake is not selling disaggregation in the abstract &#8212; it is the team that runs Kimi's production traffic deciding, after chunked prefill was already available to them, that a colocated engine with chunked prefill does not substitute for a dedicated decode pool. It also narrows the justification: the case is not "interference is still bad without disaggregation" (chunked prefill has already addressed a good fraction of that, per §1.3), it is "two specific capacity constraints &#8212; cross-node prefill parallelism and KV-cache VRAM budget &#8212; are easier to solve with separate pools than with a bigger colocated one." Whether either of those two reasons applies to a given deployment (do you actually serve long-context requests at meaningful volume? is decode's KV-cache footprint actually your binding constraint?) is a more specific question than "does interference exist," and it is the right question to ask before paying disaggregation's operational cost.</p>
+
+<h2 id="tco-crossover">7. The TCO crossover: where disaggregation stops winning</h2>
+<p>Every result so far optimizes goodput or throughput at a fixed SLO or a fixed hardware generation. SemiAnalysis's InferenceMAX benchmark asks a different question: given a real cost of ownership for the hardware, what configuration gives you the lowest dollar cost per million tokens served, across the full range of interactivity (tokens/second/user) a deployment might target<a class="cite" href="#ref-6">6</a>? Their framing is explicit that this, not raw throughput, is the metric that should decide a deployment: <q>TCO per million tokens is the true north star that customers care about &#8212; performance is merely a stepping stone to calculating this metric</q><a class="cite" href="#ref-6">6</a>.</p>
+<p>Comparing a GB200 NVL72 rack running TensorRT-LLM with Dynamo's disaggregated prefill against single-node 8-GPU B200 servers running TensorRT-LLM aggregated (colocated), the result is a genuine crossover, not a one-sided win: <q>below 90 tok/s/user interactivity, the GB200 NVL72 on the TRT-LLM engine using Dynamo disagg prefill decisively outperforms all single node 8-GPU servers on TCO per million tokens</q>, but <q>for interactivity levels above 90 tok/s/user, the B200 on TRT-LLM beats the GB200 NVL72</q><a class="cite" href="#ref-6">6</a>. Interactivity here is inversely related to how much per-token latency you are willing to tolerate: low tokens/s/user targets correspond to batch-heavy, throughput-oriented workloads (large concurrent batches, more tolerance for per-token latency), where the extra GPUs a disaggregated deployment devotes to prefill pay for themselves; high tokens/s/user targets correspond to latency-sensitive, small-batch workloads, where NVL72's scale-up domain advantage matters less than a single aggregated server's lower fixed cost and shorter communication path.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">Schematic TCO-per-million-tokens crossover between GB200 NVL72 disaggregated prefill and aggregated 8-GPU B200 servers, as a function of interactivity target</title>
+<line x1="70" y1="240" x2="740" y2="240" class="d-axis"/>
+<line x1="70" y1="240" x2="70" y2="30" class="d-axis"/>
+<text x="405" y="278" text-anchor="middle" class="d-small d-text-light">interactivity target (tokens/s/user, low &#8594; high)</text>
+<text x="30" y="140" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 30 140)">TCO / M tokens (lower is better)</text>
+<path d="M100,60 C 280,80 380,160 460,180 C 560,205 650,215 720,220" class="d-line d-stroke-blue" fill="none"/>
+<path d="M100,200 C 250,190 360,178 460,180 C 560,182 650,150 720,90" class="d-line d-stroke-cyan" fill="none"/>
+<line x1="460" y1="30" x2="460" y2="240" class="d-outline d-dashed"/>
+<circle cx="460" cy="180" r="6" class="d-fill-orange"/>
+<text x="460" y="20" text-anchor="middle" class="d-mono d-small">90 tok/s/user<a class="cite" href="#ref-6">6</a></text>
+<rect x="580" y="55" width="150" height="46" class="d-label-bg"/>
+<line x1="590" y1="65" x2="614" y2="65" class="d-line d-stroke-blue"/><text x="620" y="69" class="d-small">GB200 NVL72 disagg</text>
+<line x1="590" y1="87" x2="614" y2="87" class="d-line d-stroke-cyan"/><text x="620" y="91" class="d-small">8&#215;GPU B200 aggregated</text>
+<text x="200" y="255" text-anchor="middle" class="d-small d-text-light">disagg wins</text>
+<text x="640" y="255" text-anchor="middle" class="d-small d-text-light">aggregated wins</text>
+</svg>
+</svg>
+<figcaption><b>Figure 4.</b> Schematic reproduction of InferenceMAX's qualitative finding: below about 90 tokens/s/user of interactivity, GB200 NVL72 with disaggregated prefill has lower TCO per million tokens than an aggregated 8-GPU B200 server; above that interactivity target, the aggregated B200 server wins. Curve shapes are illustrative &#8212; SemiAnalysis does not publish exact dollar values per interactivity level &#8212; the crossover point (90 tok/s/user) is the cited number<a class="cite" href="#ref-6">6</a>.</figcaption>
+</figure>
+
+<p>Two qualifiers matter for reading this result correctly. First, it is model- and workload-specific: the benchmark cited here is a summarization-shaped workload (long input, shorter output) on a specific model, and InferenceMAX's own methodology notes the advantage on B200/H200 hardware requires disaggregated prefill and wide expert parallelism to actually be implemented over the available interconnect (Spectrum-X as well as InfiniBand) to unlock the higher token-throughput-per-megawatt these parts are capable of<a class="cite" href="#ref-6">6</a> &#8212; the crossover is a property of a specific, tuned software stack on specific hardware, not a universal law. Second, the crossover point itself should be read as a snapshot of the current state of Dynamo's and TensorRT-LLM's disaggregation optimization, not a hardware limit: the software work to get disaggregated prefill running efficiently across a wide interactivity range is ongoing, and where exactly the curves cross will move as that work lands.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>All three positions below agree on the interference mechanism in §1 &#8212; nobody disputes that colocating prefill and decode causes measurable stalls. They disagree on how strong a conclusion that licenses: whether disaggregation is close to a default good decision, whether it is conditional on a specific operating point, or whether the second pool is frequently not worth the added complexity at all.</p>
+<div class="positions">
+<article class="position">
+<h4>Disaggregation is a near-unconditional win once you optimize for goodput</h4>
+<p class="who">DistServe<a class="cite" href="#ref-1">1</a>, Splitwise<a class="cite" href="#ref-3">3</a></p>
+<p>Both OSDI/ISCA 2024 papers frame the result as: given an SLO-attainment target, separating the phases removes a source of queueing variance (§3.1) and lets each phase use hardware matched to its own bottleneck (§4.2), and the measured gains &#8212; 2.0&#8211;12.6&#215; depending on metric and workload &#8212; are large enough that the cross-node communication tax (§3.4, well under 1% of latency) is not a serious counterargument. Neither paper frames the decision as conditional on an interactivity target; both present it as strictly better than colocation once you are optimizing SLO-constrained throughput per dollar of GPU.</p>
+<ul class="pros"><li>Grounded in a directly measured queueing mechanism, not an aggregate statistic</li><li>Confirmed independently by two groups on different hardware and workload traces</li><li>The gains are largest exactly where SLOs are tight, which is the regime production serving actually cares about</li></ul>
+<ul class="cons"><li>Measured on A100-generation hardware where colocated per-GPU throughput headroom is lower than on B200/GB200</li><li>Does not report a TCO-per-token figure, only SLO-constrained request rate, so it cannot be compared directly against a dollar-cost target</li></ul>
+</article>
+<article class="position">
+<h4>The win is conditional on the interactivity target; above ~90 tok/s/user it inverts</h4>
+<p class="who">SemiAnalysis, InferenceMAX<a class="cite" href="#ref-6">6</a></p>
+<p>Measuring TCO per million tokens instead of SLO-constrained request rate, and on GB200 NVL72 vs. B200-generation hardware, disaggregated prefill only wins below roughly 90 tokens/s/user of interactivity; above that, a single aggregated 8-GPU B200 server has better economics. The crossover exists because a dedicated prefill pool's advantage is largest for throughput-oriented, latency-tolerant workloads, and shrinks as the target interactivity rises toward what a well-provisioned aggregated server can already deliver on newer hardware.</p>
+<ul class="pros"><li>Directly measures the dollar-denominated metric an infrastructure decision actually needs</li><li>Uses current-generation hardware (GB200/B200) rather than A100-era hardware</li><li>Makes the conditionality explicit instead of treating disaggregation as unconditionally correct</li></ul>
+<ul class="cons"><li>Third-party analysis, not a peer-reviewed measurement, and does not publish exact TCO figures at each interactivity level (labelled analysis, not primary benchmark, per the source hierarchy)</li><li>The disaggregated-prefill software stack it benchmarks is, by the authors' own account, still being optimized &#8212; the crossover point is a snapshot, not a fixed property of the hardware</li></ul>
+</article>
+<article class="position">
+<h4>A second pool often isn't worth the operational cost; chunked prefill on one pool captures most of it</h4>
+<p class="who">Mooncake's own §5 discussion<a class="cite" href="#ref-5">5</a>, read alongside the O(N&sup2;) chunking cost DistServe itself derives<a class="cite" href="#ref-1">1</a></p>
+<p>Even a team that ships and runs a KV-centric disaggregated architecture in production explicitly asks whether chunked prefill has made the split unnecessary, and answers narrowly: keep it, but only because of two specific capacity constraints (cross-node prefill parallelism for long context, decode-side VRAM headroom), not because interference alone still justifies it. That is a materially weaker claim than "disaggregation wins" &#8212; it implies that for workloads without long-context prefill and without a binding KV-cache-capacity constraint, chunked prefill on one pool may be enough, and the operational cost of a second pool (a second autoscaler, cross-node KV transfer, xPyD reconfiguration &#8212; Module 4) is not automatically justified.</p>
+<ul class="pros"><li>Comes from a production system's own authors reconsidering a design they already built and operate, not a synthetic benchmark</li><li>Narrows the justification to concrete, checkable conditions (context length distribution, KV-cache capacity pressure) rather than a blanket claim</li></ul>
+<ul class="cons"><li>Mooncake's own conclusion is still to keep disaggregation &#8212; this is a narrowing of the argument, not a rebuttal of it</li><li>Does not provide a quantitative threshold (how long is "long context," how much VRAM pressure is "binding") the way the TCO crossover does</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The three positions are measuring different things and mostly do not actually contradict each other once you separate the axes. DistServe and Splitwise hold SLO attainment fixed and ask "what is the maximum request rate per GPU" &#8212; on that axis, on A100-class hardware, disaggregation's win is large and consistent across three independent workload traces (§3.3, §4). InferenceMAX holds a hardware budget fixed and asks "what is the dollar cost per token across a swept interactivity target" on GB200/B200-class hardware &#8212; on that axis, the answer inverts once the target shifts toward high-interactivity, low-batch serving, because that is exactly the regime where an aggregated server's simplicity and NVL72's per-GPU headroom close the gap that a dedicated prefill pool used to open. Neither finding is wrong; they describe the same mechanism (§1) evaluated at different operating points on different hardware generations, three years apart, with the newer benchmark's disaggregation implementation explicitly still under active optimization<a class="cite" href="#ref-6">6</a>. Mooncake's position is the practical synthesis: treat "does disaggregation pay" as a question about your specific traffic (context-length distribution, decode KV-cache pressure, target interactivity) rather than a yes/no verdict borrowed from someone else's benchmark. What would settle the disagreement is not more papers at either extreme but a TCO-per-token study that sweeps interactivity target the way InferenceMAX does <em>and</em> reports SLO attainment the way DistServe does, on the same hardware generation &#8212; nobody has published that yet.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The InferenceMAX crossover point (§7) is the number in this module most likely to move within the next year: it is a function of how far NVIDIA's Dynamo and TensorRT-LLM teams have gotten in optimizing the disaggregated-prefill code path for high-interactivity, low-batch serving on GB200/B200-class hardware, not a property of the silicon<a class="cite" href="#ref-6">6</a>. As wide expert parallelism and disaggregated prefill get tuned further across a broader interactivity range<a class="cite" href="#ref-6">6</a>, expect the 90 tok/s/user figure to shift, most plausibly upward as the disaggregated path closes its efficiency gap at low-batch operating points. Track InferenceMAX's published results directly rather than treating this module's number as durable past 2027.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">paper</span>Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X., Zhang, H. <em>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</em>. USENIX OSDI 2024. arXiv:2401.09670v3. <a href="https://arxiv.org/pdf/2401.09670">https://arxiv.org/pdf/2401.09670</a>. Accessed 2026-09-17. <span class="ref-use">Used for: compute-bound/memory-bound framing (&#167;2.1), interference mechanism and chunked-prefill limitation (&#167;2.3, Fig. 2), per-GPU goodput definition and headline 1.6/5.6/10 rps result (&#167;1, Fig. 1), M/D/1 queueing model (Eq. 1), high-/low-node-affinity placement algorithms (&#167;4.1-4.2), end-to-end evaluation results (&#167;6.2, Table 1, Fig. 8-9), communication-overhead breakdown (&#167;3.3, &#167;6.3).</span></li>
+<li id="ref-2"><span class="ref-type">official</span>Anyscale. <em>Understand LLM latency and throughput metrics</em>. docs.anyscale.com, 2026. <a href="https://docs.anyscale.com/llm/serving/benchmarking/metrics">https://docs.anyscale.com/llm/serving/benchmarking/metrics</a>. Accessed 2026-09-17. <span class="ref-use">Used for: TTFT, TPOT/ITL, and goodput formula definitions (&#167;2).</span></li>
+<li id="ref-3"><span class="ref-type">paper</span>Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, I., Maleki, S., Bianchini, R. <em>Splitwise: Efficient Generative LLM Inference Using Phase Splitting</em>. ISCA 2024. arXiv:2311.18677v2. <a href="https://arxiv.org/pdf/2311.18677">https://arxiv.org/pdf/2311.18677</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Azure production-trace ISL/OSL medians (&#167;III.A), A100 vs. H100 hardware-delta table (Table I), cluster-level throughput/cost result (Abstract).</span></li>
+<li id="ref-4"><span class="ref-type">official</span>NVIDIA / TensorRT-LLM team. <em>Disaggregated Serving in TensorRT LLM</em>. NVIDIA TensorRT-LLM Tech Blog, 2026. <a href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: GB200 disaggregation speedup ranges by model, ISL:OSL, and MTP configuration.</span></li>
+<li id="ref-5"><span class="ref-type">paper</span>Qin, R., Li, Z., He, W., Zhang, M., Wu, Y., Zheng, W., Xu, X. <em>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</em>. USENIX FAST 2025 (Best Paper). arXiv:2407.00079v4. <a href="https://arxiv.org/pdf/2407.00079">https://arxiv.org/pdf/2407.00079</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the &#167;5 reconsideration of whether disaggregation is still necessary given chunked prefill, and the two stated reasons for keeping it.</span></li>
+<li id="ref-6"><span class="ref-type">analysis</span>SemiAnalysis. <em>InferenceMAX: Open Source Inference Benchmarking</em>. InferenceMAX v1, 2026. <a href="https://newsletter.semianalysis.com/p/inferencemax-open-source-inference">https://newsletter.semianalysis.com/p/inferencemax-open-source-inference</a>. Accessed 2026-09-17. <span class="ref-use">Used for: TCO-per-million-tokens framing, the ~90 tok/s/user crossover between GB200 NVL72 disaggregated prefill and aggregated 8-GPU B200 servers, and the note on ongoing optimization of the disaggregated-prefill implementation.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

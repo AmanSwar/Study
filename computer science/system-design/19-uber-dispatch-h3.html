@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uber: Dispatch, Geo-Indexing with H3, and Ringpop · System Design</title>
+<meta name="description" content="H3's hexagonal hierarchical spatial index, built because squares and postal codes both give geospatial dispatch math the wrong properties, and Ringpop's gossip-based consistent hashing underneath Uber's Geospatial dispatch service.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 19</p>
+  <h1>Uber: Dispatch, Geo-Indexing with H3, and Ringpop</h1>
+  <p class="lede">Two Uber-built systems solve two different problems in the same dispatch stack: H3 turns a continuous, arbitrarily-shaped map into a hexagonal index cheap enough to bucket, join, and aggregate millions of marketplace events a day; Ringpop turns a set of stateless-looking application processes into a self-organizing, consistently-hashed cluster that can hold the ephemeral location of every online driver without a database underneath it. After this module you can explain why Uber chose hexagons over squares or postal codes for spatial analysis, derive H3's cell-count and area arithmetic from its aperture-7 subdivision rule, and read Ringpop's gossip-plus-consistent-hashing design as a specific, opinionated answer to the sharding problem Module 3 already introduced in the abstract.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>7</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 3</b>, <b>Module 6</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">Uber marketplace pipeline: GPS pings indexed by H3, sharded across a Ringpop cluster</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="20" y="130" width="150" height="70" rx="8" class="d-block-muted"/>
+    <text x="95" y="160" text-anchor="middle" class="d-bold">Driver &amp; rider</text>
+    <text x="95" y="178" text-anchor="middle" class="d-bold">GPS events</text>
+    <text x="95" y="55" text-anchor="middle" class="d-small d-text-light">lat/lng, continuous, one per second per device</text>
+
+    <path d="M170,165 L228,165" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="230" y="120" width="170" height="90" rx="8" class="d-block d-fill-blue-soft d-stroke-blue"/>
+    <text x="315" y="148" text-anchor="middle" class="d-bold">H3 index</text>
+    <text x="315" y="168" text-anchor="middle" class="d-small">64-bit hex cell id</text>
+    <text x="315" y="186" text-anchor="middle" class="d-small">chosen resolution 0&#8211;15</text>
+    <text x="315" y="95" text-anchor="middle" class="d-small d-text-light">§2</text>
+
+    <path d="M400,165 L458,165" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="429" y="153" text-anchor="middle" class="d-mono d-small">hex cell id (key)</text>
+
+    <rect x="460" y="70" width="220" height="200" rx="10" class="d-panel"/>
+    <text x="570" y="60" text-anchor="middle" class="d-small d-text-light">§3 — Ringpop-sharded Geospatial workers</text>
+    <circle cx="510" cy="120" r="26" class="d-fill-cyan"/><text x="510" y="124" text-anchor="middle" class="d-text-inv d-small d-bold">W1</text>
+    <circle cx="630" cy="120" r="26" class="d-fill-cyan"/><text x="630" y="124" text-anchor="middle" class="d-text-inv d-small d-bold">W2</text>
+    <circle cx="510" cy="220" r="26" class="d-fill-cyan"/><text x="510" y="224" text-anchor="middle" class="d-text-inv d-small d-bold">W3</text>
+    <circle cx="630" cy="220" r="26" class="d-fill-cyan"/><text x="630" y="224" text-anchor="middle" class="d-text-inv d-small d-bold">W4</text>
+    <path d="M536,120 L604,120" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M630,146 L630,194" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M604,220 L536,220" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M510,194 L510,146" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="570" y="265" text-anchor="middle" class="d-small d-text-light">SWIM gossip + consistent-hash ring, no DB</text>
+
+    <path d="M680,170 L740,170" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="742" y="130" width="50" height="80" rx="8" class="d-block-accent"/>
+    <text x="767" y="160" text-anchor="middle" class="d-text-inv d-small d-bold">Match /</text>
+    <text x="767" y="176" text-anchor="middle" class="d-text-inv d-small d-bold">price /</text>
+    <text x="767" y="192" text-anchor="middle" class="d-text-inv d-small d-bold">ETA</text>
+
+    <text x="400" y="300" text-anchor="middle" class="d-small d-text-light">H3 answers "which bucket does this point fall in"; Ringpop answers "which worker owns this bucket's live state right now"</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> This module's own composition of two systems Uber documents separately: H3 converts a raw GPS event into a hexagonal cell id usable as a hash/join key<a class="cite" href="#ref-1">1</a>; Ringpop shards ownership of a key space across a gossiping cluster of application workers, first deployed for Uber's Geospatial service, which tracks every online driver's live location<a class="cite" href="#ref-5">5</a>. Uber's own posts do not state that Geospatial's shard key is literally an H3 cell id (§3.1) — the pipeline shown is a didactic frame, not a disclosed architecture. Matching, pricing, and ETA logic downstream is not documented at the depth this module requires and is out of scope (see "What is changing").</figcaption>
+</figure>
+
+<h2 id="marketplace-indexing-problem">1. Why Uber needed a purpose-built grid, not a database of points</h2>
+<p>Uber's own framing of the problem is deliberately mundane: "grid systems are critical to analyzing large spatial data sets, partitioning areas of the Earth into identifiable grid cells"<a class="cite" href="#ref-1">1</a>. Every minute, "riders request rides, driver-partners start trips, and hungry users request food," and each of these events happens at one exact latitude/longitude<a class="cite" href="#ref-1">1</a>. Two operations need to run continuously over this event stream: aggregation ("is there more demand than supply in this part of the city, so we should raise the price") and proximity ("are there two ride requests within close range of this specific driver, so uberPOOL can combine them")<a class="cite" href="#ref-1">1</a>. Both operations are trivial at the granularity of "the whole city" and intractable at the granularity of "the exact point," because point-level analysis means comparing every event against every other event with no useful notion of "nearby." What Uber needed was a fixed, stable partition of the map into cells small enough to be locally uniform and large enough to hold a meaningful sample of events — the same bucketing move as a histogram, applied to two-dimensional space instead of one-dimensional value.</p>
+
+<p>The obvious candidate — a boundary someone already drew, such as a postal code or an Uber-operations-defined city zone — fails for a reason that has nothing to do with hexagons yet: those boundaries are unstable and not designed for this purpose. Postal-code areas "have unusual shapes and sizes which are not helpful for analysis, and are subject to change for reasons entirely unrelated to what we would use them for"<a class="cite" href="#ref-1">1</a>, and operations-drawn zones "require frequent updating as cities change and often define the edges of areas arbitrarily"<a class="cite" href="#ref-1">1</a>. A grid system, by contrast, has "comparable shapes and sizes across the cities that Uber operates in and [is] not subject to arbitrary changes"<a class="cite" href="#ref-1">1</a> — the partition is a mathematical object, not an administrative one, so a query written against it means the same thing in every city, forever.</p>
+
+<p>That still leaves the question of which grid. The default choice — a Mercator projection with a square grid, the same combination every web map uses — has two independent defects for this workload. First, "the Mercator projection has significant size distortion, so some cells will have vastly different areas"<a class="cite" href="#ref-1">1</a>: a square one degree wide near the equator covers a very different ground area than one near a pole, which breaks any analysis that assumes roughly-equal-area buckets (surge pricing per unit area, for instance). Second, and this is the defect that survives even after you fix the projection, a square grid gives every cell two structurally different kinds of neighbor: "squares having two different types of neighbors, one type with which they share an edge (in the four cardinal directions) and another type with which they share a vertex (in four diagonal directions)"<a class="cite" href="#ref-1">1</a>. A triangular grid is worse still, with three distinct neighbor-distance classes. A hexagonal grid has exactly one: "hexagons have only one distance between a hexagon centerpoint and its neighbors'... compared to two distances for squares or three distances for triangles"<a class="cite" href="#ref-1">1</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f2t"><title id="f2t">Neighbor-distance classes for triangle, square, and hexagon grids</title>
+    <text x="130" y="30" text-anchor="middle" class="d-title d-bold">Triangle: 3 distance classes</text>
+    <polygon points="130,60 175,150 85,150" class="d-outline"/>
+    <polygon points="130,60 175,150 220,60" class="d-outline"/>
+    <polygon points="85,150 175,150 130,235" class="d-outline"/>
+    <polygon points="175,150 220,60 265,150" class="d-outline"/>
+    <circle cx="130" cy="123" r="4" class="d-fill-orange"/>
+    <path d="M130,123 L130,100" class="d-arrow-active"/>
+    <path d="M130,123 L110,140" class="d-arrow-active"/>
+    <path d="M130,123 L150,140" class="d-arrow-active"/>
+    <text x="130" y="252" text-anchor="middle" class="d-small d-text-light">3 distinct edge-share distances</text>
+
+    <text x="400" y="30" text-anchor="middle" class="d-title d-bold">Square: 2 distance classes</text>
+    <rect x="340" y="70" width="60" height="60" class="d-outline"/>
+    <rect x="400" y="70" width="60" height="60" class="d-outline"/>
+    <rect x="340" y="130" width="60" height="60" class="d-outline"/>
+    <rect x="400" y="130" width="60" height="60" class="d-outline"/>
+    <rect x="280" y="70" width="60" height="60" class="d-outline"/>
+    <rect x="280" y="130" width="60" height="60" class="d-outline"/>
+    <rect x="340" y="10" width="0" height="0"/>
+    <circle cx="370" cy="100" r="4" class="d-fill-orange"/>
+    <path d="M370,100 L370,70" class="d-arrow-active"/>
+    <path d="M370,100 L340,100" class="d-arrow-active"/>
+    <path d="M370,100 L340,70" class="d-arrow-active d-dashed"/>
+    <text x="400" y="220" text-anchor="middle" class="d-small d-text-light">edge-neighbor vs. vertex-neighbor (dashed)</text>
+
+    <text x="650" y="30" text-anchor="middle" class="d-title d-bold">Hexagon: 1 distance class</text>
+    <polygon points="650,70 685,90 685,130 650,150 615,130 615,90" class="d-outline"/>
+    <polygon points="685,90 720,70 755,90 755,130 720,150 685,130" class="d-outline"/>
+    <polygon points="650,150 685,130 685,170 650,190 615,170 615,130" class="d-outline"/>
+    <polygon points="615,90 650,70 615,50 580,70 580,110 615,130" class="d-outline"/>
+    <polygon points="685,130 720,150 720,190 685,210 650,190 650,150" class="d-outline"/>
+    <polygon points="720,150 755,130 755,170 720,190" class="d-outline"/>
+    <circle cx="650" cy="110" r="4" class="d-fill-orange"/>
+    <path d="M650,110 L650,80" class="d-arrow-active"/>
+    <path d="M650,110 L620,95" class="d-arrow-active"/>
+    <path d="M650,110 L620,125" class="d-arrow-active"/>
+    <text x="650" y="240" text-anchor="middle" class="d-small d-text-light">all 6 neighbors equidistant</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> A hexagon's centerpoint is equidistant from all six neighbors' centerpoints; a square has two distinct distances (edge-sharing vs. vertex-sharing neighbors) and a triangle has three, which forces multiple coefficient sets into any distance-weighted analysis run over the grid<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>The single-distance property is not an aesthetic preference; it directly serves the two operations from the opening paragraph. Uber states the payoff explicitly: uniform neighbor distance "greatly simplifies performing analysis and smoothing over gradients," hexagons "minimize the quantization error introduced when users move through a city," and they "allow us to approximate radiuses easily"<a class="cite" href="#ref-1">1</a> — a k-ring of hexagons around a point is a much better disk approximation than a k-ring of squares, because a square k-ring has corners that overshoot the true radius by up to \(\sqrt2\times\) in the diagonal direction while a hexagonal k-ring's overshoot is bounded much more tightly. Any downstream computation that treats "distance in grid cells" as a proxy for "physical distance" — surge-price smoothing across neighboring cells, or an Elasticsearch geo-radius query approximated by unioning cells<a class="cite" href="#ref-1">1</a> — inherits whichever distortion the grid shape introduces, and a hexagon introduces the least of the three regular tilings that can cover a plane.</p>
+
+<p>A fixed grid also does not force a fixed notion of "neighborhood." Grid cells "do not align to streets and neighborhoods in cities," but "they can be used to efficiently represent neighborhoods by clustering grid cells... using objective functions, producing shapes much more useful for analysis"<a class="cite" href="#ref-1">1</a> — instead of hand-drawing a neighborhood boundary once (and then maintaining it as the city changes, exactly the postal-code problem this section opened with), an analyst clusters whichever set of hexagons an objective function groups together for the question at hand, and a different question can cluster the same base cells differently. The membership test this enables is cheap for the same reason index truncation is cheap in §2.3: "determining membership of a cluster is as efficient as a set lookup operation"<a class="cite" href="#ref-1">1</a> on hexagon ids, rather than a point-in-polygon test against an arbitrary, hand-maintained boundary.</p>
+
+<h2 id="h3-hierarchical-index">2. H3: a hexagonal, hierarchical spatial index</h2>
+<p>Choosing "hexagon" as the cell shape answers only half the design problem. A global grid system needs two ingredients: "a map projection... for going from a three-dimensional location on Earth to a two dimensional point on a map. A grid is then overlaid on the map"<a class="cite" href="#ref-1">1</a>. Uber's H3 (open-sourced in 2018) answers both questions in a way most web-mapping grids do not: instead of unfolding the globe into one flat sheet and tiling that sheet with hexagons, it projects the sphere onto the twenty faces of an icosahedron and tiles each face directly, "form[ing] a geodesic discrete global grid system"<a class="cite" href="#ref-1">1</a>, using "gnomonic projections centered on icosahedron faces"<a class="cite" href="#ref-1">1</a> to keep per-face distortion low and roughly constant, unlike Mercator's distortion that grows without bound toward the poles.</p>
+
+<h3 id="icosahedron-pentagons">2.1 Tiling a sphere: the icosahedron and its twelve unavoidable pentagons</h3>
+<p>A hexagon-only tiling of a sphere is a geometric impossibility — Euler's formula for polyhedra forces exactly twelve five-sided defects into any closed hexagonal-dominant tiling of a topological sphere, regardless of implementation. H3 does not fight this; it places the defects deliberately. The grid is "constructed by laying out 122 base cells over the Earth, with ten cells per face" of the icosahedron<a class="cite" href="#ref-1">1</a>, and "since it is not possible to tile the icosahedron with only hexagons, we chose to introduce twelve pentagons, one at each of the icosahedron vertices"<a class="cite" href="#ref-1">1</a>. Of the 122 base cells, 110 are hexagons and 12 are pentagons<a class="cite" href="#ref-2">2</a> — one pentagon sits at each of the icosahedron's twelve vertices, and every finer resolution inherits exactly the same twelve pentagon locations, because a pentagon's descendants after subdivision still contain exactly one pentagon each (§2.2).</p>
+
+<p>Where those twelve vertices land on the actual Earth is itself a deliberate choice, not an artifact: H3 uses "the spherical icosahedron orientation by R. Buckminster Fuller, which places all the vertices in the water. This helps avoid pentagons surfacing in our work"<a class="cite" href="#ref-1">1</a>. Pentagons behave differently from hexagons under H3's operations (they have five neighbors instead of six, and their subdivision arithmetic is irregular — see §2.2), so pushing every one of the twelve singular points into open ocean means that essentially all of Uber's actual dispatch, pricing, and marketplace-analysis workload — which happens in cities, none of which sit on an icosahedron vertex — never has to special-case a pentagon at all.</p>
+
+<p>Laying the grid on the icosahedron's twenty flat faces rather than one unfolded sheet has a second-order consequence worth flagging: "an icosahedron-based map projection results in twenty separate two-dimensional planes rather than a single plane... some cells are contained by more than one face"<a class="cite" href="#ref-1">1</a>. A cell straddling a fold between two faces is not a bug in the tiling, it is the price of using twenty flat, low-distortion planes instead of one heavily-distorted one — the same trade every polyhedral globe projection makes, and one H3's base-cell bookkeeping absorbs so that a caller never needs to know which face (or faces) a given cell happens to sit on.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f3t"><title id="f3t">Icosahedron tiled onto the globe, with the 12 pentagons at its vertices</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="180" y="30" text-anchor="middle" class="d-title d-bold">Icosahedron: 20 faces, 12 vertices</text>
+    <polygon points="180,50 250,90 250,160 180,200 110,160 110,90" class="d-outline"/>
+    <polygon points="180,50 250,90 300,60" class="d-outline"/>
+    <polygon points="180,50 110,90 60,60" class="d-outline"/>
+    <polygon points="250,90 250,160 320,150" class="d-outline"/>
+    <polygon points="110,90 110,160 40,150" class="d-outline"/>
+    <polygon points="180,200 250,160 240,240" class="d-outline"/>
+    <polygon points="180,200 110,160 120,240" class="d-outline"/>
+    <circle cx="180" cy="50" r="6" class="d-fill-orange"/>
+    <circle cx="250" cy="90" r="6" class="d-fill-orange"/>
+    <circle cx="250" cy="160" r="6" class="d-fill-orange"/>
+    <circle cx="180" cy="200" r="6" class="d-fill-orange"/>
+    <circle cx="110" cy="160" r="6" class="d-fill-orange"/>
+    <circle cx="110" cy="90" r="6" class="d-fill-orange"/>
+    <circle cx="300" cy="60" r="6" class="d-fill-orange"/>
+    <circle cx="60" cy="60" r="6" class="d-fill-orange"/>
+    <circle cx="320" cy="150" r="6" class="d-fill-orange"/>
+    <circle cx="40" cy="150" r="6" class="d-fill-orange"/>
+    <circle cx="240" cy="240" r="6" class="d-fill-orange"/>
+    <circle cx="120" cy="240" r="6" class="d-fill-orange"/>
+    <text x="180" y="275" text-anchor="middle" class="d-small d-text-light">orange = vertex = pentagon center, all 12 placed in ocean by Fuller orientation<a class="cite" href="#ref-1">1</a></text>
+
+    <path d="M360,150 L420,150" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <text x="390" y="140" text-anchor="middle" class="d-small">project</text>
+
+    <text x="600" y="30" text-anchor="middle" class="d-title d-bold">Globe: 122 base cells (10/face)</text>
+    <circle cx="600" cy="150" r="120" class="d-outline"/>
+    <g class="d-outline">
+      <path d="M600,30 L680,80 M600,30 L520,80 M680,80 L720,150 M520,80 L480,150 M720,150 L680,220 M480,150 L520,220 M680,220 L600,270 M520,220 L600,270"/>
+      <path d="M600,30 L600,90 M480,150 L540,150 M720,150 L660,150 M600,270 L600,210"/>
+    </g>
+    <circle cx="600" cy="30" r="7" class="d-fill-orange"/>
+    <circle cx="600" cy="270" r="7" class="d-fill-orange"/>
+    <circle cx="680" cy="80" r="7" class="d-fill-orange"/>
+    <circle cx="520" cy="80" r="7" class="d-fill-orange"/>
+    <circle cx="720" cy="150" r="7" class="d-fill-orange"/>
+    <circle cx="480" cy="150" r="7" class="d-fill-orange"/>
+    <circle cx="680" cy="220" r="7" class="d-fill-orange"/>
+    <circle cx="520" cy="220" r="7" class="d-fill-orange"/>
+    <text x="600" y="300" text-anchor="middle" class="d-small d-text-light">110 hexagon base cells + 12 pentagon base cells = 122<a class="cite" href="#ref-1">1</a></text>
+  </svg>
+  <figcaption><b>Figure 3.</b> H3 projects the sphere onto an icosahedron's 20 faces (left, vertices marked) using a Fuller orientation that places every vertex in open ocean, then lays 122 base cells across the faces at 10 per face, 110 of which are hexagons and 12 of which are the unavoidable pentagons sitting exactly at the 12 vertices<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>. This diagram is schematic; actual base-cell boundaries are irregular, not the regular grid shown.</figcaption>
+</figure>
+
+<h3 id="resolution-ladder">2.2 The resolution ladder: aperture-7 subdivision</h3>
+<p>The hierarchical half of H3's name comes from a single, uniform subdivision rule applied recursively: "H3 supports sixteen resolutions. Each finer resolution has cells with one seventh the area of the coarser resolution"<a class="cite" href="#ref-1">1</a>. Resolutions are numbered 0 (the 122 base cells) through 15 (the finest), and the indexing functions take this resolution as an explicit integer argument: <code>geoToH3</code> "takes a latitude, longitude, and resolution (between 0 and 15, with 0 being coarsest and 15 being finest), and returns an index"<a class="cite" href="#ref-1">1</a>. Because every hexagon has exactly 7 immediate children at the next resolution — one that shares the parent's centerpoint and six arranged around it — the identifier of a fine cell "can be easily truncated to find [its] ancestor cell at a coarser resolution"<a class="cite" href="#ref-1">1</a>, turning "is this fine cell inside that coarse cell" into an O(1) bit-mask check rather than a geometric containment test.</p>
+
+<p>The subdivision is only approximate, and H3 says so plainly: "hexagons cannot be perfectly subdivided into seven hexagons, so the finer cells are only approximately contained within a parent cell... this distortion is only present when performing truncation of a cell identifier; when indexing locations at a specific resolution, the cell boundaries are exact"<a class="cite" href="#ref-1">1</a>. In other words, the ladder is exact for the one operation dispatch actually needs (which resolution-<em>r</em> cell contains this GPS point) and only approximate for a second-order operation (does a resolution-<em>r</em> boundary sit exactly inside its resolution-(r&#8722;1) parent's boundary) that matters for cartography more than for bucketing events.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 260" role="img" aria-labelledby="f4t"><title id="f4t">A hexagon at resolution N subdividing into 7 hexagons at resolution N+1</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="150" y="30" text-anchor="middle" class="d-title d-bold">Resolution N</text>
+    <polygon points="150,70 210,105 210,175 150,210 90,175 90,105" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="150" y="145" text-anchor="middle" class="d-bold">1 cell</text>
+    <text x="150" y="235" text-anchor="middle" class="d-small d-text-light">area A</text>
+
+    <path d="M270,140 L360,140" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <text x="315" y="128" text-anchor="middle" class="d-small">aperture-7 split</text>
+
+    <text x="580" y="30" text-anchor="middle" class="d-title d-bold">Resolution N+1: 7 children</text>
+    <g>
+      <polygon points="580,90 610,107 610,142 580,159 550,142 550,107" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <polygon points="580,159 610,142 610,177 580,194 550,177 550,142" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <polygon points="640,90 670,107 670,142 640,159 610,142 610,107" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <polygon points="640,159 670,142 670,177 640,194 610,177 610,142" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <polygon points="520,90 550,107 550,142 520,159 490,142 490,107" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <polygon points="520,159 550,142 550,177 520,194 490,177 490,142" class="d-fill-cyan-soft d-stroke-cyan"/>
+      <polygon points="580,124 610,141 610,176 580,193 550,176 550,141" class="d-fill-orange d-stroke-cyan"/>
+    </g>
+    <text x="580" y="225" text-anchor="middle" class="d-small d-text-light">each child area = A / 7 (approximate containment)<a class="cite" href="#ref-1">1</a></text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Every hexagon has 7 children one resolution finer, each with roughly one-seventh its parent's area; the orange child shares the parent's centerpoint<a class="cite" href="#ref-1">1</a>. Pentagons subdivide irregularly (6 children: 5 hexagons and 1 pentagon), which is why the cell-count formula in the derivation below has a correction term.</figcaption>
+</figure>
+
+<p>Table 1 gives the full ladder using H3's own published statistics. The cell count grows by almost exactly 7&times; per level (the "almost" is the twelve pentagons, which grow slightly slower); average edge length shrinks by a factor of roughly \(\sqrt7 \approx 2.65\) per level, since area scales as the square of edge length and area itself shrinks by 7&times;.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 1.</b> H3 resolution ladder, resolutions 0&#8211;15: total cell count and average hexagon area/edge length, computed on the WGS84 authalic sphere<a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th class="num">Res</th><th class="num">Total cells</th><th class="num">Avg. hex area (km&sup2;)</th><th class="num">Avg. edge length (km)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0</td><td class="num">122</td><td class="num">4,357,449.4</td><td class="num">1,281.256</td></tr>
+    <tr><td class="num">1</td><td class="num">842</td><td class="num">609,788.4</td><td class="num">483.057</td></tr>
+    <tr><td class="num">2</td><td class="num">5,882</td><td class="num">86,801.8</td><td class="num">182.513</td></tr>
+    <tr><td class="num">3</td><td class="num">41,162</td><td class="num">12,393.4</td><td class="num">68.979</td></tr>
+    <tr><td class="num">4</td><td class="num">288,122</td><td class="num">1,770.3</td><td class="num">26.072</td></tr>
+    <tr><td class="num">5</td><td class="num">2,016,842</td><td class="num">252.9</td><td class="num">9.854</td></tr>
+    <tr><td class="num">6</td><td class="num">14,117,882</td><td class="num">36.1</td><td class="num">3.725</td></tr>
+    <tr><td class="num">7</td><td class="num">98,825,162</td><td class="num">5.2</td><td class="num">1.406</td></tr>
+    <tr><td class="num">8</td><td class="num">691,776,122</td><td class="num">0.74</td><td class="num">0.531</td></tr>
+    <tr><td class="num">9</td><td class="num">4,842,432,842</td><td class="num">0.105</td><td class="num">0.201</td></tr>
+    <tr><td class="num">10</td><td class="num">33,897,029,882</td><td class="num">0.015</td><td class="num">0.0759</td></tr>
+    <tr><td class="num">11</td><td class="num">237,279,209,162</td><td class="num">0.0021</td><td class="num">0.0287</td></tr>
+    <tr><td class="num">12</td><td class="num">1,660,954,464,122</td><td class="num">0.00031</td><td class="num">0.0108</td></tr>
+    <tr><td class="num">13</td><td class="num">11,626,681,248,842</td><td class="num">0.000044</td><td class="num">0.0041</td></tr>
+    <tr><td class="num">14</td><td class="num">81,386,768,741,882</td><td class="num">0.0000063</td><td class="num">0.00155</td></tr>
+    <tr><td class="num">15</td><td class="num">569,707,381,193,162</td><td class="num">0.0000009</td><td class="num">0.00058</td></tr>
+  </tbody>
+</table>
+
+<p>A resolution around 8 or 9 (average edge 531&nbsp;m or 201&nbsp;m) is a plausible operating point for city-level surge-pricing buckets — small enough to distinguish a city block from its neighbor, large enough that a bucket still accumulates a usable sample of ride requests in a short pricing window — though Uber's public blog post does not state which resolutions it actually runs in production, and this module does not guess<mark class="unverified" title="Uber's H3 blog post explains the resolution mechanism and gives worked cell-count examples at resolution 6, but does not disclose which resolution(s) production dispatch, pricing, or uberPOOL matching actually query against.">at production resolutions</mark>.</p>
+
+<details class="more"><summary>Derivation of the cell-count formula, and why it is not just \(122 \times 7^r\)</summary>
+<p>H3's own documentation derives a closed form for the total number of cells at resolution <em>r</em> (counting <em>r</em> as levels of subdivision below resolution 0), and it is worth re-deriving because the "12 pentagons" detail from §2.1 changes the arithmetic<a class="cite" href="#ref-2">2</a>. A hexagon has exactly 7 children per level, so the number of resolution-<em>r</em> descendants of a single resolution-0 hexagon is</p>
+<p>$$h(r) = 7^r$$</p>
+<p>A pentagon subdivides irregularly: "pentagons have 6 children: 5 hexagons and 1 pentagon"<a class="cite" href="#ref-2">2</a>. Writing \(p(r)\) for the number of resolution-<em>r</em> descendants of a single resolution-0 pentagon, the recurrence is \(p(0)=1\) and, for \(r\ge1\),</p>
+<p>$$p(r) = 5 \cdot h(r-1) + p(r-1) = 5\cdot7^{\,r-1} + p(r-1)$$</p>
+<p>because at each level, 5 of the pentagon's 6 children are ordinary hexagons (each spawning \(h(r-1)\) further descendants) and 1 child is again a pentagon. Summing the geometric series gives the closed form</p>
+<p>$$p(r) = 1 + 5\cdot\frac{7^r-1}{6}$$</p>
+<p>Resolution 0 has 110 hexagon base cells and 12 pentagon base cells<a class="cite" href="#ref-2">2</a>, so the total cell count at resolution <em>r</em> is</p>
+<p>$$C(r) = 110\cdot h(r) + 12\cdot p(r) = 110\cdot7^r + 12\left(1 + 5\cdot\frac{7^r-1}{6}\right) = 120\cdot7^r + 2$$</p>
+<p>This matches Table 1 exactly: \(C(0) = 120+2=122\); \(C(1)=840+2=842\); \(C(6) = 120\times117{,}649 + 2 = 14{,}117{,}880+2=14{,}117{,}882\)<a class="cite" href="#ref-2">2</a>. The "+2" and the coefficient "120" instead of "122" are the pentagons' fingerprint on the formula — a naive \(122\times7^r\) would overcount by exactly the deficit each pentagon accumulates from having 6 children instead of 7, compounded over <em>r</em> levels.</p>
+<p>The same aperture-7 growth shows up in Uber's own worked example of representing a fixed area (the state of California) at a single resolution versus a mix of resolutions: "the uncompact representation has 10,633 hexagons at resolution 6, but the compact representation has 901 hexagons at resolutions up to 6"<a class="cite" href="#ref-1">1</a> — replacing 7 same-resolution siblings with their 1 common parent whenever all 7 are present in the set, recursively, is exactly the inverse of the subdivision in Figure 4, and it is why H3 ships this compact/uncompact pair as a core operation rather than leaving it to callers.</p>
+</details>
+
+<h3 id="index-encoding">2.3 The 64-bit index</h3>
+<p>Every H3 cell, at every resolution, is a single 64-bit integer: "the H3 library... [transforms] latitude and longitude pairs to a 64-bit H3 index, identifying a grid cell"<a class="cite" href="#ref-1">1</a>. The layout packs a mode tag, the resolution, a base-cell number, and a sequence of per-resolution "digits" into fixed bit fields<a class="cite" href="#ref-3">3</a>, and the exact offsets are visible directly in H3's source: bit 63 is an always-zero high bit, bits 59&#8211;62 (4 bits) hold the mode, bits 56&#8211;58 (3 bits) hold a mode-dependent field, bits 52&#8211;55 (4 bits) hold the resolution (0&#8211;15, matching the sixteen resolutions exactly), bits 45&#8211;51 (7 bits) hold the base-cell number (enough to address the 122 base cells with room to spare), and the remaining 45 bits hold fifteen 3-bit "digit" fields, one per possible resolution level below 0<a class="cite" href="#ref-4">4</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 200" role="img" aria-labelledby="f5t"><title id="f5t">Bit layout of the 64-bit H3 index</title>
+    <rect x="20" y="60" width="20" height="50" class="d-block-muted"/><text x="30" y="90" text-anchor="middle" class="d-text-inv d-small">0</text>
+    <rect x="40" y="60" width="80" height="50" class="d-block d-fill-blue-soft d-stroke-blue"/><text x="80" y="85" text-anchor="middle" class="d-small d-bold">Mode</text><text x="80" y="100" text-anchor="middle" class="d-small">4 bits</text>
+    <rect x="120" y="60" width="60" height="50" class="d-fill-cyan-soft d-stroke-cyan"/><text x="150" y="85" text-anchor="middle" class="d-small d-bold">Mode-dep.</text><text x="150" y="100" text-anchor="middle" class="d-small">3 bits</text>
+    <rect x="180" y="60" width="80" height="50" class="d-fill-amber-soft d-stroke-amber"/><text x="220" y="85" text-anchor="middle" class="d-small d-bold">Resolution</text><text x="220" y="100" text-anchor="middle" class="d-small">4 bits (0&#8211;15)</text>
+    <rect x="260" y="60" width="110" height="50" class="d-fill-green-soft d-stroke-green"/><text x="315" y="85" text-anchor="middle" class="d-small d-bold">Base cell</text><text x="315" y="100" text-anchor="middle" class="d-small">7 bits (0&#8211;121 used)</text>
+    <rect x="370" y="60" width="410" height="50" class="d-fill-orange-soft d-stroke-orange"/><text x="575" y="80" text-anchor="middle" class="d-small d-bold">Digit&#8321; ... Digit&#8321;&#8325;</text><text x="575" y="100" text-anchor="middle" class="d-small">15 &times; 3 bits = 45 bits</text>
+    <text x="20" y="45" class="d-mono d-small">bit 63</text>
+    <text x="780" y="45" text-anchor="end" class="d-mono d-small">bit 0</text>
+    <text x="400" y="140" text-anchor="middle" class="d-small d-text-light">total: 1 + 4 + 3 + 4 + 7 + 45 = 64 bits<a class="cite" href="#ref-4">4</a></text>
+    <text x="400" y="165" text-anchor="middle" class="d-small d-text-light">digit value 7 (of 0&#8211;7) marks "beyond this cell's resolution," e.g. H3_INIT sets every digit to 7<a class="cite" href="#ref-4">4</a></text>
+  </svg>
+  <figcaption><b>Figure 5.</b> The 64-bit H3 index: an unused high bit, a 4-bit mode tag (1 = cell, 2 = directed edge, 4 = vertex), a 3-bit mode-dependent field, a 4-bit resolution, a 7-bit base-cell number, and fifteen 3-bit digit fields, one per resolution level<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>. Truncating an index to a coarser resolution is exactly overwriting the trailing digits with the sentinel value 7 and decrementing the resolution field<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<p>Each 3-bit digit encodes which of a parent's (up to 7) children the index descends into at that resolution, using values 0&#8211;6; the seventh value a 3-bit field can hold, 7, is reserved as a sentinel rather than a real direction — the source comment on H3's initialization constant is explicit that a fresh index "expects all direction digits to be 7 beyond the cell's resolution"<a class="cite" href="#ref-4">4</a>. Because each digit occupies a fixed-width field at a fixed offset, truncating a fine index to find its resolution-<em>r</em> ancestor (the operation §2.2 needs for the compact/uncompact transform) is a mask-and-shift: overwrite the digit fields below resolution <em>r</em> with the sentinel and decrement the resolution field, with no arithmetic on latitude or longitude at all. This is the concrete payoff of paying for a hierarchical index up front — parent/child and ancestor/descendant queries, which a flat grid of independent cell ids cannot answer without a side lookup table, become bit operations on the index itself.</p>
+
+<p>Two further index kinds ride on the same 64-bit scheme and matter directly for a dispatch workload. Mode 1's neighbor query, exposed as the <code>kRing</code> function, "provides grid cells within grid distance <em>k</em> of an origin index"<a class="cite" href="#ref-1">1</a> — the operation §1 already motivated as a disk approximation, and the one a proximity check such as uberPOOL's "two ride requests within close proximity to a specific driver"<a class="cite" href="#ref-1">1</a> actually runs. Mode 2, the directed edge, indexes an ordered pair of adjacent cells rather than a single cell: "H3 has functions for directed edges of grid cells which can represent the movement from one cell to another... [a directed edge] can be obtained from two neighboring cells, or by finding all edges of a cell. When needed, an edge can be converted back to the origin or destination indexes"<a class="cite" href="#ref-1">1</a>. A directed edge is exactly what a driver crossing from one hex into an adjacent one produces, and encoding that transition as its own 64-bit value — rather than as a pair of cell ids that must be looked up and compared separately — lets a consumer test cell-boundary crossings with the same fixed-width bit operations §2.3 already uses for ancestry.</p>
+
+<h2 id="ringpop-gossip-sharding">3. Ringpop: gossip membership and consistent hashing for application-layer sharding</h2>
+
+<h3 id="geospatial-problem">3.1 The problem: ephemeral state that a database is the wrong tool for</h3>
+<p>H3 (§2) is a pure indexing scheme — it says nothing about which machine should hold the data for a given cell. Uber's Geospatial service is where that question became urgent: it is "the first layer of Uber's matching system," and it "keeps track of the real-time location of every active online driver partner on our platform to gather potential matches for ride requests. Pinged continuously with driver location updates, it then searches those locations for riders with the app open"<a class="cite" href="#ref-5">5</a>. Uber's stated reason for not simply putting this in a database is that "database storage would be useless because of how fleeting the location data is"<a class="cite" href="#ref-5">5</a> — a driver's location update arrives, gets searched against a handful of times, and is superseded by the next update seconds later; paying a database's durability and replication cost for state with a lifetime measured in seconds buys nothing. Before Geospatial existed, Uber ran a much simpler design that "held all active vehicles in memory" on presumably one or a small number of machines and "had to search through every single car to find the ones near the requested pick-up location, even if they were nowhere near the vicinity from the get-go. This worked for a while but, with our growth, became unsustainable"<a class="cite" href="#ref-5">5</a> — an unindexed, unsharded linear scan that Uber's own post frames as the direct motivation for building Ringpop.</p>
+
+<p>The requirement, stated in system-design vocabulary, is exactly the sharding problem Module 3 introduces: partition a key space (here, geographic cells or driver ids) across many machines so that each holds only its own slice of a much larger, entirely in-memory dataset, and reassign slices automatically as machines join, leave, or fail — without paying a persistent-storage system's durability cost for state that does not need to survive a restart. Ringpop is Uber's answer, built as "a Node.js library that brings cooperation and coordination to distributed applications that would otherwise run as sets of independent worker instances"<a class="cite" href="#ref-5">5</a>, and it has three parts: a membership protocol (SWIM) for workers to discover each other and detect failures, consistent hashing to assign the key space across whichever workers are currently alive, and a forwarding layer so a request landing on the wrong worker still reaches the right one<a class="cite" href="#ref-5">5</a>.</p>
+
+<p>One composition detail is worth stating precisely rather than assuming: Uber's Ringpop post never names H3, and Uber's H3 post never names Ringpop or Geospatial<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-5">5</a> — the two are documented as separate systems, not as an explicitly linked pipeline. Figure 1's framing of "H3 cell id as the key Ringpop shards over" is this module's own composition of two systems that solve adjacent problems in the same domain (spatial indexing and application-layer sharding, both serving Uber's marketplace), useful for building intuition about how the pieces this course covers fit together, not a claim about Geospatial's literal, undisclosed shard-key choice.</p>
+
+<h3 id="swim-gossip-mechanism">3.2 SWIM gossip: how N nodes learn about one status change without a coordinator</h3>
+<p>Ringpop's membership layer is a variation on SWIM (Scalable Weakly-consistent Infection-style process group Membership protocol), a general-purpose failure-detection and dissemination protocol from Das, Gupta, and Motivala, published at DSN 2002<a class="cite" href="#ref-6">6</a>. SWIM's motivating complaint about the traditional alternative — every member heartbeating to every other member, or to a central server — is that it "impose[s] network loads that grow quadratically with group size, or compromise[s] response times or false positive frequency"<a class="cite" href="#ref-6">6</a>. SWIM's fix is to split the problem into two independent pieces: a failure detector that imposes "a constant message load per group member" regardless of how many members there are, and a dissemination mechanism that piggybacks membership updates onto the failure detector's own messages instead of sending anything extra<a class="cite" href="#ref-6">6</a>.</p>
+
+<p>The failure detector itself is a randomized probe, not a heartbeat: each protocol period, a member picks one other member at random and sends it a direct <code>ping</code>. If no <code>ack</code> arrives before a timeout, the prober does not immediately declare the target dead — it asks <em>k</em> other randomly chosen members to relay an indirect <code>ping-req</code>, each of which pings the suspect target directly and forwards back any <code>ack</code> it receives<a class="cite" href="#ref-6">6</a>. This indirect hop exists specifically to distinguish "the target is actually down" from "the direct network path between prober and target is congested or lossy" — a real distinction a plain heartbeat scheme cannot make. Only if neither the direct ping nor any of the <em>k</em> indirect relays produces an <code>ack</code> does the prober mark the target as failed locally.</p>
+
+<p>Dissemination is where the "infection-style" name comes from: "the process simply multicasts this information to the rest of the group" on a status change, but the actual mechanism SWIM's more efficient variant uses "piggybacks membership updates on the ping and ack messages sent by the failure detector protocol. This completely eliminates the generation of extra packets by the Dissemination Component... This approach results in an infection-style dissemination, with the associated benefits of robustness to packet losses, and of low latency"<a class="cite" href="#ref-6">6</a>. Each ping or ack a member sends carries a few recently-learned membership facts as a side payload; because every member is independently, randomly pinging others every protocol period, a single new fact — "node X just failed" — rides along on an ever-growing number of messages each round, the same way a rumor spreads through a population: one person tells two, each of those tells two more, and so on. SWIM's own analysis states the payoff of this structure directly: "the dissemination latency in the group grows slowly (logarithmically) with the number of members"<a class="cite" href="#ref-6">6</a> — doubling the cluster size adds a roughly constant number of additional gossip rounds before every member has heard the news, not a doubling of rounds.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f6t"><title id="f6t">A status change propagating from one node to all N nodes via repeated pairwise gossip pings</title>
+    <defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+    <text x="400" y="25" text-anchor="middle" class="d-title d-bold">Round 1: A learns C failed, pings B</text>
+    <circle cx="80" cy="80" r="22" class="d-fill-orange"/><text x="80" y="85" text-anchor="middle" class="d-text-inv d-bold">A</text>
+    <circle cx="220" cy="80" r="22" class="d-fill-blue"/><text x="220" y="85" text-anchor="middle" class="d-text-inv d-bold">B</text>
+    <circle cx="80" cy="180" r="22" class="d-outline d-dashed"/><text x="80" y="185" text-anchor="middle" class="d-small">C&#10007;</text>
+    <circle cx="220" cy="180" r="22" class="d-block-muted"/><text x="220" y="185" text-anchor="middle" class="d-text-inv d-bold">D</text>
+    <path d="M100,80 L198,80" class="d-arrow-active" marker-end="url(#f6-arr)"/>
+    <text x="150" y="70" text-anchor="middle" class="d-mono d-small">ping{C:failed}</text>
+
+    <line x1="330" y1="0" x2="330" y2="320" class="d-dashed d-outline"/>
+
+    <text x="500" y="25" text-anchor="middle" class="d-title d-bold">Round 2: B (infected) pings D; A pings D too</text>
+    <circle cx="410" cy="80" r="22" class="d-fill-orange"/><text x="410" y="85" text-anchor="middle" class="d-text-inv d-bold">A</text>
+    <circle cx="550" cy="80" r="22" class="d-fill-orange"/><text x="550" y="85" text-anchor="middle" class="d-text-inv d-bold">B</text>
+    <circle cx="410" cy="180" r="22" class="d-outline d-dashed"/><text x="410" y="185" text-anchor="middle" class="d-small">C&#10007;</text>
+    <circle cx="550" cy="180" r="22" class="d-block-muted"/><text x="550" y="185" text-anchor="middle" class="d-text-inv d-bold">D</text>
+    <path d="M550,102 L550,158" class="d-arrow-active" marker-end="url(#f6-arr)"/>
+    <path d="M425,95 L535,165" class="d-arrow-active" marker-end="url(#f6-arr)"/>
+    <text x="600" y="130" text-anchor="middle" class="d-mono d-small">ping{C:failed}</text>
+
+    <text x="400" y="300" text-anchor="middle" class="d-small d-text-light">every ping/ack carries piggybacked membership facts; a fact reaches all N members in O(log N) rounds, not O(N)<a class="cite" href="#ref-6">6</a></text>
+  </svg>
+  <figcaption><b>Figure 6.</b> SWIM's dissemination mechanism: node A directly detects C's failure (after C fails to answer a ping and every indirect ping-req relay also times out<a class="cite" href="#ref-6">6</a>) and piggybacks that fact onto its next round of ordinary pings; every node that receives the fact does the same on its own subsequent pings, so the fact spreads infection-style rather than via any single broadcaster<a class="cite" href="#ref-6">6</a>. Ringpop runs this protocol over TCP rather than SWIM's original UDP/multicast substrate, and adds a periodic membership+ring checksum exchange and a policy of retaining down members in the member list rather than deleting them<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<p>Ringpop is explicit that it takes this general protocol and specializes it with four concrete choices: "Ringpop 1) implements a SWIM gossip protocol variation, 2) gossips over TCP, 3) computes membership and ring checksums, and 4) retains members that are down in its member list"<a class="cite" href="#ref-5">5</a>. The TCP choice trades SWIM's original UDP-based low-overhead probing for reliable delivery of individual gossip messages, at the cost of TCP's connection overhead — a trade Uber's post does not quantify, but which fits an environment (a data-center-internal application cluster) where connection setup cost is small relative to WAN loss rates SWIM's UDP design was tuned for. The checksum addition lets any node cheaply detect that its view of the ring has diverged from a peer's without exchanging the full membership list on every gossip round. Retaining down members, rather than deleting them, matters specifically for the consistent-hashing layer built on top (§3.3): a member the ring still remembers is a member whose virtual-node tokens still occupy a stable position, so re-adding a briefly-flapping node does not require re-deriving its ring position from scratch.</p>
+
+<h3 id="ringpop-consistent-hash-ring">3.3 Ringpop's consistent-hash ring: the same mechanism, different constants</h3>
+<p>Once every Ringpop node has (eventually) learned about every other node through gossip, something has to turn "the current membership list" into "who owns this key" — and this is exactly the consistent-hashing problem Module 3 §3.2 covers in depth for Dynamo. Ringpop reuses the mechanism (a hash-ring with tokens, minimal reassignment on membership change) but not Dynamo's specific choices: "Ringpop 1) uses FarmHash as its hashing function, 2) uses a red-black tree for its ring, and 3) adds a uniform number of replica points per node"<a class="cite" href="#ref-5">5</a>. FarmHash is Google's non-cryptographic hash family, chosen for speed over the cryptographic-strength hashes some other ring implementations use; a red-black tree gives Ringpop O(log n) insertion, deletion, and successor lookup on the ring as membership changes, rather than a sorted array that would need an O(n) shift on every insert; and "a uniform number of replica points per node" is Ringpop's version of Dynamo's virtual nodes — every physical worker gets the same number of positions on the ring, rather than a heterogeneity-aware count, which is a simpler policy appropriate for a cluster of Uber's application workers, which Uber's post gives no indication are intentionally heterogeneous in the way Dynamo's storage-node fleet is<a class="cite" href="#ref-5">5</a>.</p>
+
+<p>The payoff Ringpop cites for consistent hashing is the identical minimal-reassignment property Module 3 derives for Dynamo: "when node 1 in the hash ring goes down, work proceeds as usual. All of those objects between nodes 1 and 2 get picked up by node 2... you don't reassign and rebalance object data to new spots, significantly reducing latency"<a class="cite" href="#ref-5">5</a>. Because that mechanism is already covered in full in Module 3 (§3.2, Figure 4 there), the figure below draws it specifically in Ringpop's own vocabulary and bootstrap sequence rather than repeating the general derivation.</p>
+
+<p>Cluster formation itself is fully decentralized and grows one gossip exchange at a time, with no separate coordinator standing up the ring: "Ringpop bootstraps itself with a bootstrap file or host list... The first node has no one to join. It exists as a 1-node cluster. The second node starts up and queries the same bootstrap list. This time it finds A. A and B exchange info. They form a 2-node cluster and hash their addresses along the ring"<a class="cite" href="#ref-5">5</a>. A third node repeats the same procedure against whichever seed nodes it finds in its bootstrap list, learns of A and B (and, transitively, everyone A and B have already gossiped about), and joins as a full participant: "C decides to join and now we have a 3-node cluster. Each of them ping one another periodically"<a class="cite" href="#ref-5">5</a>. Nothing about this sequence depends on cluster size or on any single node being reachable first except whichever seed addresses are in the bootstrap list — the ring assembles itself from repeated pairwise exchanges of the same shape §3.2 already describes for failure detection, just applied to a node discovering peers for the first time rather than to detecting one going away.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f7t"><title id="f7t">Ringpop's consistent-hash ring before and after a node departs; only the adjacent range moves</title>
+    <defs><marker id="f7-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+    <text x="200" y="25" text-anchor="middle" class="d-title d-bold">Before: 3-node cluster, FarmHash ring</text>
+    <circle cx="200" cy="170" r="100" class="d-outline"/>
+    <circle cx="200" cy="70" r="12" class="d-fill-cyan"/><text x="200" y="52" text-anchor="middle" class="d-mono d-small">A</text>
+    <circle cx="286" cy="220" r="12" class="d-fill-blue"/><text x="310" y="230" text-anchor="middle" class="d-mono d-small">B</text>
+    <circle cx="114" cy="220" r="12" class="d-fill-green"/><text x="90" y="230" text-anchor="middle" class="d-mono d-small">C</text>
+    <text x="200" y="300" text-anchor="middle" class="d-small d-text-light">each node has a uniform count of replica points (only 1 shown per node)<a class="cite" href="#ref-5">5</a></text>
+
+    <text x="600" y="25" text-anchor="middle" class="d-title d-bold">After: B fails; only B's range moves</text>
+    <circle cx="600" cy="170" r="100" class="d-outline"/>
+    <circle cx="600" cy="70" r="12" class="d-fill-cyan"/><text x="600" y="52" text-anchor="middle" class="d-mono d-small">A</text>
+    <circle cx="686" cy="220" r="12" class="d-outline d-dashed"/><text x="710" y="230" text-anchor="middle" class="d-mono d-small d-text-light">B gone</text>
+    <circle cx="514" cy="220" r="12" class="d-fill-green"/><text x="490" y="230" text-anchor="middle" class="d-mono d-small">C</text>
+    <path d="M600,82 A112,112 0 0,1 671,205" class="d-arrow-active" style="stroke-width:3" marker-end="url(#f7-arr)"/>
+    <text x="600" y="295" text-anchor="middle" class="d-small d-text-light">B's arc reassigns to its ring successor, A; C's arc is untouched<a class="cite" href="#ref-5">5</a></text>
+  </svg>
+  <figcaption><b>Figure 7.</b> The same minimal-reassignment mechanism Module 3 §3.2 derives for Dynamo, drawn in Ringpop's own terms: FarmHash places each worker's replica points on a red-black-tree-backed ring<a class="cite" href="#ref-5">5</a>; when worker B fails (detected via the SWIM gossip of §3.2), only the arc of key space that pointed to B reassigns, to B's immediate successor A, and worker C's range is completely unaffected<a class="cite" href="#ref-5">5</a>. In Geospatial, that arc is a slice of driver-location state, not a slice of durable storage — there is nothing to migrate, only new keys to start routing differently.</figcaption>
+</figure>
+
+<h3 id="handle-or-forward">3.4 Handle-or-forward: decoupling clients from the sharding scheme</h3>
+<p>Knowing which node owns a key is only useful if a request that lands on the wrong node anyway still gets served correctly. Ringpop's answer is a routing convention embedded in every node: "Ringpop 1) has codified a handle or forward pattern, uses TChannel as its transport and forwarding channel, has forwarding transparent to the developer... packs forwarded requests as HTTP over TChannel"<a class="cite" href="#ref-5">5</a>. Concretely, "requests for data can hit any random node, and Ringpop will forward the request to the appropriate destination within the ring... A receives a request and hashes the shard key. It uses the handle or forward pattern to determine where the request should be processed. A decides to forward the request to B"<a class="cite" href="#ref-5">5</a>. TChannel is Uber's own RPC transport, and layering forwarded requests as HTTP over it means an application's handler code does not need a separate code path for "a request that arrived correctly" versus "a request that arrived at the wrong node and needs one more hop."</p>
+
+<p>The stated benefit is the same client/server decoupling any sharding-aware proxy buys (Module 13's Vitess VTGate is the same idea applied to sharded MySQL): "this eliminates the need for any coupling between client and server. Your application will route requests within itself, and clients will communicate with your application without knowledge of the sharding scheme"<a class="cite" href="#ref-5">5</a>. A caller of Geospatial does not need to know how many workers exist, which FarmHash ranges they own, or that a node just failed — it sends a request to any node in the cluster and Ringpop's handle-or-forward logic gets it to the right owner, re-deriving that owner fresh on every request from the current (gossiped) ring state rather than from a client-side cache that could go stale.</p>
+
+<h3 id="gossip-vs-centralized">3.5 Decentralized gossip versus centralized coordination for the same problem</h3>
+<p>Module 6 covers a structurally different answer to "how does a cluster agree on who is a member": a centralized coordination service. ZooKeeper's ephemeral znodes, deleted automatically when a client's session ends, are one standard way to implement membership and liveness detection<a class="cite" href="#ref-7">7</a> — a worker registers an ephemeral znode on startup, other workers watch that znode's parent directory, and a crash is detected the moment the session times out and ZooKeeper's own leader-based Zab protocol deletes the znode and fires the watch. Ringpop's SWIM-gossip approach and ZooKeeper's centralized-znode approach solve the identical membership problem with structurally opposite designs, summarized in Table 2.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Two working answers to "how does a cluster learn who is currently a member," contrasted on the axes that matter for a dispatch-latency-sensitive workload<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a>.</caption>
+  <thead><tr><th>Property</th><th>Ringpop (SWIM gossip)</th><th>ZooKeeper (centralized)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Where membership state lives</td><td>Replicated, eventually-consistent, on every member<a class="cite" href="#ref-5">5</a></td><td>A separate quorum-replicated ensemble, external to the members<a class="cite" href="#ref-7">7</a></td></tr>
+    <tr><td class="row">Failure detection</td><td>Peer-to-peer randomized probing; no single point does the detecting<a class="cite" href="#ref-6">6</a></td><td>Session/heartbeat timeout against the ensemble; the ensemble does the detecting<a class="cite" href="#ref-7">7</a></td></tr>
+    <tr><td class="row">Message load per member as N grows</td><td>Constant, independent of N<a class="cite" href="#ref-6">6</a></td><td>Bounded by ensemble capacity; reads served locally, writes go through the leader<a class="cite" href="#ref-7">7</a></td></tr>
+    <tr><td class="row">Consistency of the membership view</td><td>Weak/eventual — different members can disagree briefly<a class="cite" href="#ref-6">6</a></td><td>Linearizable writes via Zab; any client sees a consistent order<a class="cite" href="#ref-7">7</a></td></tr>
+    <tr><td class="row">Extra infrastructure to operate</td><td>None — every application node is also a membership node<a class="cite" href="#ref-5">5</a></td><td>A dedicated ZooKeeper ensemble (typically odd-sized, 3 or 5)<a class="cite" href="#ref-7">7</a></td></tr>
+    <tr><td class="row">First production use cited</td><td>Uber Geospatial, ephemeral driver-location sharding<a class="cite" href="#ref-5">5</a></td><td>Leader election, locks, config for Kafka/HBase-style systems<a class="cite" href="#ref-7">7</a></td></tr>
+  </tbody>
+</table>
+
+<p>Uber's own post frames Ringpop's value proposition directly against a client/server-coupled or centrally-coordinated alternative: "Ringpop developers take ownership of the scalability and availability of their services rather than relying on external infrastructure-level solutions or systems specialists"<a class="cite" href="#ref-5">5</a>. That is a genuine operational trade, not just a technical one — a team embedding Ringpop does not need to provision, monitor, or page on a separate ZooKeeper ensemble, but it does take on the correctness burden of an eventually-consistent membership protocol running inside its own service.</p>
+
+<p>Uber's post is explicit that Geospatial was only the first of several internal uses, not a one-off: teams also embed Ringpop "for sharding, leader election, ordering or batching writes into a distributed database, request coalescing, work delegation, data aggregation, and caching"<a class="cite" href="#ref-5">5</a>. Leader election is worth flagging specifically, because Module 6 §9.3 covers exactly the same primitive built on top of ZooKeeper's ephemeral znodes and watches — the same coordination goal, reachable from either a centralized-ensemble foundation or a decentralized-gossip-plus-ring foundation, which is precisely the choice §3.5's disagreement is about.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The disagreement here is not about H3 — nobody in the sources this module draws on argues against a hierarchical hex grid for spatial bucketing once the neighbor-distance argument in §1 is granted. It is about Ringpop's half of the design: whether a decentralized, gossip-based, eventually-consistent membership protocol is the right foundation for application-layer sharding of latency-sensitive state, or whether a centralized coordination service such as ZooKeeper (Module 6 §9) or a leader-election-based scheme is the better foundation for the same problem. This is the same fault line Module 3's "strong, synchronously-replicated consistency vs. eventual consistency" disagreement runs along, applied one layer up — to who is a member, not to what value a key holds.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Decentralized gossip and consistent hashing is the right default for high-churn, latency-sensitive application state</h4>
+    <p class="who">Uber Engineering, building Ringpop for Geospatial<a class="cite" href="#ref-5">5</a>; the SWIM authors, motivating gossip explicitly against heartbeat-to-a-central-server designs<a class="cite" href="#ref-6">6</a>; the broader Dynamo lineage Module 3 covers, which reaches the same conclusion for storage rather than application state<a class="cite" href="#ref-5">5</a></p>
+    <p>A gossip protocol's message load and detection-time guarantees are independent of cluster size<a class="cite" href="#ref-6">6</a>, and it introduces no additional service to provision, monitor, or fail over — "every application node is also a membership node." For state whose value changes every few seconds and whose loss is inconsequential (a driver's last-known GPS ping, superseded within seconds anyway), the strict linearizability a centralized coordinator would provide is a guarantee nobody downstream is actually consuming.</p>
+    <ul class="pros">
+      <li>No extra infrastructure (ensemble, quorum, dedicated ops burden) to run alongside the application<a class="cite" href="#ref-5">5</a></li>
+      <li>Constant per-member message load and logarithmic dissemination latency as the cluster grows, not linear or quadratic<a class="cite" href="#ref-6">6</a></li>
+      <li>No single component (a leader, an ensemble) whose own failure stalls membership updates for everyone</li>
+    </ul>
+    <ul class="cons">
+      <li>Membership views are only eventually consistent — different nodes can briefly disagree about who owns a key, which the handle-or-forward pattern (§3.4) papers over with an extra hop rather than eliminating<a class="cite" href="#ref-5">5</a></li>
+      <li>SWIM's failure-detection time is a probabilistic, expected bound, not the deterministic bound a session-timeout-based scheme gives<a class="cite" href="#ref-6">6</a></li>
+      <li>Correctness of the gossip protocol becomes the embedding team's problem, not an operated-service's problem<a class="cite" href="#ref-5">5</a></li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Centralized coordination is the right default when the membership view itself must be strongly consistent</h4>
+    <p class="who">The ZooKeeper design as documented in Module 6 §9<a class="cite" href="#ref-7">7</a>; systems that build leader election, distributed locks, or exactly-once resource assignment on top of membership, where two nodes briefly disagreeing about who is alive is a correctness bug, not a tolerable staleness window</p>
+    <p>ZooKeeper's ephemeral znodes plus Zab give every client a single, linearizable answer to "who is currently a member" — useful precisely when the answer feeds a decision that must not be made twice (electing one leader, granting one lock). The cost is a dedicated ensemble that must itself stay available, and a write path that goes through one leader rather than being accepted anywhere.</p>
+    <ul class="pros">
+      <li>One consistent answer to "who is a member," with no risk of two nodes disagreeing about the current view<a class="cite" href="#ref-7">7</a></li>
+      <li>A single, well-understood coordination primitive (watches, ephemeral znodes) that many unrelated services can share, rather than each service embedding and re-verifying its own gossip logic<a class="cite" href="#ref-7">7</a></li>
+      <li>Deterministic failure detection tied to a session timeout, not a probabilistic expected-time bound<a class="cite" href="#ref-7">7</a></li>
+    </ul>
+    <ul class="cons">
+      <li>A separate ensemble to provision and keep available; if it is down, every dependent service's membership view stalls<a class="cite" href="#ref-7">7</a></li>
+      <li>Write throughput is bounded by what the leader can serialize, not by the aggregate capacity of the cluster being coordinated<a class="cite" href="#ref-7">7</a></li>
+      <li>Overkill for state where a few seconds of view staleness has no observable consequence, which is Geospatial's actual workload<a class="cite" href="#ref-5">5</a></li>
+    </ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Uber's own choice is the more defensible one for its own stated problem: driver-location state that is superseded within seconds carries no cost from a brief membership-view disagreement, and the operational win of not running a separate coordination ensemble alongside every sharded application service is real. The centralized-coordination position wins specifically when the thing being coordinated is not ephemeral cache-like state but a decision that must not be duplicated — a lock, a leader, a durable write assignment — which is exactly the domain Module 6 covers ZooKeeper/Chubby/etcd occupying in this course (Bigtable's master election, Kafka's controller election). Neither source in this module's map runs a head-to-head benchmark of Ringpop against a ZooKeeper-coordinated equivalent at Uber's own scale, so the comparison here is architectural, not measured; a benchmark holding cluster size, churn rate, and workload fixed across both designs would be the evidence that could sharpen this beyond "it depends on whether the coordinated fact is disposable."</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Both primary sources this module draws on are old by this course's standards: the H3 blog post is from 2018-06-27 and the Ringpop blog post from 2016-02-04<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-5">5</a>. Uber's public engineering blog has not published a comparably detailed architecture update on either system's current production status since, and this module does not speculate about what may have changed inside Uber's dispatch stack in the years since — including whether Ringpop remains the sharding layer under Geospatial today, and what, if anything, replaced or extended it. What has changed publicly is H3 itself: it is maintained as an Apache-2.0-licensed open-source project (h3geo.org, copyright Uber Technologies, Inc. as of this module's access date) with bindings well beyond the Java/JavaScript pair the 2018 post announced, and it is used by organizations outside Uber for the same underlying reason — a stable, hierarchical, single-neighbor-distance grid is useful for any workload that buckets geospatial events, not only ride-hailing dispatch<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">blog</span>Uber Engineering (Isaac Brodsky). <em>H3: Uber's Hexagonal Hierarchical Spatial Index</em>. 2018-06-27. <a href="https://www.uber.com/en-EG/blog/h3/">https://www.uber.com/en-EG/blog/h3/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the marketplace-indexing motivation, hexagon-vs-square-vs-postal-code rationale, icosahedron/pentagon tiling, 16 resolutions and aperture-7 subdivision, 64-bit index description, compact/uncompact example.</span></li>
+  <li id="ref-2"><span class="ref-type">official</span>H3 Project (Uber Technologies, Inc.). <em>Tables of Cell Statistics Across Resolutions</em>. h3geo.org documentation, v4.x. <a href="https://h3geo.org/docs/core-library/restable/">https://h3geo.org/docs/core-library/restable/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Table 1 (cell counts, average area, average edge length per resolution), the cell-count derivation and its closed form \(C(r)=2+120\cdot7^r\), the hexagon/pentagon children counts (7 and 6 respectively).</span></li>
+  <li id="ref-3"><span class="ref-type">official</span>H3 Project (Uber Technologies, Inc.). <em>H3Index Representation / Bit layout of H3Index</em>. h3geo.org documentation, v4.x. <a href="https://h3geo.org/docs/core-library/h3Indexing/">https://h3geo.org/docs/core-library/h3Indexing/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the field layout of the 64-bit H3 index (mode, mode-dependent, resolution, base cell, 15 digits) and the mode-number scheme (1 = cell, 2 = directed edge, 4 = vertex).</span></li>
+  <li id="ref-4"><span class="ref-type">repo</span>Uber Technologies, Inc. <em>h3lib/include/h3Index.h</em>. GitHub, uber/h3, master branch. <a href="https://github.com/uber/h3/blob/master/src/h3lib/include/h3Index.h">https://github.com/uber/h3/blob/master/src/h3lib/include/h3Index.h</a>. Accessed 2026-09-17. <span class="ref-use">Used for: exact bit offsets and widths (H3_MODE_OFFSET=59, H3_RES_OFFSET=52, H3_BC_OFFSET=45, H3_PER_DIGIT_OFFSET=3, H3_RESERVED_OFFSET=56) and the digit-sentinel value 7 (H3_INIT).</span></li>
+  <li id="ref-5"><span class="ref-type">blog</span>Uber Engineering (Lucie Lozinski). <em>Uber Engineering's Ringpop</em>. 2016-02-04. <a href="https://www.uber.com/en-ES/blog/ringpop-open-source-nodejs-library">https://www.uber.com/en-ES/blog/ringpop-open-source-nodejs-library</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the Geospatial use case and its pre-Ringpop linear-scan design, Ringpop's three-part architecture (SWIM variation, consistent hashing, forwarding), the FarmHash/red-black-tree/replica-point ring specialization, the handle-or-forward pattern, and the contrast with external coordination infrastructure.</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Das, A., Gupta, I., Motivala, A. <em>SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol</em>. Proceedings of the International Conference on Dependable Systems and Networks (DSN), 2002. <a href="https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf">https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the general SWIM mechanism Ringpop specializes — randomized direct/indirect ping-based failure detection (§3.1 of the paper), piggybacked infection-style dissemination (§4.1), and the constant-message-load/logarithmic-dissemination-latency properties.</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Hunt, P., Konar, M., Junqueira, F. P., Reed, B. <em>ZooKeeper: Wait-free Coordination for Internet-scale Systems</em>. USENIX ATC 2010. <a href="https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf">https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: znode/ephemeral-node and watch mechanics underlying the centralized-membership alternative in §3.5 (already covered in depth in Module 6 §9), Table 2's centralized-coordination column (session-timeout failure detection, leader-serialized writes via Zab, ensemble sizing), and the "Where experts disagree" centralized-coordination position.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request Routing, Admission Control, and SLO Tiers · System Design</title>
+<meta name="description" content="How an AI inference platform decides which request runs now, which waits, which gets a smaller model, and which gets rejected outright -- admission control, routing dimensions, SLO-tiered lanes, and graceful degradation, grounded in Borg and the Kubernetes Gateway API Inference Extension.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">System Design · Module 24</p>
+<h1>Request Routing, Admission Control, and SLO Tiers: Fallbacks and Graceful Degradation</h1>
+<p class="lede">Once a request clears the gateway's identity and rate-limit checks, one question remains before a single GPU cycle is spent: which backend, at what priority, and what happens if the answer is "none available right now." This module works through admission control (reject now vs. queue and hope), the dimensions that narrow a request to one backend, the SLO-tiered lanes that make "priority" mean something concrete, and the ordered cascade of fallbacks a platform runs through before it finally says no. After it, you can read an inference gateway's routing config and predict exactly which requests it will shed first under load, and why.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>40 min</b> read</span>
+<span class="chip"><b>5</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-18</span>
+<span class="chip">Prerequisite: <b>Module 21</b>, <b>Module 22</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 380" role="img" aria-labelledby="f1t"><title id="f1t">Where this module's four decisions sit inside the request lifecycle</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="10" y="20" width="130" height="50" rx="8" class="d-block-muted"/>
+<text x="75" y="41" text-anchor="middle" class="d-text-inv d-bold d-small">Auth + budget</text>
+<text x="75" y="57" text-anchor="middle" class="d-text-inv d-small">Module 21</text>
+<path d="M140,45 L175,45" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="176" y="20" width="130" height="50" rx="8" class="d-block-muted"/>
+<text x="241" y="41" text-anchor="middle" class="d-text-inv d-bold d-small">Rate limiter</text>
+<text x="241" y="57" text-anchor="middle" class="d-text-inv d-small">Module 22</text>
+<path d="M241,70 L241,105" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="20" y="115" width="760" height="185" rx="10" class="d-panel"/>
+<text x="40" y="138" class="d-title d-bold">This module</text>
+<rect x="40" y="150" width="160" height="55" rx="8" class="d-block"/>
+<text x="120" y="172" text-anchor="middle" class="d-text-inv d-bold d-small">1. Admission</text>
+<text x="120" y="188" text-anchor="middle" class="d-text-inv d-small">quota check</text>
+<path d="M200,177 L235,177" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="236" y="150" width="160" height="55" rx="8" class="d-block"/>
+<text x="316" y="172" text-anchor="middle" class="d-text-inv d-bold d-small">2. SLO tier</text>
+<text x="316" y="188" text-anchor="middle" class="d-text-inv d-small">lane assignment</text>
+<path d="M396,177 L431,177" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="432" y="150" width="160" height="55" rx="8" class="d-block"/>
+<text x="512" y="172" text-anchor="middle" class="d-text-inv d-bold d-small">3. Routing</text>
+<text x="512" y="188" text-anchor="middle" class="d-text-inv d-small">model+region+pin</text>
+<path d="M592,177 L627,177" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="628" y="150" width="132" height="55" rx="8" class="d-block-2"/>
+<text x="694" y="172" text-anchor="middle" class="d-text-inv d-bold d-small">4. Backend pick</text>
+<text x="694" y="188" text-anchor="middle" class="d-text-inv d-small">KV-cache/queue</text>
+<path d="M120,205 L120,225" class="d-dashed d-arrow" marker-end="url(#f1-arr)" style="stroke-width:1.5"/>
+<path d="M694,205 L694,225" class="d-dashed d-arrow" marker-end="url(#f1-arr)" style="stroke-width:1.5"/>
+<rect x="40" y="228" width="280" height="60" rx="8" class="d-outline d-dashed"/>
+<text x="180" y="250" text-anchor="middle" class="d-small d-text-light">Degradation cascade if step 1 or 4</text>
+<text x="180" y="264" text-anchor="middle" class="d-small d-text-light">fails: failover -&gt; downgrade -&gt; queue -&gt; reject</text>
+<text x="180" y="280" text-anchor="middle" class="d-mono d-small">Figure 5</text>
+<rect x="560" y="228" width="200" height="60" rx="8" class="d-outline d-dashed"/>
+<text x="660" y="250" text-anchor="middle" class="d-small d-text-light">Backend selected =&gt;</text>
+<text x="660" y="264" text-anchor="middle" class="d-small d-text-light">Module 25 interface</text>
+<text x="660" y="280" text-anchor="middle" class="d-mono d-small">handoff</text>
+<path d="M694,205 L470,320" class="d-arrow" marker-end="url(#f1-arr)" style="stroke-width:1.5"/>
+<rect x="330" y="320" width="200" height="50" rx="8" class="d-block-accent"/>
+<text x="430" y="341" text-anchor="middle" class="d-text-inv d-bold d-small">Billing hold placed</text>
+<text x="430" y="357" text-anchor="middle" class="d-text-inv d-small">Module 23 (runs after this)</text>
+</svg>
+<figcaption><b>Figure 1.</b> This module owns four decisions between the gateway's identity/rate-limit checks (Module 21, Module 22) and the GPU backend handoff (Module 25): admission (accept or reject at submission), SLO-tier lane assignment, routing-dimension narrowing, and final backend pick by live telemetry. The billing hold (Module 23) is numbered earlier in this course but executes chronologically after step 4, once the selected backend's price is known. Failures at step 1 or step 4 trigger the degradation cascade in Figure 5.</figcaption>
+</figure>
+
+<h2 id="lifecycle-position">1. Where this sits in the request lifecycle</h2>
+<p>Module 21 traced the top of the gateway's request lifecycle: a virtual key is authenticated and checked against its budget, a parallel rate limiter validates requests-per-minute and tokens-per-minute across the global, key, user, and team levels, and only then does the request reach what LiteLLM's own architecture documentation simply calls "the Router" before a provider call goes out<a class="cite" href="#ref-1">1</a>. That single word, "Router," is doing a lot of work. Inside it are four separable decisions this module unpacks: whether to admit the request at all, which service-level lane it belongs to, which combination of model, region, and version it is allowed to land on, and — only at the very last step — which specific backend instance actually receives it. Module 25 picks up immediately after the fourth decision: once a backend is chosen, that module designs the interface across which the request actually crosses from platform to GPU serving stack.</p>
+<p>Admission control and routing are not the same decision, and treating them as one is a common design error. Admission control answers a yes/no question — does this request get to consume any resource at all, right now — using information that is known before any backend is even considered: the caller's identity, its quota, and the platform's aggregate load. Routing answers a which question — given that the request is admitted, which of several compatible backends should carry it — using information about the backends themselves. Google's Borg cluster manager keeps this distinction explicit in its own architecture: quota-checking is described as "part of admission control, not scheduling: jobs with insufficient quota are immediately rejected upon submission"<a class="cite" href="#ref-2">2</a>, while the placement decision — which machines actually run an admitted job — is a separate, later step. Section 2 below builds on exactly this separation. An inference gateway that conflates the two ends up either rejecting requests it could have served (because it checked backend load before checking quota, and gave up too early) or accepting requests it cannot serve (because it checked quota and stopped, without ever asking whether any backend had room).</p>
+<p>There is a second ordering subtlety worth stating plainly because the course's module numbers do not match the runtime order of events. Module 23 covers the billing hold that reserves a worst-case credit amount against a streaming request. That hold cannot be placed until the request's price is known, and price depends on which model and region actually serve the request — a fact this module's routing decision determines. So although billing is numbered before routing in this course (Module 23 precedes Module 24), the hold it describes is placed chronologically after this module's routing decision resolves, once Module 25's interface confirms which backend was selected. Figure 1 draws this explicitly: the billing box sits downstream of the routing box, not upstream of it, regardless of module numbers.</p>
+<p>The reason this module exists at all — rather than reusing Module 1's load-balancing vocabulary wholesale — is that generic L4/L7 balancing was built for a different traffic shape. Round-robin, least-connections, and ip-hash algorithms (Module 1) assume requests are short, stateless, and roughly interchangeable in cost. The Kubernetes project's own announcement of its Gateway API Inference Extension states the mismatch directly: "unlike typical short-lived, stateless web requests, LLM inference sessions are often long-running, resource-intensive, and partially stateful. For example, a single GPU-backed model server may keep multiple inference sessions active and maintain in-memory token caches"<a class="cite" href="#ref-3">3</a>. A load balancer that only sees HTTP path and connection count has no way to know that one candidate backend already holds the exact prefix cache this request needs, or that another is one queued request away from violating its latency budget. The same announcement is blunt about the consequence: "traditional load balancers focused on HTTP path or round-robin lack the specialized capabilities needed for these workloads. They also don't account for model identity or request criticality (e.g., interactive chat vs. batch jobs)"<a class="cite" href="#ref-3">3</a>. Everything in sections 3 through 5 is the answer to that gap: dimensions that do encode model identity and criticality, and signals that do reflect real backend state.</p>
+<p>It is also worth separating this module's admission control from Module 22's rate limits, because both run before a request is served and both can produce a rejection, which invites conflating them. A rate limit is a per-caller ceiling — it protects one tenant's fair share of the platform and answers "has this specific key, user, or team asked for too much, too fast." Admission control in this module's sense is a platform-wide capacity question, independent of any single caller's history — it answers "does the platform, in aggregate, have room to accept one more unit of committed work at this priority." A caller can be well within its own rate limit and still be rejected by admission control, if the platform's aggregate quota at that caller's priority is exhausted by every caller combined; conversely, a caller that trips its own rate limit never reaches this module's admission check at all, because Module 22's layer runs first and rejects on a completely different signal. The two layers are complementary because they protect against two different failure modes — one caller monopolizing capacity, and every caller together exceeding it — and a platform that only implements one of them is exposed to the failure the other one exists to prevent.</p>
+
+<h2 id="admission-control">2. Admission control: quota checked at submission, not at scheduling</h2>
+<p>Borg is the direct architectural ancestor of Kubernetes<a class="cite" href="#ref-2">2</a>, and its admission-control design is the precedent this module's figure plan is built around. Every Borg job carries a small positive-integer <em>priority</em>, and Borg defines non-overlapping <em>priority bands</em> for different uses. In decreasing-priority order these are monitoring, production, batch, and best-effort (also called testing or free); for the purposes of the paper, "prod" jobs are the ones in the monitoring and production bands<a class="cite" href="#ref-2">2</a>. Tasks inside the production band are deliberately disallowed from preempting one another, specifically to stop preemption cascades in which a high-priority task bumps a slightly lower one, which bumps another, and so on<a class="cite" href="#ref-2">2</a>.</p>
+<p>Priority alone answers "who wins a resource conflict." <em>Quota</em> is the separate mechanism that answers "who is even allowed to ask." Borg's paper defines it precisely: "Quota is expressed as a vector of resource quantities (CPU, RAM, disk, etc.) at a given priority, for a period of time (typically months)," giving as its own worked example "20 TiB of RAM at prod priority from now until the end of July in cell xx"<a class="cite" href="#ref-2">2</a>. The admission rule follows directly: "Quota-checking is part of admission control, not scheduling: jobs with insufficient quota are immediately rejected upon submission"<a class="cite" href="#ref-2">2</a>. Scheduling is a downstream, independent step — the paper is explicit that "a low-priority job may be admitted but remain pending (unscheduled) due to insufficient resources"<a class="cite" href="#ref-2">2</a>. That single sentence is the cleanest available statement of the two-decision structure this module opened with: admission is a budget check against a static allocation; scheduling (here, routing) is a live placement decision against real machine state, and a request can clear the first and still wait on the second.</p>
+<p>Borg also documents the economics that make hard quota work as an admission gate rather than degenerating into either constant false rejections or unlimited overcommit. Higher-priority quota costs more than lower-priority quota, and "production-priority quota is limited to the actual resources available in the cell, so that a user who submits a production-priority job that fits in their quota can expect it to run, modulo fragmentation and constraints"<a class="cite" href="#ref-2">2</a>. Because users rationally overbuy quota to insulate themselves against future growth, Borg counters by overselling quota at lower priority levels — "every user has infinite quota at priority zero, although this is frequently hard to exercise because resources are over-subscribed"<a class="cite" href="#ref-2">2</a>. Quota allocation itself is handled outside Borg entirely, tied to physical capacity planning<a class="cite" href="#ref-2">2</a>; the admission check at request time is a fast comparison against a number that was decided somewhere else, in advance, which is exactly why it can run before any backend lookup and reject in microseconds. The "infinite quota at priority zero, usually unusable" pattern has a direct AI-platform reading: a best-effort or free tier that is nominally unlimited but sits behind every paying tier's quota is not a contradiction, it is the same oversell-at-the-bottom design Borg uses, and it is why a free-tier caller can be told its request was "accepted" and still wait far longer than a paid tier's stated budget — Module 22's usage-tier and workspace-budget structures are the AI-platform implementation of the quota vector this section describes; this module only needs the admission rule it enforces.</p>
+
+<h3 id="admission-control-headroom">2.1 Worked derivation: quota headroom and the reject boundary</h3>
+<p>Take Borg's own example allocation — 20 TiB of RAM quota at prod priority in a cell<a class="cite" href="#ref-2">2</a> — and extend it with an illustrative scenario to make the admission arithmetic concrete. Suppose a team's currently-running prod jobs commit 14 TiB of RAM against that 20 TiB ceiling, and a new job requests \(N\) replicas at 1.5 TiB of RAM each. Admission control does not ask whether any machine has 1.5 TiB free; it asks whether the *quota ledger* has room:</p>
+$$ \text{committed} + N \times \text{per-replica RAM} \le \text{quota} $$
+$$ 14\,\text{TiB} + N \times 1.5\,\text{TiB} \le 20\,\text{TiB} $$
+<p>Solving for \(N\) gives \(N \le 4\). A request for a 5th replica is rejected at submission — before Borg's scheduler ever runs feasibility checking or scoring to find it a machine — purely because the quota ledger has no headroom left, independent of whether some machine in the cell is in fact idle. This is the mechanism, not a metaphor: a system that checks quota before scheduling can reject in the time it takes to read and compare two numbers, and it rejects a knowably-over-budget request even when spare hardware exists elsewhere in the cell, because admission control's job is to protect the allocation, not to find capacity. An inference gateway that reuses this pattern — a virtual key's committed token-spend against its allocated budget<a class="cite" href="#ref-1">1</a> — gets the same property: rejection is a cache read, not a round trip to a model server.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f2t"><title id="f2t">Reject-at-submission versus accept-then-estimate-and-reconcile admission control</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="20" y="30" class="d-title d-bold">Hard quota (Borg-style)</text>
+<rect x="20" y="45" width="140" height="45" rx="8" class="d-block"/>
+<text x="90" y="72" text-anchor="middle" class="d-text-inv d-small">Request submitted</text>
+<path d="M160,67 L200,67" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="201" y="45" width="160" height="45" rx="8" class="d-hl"/>
+<text x="281" y="67" text-anchor="middle" class="d-small d-bold">quota vector check</text>
+<text x="281" y="80" text-anchor="middle" class="d-small">(§2.1 arithmetic)</text>
+<path d="M361,55 L400,55" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="401" y="30" width="150" height="35" rx="8" class="d-fill-green-soft d-stroke-green"/>
+<text x="476" y="52" text-anchor="middle" class="d-small">admit, then schedule</text>
+<path d="M361,80 L400,80" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="401" y="75" width="150" height="35" rx="8" class="d-fill-red-soft d-stroke-red"/>
+<text x="476" y="97" text-anchor="middle" class="d-small">reject now, no lookup</text>
+<text x="20" y="140" class="d-small d-text-light">Reject boundary is a fixed number, known before submission.</text>
+
+<text x="20" y="185" class="d-title d-bold">Optimistic estimate (Envoy AI Gateway)</text>
+<rect x="20" y="200" width="140" height="45" rx="8" class="d-block"/>
+<text x="90" y="227" text-anchor="middle" class="d-text-inv d-small">Request arrives</text>
+<path d="M160,222 L200,222" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="201" y="200" width="160" height="45" rx="8" class="d-hl"/>
+<text x="281" y="219" text-anchor="middle" class="d-small d-bold">would-exceed-limit?</text>
+<text x="281" y="233" text-anchor="middle" class="d-small">check (estimate)</text>
+<path d="M361,210 L400,210" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="401" y="195" width="170" height="35" rx="8" class="d-fill-red-soft d-stroke-red"/>
+<text x="486" y="217" text-anchor="middle" class="d-small">429, not processed</text>
+<path d="M361,235 L400,235" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="401" y="230" width="170" height="35" rx="8" class="d-fill-green-soft d-stroke-green"/>
+<text x="486" y="252" text-anchor="middle" class="d-small">process, then count</text>
+<path d="M571,247 L610,247" class="d-arrow" marker-end="url(#f2-arr)"/>
+<rect x="611" y="230" width="150" height="35" rx="8" class="d-block-accent"/>
+<text x="686" y="252" text-anchor="middle" class="d-text-inv d-small">true cost reconciled</text>
+<text x="20" y="290" class="d-small d-text-light">Reject boundary is an estimate; true cost is only known after generation<a class="cite" href="#ref-4">4</a>.</text>
+</svg>
+<figcaption><b>Figure 2.</b> Two admission designs checked before this module's routing step runs. Borg rejects deterministically against a pre-negotiated quota vector, with no need to know a request's true resource cost in advance<a class="cite" href="#ref-2">2</a>. Envoy AI Gateway's token-based rate limiter checks whether processing "would exceed the configured token limit" and rejects with an HTTP 429 if so, but otherwise "the request is processed and its token usage is counted towards the total" only afterward<a class="cite" href="#ref-4">4</a> — an estimate-now, reconcile-later design, because an LLM response's true token cost is not known until generation finishes.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 1.</b> Borg's priority bands, in decreasing priority order<a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Band</th><th>Relative order</th><th>Preemption rule</th><th>Quota cost</th><th>Example workload</th></tr></thead>
+<tbody>
+<tr><td class="row">Monitoring</td><td class="num">1 (highest)</td><td>Can preempt any lower band</td><td data-best>Highest</td><td>Health-check and SLO-violation alerting infrastructure</td></tr>
+<tr><td class="row">Production ("prod")</td><td class="num">2</td><td>Cannot preempt other production tasks (disallowed, to stop preemption cascades)</td><td>High</td><td>Gmail, Docs, web search-serving<a class="cite" href="#ref-2">2</a></td></tr>
+<tr><td class="row">Batch</td><td class="num">3</td><td>Preemptible by monitoring and production</td><td>Lower</td><td>MapReduce jobs, offline analysis</td></tr>
+<tr><td class="row">Best-effort ("testing"/"free")</td><td class="num">4 (lowest)</td><td>Preemptible by all higher bands; effectively infinite quota, frequently unusable due to oversubscription</td><td data-worst>Zero</td><td>Ad hoc test runs</td></tr>
+</tbody>
+</table>
+<p>Envoy AI Gateway's own documentation of its usage-based rate limiter is a useful contrast precisely because it is not a hard-quota system in Borg's sense: "when a request is received: AI Gateway checks if processing this request would exceed the configured token limit. If the limit would be exceeded, the request is rejected with a 429 status code. If within the limit, the request is processed and its token usage is counted towards the total"<a class="cite" href="#ref-4">4</a>. That last clause matters — the check at arrival is against an <em>estimate</em>, because an LLM completion's true token cost is unknowable until the model finishes generating it. The gateway's own example configuration limits are stated as flat per-hour ceilings — "GPT-4: 1000 total tokens per hour per user... GPT-3.5-turbo: 5000 total tokens per hour per user"<a class="cite" href="#ref-4">4</a> — and token usage is extracted automatically from responses that follow the OpenAI schema, with response transformers available for non-OpenAI backends such as AWS Bedrock<a class="cite" href="#ref-4">4</a>. This is the same estimate-then-reconcile shape Module 23 formalizes for billing holds: an admission or spend decision made against a provisional number, corrected once the real number is known. Section 6 returns to why this design cannot, by itself, substitute for a hard quota gate under sustained overload.</p>
+
+<h3 id="admission-vs-scheduling">2.2 Admission is not scheduling: feasibility and scoring as the next, separate step</h3>
+<p>Borg's paper is explicit that admission control and scheduling are two different algorithms running at two different times, and it is worth reading exactly how it describes the second one, because Sections 3 and 5 of this module are the AI-platform analog of it. Once a job clears quota and is admitted, it sits in a pending queue that Borg's scheduler "scans asynchronously," proceeding "from high to low priority, modulated by a round-robin scheme within a priority to ensure fairness across users and avoid head-of-line blocking behind a large job"<a class="cite" href="#ref-2">2</a>. That round-robin-within-a-priority detail matters and has a direct AI-platform equivalent: without it, one tenant submitting a very large job (or, on an inference platform, a burst of long-context requests) could monopolize its priority band's scheduling attention while every other tenant at the same priority waits behind it. Section 4's SLO lanes need the same fairness discipline within a lane, not just an ordering between lanes.</p>
+<p>The scheduling algorithm itself has two parts, and both map onto this module's later sections. <em>Feasibility checking</em> "finds machines on which the task could run" — machines that meet the task's constraints and "also have enough 'available' resources — which includes resources assigned to lower-priority tasks that can be evicted"<a class="cite" href="#ref-2">2</a>. This is Section 3's candidate-set narrowing: model identity, region, tier, and version pin play exactly the role of Borg's constraints, cutting the machine population down to the subset that could conceivably run the task at all, before anything about relative goodness is considered. <em>Scoring</em> then "picks one of the feasible machines," and Borg's built-in scoring criteria are "minimizing the number and priority of preempted tasks, picking machines that already have a copy of the task's packages, spreading tasks across power and failure domains, and packing quality including putting a mix of high and low priority tasks on a machine"<a class="cite" href="#ref-2">2</a>. Read that list against Section 5: "picking machines that already have a copy of the task's packages" is precisely the same idea as prefix-cache and LoRA-adapter affinity — reward a candidate for already holding something the request needs, rather than making it fetch that thing from scratch. "Minimizing the number and priority of preempted tasks" is the same idea KV-cache utilization and queue depth serve for an inference backend: prefer a candidate whose selection disturbs the least already-committed work. Borg names this step scoring; the Gateway API Inference Extension's EPP names it picking the endpoint that "best achieves the configured objectives"<a class="cite" href="#ref-5">5</a>. The vocabulary differs; the two-phase feasibility-then-scoring structure, run strictly after admission has already succeeded, does not.</p>
+
+<h2 id="routing-dimensions">3. Routing dimensions: narrowing a request to one backend</h2>
+<p>Once a request is admitted, routing narrows an open-ended set of backends down to one. Four dimensions do most of the narrowing in practice, and they compose — each one shrinks the candidate set before the next is applied, rather than voting independently:</p>
+<ul>
+<li><strong>Model identity.</strong> The request names a model (or a model alias); only backends serving that exact model, or a version-compatible alternative, are candidates at all.</li>
+<li><strong>Region.</strong> Data-residency requirements, latency to the caller, or simple capacity placement restrict the candidate set to backends in one or more regions.</li>
+<li><strong>Tier/priority.</strong> An interactive request and a batch request may be forbidden from sharing the same physical pool even if both name the same model, because admitting the batch request onto the interactive pool would consume capacity the platform has promised to keep free for low-latency traffic (Section 4 makes this precise).</li>
+<li><strong>Explicit version pin.</strong> A caller that pins a specific model version — rather than accepting "whatever the alias currently points to" — removes every backend running a different version from the candidate set, even a newer one, because a pinned caller has contracted for a specific, unchanging output contract.</li>
+</ul>
+<p>What remains after all four filters is a candidate set, not a single backend — and it is deliberately not narrowed further by the same static rules, because the fifth and final narrowing step needs information the first four dimensions cannot provide: which candidate is actually best positioned right now. Section 5 covers that step.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f3t"><title id="f3t">Routing decision tree narrowing a request to a candidate set, then to one backend</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="330" y="10" width="140" height="40" rx="8" class="d-block"/>
+<text x="400" y="35" text-anchor="middle" class="d-text-inv d-bold d-small">Incoming request</text>
+<path d="M400,50 L400,75" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="300" y="80" width="200" height="38" rx="8" class="d-panel"/>
+<text x="400" y="104" text-anchor="middle" class="d-small">1. Model identity filter</text>
+<path d="M400,118 L400,143" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="300" y="148" width="200" height="38" rx="8" class="d-panel"/>
+<text x="400" y="172" text-anchor="middle" class="d-small">2. Region filter</text>
+<path d="M400,186 L400,211" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="300" y="216" width="200" height="38" rx="8" class="d-panel"/>
+<text x="400" y="240" text-anchor="middle" class="d-small">3. Tier/priority filter</text>
+<path d="M400,254 L400,279" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="300" y="284" width="200" height="38" rx="8" class="d-panel"/>
+<text x="400" y="308" text-anchor="middle" class="d-small">4. Version-pin filter</text>
+<path d="M500,303 L560,255" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="565" y="225" width="210" height="60" rx="8" class="d-block-2"/>
+<text x="670" y="248" text-anchor="middle" class="d-text-inv d-bold d-small">Candidate set</text>
+<text x="670" y="264" text-anchor="middle" class="d-text-inv d-small">(N compatible backends)</text>
+<path d="M670,285 L670,305" class="d-arrow" marker-end="url(#f3-arr)"/>
+<rect x="565" y="308" width="210" height="26" rx="6" class="d-hl"/>
+<text x="670" y="326" text-anchor="middle" class="d-small d-bold">-&gt; Figure 4 signal pick (§5)</text>
+<rect x="10" y="80" width="270" height="242" rx="8" class="d-outline d-dashed"/>
+<text x="25" y="98" class="d-small d-text-light">Each filter only shrinks the set;</text>
+<text x="25" y="112" class="d-small d-text-light">an empty result at any step means</text>
+<text x="25" y="126" class="d-small d-text-light">no candidate exists and the</text>
+<text x="25" y="140" class="d-small d-text-light">degradation cascade (Fig. 5) starts.</text>
+</svg>
+<figcaption><b>Figure 3.</b> Model identity, region, tier/priority, and an explicit version pin apply in sequence, each removing incompatible backends. Version pinning is a hard filter, not a preference: a pinned caller has contracted for a fixed output contract, so a newer version of the same model alias is excluded exactly like an incompatible model would be. An empty candidate set after any filter routes into Figure 5's cascade rather than failing silently.</figcaption>
+</figure>
+
+<h3 id="routing-dimensions-litellm">3.1 What "the Router" actually does: LiteLLM's fallback and retry layers</h3>
+<p>LiteLLM's own architecture documentation names the internal structure of its Router component as three sequential layers wrapped around the actual provider call: a <code>function_with_fallbacks</code> layer that "catches failures; moves to the next model group in fallbacks," a <code>function_with_retries</code> layer nested inside it that "retries on another available deployment in the same group," and only inside both of those, the actual <code>litellm.completion()</code> or <code>litellm.embedding()</code> call that executes the provider API request and translates its response back to a common format<a class="cite" href="#ref-1">1</a>. Read against the four-dimension filter above, this maps cleanly: a "model group" in LiteLLM's fallback layer is the output of dimensions 1, 2, and 4 (model identity, region, version) narrowed to a named, interchangeable set; "another available deployment in the same group" is exactly the candidate set Figure 3 produces; and the retry layer is what runs when a specific candidate in that set is unavailable, before the fallback layer gives up on the group entirely and tries a different one. Section 6 reuses this exact two-layer structure — retry-within-group, then fallback-across-groups — as the concrete mechanics behind two consecutive steps of the degradation cascade.</p>
+<p>Version pinning deserves emphasis because it is the filter most often treated as a preference rather than a hard constraint, and getting that wrong breaks Module 25's contract. A caller that has validated its prompts, tool schemas, and downstream parsing against one specific model version is not asking for "the best available version of this model" — it is asking for the one it tested against. Routing that silently substitutes a newer version because the pinned one is momentarily unavailable produces output the caller's own validation never covered. This is why version pinning sits inside the routing-dimension filter (a hard exclusion, evaluated before any backend telemetry is consulted) rather than inside the backend-selection signal (Section 5), which is only allowed to choose among backends that already satisfy the pin.</p>
+
+<h2 id="slo-tiers">4. SLO-tiered lanes: interactive, priority, and batch</h2>
+<p>A priority number by itself is not an SLO. Module 11 defines the distinction precisely: an SLI is a measured quantity, an SLO is a target for that quantity, and an SLA attaches a consequence to missing the target — this module does not re-derive that vocabulary, only applies it. What a lane actually needs to mean, concretely, is a bundle of three things that travel together: a latency budget (the SLI target), a queueing position relative to other lanes (what happens when demand exceeds capacity), and a fallback eligibility (whether this lane's requests are allowed to degrade under Figure 5's cascade, and to what).</p>
+<p>Borg's priority bands are the closest documented precedent for exactly this bundling, even though Borg's paper frames it as cluster scheduling rather than API serving. The paper's own workload description states the difference in stakes directly: "the first is long-running services that should 'never' go down, and handle short-lived latency-sensitive requests (a few &mu;s to a few hundred ms)... the second is batch jobs that take from a few seconds to a few days to complete; these are much less sensitive to short-term performance fluctuations"<a class="cite" href="#ref-2">2</a>. That is a latency budget (microseconds to hundreds of milliseconds for prod, seconds to days for batch) and a queueing tolerance (batch jobs can wait; prod requests cannot) bundled into one classification, exactly the shape an inference platform's lanes need. The production band's added guarantee — no intra-band preemption, so a prod task is never bumped by another prod task<a class="cite" href="#ref-2">2</a> — is the fallback-eligibility half of the bundle: prod is the lane that is protected from a specific class of degradation that lower bands are not.</p>
+<p>The Kubernetes Gateway API Inference Extension's own documentation names the equivalent concept for AI serving as <em>serving priority</em>: an operator can "specify that your models for online inference of chat tasks (which is more latency sensitive) have a higher priority than a model for latency tolerant tasks"<a class="cite" href="#ref-5">5</a>. The Kubernetes project's announcement of the same extension calls the underlying property <em>request criticality</em>, contrasting "interactive chat vs. batch jobs" as the canonical example pair<a class="cite" href="#ref-3">3</a>. Both sources describe the same bundling Borg's bands provide — a request's criticality determines both how it is scheduled under contention and how latency-sensitive its budget is — without either source enumerating a fixed, standardized set of band names the way Borg's four-band vocabulary does.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f4t"><title id="f4t">SLO-tier ladder: interactive, priority, and batch lanes with latency budget, queueing position, and fallback eligibility</title>
+<rect x="20" y="20" width="180" height="0" class="d-axis"/>
+<rect x="20" y="40" width="760" height="60" rx="8" class="d-fill-blue-soft d-stroke-blue"/>
+<text x="40" y="62" class="d-bold d-small">Interactive (chat)</text>
+<text x="40" y="80" class="d-small d-text-light">Latency budget: hundreds of ms. Queued first, ahead of all other lanes.</text>
+<text x="620" y="62" class="d-small d-bold">Fallback: downgrade or</text>
+<text x="620" y="80" class="d-small d-bold">failover before queueing long</text>
+<rect x="20" y="110" width="760" height="60" rx="8" class="d-fill-amber-soft d-stroke-amber"/>
+<text x="40" y="132" class="d-bold d-small">Priority (guaranteed background)</text>
+<text x="40" y="150" class="d-small d-text-light">Latency budget: seconds. Queued behind interactive, ahead of batch.</text>
+<text x="620" y="132" class="d-small d-bold">Fallback: queue, then</text>
+<text x="620" y="150" class="d-small d-bold">downgrade if queue grows</text>
+<rect x="20" y="180" width="760" height="60" rx="8" class="d-fill-cyan-soft d-stroke-cyan"/>
+<text x="40" y="202" class="d-bold d-small">Batch</text>
+<text x="40" y="220" class="d-small d-text-light">Latency budget: minutes to hours (Borg's batch: seconds to days<a class="cite" href="#ref-2">2</a>).</text>
+<text x="620" y="202" class="d-small d-bold">Fallback: queue indefinitely,</text>
+<text x="620" y="220" class="d-small d-bold">preemptible by higher lanes</text>
+<text x="400" y="270" text-anchor="middle" class="d-small d-text-light">Same request criticality/priority signal Gateway API Inference Extension exposes to routing<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-3">3</a></text>
+</svg>
+<figcaption><b>Figure 4.</b> Each lane bundles a latency budget, a queueing position under contention, and a fallback eligibility, mirroring Borg's prod/batch split and never-preempt-within-prod rule<a class="cite" href="#ref-2">2</a>, and named as "serving priority" or "request criticality" in the Gateway API Inference Extension's own routing-signal design<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-3">3</a>. Lane boundaries here are illustrative composites of these two sources' framing, not a single vendor's fixed enumeration.</figcaption>
+</figure>
+
+<p>Two design consequences follow directly from treating tiers as bundles rather than as a single priority integer. First, a priority number that only affects scheduling order but carries no fallback-eligibility rule is silently unsafe under sustained overload: without a stated degradation path, an overloaded low-priority lane either starves indefinitely (no SLO was ever promised, so nothing is technically violated, but the caller has no way to know when to stop waiting) or it forces an operator to intervene by hand, which is precisely the ad hoc failure mode Section 6 argues should not exist as a separate "incident response" procedure. Second, because the production band's no-intra-band-preemption rule<a class="cite" href="#ref-2">2</a> exists specifically to prevent preemption cascades, an interactive lane on an inference platform should carry the equivalent guarantee: an interactive request should never be evicted from its position by another interactive request, only by an explicit higher-criticality class or by the cascade in Figure 5. Mixing "priority as a scheduling tiebreaker" with "priority as an eviction weapon within the same tier" reproduces the exact cascading-preemption failure Borg's design deliberately forecloses.</p>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>A lane's latency budget and its bounded queue length are the same constraint viewed two ways, and the arithmetic is simple enough to do at design time. If a lane promises a latency budget \(B\) and the backend serving that lane completes one request every \(s\) seconds on average, a request sitting at position \(k\) in that lane's queue cannot finish before \(k \times s\) seconds have passed even if nothing else goes wrong — so the queue cannot safely be allowed to grow past \(k_{\max} = B / s\) requests without the tail of the queue structurally breaching the budget. This is exactly why queue depth (Section 5) is a leading indicator of an SLO violation rather than a lagging one: it crosses \(k_{\max}\) before any individual request's measured latency does. A platform that only alarms on measured latency finds out about the breach after it has already happened to some caller; a platform that alarms on queue depth against this bound finds out before the next caller is affected.</p></aside>
+
+<h2 id="backend-signals">5. Backend-aware routing signals: KV-cache utilization and queue depth</h2>
+<p>Everything in Sections 3 and 4 narrows a request to a candidate <em>set</em>. Picking one member of that set is the job Module 1's classical algorithms (round robin, least-connections, ip-hash, weighted) were built for, and the Kubernetes project's own case against reusing them unmodified is direct: those algorithms "lack the specialized capabilities needed for these workloads. They also don't account for model identity or request criticality"<a class="cite" href="#ref-3">3</a>. The Gateway API Inference Extension's answer is to add a component that has access to information a generic L7 balancer never sees: live, per-backend model-server state.</p>
+<p>The extension's central abstraction is the <em>InferencePool</em>, described as representing "a set of endpoints running a model server framework," paired with an <em>Endpoint Picker</em> (EPP) that "functions as an implementation of an Inference Router that will fetch metrics from whichever portion of the InferencePool endpoints can best achieve the configured objectives"<a class="cite" href="#ref-5">5</a>. Architecturally, the EPP is not a replacement for an existing gateway; it is bolted onto one. The documentation states this design choice explicitly: the project is "leveraging Envoy's External Processing Protocol to extend any gateway that supports both ext-proc and Gateway API into an inference gateway"<a class="cite" href="#ref-5">5</a> — reusing an existing, battle-tested Envoy-class data plane rather than building a bespoke proxy from scratch, the same ext-proc extension pattern Module 21 introduces at the top of the gateway stack. The claimed payoff is stated plainly, if without a specific measured figure in the introductory documentation: model-server-aware, metrics-driven load balancing "has been proven to reduce the serving latency and improve utilization of accelerators in your clusters"<a class="cite" href="#ref-5">5</a>.</p>
+<p>Two signals do most of the work, and they are complementary rather than redundant. <strong>KV-cache utilization</strong> reflects how much of a backend's attention-cache capacity is already committed to in-flight sessions — a backend at high KV-cache utilization can still accept a request, but doing so risks evicting or slowing other sessions already resident, and a backend that already holds the relevant prefix in cache is a better placement for a request that shares that prefix. <strong>Queue depth</strong> reflects how many requests are already waiting for a turn on the backend's compute, independent of cache state — a backend can have room in its KV cache and still have a long queue, if its GPUs are saturated by compute-bound requests rather than memory-bound ones. The Kubernetes project's announcement names both explicitly as the routing signals the extension introduces<a class="cite" href="#ref-3">3</a>, and the two together give the EPP a genuine picture of backend health that neither alone provides: cache pressure without queue pressure means "slow to reuse, fast to start"; queue pressure without cache pressure means "fast to reuse, slow to start."</p>
+<p>The same extension exposes two further signals worth naming because they narrow the candidate set from Section 3 in a way none of that section's four static dimensions can: <em>LoRA adapter availability</em>, which routes a request toward a backend that already has the specific low-rank adapter it needs loaded rather than one that would have to load it first, and <em>prefix-cache status</em>, a more general form of the KV-cache-utilization signal that specifically tracks whether a candidate backend already holds the shared prompt prefix a request needs<a class="cite" href="#ref-5">5</a>. Both are properties of backend <em>state</em>, not backend <em>identity</em> — a backend does not statically declare "I serve model X with adapter Y," it reports "I currently hold adapter Y in memory," which can change from one moment to the next as other requests load and evict adapters. This is exactly the kind of information a static routing table, decided once at deploy time, structurally cannot encode, and it is why this signal layer has to sit downstream of Section 3's static filters rather than inside them.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 2.</b> Four systems this module and its neighbors cite, compared on how each makes a routing or admission decision.</caption>
+<thead><tr><th>System</th><th>Decision it makes</th><th>Signal used</th><th>Admission mechanism</th><th>Extension pattern</th></tr></thead>
+<tbody>
+<tr><td class="row">Borg scheduler<a class="cite" href="#ref-2">2</a></td><td>Admission (quota) + placement (feasibility/scoring)</td><td>Static quota vector; live machine resource fit</td><td>Hard reject at submission if quota insufficient</td><td>N/A -- built-in cluster manager</td></tr>
+<tr><td class="row">LiteLLM Router<a class="cite" href="#ref-1">1</a></td><td>Candidate-group selection + retry/fallback</td><td>Deployment availability within a model group</td><td>None built in; relies on the parallel-request rate limiter upstream</td><td>Native proxy component, not an extension</td></tr>
+<tr><td class="row">Envoy AI Gateway<a class="cite" href="#ref-4">4</a></td><td>Token-budget admission</td><td>Estimated token cost vs. configured limit</td><td>429 if estimate would exceed limit; usage reconciled after generation</td><td>Layered on Envoy's Global Rate Limit API</td></tr>
+<tr><td class="row">Gateway API Inference Extension EPP<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-3">3</a></td><td>Backend selection within a candidate pool</td><td>KV-cache utilization, queue depth, LoRA/prefix-cache state</td><td>None -- picks best available, does not formally reject</td><td>Envoy ext-proc extension of an existing gateway</td></tr>
+</tbody>
+</table>
+<p>Table 2's last column is the point worth sitting with: none of these four systems does everything. Borg is a complete admission-and-placement system but has no notion of KV-cache or token cost. Envoy AI Gateway admits on estimated cost but has no backend-state signal at all. The Inference Extension's EPP has rich backend-state signal but, on its own introductory documentation, no formal admission gate — it optimizes placement among whatever arrives, rather than rejecting anything. A production inference platform composes pieces of at least three of these four systems, because no single one of them, as documented, is a complete answer to both questions this module opened with. Concretely, the ext-proc extension pattern means these compositions are not exclusive alternatives at the infrastructure level either: an Envoy-class gateway can run a token-budget check as one ext-proc hook and hand the survivors to an EPP-style endpoint picker as a second hook on the same request path, because both are designed to extend an existing gateway rather than to be the gateway<a class="cite" href="#ref-5">5</a>. The interesting design work is not choosing one of Table 2's rows; it is deciding which hook runs first and what each one is allowed to see.</p>
+
+<h2 id="degradation-cascade">6. The graceful-degradation cascade, and why this is incident response</h2>
+<p>Every mechanism in Sections 2 through 5 has a failure mode: quota can be exhausted, a pinned version can be down, an entire region can be unreachable, a candidate set can be empty. What a platform does next is not a separate "incident response" system layered on top — it is the same admission, routing, and SLO-tier machinery already described, run in a fixed order, under stress. Stating this precisely is this module's answer to a real gap: no source in this course's map documents "incident response for an inference platform" as its own topic, because the organizations that publish this material do not treat it as one either. LiteLLM's Router ships exactly two degradation primitives — a retry layer and a fallback layer<a class="cite" href="#ref-1">1</a> — and Borg's paper describes what happens to an admitted-but-unschedulable job with the same plainness it uses for everything else: it stays pending<a class="cite" href="#ref-2">2</a>. Neither source frames either behavior as an incident.</p>
+<p>The cascade has an order, and the order matters because each step is more expensive and more visible than the one before it. A platform that skips straight to region failover when a same-region retry would have worked wastes cross-region bandwidth and adds latency for no reason; a platform that downgrades a model before exhausting cheaper options degrades response quality when it did not need to.</p>
+
+<div class="stepper">
+<figure class="fig fig-plain">
+<svg viewBox="0 0 800 260" role="img" aria-label="Graceful-degradation cascade for an unavailable primary backend">
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="90" width="150" height="60" rx="8" class="d-block-accent"/>
+<text x="95" y="115" text-anchor="middle" class="d-text-inv d-bold d-small">Primary backend</text>
+<text x="95" y="132" text-anchor="middle" class="d-text-inv d-small">unavailable</text>
+<path d="M170,120 L205,120" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+<g data-step="1">
+<rect x="210" y="90" width="150" height="60" rx="8" class="d-hl"/>
+<text x="285" y="115" text-anchor="middle" class="d-bold d-small">1. Retry / region</text>
+<text x="285" y="132" text-anchor="middle" class="d-small">failover</text>
+</g>
+<path d="M360,120 L395,120" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+<g data-step="2">
+<rect x="400" y="90" width="150" height="60" rx="8" class="d-hl"/>
+<text x="475" y="115" text-anchor="middle" class="d-bold d-small">2. Model</text>
+<text x="475" y="132" text-anchor="middle" class="d-small">downgrade</text>
+</g>
+<path d="M550,120 L585,120" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+<g data-step="3">
+<rect x="590" y="90" width="80" height="60" rx="8" class="d-hl"/>
+<text x="630" y="115" text-anchor="middle" class="d-bold d-small">3. Queue</text>
+<text x="630" y="132" text-anchor="middle" class="d-small">(bounded)</text>
+</g>
+<path d="M670,120 L705,120" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+<g data-step="4">
+<rect x="710" y="90" width="75" height="60" rx="8" class="d-fill-red-soft d-stroke-red"/>
+<text x="747" y="115" text-anchor="middle" class="d-small d-bold">4. Reject</text>
+<text x="747" y="132" text-anchor="middle" class="d-small">(429/503)</text>
+</g>
+
+<text x="285" y="180" text-anchor="middle" class="d-small d-text-light">LiteLLM retry layer<a class="cite" href="#ref-1">1</a></text>
+<text x="475" y="180" text-anchor="middle" class="d-small d-text-light">LiteLLM fallback layer<a class="cite" href="#ref-1">1</a></text>
+<text x="630" y="180" text-anchor="middle" class="d-small d-text-light">Borg pending state<a class="cite" href="#ref-2">2</a></text>
+<text x="747" y="180" text-anchor="middle" class="d-small d-text-light">insufficient quota<a class="cite" href="#ref-2">2</a></text>
+</svg>
+</figure>
+<ol class="steps">
+<li><b>Retry within the same model group, possibly in another region.</b> LiteLLM's retry layer "retries on another available deployment in the same group"<a class="cite" href="#ref-1">1</a> — this is the cheapest recovery because it changes nothing about which model the caller gets, only which physical replica serves it. A version-pinned caller (Section 3.1) can still be served here, because the candidate set already excludes incompatible versions before this step runs.</li>
+<li><b>Fall back to a different model group.</b> Only once retries within the original group are exhausted does LiteLLM's fallback layer "move to the next model group in fallbacks"<a class="cite" href="#ref-1">1</a> — this is where a genuine model downgrade happens, and it is the first step in the cascade that can change the caller's output. It is safe only if two conditions hold: the fallback's output contract is compatible with what the caller's code expects (the same reason Section 3.1 treats version pinning as a hard filter, not a preference), and the operation being retried is idempotent, so that a partially-completed primary-model attempt does not double-execute or double-charge when the fallback model picks it up. Module 18 and Module 23 establish exactly this idempotency guarantee for the billing side of a retried request; this step depends on it holding.</li>
+<li><b>Queue.</b> If no fallback group has room either, the request does not fail — it waits. This is precisely Borg's "admitted but remain pending (unscheduled) due to insufficient resources" state<a class="cite" href="#ref-2">2</a>, applied to a request rather than a job. A bounded queue with the SLO-tier lane's stated latency budget (Figure 4) is what keeps this step from becoming an unbounded wait: once a request would age past its lane's budget while still queued, the cascade proceeds to the final step rather than holding it indefinitely.</li>
+<li><b>Reject.</b> Only after retry, fallback, and a bounded wait have all failed does the platform return an explicit rejection — the same admission-control refusal Section 2 describes, now triggered by exhausted real-time capacity rather than exhausted quota, but returned with the same HTTP-level signal (429 or 503) a caller's retry logic already has to handle.</li>
+</ol>
+</div>
+
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>An "incident" on an inference platform is not a different code path from normal operation — it is this cascade running with a higher fraction of requests reaching steps 2 through 4 instead of resolving at step 1. A platform that has correctly designed admission control, routing dimensions, SLO tiers, and this cascade has already built its incident response; a platform that treats incident response as a separate on-call procedure is building a second system to duplicate the first one, usually badly, under worse conditions than the ones it was tested in.</p></aside>
+
+<p>The precondition worth restating from step 2, because it is easy to gloss over: a fallback is only as safe as the guarantee that re-running (or partially re-running) the underlying operation cannot corrupt state. Every fallback in this cascade is, structurally, a retry — of the whole request at a different backend, or of the same request against a different model. Module 8's idempotency-key vocabulary and Module 18's three-state (absent/in-flight/complete) ledger model are what make "just retry it somewhere else" a safe instruction rather than a data-corruption risk, and Module 23 extends that same model to a still-streaming, partially-billed request. This module assumes that machinery is in place; it does not re-derive it.</p>
+
+<h3 id="degradation-backpressure">6.1 What the client is told at each step</h3>
+<p>Module 10 already establishes bounded queues and load shedding as the two general backpressure primitives every layer of this course reuses; what is specific to this cascade is which signal accompanies which step, because a client's own retry logic has to distinguish "try again immediately, somewhere else" from "stop and back off." Step 1 (retry within a group) and step 2 (fallback across groups) are, by design, invisible to the caller — LiteLLM's retry and fallback layers resolve inside a single client-facing request<a class="cite" href="#ref-1">1</a>, so from outside the platform a successful retry or fallback looks identical to a first-attempt success. Step 3 (queue) is where the platform has to start telling the caller something, because a caller with its own latency budget needs to know whether it is worth waiting. A queued request can be held open (the caller simply experiences added latency up to the lane's budget) or, once that budget is exhausted, answered with an explicit signal that more waiting will not help — the same 429/503 vocabulary Envoy AI Gateway already returns when a token estimate would exceed a limit<a class="cite" href="#ref-4">4</a>, reused here for a capacity rather than a budget reason. Step 4 (reject) is unambiguous: the request is refused, and the caller's own retry-with-backoff logic (Module 10) is the correct response, not an immediate resubmission, because an immediate retry into a still-saturated system only adds to the queue depth that caused the rejection in the first place.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Every source in this module agrees that a request must clear some gate before it consumes GPU cycles. They do not agree on what that gate should check, or when. Three real, currently-shipping designs answer the question differently, and the difference is not cosmetic — it determines whether a platform fails safely under sustained overload or merely fails slowly.</p>
+<div class="positions">
+<article class="position">
+<h4>Admission is a hard quota check, decided before submission</h4>
+<p class="who">Borg's admission-control design, the direct ancestor of Kubernetes<a class="cite" href="#ref-2">2</a></p>
+<p>Quota is a pre-negotiated resource vector, and "jobs with insufficient quota are immediately rejected upon submission"<a class="cite" href="#ref-2">2</a>, without ever consulting real-time backend state. The check is deterministic and cheap — a comparison against a number decided during capacity planning, not a query to any live system.</p>
+<ul class="pros"><li>Rejects in the time of a lookup, before any resource is touched.</li><li>Protects the allocation regardless of whether spare capacity happens to exist elsewhere, which keeps multi-tenant cost and capacity guarantees meaningful.</li><li>Requires no knowledge of a request's true cost in advance.</li></ul>
+<ul class="cons"><li>Blind to real-time backend saturation: a request within quota can still find every candidate backend full.</li><li>Quota allocation is a manual, out-of-band process<a class="cite" href="#ref-2">2</a>, so it lags real demand shifts.</li></ul>
+</article>
+<article class="position">
+<h4>Admission is an estimate, corrected after the fact</h4>
+<p class="who">Envoy AI Gateway's token-based rate limiting<a class="cite" href="#ref-4">4</a></p>
+<p>Because an LLM response's true token cost is unknowable until generation finishes, the gate checks whether processing <em>would</em> exceed a configured limit, admits if not, and only counts real usage against the budget afterward<a class="cite" href="#ref-4">4</a>. The gate is provisional by construction.</p>
+<ul class="pros"><li>Works when true cost genuinely cannot be known at admission time — the common case for generative workloads.</li><li>Reconciliation (Module 23's hold-and-release pattern) keeps the ledger eventually accurate even though the gate itself is approximate.</li></ul>
+<ul class="cons"><li>Systematically over- or under-admits relative to the true limit, because the number it checks against is an estimate, not the eventual truth.</li><li>Under sustained overload, admitting on optimistic estimates and reconciling later means the platform discovers it is over budget only after resources are already spent — too late to have prevented the overload.</li></ul>
+</article>
+<article class="position">
+<h4>There is no formal admission gate; placement is telemetry-driven and always tries to find room</h4>
+<p class="who">Kubernetes Gateway API Inference Extension's Endpoint Picker<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-3">3</a></p>
+<p>The EPP's stated job is to fetch live metrics and pick the endpoint that "best achieves the configured objectives"<a class="cite" href="#ref-5">5</a> among an InferencePool's members. Its introductory documentation describes selection among available backends, not a formal accept/reject decision at the pool's boundary.</p>
+<ul class="pros"><li>Uses the most accurate available picture of backend state — KV-cache utilization, queue depth, adapter and prefix-cache residency<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-3">3</a> — information neither of the other two positions has access to.</li><li>Naturally load-aware: it will not send a request to the most-saturated backend when a less-saturated one exists.</li></ul>
+<ul class="cons"><li>"Best available" still finds an answer even when every candidate is badly saturated, because picking the least-bad option is not the same as refusing to add more load; without a paired admission gate this can let queue depth grow without bound.</li><li>Depends on a telemetry pipeline that itself has latency and can be stale under the exact load spikes it exists to handle.</li></ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>These three are not competing final answers to the same question; they are answers to three different questions that a complete platform must ask in a specific order. Borg's hard quota gate should run first, precisely because it is cheap, deterministic, and independent of backend state — it is the mechanism that keeps a single over-quota tenant from ever reaching the expensive parts of the pipeline, and it is the correct thing to check before anything else regardless of how well-instrumented the backends are. The Inference Extension's telemetry-driven placement should run second, among whatever the quota gate admits, because once a request is legitimately entitled to run, picking the backend with spare KV-cache and a short queue is strictly better than picking blindly — but it is not a substitute for the first gate, because "always find the best available backend" degrades gracelessly into "queue depth grows everywhere" once every backend is genuinely saturated, with no rejection signal to relieve the pressure. Envoy AI Gateway's estimate-then-reconcile pattern is the right tool for a narrower job: tracking a value, like true token spend, that cannot be known until after the fact — it belongs paired with Module 23's billing reconciliation, not used as the platform's only admission gate, because a gate that discovers overload after resources are spent has already failed at the one thing an admission gate exists to do. What would settle this in a specific deployment is a load test that drives sustained demand past capacity and measures which layer's queue actually grows unbounded first; whichever layer has no reject signal at all is the one that needs a hard quota check added in front of it.</p>
+</div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The Kubernetes Gateway API Inference Extension is the least settled piece of this module's grounding, and it is worth flagging precisely because its own documentation shows the seams. Its API reference is published in two forms side by side — a "v1 API Reference" and a "v1alpha1 API Reference"<a class="cite" href="#ref-5">5</a> — without the introductory documentation itself stating which one is the current recommendation for a new deployment; the project also lists an <code>InferencePoolImport</code> type alongside <code>InferencePool</code> without fully specifying it in the introduction<a class="cite" href="#ref-5">5</a>. Read together, this is a project still moving fields from an alpha surface toward a stabilized v1 surface, which is normal for an extension this young — the Kubernetes announcement of the project is dated 2025-06-05<a class="cite" href="#ref-3">3</a> — but it means the exact object schema this section describes conceptually (InferencePool, EPP-selected objectives, serving priority) should be checked against the live API reference rather than assumed frozen, if you are implementing against it rather than just reasoning about the pattern. The three-way division this module's disagreement section describes — hard quota, optimistic estimate, telemetry-driven placement — is comparatively stable, because it reflects a structural difference in what information is available at each decision point rather than an implementation detail likely to be refactored away.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>BerriAI / LiteLLM contributors. <em>Life of a Request (LiteLLM Proxy architecture)</em>. LiteLLM, docs.litellm.ai live docs, 2026. <a href="https://docs.litellm.ai/docs/proxy/architecture">https://docs.litellm.ai/docs/proxy/architecture</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the virtual-key auth/budget check and parallel rate-limiter stages preceding the Router; the Router's internal function_with_fallbacks / function_with_retries / completion() layering; async post-response spend logging.</span></li>
+<li id="ref-2"><span class="ref-type">paper</span>Verma, A., Pedrosa, L., Korupolu, M., Oppenheimer, D., Tune, E., Wilkes, J. <em>Large-scale cluster management at Google with Borg</em>. EuroSys '15. <a href="https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/43438.pdf">https://research.google.com/pubs/archive/43438.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: priority bands and the prod/batch/best-effort split (&sect;2.5); the quota-as-resource-vector definition and its "20 TiB of RAM" example (&sect;2.5); "quota-checking is admission control, not scheduling" and the admitted-but-pending state (&sect;2.5); intra-production-band no-preemption rule (&sect;2.5); workload latency characterization (&sect;2.1).</span></li>
+<li id="ref-3"><span class="ref-type">blog</span>Kubernetes project contributors. <em>Introducing Gateway API Inference Extension</em>. Kubernetes (kubernetes.io/blog), published 2025-06-05. <a href="https://kubernetes.io/blog/2025/06/05/introducing-gateway-api-inference-extension/">https://kubernetes.io/blog/2025/06/05/introducing-gateway-api-inference-extension/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: why long-running, partially-stateful inference sessions break generic L7 load balancing; KV-cache utilization and queue depth as named routing signals; the "interactive chat vs. batch jobs" request-criticality framing.</span></li>
+<li id="ref-4"><span class="ref-type">official</span>Envoy AI Gateway project. <em>Usage-based Rate Limiting</em>. Envoy AI Gateway, v0.1 docs, 2026. <a href="https://aigateway.envoyproxy.io/docs/0.1/capabilities/usage-based-ratelimiting/">https://aigateway.envoyproxy.io/docs/0.1/capabilities/usage-based-ratelimiting/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the check-would-exceed-then-process-then-count two-phase admission design; the per-hour token-limit example configuration; automatic token-usage extraction from OpenAI-schema responses.</span></li>
+<li id="ref-5"><span class="ref-type">official</span>kubernetes-sigs contributors (Red Hat, Google Cloud, IBM Research, CoreWeave, NVIDIA). <em>Introduction (Kubernetes Gateway API Inference Extension)</em>. Kubernetes SIGs, live docs, 2026. <a href="https://gateway-api-inference-extension.sigs.k8s.io/">https://gateway-api-inference-extension.sigs.k8s.io/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the InferencePool and Endpoint Picker (EPP) abstractions; the ext-proc extension pattern for reusing an existing gateway; serving-priority configuration; LoRA-adapter-availability and prefix-cache-status routing signals.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

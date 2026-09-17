@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transactions, Indexes, and the Relational/NoSQL Split · System Design</title>
+<meta name="description" content="What a transaction actually guarantees at read committed, snapshot isolation, and serializable; how two-phase commit and Spanner's TrueTime make a write durable across machines; B-tree versus LSM-tree indexes; and why Dynamo's lineage deliberately rejects general transactions that Bigtable and Spanner keep.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">System Design · Module 4</p>
+  <h1>Transactions, Indexes, and the Relational/NoSQL Split</h1>
+  <p class="lede">A transaction's isolation level decides which of another transaction's half-finished writes you are allowed to see; an index decides whether reading one row costs a lookup or a scan; a data model decides whether "one write" means one row, one versioned cell, or one opaque blob. This module derives all three from the papers that made the canonical, opposite choices — Bigtable and Spanner keeping general transactions and Dynamo deliberately throwing them away — so that after it, "ACID" or "eventually consistent" on a product page tells you exactly which guarantee was kept and which was traded for availability.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>35 min</b> read</span>
+    <span class="chip"><b>7</b> sources</span>
+    <span class="chip chip-amber">As of 2026-09-17</span>
+    <span class="chip">Prerequisite: <b>Module 3</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f1t"><title id="f1t">One write, four independent questions this module answers</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="20" y="130" width="150" height="64" rx="8" class="d-block-muted"/>
+    <text x="95" y="156" text-anchor="middle" class="d-bold d-small">WRITE</text>
+    <text x="95" y="174" text-anchor="middle" class="d-mono d-small d-text-light">(key, value)</text>
+
+    <path d="M170,150 Q220,60 285,50" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M170,158 Q220,125 285,122" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M170,166 Q220,198 285,200" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M170,174 Q220,258 285,274" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="285" y="20" width="495" height="58" rx="8" class="d-block"/>
+    <text x="305" y="42" class="d-text-inv d-bold">Isolation level</text>
+    <text x="305" y="60" class="d-text-inv d-small">which concurrent writes can this transaction see? (§2)</text>
+
+    <rect x="285" y="94" width="495" height="58" rx="8" class="d-block-2"/>
+    <text x="305" y="116" class="d-text-inv d-bold">Commit protocol</text>
+    <text x="305" y="134" class="d-text-inv d-small">how does it become durable on every machine at once? (§3)</text>
+
+    <rect x="285" y="168" width="495" height="58" rx="8" class="d-block-accent"/>
+    <text x="305" y="190" class="d-text-inv d-bold">Index structure</text>
+    <text x="305" y="208" class="d-text-inv d-small">does a later read cost a lookup or a scan? (§4)</text>
+
+    <rect x="285" y="242" width="495" height="58" rx="8" class="d-fill-green"/>
+    <text x="305" y="264" class="d-text-inv d-bold">Data model</text>
+    <text x="305" y="282" class="d-text-inv d-small">what shape does the stored record take? (§5, §6)</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The same write raises four independent design questions this module answers in order. Bigtable<a class="cite" href="#ref-3">3</a> and Spanner<a class="cite" href="#ref-6">6</a> answer all four by keeping general transactions and a strict isolation guarantee; Dynamo<a class="cite" href="#ref-7">7</a> answers all four by rejecting general transactions and strict isolation in exchange for availability.</figcaption>
+</figure>
+
+<h2 id="acid">1. ACID: what each guarantee actually constrains</h2>
+<p>"ACID (Atomicity, Consistency, Isolation, Durability) is a set of properties that guarantee that database transactions are processed reliably"<a class="cite" href="#ref-7">7</a> — that is Amazon's own one-line gloss, from the paper that goes on to reject three of the four letters for its own key-value store. The acronym is old and the individual letters are unevenly interesting to an engineer who already reasons about consistency across GPUs and KV caches for a living.</p>
+<p><strong>Atomicity</strong> means a transaction's writes either all happen or none do; there is no state in which a caller can observe half of a multi-key update. <strong>Durability</strong> means that once a transaction is acknowledged as committed, it survives a crash — normally by fsyncing a write-ahead log before acknowledging. Neither of these is where systems disagree: every system in this module, including Dynamo, gives you atomicity and durability for whatever unit of write it accepts. <strong>Consistency</strong>, in the ACID sense, is the weakest letter of the four — it just means the database will not let a transaction leave application-level invariants (foreign keys, uniqueness constraints) violated, which is a property of the schema and the transaction logic, not something a storage engine implements on its own.</p>
+<p><strong>Isolation</strong> is where all of the real engineering, and all of the real disagreement, lives. It answers one question: while transaction A is in progress, what is transaction B allowed to see of A's uncommitted or concurrently-committing state? The strongest possible answer — serializability, meaning the system behaves as if every transaction ran alone, one after another, in some order — is expensive to implement and expensive to run. Every isolation level weaker than serializable is a deliberate, named trade of some of that guarantee for throughput or latency, and the entire relational-versus-NoSQL argument in this module's "Where experts disagree" section is really an argument about how much of that trade is worth making and where.</p>
+
+<h2 id="isolation-ladder">2. The isolation-level ladder</h2>
+<p>Database vendors have offered isolation levels weaker than full serializability since at least the 1995 ANSI SQL-92 standard, and the standard's own definitions turned out to be broken. The paper that fixed them — Berenson, Bernstein, Gray, Melton, and the O'Neils, writing while at Microsoft, Sybase, and UMass Boston — showed that the ANSI phenomena "fail to characterize several popular isolation levels, including the standard locking implementations of the levels," and introduced a fourth phenomenon (<em>dirty write</em>) plus a new isolation type, <em>snapshot isolation</em>, that the standard did not anticipate at all<a class="cite" href="#ref-1">1</a>. That 1995 taxonomy is still the one every mainstream database documents its isolation levels against, including PostgreSQL's own manual today<a class="cite" href="#ref-2">2</a>, so it is the right place to start rather than treating "read committed" and "serializable" as folklore terms.</p>
+
+<h3 id="anomaly-phenomena">2.1 The four phenomena an isolation level can forbid</h3>
+<p>The paper defines phenomena as action subsequences across two transactions T1 and T2, written in a shorthand where <code>w1[x]</code> means "T1 writes x," <code>c1</code> means "T1 commits," and <code>a1</code> means "T1 aborts"<a class="cite" href="#ref-1">1</a>:</p>
+<ul>
+<li><strong>P0 — Dirty write.</strong> T1 modifies x; T2 modifies x again before T1 commits or aborts. If either rolls back, it is unclear which value is correct<a class="cite" href="#ref-1">1</a>.</li>
+<li><strong>P1 — Dirty read.</strong> T1 modifies x; T2 reads that same x before T1 commits or aborts, so T2 may read a value that never actually existed once T1 rolls back<a class="cite" href="#ref-1">1</a>.</li>
+<li><strong>P2 — Fuzzy (non-repeatable) read.</strong> T1 reads x; T2 modifies or deletes x and commits; if T1 rereads x it gets a different, or missing, value<a class="cite" href="#ref-1">1</a>.</li>
+<li><strong>P3 — Phantom.</strong> T1 reads a set of rows matching a predicate; T2 inserts or updates a row that now also matches, and commits; T1's repeated query returns a different set<a class="cite" href="#ref-1">1</a>.</li>
+</ul>
+<p>Dirty writes (P0) are forbidden at every isolation level any serious database ships — allowing them would mean two uncommitted transactions could interleave writes to the same row and leave a value nobody actually wrote — so P0 is really a floor rather than a distinguishing feature<a class="cite" href="#ref-1">1</a>. The three levels this module's figure puts on a ladder differ in which of P1, P2, and P3 they still allow, plus a fifth phenomenon the 1995 paper had to invent to describe the level in the middle.</p>
+
+<h3 id="rc-si-serializable">2.2 Read committed, snapshot isolation, serializable</h3>
+<p><strong>Read committed</strong> is the weakest level anyone still uses in production; it forbids P0 and P1 (you never see another transaction's uncommitted writes) but allows P2 and P3. PostgreSQL, where read committed is the default, states this precisely: "a <code>SELECT</code> query... sees only data committed before the query began; it never sees either uncommitted data or changes committed by concurrent transactions during the query's execution"<a class="cite" href="#ref-2">2</a> — but that promise is re-evaluated every single statement, not once per transaction, which is exactly why two <code>SELECT</code>s five milliseconds apart in the same transaction can return different rows for the same predicate.</p>
+<p><strong>Snapshot isolation</strong> is the interesting middle rung, and it is not one of the four ANSI levels at all — it is the isolation type the 1995 paper defined specifically because several real systems (Oracle among them) were shipping something the ANSI phenomena could not describe<a class="cite" href="#ref-1">1</a>. Under snapshot isolation, "each transaction reads data from a snapshot of the (committed) data as of the time the transaction started, called its Start-Timestamp... A transaction running in Snapshot Isolation is never blocked attempting a read"<a class="cite" href="#ref-1">1</a>. On commit, the transaction is assigned a Commit-Timestamp and succeeds only if no other transaction with a commit timestamp inside its own execution interval wrote any of the same data — a rule the paper calls <em>first-committer-wins</em>, and which is exactly what eliminates the lost-update phenomenon (P4)<a class="cite" href="#ref-1">1</a>. PostgreSQL implements its <code>REPEATABLE READ</code> level with this exact mechanism — "The Repeatable Read isolation level is implemented using a technique known in academic database literature... as Snapshot Isolation"<a class="cite" href="#ref-2">2</a> — and surfaces first-committer-wins as an explicit client-visible error: <code>ERROR: could not serialize access due to concurrent update</code><a class="cite" href="#ref-2">2</a>.</p>
+<p><strong>Serializable</strong> forbids everything: the system "emulates serial transaction execution for all committed transactions; as if transactions had been executed one after another, serially, rather than concurrently"<a class="cite" href="#ref-1">1</a>. PostgreSQL implements this with predicate locks that "determine when a write would have had an impact on the result of a previous read from a concurrent transaction, had it run first," aborting the offending transaction with <code>ERROR: could not serialize access due to read/write dependencies among transactions</code><a class="cite" href="#ref-2">2</a> rather than blocking it up front. The cost is real: every serializable transaction now carries the bookkeeping to detect these dependencies and a nonzero abort-and-retry rate under contention, which is the whole reason the two weaker rungs below it exist commercially.</p>
+
+<h3 id="write-skew">2.3 The anomaly each rung still permits</h3>
+<p>The reason snapshot isolation is genuinely dangerous rather than merely "a bit weaker than serializable" is <em>write skew</em>, a fifth phenomenon the same authors had to add later to describe it: "Suppose T1 reads x and y, which are consistent with a constraint C(), and then T2 reads x and y, writes x, and commits. Then T1 writes y. If there were a constraint between x and y, it might be violated"<a class="cite" href="#ref-1">1</a>. Concretely: two doctors on call for the same ward each independently check "is at least one of us still on call?", both see "yes, the other one is," and both remove themselves — the invariant ("at least one doctor on call") is violated even though neither transaction ever wrote a row the other one wrote. Snapshot isolation cannot see this, because P2 requires a shared write and A5B does not involve one: "Clearly neither A5A nor A5B could arise in histories where P2 is precluded, since both A5A and A5B have T2 write a data item that has been previously read by an uncommitted T1"<a class="cite" href="#ref-1">1</a> — write skew reads two rows and writes only one each, so no dirty-write detection ever fires. The two isolation levels are formally <em>incomparable</em>: "REPEATABLE READ »« Snapshot Isolation"<a class="cite" href="#ref-1">1</a> — snapshot isolation forbids phantoms (P3) that PostgreSQL's REPEATABLE READ still allows in the ANSI sense, but permits write skew that a lock-based REPEATABLE READ does not.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f2t"><title id="f2t">Isolation-level ladder from read committed to serializable, with the anomaly each rung still permits</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="70" y1="270" x2="730" y2="270" class="d-axis"/>
+    <text x="400" y="300" text-anchor="middle" class="d-small d-text-light">increasing isolation strength, increasing coordination cost →</text>
+
+    <rect x="90" y="150" width="180" height="90" rx="8" class="d-block-muted"/>
+    <text x="180" y="178" text-anchor="middle" class="d-bold">Read committed</text>
+    <text x="180" y="198" text-anchor="middle" class="d-small d-text-light">re-checks committed data</text>
+    <text x="180" y="214" text-anchor="middle" class="d-small d-text-light">every statement</text>
+
+    <rect x="310" y="100" width="180" height="90" rx="8" class="d-block-2"/>
+    <text x="400" y="128" text-anchor="middle" class="d-text-inv d-bold">Snapshot isolation</text>
+    <text x="400" y="148" text-anchor="middle" class="d-text-inv d-small">one snapshot for the</text>
+    <text x="400" y="164" text-anchor="middle" class="d-text-inv d-small">whole transaction</text>
+
+    <rect x="530" y="50" width="180" height="90" rx="8" class="d-block"/>
+    <text x="620" y="78" text-anchor="middle" class="d-text-inv d-bold">Serializable</text>
+    <text x="620" y="98" text-anchor="middle" class="d-text-inv d-small">behaves as if transactions</text>
+    <text x="620" y="114" text-anchor="middle" class="d-text-inv d-small">ran one at a time</text>
+
+    <path d="M270,195 L310,145" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M490,145 L530,95" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+    <rect x="55" y="245" width="250" height="20" rx="4" class="d-fill-amber-soft"/>
+    <text x="180" y="259" text-anchor="middle" class="d-small d-bold">still allows: fuzzy read, phantom, write skew</text>
+    <rect x="295" y="195" width="210" height="20" rx="4" class="d-fill-amber-soft"/>
+    <text x="400" y="209" text-anchor="middle" class="d-small d-bold">still allows: write skew (A5B)</text>
+    <rect x="530" y="145" width="180" height="20" rx="4" class="d-fill-green-soft"/>
+    <text x="620" y="159" text-anchor="middle" class="d-small d-bold">allows: nothing</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> The three rungs, each defined by which of P1–P3 and write skew it still permits, per the ANSI-critique paper's own phenomena and PostgreSQL's implementation of them<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>. Snapshot isolation sits strictly above read committed on some axes but is incomparable with lock-based repeatable read on phantoms<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 1.</b> Which anomalies each isolation level still permits, by the ANSI-critique paper's phenomena (broad interpretation) and PostgreSQL's documented behavior<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</caption>
+<thead><tr><th>Isolation level</th><th>Dirty write (P0)</th><th>Dirty read (P1)</th><th>Fuzzy/non-repeatable read (P2)</th><th>Phantom (P3)</th><th>Lost update (P4)</th><th>Write skew (A5B)</th></tr></thead>
+<tbody>
+<tr><td class="row">Read committed</td><td>Not possible</td><td>Not possible</td><td data-worst>Possible</td><td data-worst>Possible</td><td data-worst>Possible</td><td data-worst>Possible</td></tr>
+<tr><td class="row">Snapshot isolation</td><td>Not possible</td><td>Not possible</td><td>Not possible</td><td>Not possible</td><td>Not possible</td><td data-worst>Possible</td></tr>
+<tr><td class="row">Serializable</td><td>Not possible</td><td>Not possible</td><td>Not possible</td><td>Not possible</td><td>Not possible</td><td data-best>Not possible</td></tr>
+</tbody>
+</table>
+<p>Lost update (P4) is the case where "T1 reads a data item and then T2 updates the data item (possibly based on a previous read), then T1 (based on its earlier read value) updates the data item and commits" — T2's update is silently overwritten and disappears even though T2 committed cleanly<a class="cite" href="#ref-1">1</a>. Read committed permits it outright. Snapshot isolation eliminates it as a side effect of first-committer-wins, not as a separately implemented check: "forbidding P2 also precludes P4, since w2[x] comes after r1[x] and before T1 commits or aborts"<a class="cite" href="#ref-1">1</a> — which is exactly why P4 is a useful anomaly for telling read committed and snapshot isolation apart even though neither the ANSI standard nor a casual reading of "isolation levels" would predict that a single mechanism (blocking a second writer to an already-read row) closes two named anomalies (P4 and, separately, most instances of P2) at once.</p>
+
+<h3 id="locking-implementation">2.4 What the levels look like as actual locks</h3>
+<p>Read committed and serializable are not just abstract permission tables — most production databases implement them as concrete lock durations, and the ANSI-critique paper tabulates exactly which locks: read committed takes well-formed write locks of long duration plus read locks of only short duration (released immediately after each statement), while serializable adds long-duration read locks and long-duration read <em>predicate</em> locks, held until commit, which is what makes it able to detect a phantom insert that would have matched an earlier query's predicate<a class="cite" href="#ref-1">1</a>. The paper also names the level PostgreSQL's serializable sits directly below: <em>cursor stability</em>, which "extends READ COMMITTED locking behavior for SQL cursors by adding a new read action for FETCH... requiring that a lock be held on the current item of the cursor," specifically to close the lost-update case for whichever single row a cursor currently points at, without paying for full repeatable-read locking on every row a transaction touches<a class="cite" href="#ref-1">1</a>. Locking is not the only implementation strategy — PostgreSQL's serializable level uses predicate <em>tracking</em> (Serializable Snapshot Isolation) rather than predicate locking in the classical sense<a class="cite" href="#ref-2">2</a> — but the lock-duration framing is still the fastest way to build intuition for why stronger levels cost more: every level up the ladder either holds a lock longer or widens what it locks from an item to a predicate.</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Most engineers read "REPEATABLE READ" and assume it means what the name says. In PostgreSQL and most other multi-version systems, REPEATABLE READ is implemented as snapshot isolation, which repeats reads but still permits write skew<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>. If your invariant spans two rows — two account balances, a seat count and a booking count, two doctors' on-call status — snapshot isolation alone does not protect it; you need either explicit locking (<code>SELECT ... FOR UPDATE</code>) or the serializable level.</p></aside>
+
+<h2 id="two-phase-commit">3. Two-phase commit: making a distributed write atomic</h2>
+<p>Isolation answers what one machine shows to concurrent readers. Two-phase commit (2PC) answers a completely different question: when a single transaction touches data on <em>N</em> different machines, how do all <em>N</em> agree on commit or abort as one atomic unit, given that any of them can crash mid-transaction? Gray and Lamport's 2004 Microsoft Research paper — later published in ACM Transactions on Database Systems — gives the cleanest formal treatment of both the classic protocol and its limitation<a class="cite" href="#ref-5">5</a>.</p>
+
+<h3 id="2pc-protocol">3.1 The protocol and its cost</h3>
+<p>Each participant, called a resource manager (RM), moves through four states: <em>working</em>, <em>prepared</em>, <em>committed</em>, <em>aborted</em>. The protocol's two safety requirements are simple to state: "it is impossible for one RM to be in the committed state and another to be in the aborted state," and "an RM can enter the committed state only after all RMs have been in the prepared state"<a class="cite" href="#ref-5">5</a>. A transaction manager (TM) coordinates: an RM that wants to commit enters <em>prepared</em> and tells the TM; once the TM has heard <em>prepared</em> from every RM, it enters <em>committed</em> itself and tells everyone to commit<a class="cite" href="#ref-5">5</a>.</p>
+<p>The cost is countable exactly. For <em>N</em> resource managers, the failure-free path is: the initiating RM sends <em>Prepared</em> to the TM (1 message); the TM sends <em>Prepare</em> to the other <em>N</em>−1 RMs (<em>N</em>−1 messages); each replies <em>Prepared</em> (<em>N</em>−1 messages); the TM sends <em>Commit</em> to all <em>N</em> (<em>N</em> messages). "Thus, in the normal case, the RMs learn that the transaction has been committed after four message delays. A total of 3<em>N</em>−1 messages are sent"<a class="cite" href="#ref-5">5</a>. If the TM is co-located with the initiating RM, as is typical, two of those messages are free and the count drops to 3<em>N</em>−3 over three message delays<a class="cite" href="#ref-5">5</a>. Messages are not the only cost: "the two-phase commit protocol incurs the delays associated with writes to stable storage: the write by the first RM to prepare, the writes by the remaining RMs when they prepare, and the write by the TM when it makes the commit decision. This can be reduced to two write delays by having all RMs prepare concurrently"<a class="cite" href="#ref-5">5</a> — every one of those writes is an fsync-class durability barrier, which is why 2PC's real latency floor is normally the stable-storage write path, not the network round trip.</p>
+
+<table class="tbl tbl-compare">
+<caption><b>Table 2.</b> Two-phase commit's message and delay cost as a function of participant count <em>N</em>, from the protocol's own accounting<a class="cite" href="#ref-5">5</a>.</caption>
+<thead><tr><th>Participants (<em>N</em>)</th><th class="num">Messages (3N−1)</th><th class="num">Messages, TM co-located (3N−3)</th><th class="num">Message delays</th></tr></thead>
+<tbody>
+<tr><td class="row">3</td><td class="num">8</td><td class="num">6</td><td class="num">4 (3 co-located)</td></tr>
+<tr><td class="row">5</td><td class="num">14</td><td class="num">12</td><td class="num">4 (3 co-located)</td></tr>
+<tr><td class="row">10</td><td class="num">29</td><td class="num">27</td><td class="num">4 (3 co-located)</td></tr>
+</tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f3t"><title id="f3t">Two-phase commit sequence diagram: coordinator against three resource managers, failure-free case</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    <marker id="f3-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+    <rect x="20" y="10" width="120" height="34" rx="6" class="d-block-2"/><text x="80" y="32" text-anchor="middle" class="d-text-inv d-bold d-small">TM (coordinator)</text>
+    <line x1="80" y1="44" x2="80" y2="260" class="d-axis"/>
+    <rect x="260" y="10" width="110" height="34" rx="6" class="d-block-muted"/><text x="315" y="32" text-anchor="middle" class="d-bold d-small">RM1</text>
+    <line x1="315" y1="44" x2="315" y2="260" class="d-axis"/>
+    <rect x="470" y="10" width="110" height="34" rx="6" class="d-block-muted"/><text x="525" y="32" text-anchor="middle" class="d-bold d-small">RM2</text>
+    <line x1="525" y1="44" x2="525" y2="260" class="d-axis"/>
+    <rect x="650" y="10" width="110" height="34" rx="6" class="d-block-muted"/><text x="705" y="32" text-anchor="middle" class="d-bold d-small">RM3</text>
+    <line x1="705" y1="44" x2="705" y2="260" class="d-axis"/>
+
+    <path d="M315,65 L90,65" class="d-arrow" marker-end="url(#f3-arr)"/><text x="200" y="58" text-anchor="middle" class="d-small">Prepared (RM1 entered prepared)</text>
+    <path d="M90,95 L525,95" class="d-arrow" marker-end="url(#f3-arr)"/><path d="M90,95 L705,95" class="d-arrow" marker-end="url(#f3-arr)"/><text x="400" y="88" text-anchor="middle" class="d-small">Prepare</text>
+    <path d="M525,125 L90,125" class="d-arrow" marker-end="url(#f3-arr)"/><path d="M705,130 L90,130" class="d-arrow" marker-end="url(#f3-arr)"/><text x="400" y="118" text-anchor="middle" class="d-small">Prepared (from RM2, RM3)</text>
+
+    <rect x="60" y="150" width="700" height="24" rx="4" class="d-fill-red-soft"/>
+    <text x="410" y="167" text-anchor="middle" class="d-small d-bold">if TM fails here: all RMs are "prepared" but none knows commit or abort — blocked</text>
+
+    <path d="M90,205 L315,205" class="d-arrow-active" marker-end="url(#f3-arr-r)"/>
+    <path d="M90,205 L525,205" class="d-arrow-active" marker-end="url(#f3-arr-r)"/>
+    <path d="M90,205 L705,205" class="d-arrow-active" marker-end="url(#f3-arr-r)"/>
+    <text x="400" y="198" text-anchor="middle" class="d-small d-bold">Commit (only once TM heard Prepared from all)</text>
+
+    <text x="80" y="280" text-anchor="middle" class="d-mono d-small d-text-light">4 delays, 3N−1 msgs</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The failure-free sequence for <em>N</em>=3: RM1 volunteers <em>Prepared</em>, the TM asks the rest to prepare, and only after every RM has replied <em>Prepared</em> does the TM broadcast <em>Commit</em>. The shaded band marks the protocol's one structural weakness, described next<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<h3 id="2pc-blocking">3.2 The blocking problem</h3>
+<p>Two-phase commit's failure mode is exact and unavoidable within the protocol as stated: "if the TM fails right after every RM has sent a Prepared message, then the other RMs have no way of knowing whether the TM committed or aborted the transaction"<a class="cite" href="#ref-5">5</a>. Every RM is holding locks on its own share of the data, cannot unilaterally decide to abort (another RM's peer might have already been told to commit), and cannot decide to commit either — so it blocks until an operator manually restarts or reroutes the coordinator. Gray and Lamport are explicit that ad hoc fixes ("three-phase commit" protocols that elect a new TM) have never been rigorously shown correct: "we know of none that provides a complete algorithm proven to satisfy a clearly stated correctness condition"<a class="cite" href="#ref-5">5</a>.</p>
+<p>Their own fix, Paxos Commit, replaces the single TM with 2<em>F</em>+1 coordinators running Paxos consensus on each RM's commit/abort vote, making progress as long as <em>F</em>+1 of them are alive; classic 2PC is exactly the <em>F</em>=0 special case of that algorithm<a class="cite" href="#ref-5">5</a>. This is precisely the shape of Spanner's answer, described next: rather than trusting one fragile coordinator process, replicate the coordinator's decision itself via a consensus protocol.</p>
+
+<h3 id="spanner-2pc">3.3 Spanner: two-phase commit over Paxos groups, made externally consistent</h3>
+<p>Spanner runs a transaction across <em>directories</em> — buckets of contiguous keys — each replicated by its own Paxos group with a long-lived leader<a class="cite" href="#ref-6">6</a>. A multi-group read-write transaction is 2PC with every RM's log and every TM's log itself replicated by Paxos, which is what removes the single-point-of-failure coordinator that blocks classic 2PC: "it begins two-phase commit. The client chooses a coordinator group and sends a commit message to each participant's leader with the identity of the coordinator... A non-coordinator-participant leader first acquires write locks. It then chooses a prepare timestamp... and logs a prepare record through Paxos"<a class="cite" href="#ref-6">6</a>. Because that prepare record is itself Paxos-replicated, losing the leader of a participant group does not lose the fact that it prepared — a new leader in the same Paxos group can be elected and continue.</p>
+<p>Spanner adds one more thing 2PC alone does not give you: an externally-consistent commit timestamp, using the TrueTime API's bounded clock uncertainty. "The coordinator leader ensures that clients cannot see any data committed by <em>T<sub>i</sub></em> until <code>TT.after(s<sub>i</sub>)</code> is true," where <em>s<sub>i</sub></em> is the chosen commit timestamp — a rule called <em>commit wait</em><a class="cite" href="#ref-6">6</a>. Because TrueTime keeps clock uncertainty "generally less than 10ms" globally<a class="cite" href="#ref-6">6</a>, commit wait typically costs on the order of twice that uncertainty and overlaps with the Paxos communication the commit already needs, so in practice it adds little beyond the consensus round trip already paid<a class="cite" href="#ref-6">6</a>. Read-write transactions also use wound-wait locking at each participant leader to avoid deadlock among concurrent transactions competing for the same rows<a class="cite" href="#ref-6">6</a>. The result is a system that gives every multi-row, multi-datacenter transaction the same serializable, externally-consistent guarantee a single-machine relational database gives a single-row update — at the cost of a consensus round trip and a commit-wait stall on every write.</p>
+<p>Spanner also has a lock-free path that ties directly back to §2: a <em>read-only transaction</em> is explicitly described as "a kind of transaction that has the performance benefits of snapshot isolation... reads in a read-only transaction execute at a system-chosen timestamp without locking, so that incoming writes are not blocked"<a class="cite" href="#ref-6">6</a>. Where read-write transactions pay two-phase commit and commit wait, read-only transactions simply pick a safe timestamp (the last committed write's timestamp, or the current TrueTime bound if reads span multiple Paxos groups) and read a consistent snapshot from any sufficiently up-to-date replica — the same underlying idea the ANSI-critique paper's snapshot isolation names, now made externally consistent by TrueTime rather than by a local start-timestamp<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-6">6</a>. General transactions also buy Spanner something Bigtable's schema changes cannot get: "Bigtable supports atomic schema changes in one datacenter, but its schema changes block all operations," whereas "a Spanner schema-change transaction is a generally non-blocking variant of a standard transaction... schema changes across thousands of servers can complete with minimal disruption to other concurrent activity"<a class="cite" href="#ref-6">6</a> — a concrete case where paying for general transactions removes an operational limitation (blocking schema changes) that the weaker, single-row model cannot express a fix for at all.</p>
+
+<h2 id="btree-lsm">4. Turning a scan into a lookup: B-tree vs LSM-tree</h2>
+<p>An index exists so that finding one row costs a lookup instead of a scan of everything. The two dominant on-disk shapes for that lookup structure — B-tree and log-structured merge-tree (LSM-tree) — differ in exactly one design decision: whether an update touches the existing on-disk page in place, or is deferred and later merged in from scratch.</p>
+
+<h3 id="btree-cost">4.1 The B-tree: in-place update, one random page per write</h3>
+<p>A B-tree stores one entry per indexed row in sorted order across fixed-size pages, with directory pages above pointing down to the leaf that holds a given key range. Updating an indexed row means reading the leaf page that currently holds (or should hold) that key, modifying it in place, and writing the whole page back — normally one random disk read plus one random disk write per insert, once the working set exceeds available buffer memory. The LSM-tree paper that motivates the alternative states the practical consequence bluntly: because B-tree updates are random and page-granular, "standard disk-based index structures such as the B-tree will effectively double the I/O cost of the transaction to maintain an index such as this in real time, increasing the total system cost up to fifty percent"<a class="cite" href="#ref-4">4</a>.</p>
+
+<h3 id="lsm-mechanism">4.2 The LSM-tree: memtable, immutable segments, background merge</h3>
+<p>O'Neil, Cheng, Gawlick, and O'Neil's 1996 paper proposes deferring and batching index changes instead. A two-component LSM-tree keeps a small, entirely memory-resident tree, <em>C0</em>, and a much larger disk-resident tree, <em>C1</em>: "the memory resident C0 tree has no I/O cost... whenever the C0 tree as a result of an insert reaches a threshold size near the maximum allotted, an ongoing rolling merge process serves to delete some contiguous segment of entries from the C0 tree and merge it into the C1 tree on disk"<a class="cite" href="#ref-4">4</a>. The rolling merge always reads and writes multi-page blocks (256 KB blocks are the paper's own figure) rather than single random pages, and "new leaf nodes are written to a different... free area on disk," never overwriting the old blocks in place, which is where the "log-structured" half of the name comes from — it deliberately borrows the never-overwrite discipline of the Log-Structured File System<a class="cite" href="#ref-4">4</a>. Because merges move sequential multi-page blocks instead of one random page at a time, the same number of logical inserts costs vastly fewer disk-arm seeks.</p>
+
+<h3 id="bigtable-compaction">4.3 Bigtable's concrete implementation: memtable, SSTables, three kinds of compaction</h3>
+<p>Bigtable is a direct, production implementation of the same idea, and its paper is precise about the mechanism where the LSM-tree paper is more abstract. Writes are committed to a per-tablet-server commit log first; "of these updates, the recently committed ones are stored in memory in a sorted buffer called a <em>memtable</em>; the older updates are stored in a sequence of SSTables"<a class="cite" href="#ref-3">3</a>. An SSTable is Bigtable's disk-resident, immutable, sorted file format, read in 64 KB blocks with an in-memory block index<a class="cite" href="#ref-3">3</a>. Bigtable names three distinct compactions rather than one generic merge:</p>
+<ul>
+<li><strong>Minor compaction.</strong> "When the memtable size reaches a threshold, the memtable is frozen, a new memtable is created, and the frozen memtable is converted to an SSTable and written to GFS. This... shrinks the memory usage of the tablet server, and... reduces the amount of data that has to be read from the commit log during recovery if this server dies"<a class="cite" href="#ref-3">3</a>.</li>
+<li><strong>Merging compaction.</strong> Because unchecked minor compactions would eventually require a read to merge an unbounded number of SSTables, Bigtable "periodically" merges "the contents of a few SSTables and the memtable, and writes out a new SSTable," bounding read fan-in<a class="cite" href="#ref-3">3</a>.</li>
+<li><strong>Major compaction.</strong> "A merging compaction that rewrites all SSTables into exactly one SSTable... produces an SSTable that contains no deletion information or deleted data," which is what actually reclaims space and physically erases deleted or overwritten data — important for services with a data-deletion obligation<a class="cite" href="#ref-3">3</a>.</li>
+</ul>
+<p>Reads merge the memtable and every relevant SSTable on the fly, since both are already sorted<a class="cite" href="#ref-3">3</a>, which is the same principle the LSM-tree paper describes as searching <em>C0</em> then <em>C1</em> for an exact-match find<a class="cite" href="#ref-4">4</a>. Merging multiple SSTables per read is the LSM-tree's structural read-amplification tax on top of a B-tree's single-structure lookup, and Bigtable's paper is explicit about the mitigation: "a read operation has to read from all SSTables that make up the state of a tablet. If these SSTables are not in memory, we may end up doing many disk accesses. We reduce the number of accesses by allowing clients to specify that Bloom filters should be created for SSTables... Our use of Bloom filters also implies that most lookups for non-existent rows or columns do not need to touch disk"<a class="cite" href="#ref-3">3</a> — a probabilistic, in-memory pre-check that turns "which of these <em>k</em> SSTables might contain this key" from <em>k</em> disk seeks into a handful of memory lookups plus, typically, one real seek for the SSTable that actually has the data.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f4t"><title id="f4t">B-tree in-place write path versus LSM-tree deferred write path</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="200" y="24" text-anchor="middle" class="d-title d-bold">B-tree</text>
+    <rect x="60" y="45" width="280" height="46" rx="8" class="d-block-muted"/><text x="200" y="73" text-anchor="middle" class="d-bold d-small">Write(key, value)</text>
+    <path d="M200,91 L200,120" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="60" y="120" width="280" height="46" rx="8" class="d-block-2"/><text x="200" y="148" text-anchor="middle" class="d-text-inv d-small d-bold">Write-ahead log (durability)</text>
+    <path d="M200,166 L200,195" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="60" y="195" width="280" height="46" rx="8" class="d-block-accent"/><text x="200" y="218" text-anchor="middle" class="d-text-inv d-small d-bold">random-access read leaf page</text><text x="200" y="234" text-anchor="middle" class="d-text-inv d-small">(cache miss → 1 disk seek)</text>
+    <path d="M200,241 L200,270" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="60" y="270" width="280" height="46" rx="8" class="d-block-accent"/><text x="200" y="293" text-anchor="middle" class="d-text-inv d-small d-bold">modify in place, write page back</text><text x="200" y="309" text-anchor="middle" class="d-text-inv d-small">(1 more disk seek)</text>
+
+    <text x="600" y="24" text-anchor="middle" class="d-title d-bold">LSM-tree</text>
+    <rect x="460" y="45" width="280" height="46" rx="8" class="d-block-muted"/><text x="600" y="73" text-anchor="middle" class="d-bold d-small">Write(key, value)</text>
+    <path d="M600,91 L600,120" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="460" y="120" width="280" height="46" rx="8" class="d-block-2"/><text x="600" y="148" text-anchor="middle" class="d-text-inv d-small d-bold">Write-ahead / commit log</text>
+    <path d="M600,166 L600,195" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="460" y="195" width="280" height="46" rx="8" class="d-fill-green"/><text x="600" y="218" text-anchor="middle" class="d-text-inv d-small d-bold">memtable (memory, sorted)</text><text x="600" y="234" text-anchor="middle" class="d-text-inv d-small">no I/O cost</text>
+    <path d="M600,241 L600,270" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="460" y="270" width="280" height="46" rx="8" class="d-fill-green"/><text x="600" y="293" text-anchor="middle" class="d-text-inv d-small d-bold">frozen → SSTable (minor compaction)</text><text x="600" y="309" text-anchor="middle" class="d-text-inv d-small">background merge → new sequential file</text>
+
+    <line x1="380" y1="20" x2="380" y2="330" class="d-axis d-dashed"/>
+  </svg>
+  <figcaption><b>Figure 4.</b> B-tree updates cost one random read plus one random write per insert once the page is off the hot buffer path<a class="cite" href="#ref-4">4</a>. LSM-trees absorb the write in memory for free and defer the disk cost to a background, sequential merge — Bigtable's memtable/SSTable/compaction pipeline is exactly this mechanism<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<details class="more">
+<summary>Worked derivation: why a secondary B-tree index doubled disk cost in the LSM-tree paper's own example</summary>
+<p>The LSM-tree paper motivates itself with a modified TPC-A benchmark: 1,000 transactions per second, each writing a 50-byte row to a fast-growing History table, with a secondary B-tree index on <code>Account-ID‖Timestamp</code> needed to answer recent-activity queries efficiently<a class="cite" href="#ref-4">4</a>.</p>
+<p>Without the index, the base workload already needs about 2,000 I/Os per second (roughly one read plus one write per transaction against the Account table), which at the paper's assumed nominal rate of "about 40 I/Os per second" per disk arm requires 50 disk arms<a class="cite" href="#ref-4">4</a>:</p>
+$$ \frac{2000\ \text{I/Os/s}}{40\ \text{I/Os/s per arm}} = 50\ \text{disk arms} $$
+<p>Adding the secondary index changes this because "the entries in the B-tree are generated 1000 per second, and assuming a 20 day period of accumulation... 576,000,000 entries on 9.2 GBytes of disk, or about 2.3 million pages... Since transactional Acct-ID values are randomly chosen, each transaction will require at least one page read from this index and, in the steady state a page write as well"<a class="cite" href="#ref-4">4</a> — because the index pages are far larger than memory and accessed at effectively random key values, none of them stay buffer-resident, so every transaction now costs one more random read and one more random write:</p>
+$$ 1000\ \text{TPS} \times 2\ \text{I/Os/transaction} = 2000\ \text{additional I/Os/s} \implies \frac{2000}{40} = 50\ \text{more disk arms} $$
+<p>"This addition of 2000 I/Os per second to the 2000 I/Os already needed for updating the Account table, requires a purchase of an additional 50 disk arms, doubling our disk requirements"<a class="cite" href="#ref-4">4</a> — 50 arms becomes 100 arms, purely to keep one secondary index up to date in place. That doubling, not an abstract complexity argument, is the concrete economic case the LSM-tree — and by extension Bigtable's SSTable design — was built to eliminate.</p>
+</details>
+
+<h2 id="data-models">5. Three shapes for the same byte: data models compared</h2>
+<p>Once you have picked an isolation level and an index structure, you still have to decide what a single stored record looks like. The three canonical answers in this course are the relational normalized row, Bigtable's versioned sparse map, and Dynamo's opaque blob.</p>
+
+<h3 id="relational-row">5.1 The relational row: schema-enforced, normalized, joinable</h3>
+<p>A relational row is a fixed set of typed columns, enforced by a schema declared before any data is written; a row referencing another table's row does so via a foreign key, and the two rows are typically stored separately, to be recombined on read via a join. Normalization exists to avoid storing the same fact twice — an address lives in one place, referenced by every order that ships to it — at the cost of needing a join (or, in a distributed system, a cross-partition read) to reassemble a full picture.</p>
+
+<h3 id="bigtable-model">5.2 Bigtable's (row, column, timestamp) sparse map</h3>
+<p>Bigtable's entire data model is one sentence: "A Bigtable is a sparse, distributed, persistent multidimensional sorted map. The map is indexed by a row key, column key, and a timestamp; each value in the map is an uninterpreted array of bytes... <code>(row:string, column:string, time:int64) → string</code>"<a class="cite" href="#ref-3">3</a>. Three consequences follow directly. First, rows are kept in lexicographic order and dynamically range-partitioned into tablets, so choosing row keys that sort the way you want to scan — Bigtable's own example reverses domain names so <code>com.cnn.www</code> sorts next to other <code>cnn.com</code> pages — is a first-class schema decision, not an afterthought<a class="cite" href="#ref-3">3</a>. Second, columns are grouped into <em>column families</em>, which must be declared ahead of time and are "the basic unit of access control," but "any column key within the family can be used" without pre-declaring it, and a table can have an effectively unbounded number of distinct column keys even though the number of families should stay small — "in the hundreds at most"<a class="cite" href="#ref-3">3</a>. A column key is written as <code>family:qualifier</code> (e.g., an <code>anchor:</code> family holding one column per distinct referring URL, the qualifier itself being data)<a class="cite" href="#ref-3">3</a>. Third, every cell holds multiple timestamped versions rather than one — Bigtable timestamps are 64-bit integers, assignable by the system as real time in microseconds or explicitly by the client, and per-column-family garbage-collection policy decides how many versions or how much time's worth to retain<a class="cite" href="#ref-3">3</a>. This is a schema for a table that is sparse (most row/column combinations simply do not exist) and versioned (a "cell" is really a small time series), which a fixed-width relational row cannot represent without a separate history table.</p>
+
+<h3 id="dynamo-model">5.3 Dynamo's opaque blob behind a key</h3>
+<p>Dynamo goes the other direction entirely: "Dynamo targets applications that need to store objects that are relatively small (usually less than 1MB)"<a class="cite" href="#ref-7">7</a> and gives every one of them the same interface — <code>get(key)</code> and <code>put(key, context, object)</code> — with no columns, no families, no schema of any kind visible to the store<a class="cite" href="#ref-7">7</a>. "State is stored as binary objects (i.e., blobs) identified by unique keys. No operations span multiple data items and there is no need for relational schema"<a class="cite" href="#ref-7">7</a>. Everything about the object's internal structure — which fields it has, how they are versioned, how two concurrently written versions get merged — is the application's problem, not the store's; Dynamo's own paper is explicit that this is a deliberate simplification driven by observing that "a significant portion of Amazon's services can work with this simple data model and do not need any relational schema"<a class="cite" href="#ref-7">7</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 280" role="img" aria-labelledby="f5t"><title id="f5t">Three data-model layouts side by side: relational table, Bigtable cell map, Dynamo key-value blob</title>
+    <defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="130" y="24" text-anchor="middle" class="d-title d-bold">Relational row</text>
+    <rect x="20" y="45" width="220" height="30" rx="4" class="d-panel"/><text x="130" y="65" text-anchor="middle" class="d-mono d-small">id | name | addr_id</text>
+    <rect x="20" y="80" width="220" height="30" rx="4" class="d-surface"/><text x="130" y="100" text-anchor="middle" class="d-mono d-small">7 | Aman | 42</text>
+    <path d="M240,95 L280,95" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="20" y="130" width="220" height="30" rx="4" class="d-panel"/><text x="130" y="150" text-anchor="middle" class="d-mono d-small">addr_id | city</text>
+    <rect x="20" y="165" width="220" height="30" rx="4" class="d-surface"/><text x="130" y="185" text-anchor="middle" class="d-mono d-small">42 | ...</text>
+    <text x="130" y="215" text-anchor="middle" class="d-small d-text-light">fixed columns, join to related table</text>
+
+    <text x="400" y="24" text-anchor="middle" class="d-title d-bold">Bigtable cell</text>
+    <text x="290" y="45" class="d-mono d-small d-text-light">com.cnn.www</text>
+    <rect x="290" y="55" width="130" height="26" rx="4" class="d-block-2"/><text x="355" y="73" text-anchor="middle" class="d-mono d-small d-text-inv">contents: t6</text>
+    <rect x="290" y="83" width="130" height="26" rx="4" class="d-block-2"/><text x="355" y="101" text-anchor="middle" class="d-mono d-small d-text-inv">contents: t5</text>
+    <rect x="290" y="111" width="130" height="26" rx="4" class="d-block-2"/><text x="355" y="129" text-anchor="middle" class="d-mono d-small d-text-inv">contents: t3</text>
+    <rect x="430" y="55" width="130" height="26" rx="4" class="d-block-accent"/><text x="495" y="73" text-anchor="middle" class="d-mono d-small d-text-inv">anchor:cnnsi: t9</text>
+    <text x="400" y="215" text-anchor="middle" class="d-small d-text-light">sparse cells, versioned by timestamp</text>
+
+    <text x="670" y="24" text-anchor="middle" class="d-title d-bold">Dynamo key-value</text>
+    <rect x="600" y="55" width="150" height="40" rx="6" class="d-block-muted"/><text x="675" y="79" text-anchor="middle" class="d-mono d-small">key: cart-9182</text>
+    <path d="M675,95 L675,120" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="600" y="120" width="150" height="60" rx="6" class="d-fill-green"/><text x="675" y="148" text-anchor="middle" class="d-text-inv d-small d-bold">opaque blob</text><text x="675" y="164" text-anchor="middle" class="d-text-inv d-small">&lt; 1MB, no schema</text>
+    <text x="675" y="215" text-anchor="middle" class="d-small d-text-light">store never inspects the value</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> The same fact stored three ways: a normalized relational row that joins to a related table; a Bigtable cell addressed by (row, column, timestamp) with several live versions<a class="cite" href="#ref-3">3</a>; a Dynamo key mapped to one opaque, unversioned-by-the-store blob<a class="cite" href="#ref-7">7</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 3.</b> Data model comparison across the three canonical shapes<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-7">7</a>.</caption>
+<thead><tr><th>Dimension</th><th>Relational</th><th>Bigtable</th><th>Dynamo</th></tr></thead>
+<tbody>
+<tr><td class="row">Unit of storage</td><td>typed row across declared columns</td><td>cell keyed by (row, column, timestamp)<a class="cite" href="#ref-3">3</a></td><td>opaque blob keyed by a single key<a class="cite" href="#ref-7">7</a></td></tr>
+<tr><td class="row">Schema</td><td>declared and enforced before write</td><td>column families declared; qualifiers free-form<a class="cite" href="#ref-3">3</a></td><td>none visible to the store<a class="cite" href="#ref-7">7</a></td></tr>
+<tr><td class="row">Versioning</td><td>none built in (needs a history table)</td><td>every cell holds N timestamped versions<a class="cite" href="#ref-3">3</a></td><td>none in the store; app must version if needed</td></tr>
+<tr><td class="row">Transaction scope</td><td>arbitrary rows/tables (engine-dependent)</td><td>single row only<a class="cite" href="#ref-3">3</a></td><td>single key only<a class="cite" href="#ref-7">7</a></td></tr>
+<tr><td class="row">Typical value size</td><td>row-sized (bytes-KB)</td><td>cell-sized, compressed in locality groups<a class="cite" href="#ref-3">3</a></td><td>&lt; 1 MB blob<a class="cite" href="#ref-7">7</a></td></tr>
+<tr><td class="row">Canonical use case</td><td>invariants across entities (ledgers, inventory)</td><td>web index, time-series-like sparse data<a class="cite" href="#ref-3">3</a></td><td>shopping cart, session state<a class="cite" href="#ref-7">7</a></td></tr>
+</tbody>
+</table>
+
+<h2 id="single-row-vs-general">6. Single-row atomicity vs. general transactions: the Dynamo bet</h2>
+<p>Bigtable and Dynamo both stop short of Spanner's fully general, cross-partition, serializable transaction — but they stop at different places, and the difference is the crux of this module's disagreement section.</p>
+<p>Bigtable keeps single-row atomicity and nothing more: "Bigtable supports single-row transactions, which can be used to perform atomic read-modify-write sequences on data stored under a single row key. Bigtable does not currently support general transactions across row keys, although it provides an interface for batching writes across row keys at the clients"<a class="cite" href="#ref-3">3</a>. That single-row guarantee is not a compromise forced by scale; it is a direct consequence of the data model — because Bigtable already routes any operation touching one row key to exactly one tablet server, giving that operation full atomicity costs nothing extra in coordination. The batching interface is explicitly not the same guarantee: it lets a client send several row updates in one RPC, but each row's mutation is still independently atomic, not jointly atomic with the others.</p>
+<p>Dynamo goes one full step further and refuses isolation guarantees altogether, by design rather than as an implementation gap: "Dynamo does not provide any isolation guarantees and permits only single key updates"<a class="cite" href="#ref-7">7</a>. There is no read-modify-write sequence exposed at all — a client reads a key's current version(s), computes a new value in the application, and writes it back, and if another client wrote concurrently, both versions are kept and handed to the next reader to reconcile (Module 3 already covers the vector-clock mechanics behind that reconciliation). This is the direct, load-bearing consequence of Dynamo's stated design target: "Dynamo targets the design space of an 'always writeable' data store (i.e., a data store that is highly available for writes)"<a class="cite" href="#ref-7">7</a>. A write is never rejected because of a concurrent write, a network partition, or a node failure — the price is that the store cannot promise you saw the latest value, or that no one else is writing at the same time as you.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Every system in this module had the option to build general, ACID, cross-key transactions and chose not to, except Spanner, which built them anyway at a specific, measured cost. That is not an accident of engineering taste — it reflects genuinely different priors about which failure is worse: a transaction that silently corrupts a cross-entity invariant, a write that gets rejected when a customer is trying to complete a purchase, or the cost of building and maintaining a layer above the storage engine to handle everything the engine itself declines to guarantee.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Keep general transactions and strict isolation</h4>
+    <p class="who">Spanner's design team<a class="cite" href="#ref-6">6</a>, and implicitly the entire relational-database tradition that the ANSI-SQL isolation critique<a class="cite" href="#ref-1">1</a> and PostgreSQL's serializable implementation<a class="cite" href="#ref-2">2</a> serve</p>
+    <p>Cross-entity invariants — double-entry bookkeeping, inventory counts, seat allocation — are exactly the class of bug that weak isolation lets through silently (write skew, phantom, lost update), and those bugs are far more expensive to find and fix after the fact than the latency cost of paying for real consensus and commit wait on every write. Spanner's own thesis is that at global scale, this is achievable: "the first system to distribute data at global scale and support externally-consistent distributed transactions"<a class="cite" href="#ref-6">6</a>.</p>
+    <ul class="pros"><li>Correctness by construction: the application never has to reason about which anomalies its isolation level still permits.</li><li>Proven to scale globally — Spanner shards across datacenters worldwide, not just one cluster<a class="cite" href="#ref-6">6</a>.</li><li>Simpler application code: no merge functions, no reconciliation logic, no vector clocks to interpret.</li></ul>
+    <ul class="cons"><li>Every write pays a consensus round trip (Paxos) plus commit-wait, typically on the order of TrueTime's uncertainty bound<a class="cite" href="#ref-6">6</a>.</li><li>A write can be rejected or delayed if a participant Paxos group cannot reach a majority — availability is not unconditional.</li><li>2PC over Paxos groups is a materially more complex implementation than a leaderless key-value store.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Reject general transactions and isolation, keep the store always writeable</h4>
+    <p class="who">Dynamo's design team at Amazon<a class="cite" href="#ref-7">7</a>, and the Dynamo-lineage systems (Cassandra, Riak, Voldemort, DynamoDB) that inherited its model</p>
+    <p>For the specific class of service Dynamo was built for, a rejected write is worse than a temporarily inconsistent read: "experience at Amazon has shown that data stores that provide ACID guarantees tend to have poor availability... This has been widely acknowledged by both the industry and academia"<a class="cite" href="#ref-7">7</a>. A shopping cart that refuses an add-to-cart during a network blip loses a sale outright; a shopping cart that accepts the write and merges two concurrent versions later loses nothing. Dynamo's own conflict-resolution discussion frames this explicitly as a choice about who resolves conflicts and when, favoring resolving them on read so that writes are never rejected<a class="cite" href="#ref-7">7</a>.</p>
+    <ul class="pros"><li>A write is never rejected for concurrency or partition reasons — availability is unconditional for writes<a class="cite" href="#ref-7">7</a>.</li><li>No coordinator, no consensus round trip, no single point of blocking on the write path.</li><li>Symmetric, decentralized design scales incrementally, one node at a time<a class="cite" href="#ref-7">7</a>.</li></ul>
+    <ul class="cons"><li>No cross-key atomicity at all — an application that actually needs it (a ledger, an inventory count) gets no help from the store.</li><li>Conflict resolution (merge logic) becomes the application's permanent responsibility, not a one-time cost.</li><li>"No isolation guarantees" is easy to violate accidentally if an engineer assumes single-key semantics extend to a multi-key workflow.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Give every row free atomicity, solve nothing beyond it</h4>
+    <p class="who">Bigtable's design team<a class="cite" href="#ref-3">3</a> — a pragmatic middle position between Spanner's and Dynamo's</p>
+    <p>Because every operation on a given row key is already routed to exactly one tablet server, making that operation atomic costs nothing extra in coordination — so Bigtable gives it away for free rather than treating it as a feature to price against availability<a class="cite" href="#ref-3">3</a>. But it stops there on principle, not on a roadmap: "Bigtable does not currently support general transactions across row keys"<a class="cite" href="#ref-3">3</a>, and the batching interface it does offer is explicitly not joint atomicity across rows. This is a bet that the single-row case is common enough (one web page's anchors, one user's session) to be worth optimizing for directly, while genuinely cross-entity invariants are rare enough, and hard enough to generalize correctly, to be left to a layer above (Megastore, then Spanner, at Google) rather than solved halfway inside the storage engine itself.</p>
+    <ul class="pros"><li>Atomicity that costs literally nothing, because it follows for free from the partitioning scheme already in place.</li><li>No consensus round trip, no commit-wait, no cross-partition coordination logic to get wrong.</li><li>Covers the empirically dominant case (one entity, one row) cleanly.</li></ul>
+    <ul class="cons"><li>Punts every cross-entity invariant upward exactly like Dynamo does — it is a bigger atomic unit (one row's many columns) but the same shape of gap.</li><li>The batching interface is easy to mistake for cross-row atomicity when it provides none.</li><li>Applications that outgrow single-row atomicity have no in-storage escalation path; they must move to a different system (Megastore, Spanner) entirely.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The right choice is a property of the invariant, not of scale or fashion. If a workload has a real cross-entity invariant that must never be violated even momentarily — money moving between two accounts, a seat that must not be sold twice, a schema change that must be atomic across thousands of servers — Spanner's bet is correct, and the commit-wait and consensus latency is the price of not having to write and audit reconciliation logic for every one of those invariants by hand. If a workload's "conflicts" have a well-defined application-level merge (union the items added to a cart, keep the highest bid, take the most recent write for a session token) and the true cost of an occasionally stale read is near zero, Dynamo's bet is correct, and paying for global consensus on every write would be waste with no corresponding correctness benefit. What would settle a specific case is not benchmarking the two designs against each other in the abstract, but writing down the invariant the application actually needs and checking whether it is expressible as a single-key operation — Bigtable's single-row transaction<a class="cite" href="#ref-3">3</a> is already the empirically common special case where both camps agree, since it is atomic without needing coordination in either model.</p></div>
+</section>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">paper</span>Berenson, H., Bernstein, P., Gray, J., Melton, J., O'Neil, E., O'Neil, P. <em>A Critique of ANSI SQL Isolation Levels</em>. ACM SIGMOD 1995 / Microsoft Research Technical Report MSR-TR-95-51. <a href="https://arxiv.org/abs/cs/0701157">https://arxiv.org/abs/cs/0701157</a>. Accessed 2026-09-17. <span class="ref-use">Used for: P0-P3 phenomena definitions (§2), snapshot isolation definition and first-committer-wins (§4.2), write skew/A5B (§4.2), isolation-level incomparability (Remark 9).</span></li>
+<li id="ref-2"><span class="ref-type">official</span>PostgreSQL Global Development Group. <em>PostgreSQL 18 Documentation, §13.2 Transaction Isolation</em>. Live documentation. <a href="https://www.postgresql.org/docs/current/transaction-iso.html">https://www.postgresql.org/docs/current/transaction-iso.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: read committed/repeatable read/serializable implementation details, error messages, REPEATABLE READ implemented as snapshot isolation.</span></li>
+<li id="ref-3"><span class="ref-type">paper</span>Chang, F., Dean, J., Ghemawat, S., Hsieh, W.C., Wallach, D.A., Burrows, M., Chandra, T., Fikes, A., Gruber, R.E. <em>Bigtable: A Distributed Storage System for Structured Data</em>. OSDI 2006. <a href="https://www.usenix.org/legacy/event/osdi06/tech/chang/chang.pdf">https://www.usenix.org/legacy/event/osdi06/tech/chang/chang.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: (row, column, timestamp) data model (§2), column families (§2), memtable/SSTable/compaction mechanics (§5.3), single-row transactions and no cross-row transactions (§3, §6).</span></li>
+<li id="ref-4"><span class="ref-type">paper</span>O'Neil, P., Cheng, E., Gawlick, D., O'Neil, E. <em>The Log-Structured Merge-Tree (LSM-Tree)</em>. Acta Informatica, 1996. <a href="https://www.cs.umb.edu/~poneil/lsmtree.pdf">https://www.cs.umb.edu/~poneil/lsmtree.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: B-tree I/O-doubling claim (§1), two-component C0/C1 LSM-tree mechanism and rolling merge (§2), TPC-A worked derivation (disk-arm doubling).</span></li>
+<li id="ref-5"><span class="ref-type">paper</span>Gray, J., Lamport, L. <em>Consensus on Transaction Commit</em>. Microsoft Research Technical Report MSR-TR-2003-96, published in ACM Transactions on Database Systems 31(1), 2006. <a href="https://lamport.azurewebsites.net/video/consensus-on-transaction-commit.pdf">https://lamport.azurewebsites.net/video/consensus-on-transaction-commit.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: RM/TM state machine and safety requirements (§3.1), message/delay cost 3N-1 (§3.1, Table 2), the blocking problem (§3.2), Paxos Commit as the F=0 generalization.</span></li>
+<li id="ref-6"><span class="ref-type">paper</span>Corbett, J.C., Dean, J., Epstein, M., et al. <em>Spanner: Google's Globally-Distributed Database</em>. OSDI 2012. <a href="https://research.google.com/archive/spanner-osdi2012.pdf">https://research.google.com/archive/spanner-osdi2012.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: 2PC over Paxos groups, prepare/commit record logging (§3.3), TrueTime commit wait (§3.3), wound-wait deadlock avoidance, external-consistency claim (disagreement section).</span></li>
+<li id="ref-7"><span class="ref-type">paper</span>DeCandia, G., Hastorun, D., Jampani, M., et al. <em>Dynamo: Amazon's Highly Available Key-value Store</em>. SOSP 2007. <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf</a>. Accessed 2026-09-17. <span class="ref-use">Used for: ACID definition (§1), always-writeable design target and rejection of isolation/general transactions (§6, disagreement section), key-value data model (§5.3).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

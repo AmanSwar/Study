@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SGLang: Router, PD Disaggregation, and Wide-EP Deployment Patterns · Multi-Node LLM Inference: From One Node to N</title>
+<meta name="description" content="SGLang's multi-node story in depth: the sglang-router / SGLang Model Gateway implementation, the two transfer backends behind bootstrap-handshake PD disaggregation, the exact multi-node DeepSeek deployment recipe, and what is production-ready versus still hardening.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+<p class="kicker">Multi-Node LLM Inference: From One Node to N · Module 12</p>
+<h1>SGLang: Router, PD Disaggregation, and Wide-EP Deployment Patterns</h1>
+<p class="lede">SGLang scales across nodes with three pieces that plug into the generic patterns from earlier modules: a standalone Rust router (sglang-router, now rebuilt as the SGLang Model Gateway) with a cache-aware load-balancing algorithm, two selectable transfer backends behind the bootstrap-handshake PD mechanism, and a small set of CLI flags that turn into a concrete DeepSeek-class multi-node deployment. After this module you can read sglang-router's actual routing algorithm rather than its feature list, choose between its two PD transfer backends, and reproduce the exact flags behind SGLang's own 96-H100 wide-EP deployment.</p>
+<div class="meta">
+<span class="chip chip-blue">Course</span>
+<span class="chip"><b>30 min</b> read</span>
+<span class="chip"><b>9</b> sources</span>
+<span class="chip chip-amber">As of 2026-09-17</span>
+<span class="chip">Prerequisite: <b>Module 4</b>, <b>Module 5</b></span>
+</div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 360" role="img" aria-labelledby="f1t"><title id="f1t">SGLang's multi-node stack: router, PD pools, transfer backend, wide-EP layer</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+<rect x="20" y="20" width="150" height="56" rx="8" class="d-block-accent"/>
+<text x="95" y="44" text-anchor="middle" class="d-text-inv d-bold">Client</text>
+<text x="95" y="62" text-anchor="middle" class="d-text-inv d-small">requests</text>
+<path d="M170,48 L250,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="250" y="10" width="300" height="90" rx="8" class="d-panel"/>
+<text x="400" y="28" text-anchor="middle" class="d-title d-bold">sglang-router / Model Gateway</text>
+<rect x="262" y="38" width="130" height="50" rx="6" class="d-block"/>
+<text x="327" y="58" text-anchor="middle" class="d-text-inv d-small">Control plane</text>
+<text x="327" y="75" text-anchor="middle" class="d-text-inv d-small">Worker Manager</text>
+<rect x="408" y="38" width="130" height="50" rx="6" class="d-block-2"/>
+<text x="473" y="58" text-anchor="middle" class="d-text-inv d-small">Data plane</text>
+<text x="473" y="75" text-anchor="middle" class="d-text-inv d-small">policy router</text>
+
+<path d="M330,100 L200,150" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M470,100 L600,150" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+<rect x="60" y="150" width="280" height="70" rx="8" class="d-block">
+</rect>
+<text x="200" y="174" text-anchor="middle" class="d-text-inv d-bold">Prefill pool</text>
+<text x="200" y="192" text-anchor="middle" class="d-text-inv d-small">TP16 / DP8, --enable-dp-attention</text>
+<text x="200" y="208" text-anchor="middle" class="d-text-inv d-small">--moe-a2a-backend deepep</text>
+
+<rect x="460" y="150" width="280" height="70" rx="8" class="d-block-2">
+</rect>
+<text x="600" y="174" text-anchor="middle" class="d-text-inv d-bold">Decode pool</text>
+<text x="600" y="192" text-anchor="middle" class="d-text-inv d-small">bootstrap handshake receiver</text>
+<text x="600" y="208" text-anchor="middle" class="d-text-inv d-small">(mechanism: Module 4)</text>
+
+<path d="M340,185 L460,185" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+<text x="400" y="175" text-anchor="middle" class="d-mono d-small">KV transfer</text>
+
+<rect x="200" y="240" width="400" height="46" rx="8" class="d-panel d-dashed"/>
+<text x="400" y="268" text-anchor="middle" class="d-small">Transfer backend: Mooncake (per-GPU IB map) or NIXL (UCX / LIBFABRIC)</text>
+<path d="M200,220 L260,240" class="d-arrow"/>
+<path d="M600,220 L540,240" class="d-arrow"/>
+
+<rect x="150" y="306" width="500" height="40" rx="8" class="d-surface"/>
+<text x="400" y="330" text-anchor="middle" class="d-small d-text-light">Wide-EP layer underneath both pools: DeepEP dispatch/combine, EPLB placement (Module 5)</text>
+<path d="M400,286 L400,306" class="d-arrow d-dim"/>
+</svg>
+<figcaption><b>Figure 1.</b> The four pieces this module covers: the router (sglang-router / SGLang Model Gateway) picking a worker, the prefill/decode pool split whose bootstrap-handshake mechanism was covered in Module 4, one of two selectable transfer backends carrying the KV cache, and the wide-EP dispatch/combine layer from Module 5 running underneath both pools<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<h2 id="two-problems">1. SGLang's disaggregation motivation, and why it differs from the interference argument</h2>
+<p>SGLang's own documentation frames prefill/decode disaggregation as solving two distinct problems on a unified engine, not one: <b>Prefill Interruption</b>, where incoming prefill batches delay token generation for requests already decoding, and <b>DP Attention Imbalance</b>, where data-parallel workers end up processing mismatched mixes of prefill and decode work<a class="cite" href="#ref-1">1</a>. Module 4 introduced this framing alongside the bootstrap handshake mechanism it motivates and noted, in passing, that it is a different diagnosis from DistServe's and Mooncake's interference argument (Module 3) even though both conclude that separate pools help. This module stays on the SGLang side of that split and goes one level further into why the two framings diverge, because the difference matters for how you read SGLang's own deployment guidance.</p>
+<p>DistServe's and Mooncake's case for disaggregation is a queueing argument: a compute-bound prefill job occupies the GPU long enough to stall the memory-bound decode steps of requests already in flight, so tail latency (TBT/ITL) degrades in proportion to how much prefill work is mixed into a batch (Module 3). SGLang's "Prefill Interruption" is the same underlying symptom, described the same way. "DP Attention Imbalance" is a second, separate failure mode that only exists because of how SGLang implements data-parallel attention across replicas: when <code>--enable-dp-attention</code> is active, each DP rank runs attention against its own private request slice and KV cache while MoE layers dispatch across the wider expert-parallel group (Module 5, §5.3). On a colocated engine, nothing guarantees that the prefill and decode requests land evenly across DP ranks — one rank can be doing three prefills while its neighbor idles on a single decode step, and because attention-DP ranks do not share KV cache or request queues, that imbalance cannot self-correct the way a single shared-queue engine's load naturally would. Disaggregating prefill and decode into separate pools removes DP Attention Imbalance by construction: each pool's DP ranks only ever see one kind of work, so the imbalance has nowhere to come from.</p>
+<p>The practical upshot is that SGLang's own case for disaggregation is partly attention-DP-specific — a consequence of the parallelism layout introduced for wide-EP scaling (Module 5) — rather than a general claim that holds for every tensor-parallel-only deployment. A TP-only SGLang deployment without <code>--enable-dp-attention</code> still suffers Prefill Interruption exactly as DistServe describes it, but DP Attention Imbalance specifically requires the DP-attention layout to exist in the first place. This is worth keeping straight when reading SGLang's disaggregation documentation against Module 3's more general goodput argument: SGLang is not disagreeing with DistServe, it is adding a second, layout-specific reason on top.</p>
+<p>The rest of this module covers what sits underneath that motivation on the SGLang side: the router that decides which prefill and which decode worker a request goes to, the two transfer backends that move the KV cache between them, the exact flags that turn TP16/DP8 attention-DP into a running multi-node deployment, and which parts of this stack SGLang's own issue tracker describes as settled versus still being hardened.</p>
+<h2 id="router-architecture">2. sglang-router / SGLang Model Gateway: architecture</h2>
+<p>Module 2's router-comparison table could only describe sglang-router at the level its PyPI package page documents: "a high-performance Rust-based load balancer for SGLang with multiple routing algorithms and prefill-decode disaggregation support," currently version 0.3.2, released 2026-01-15<a class="cite" href="#ref-2">2</a>, with the caveat that the package page does not itemize the internal scoring formula. The project's own repository documentation does itemize it, under a name change: the same Rust binary and Python launcher (<code>python3 -m sglang_router.launch_router</code>) are now documented as the <b>SGLang Model Gateway</b>, describing itself as "high-performance model routing control and data plane for large-scale LLM deployments"<a class="cite" href="#ref-3">3</a>. The CLI flags and Python module name are unchanged from the sglang-router package Module 2 cites — this is the same project with its documentation and internal architecture rewritten, not a replacement.</p>
+<p>The architecture splits into a control plane and a data plane<a class="cite" href="#ref-3">3</a>:</p>
+<ul>
+<li><b>Control plane.</b> A <code>WorkerManager</code> validates workers, discovers their capabilities via <code>/server_info</code> and <code>/get_model_info</code>, and keeps a shared worker registry in sync. A <code>JobQueue</code> serializes background add/remove operations so registration never blocks a client request. A background health checker and load monitor keep per-worker circuit breakers and the routing policies informed of current load. Optional Kubernetes service discovery reconciles the registry against pod state directly, with separate selectors for prefill and decode pods in PD mode.</li>
+<li><b>Data plane.</b> HTTP routers for regular and PD traffic implement <code>/generate</code> and the OpenAI-compatible endpoints (<code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/v1/embeddings</code>, <code>/v1/responses</code>, <code>/v1/rerank</code>, <code>/v1/classify</code>); a separate gRPC router streams tokenized requests directly to SGLang's gRPC workers with tokenizer, reasoning-parser, and tool-call-parser logic implemented in Rust rather than shelling out to Python. A resilience layer — token-bucket rate limiting, request queuing, a retry executor, and per-worker circuit breakers — sits in front of both.</li>
+</ul>
+<figure class="fig">
+<svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Control-plane and data-plane split inside the SGLang Model Gateway</title>
+<defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="20" width="760" height="120" rx="10" class="d-panel d-dashed"/>
+<text x="40" y="42" class="d-title d-bold">Control plane</text>
+<rect x="40" y="55" width="160" height="65" rx="8" class="d-block"/>
+<text x="120" y="80" text-anchor="middle" class="d-text-inv d-small">Worker Manager</text>
+<text x="120" y="98" text-anchor="middle" class="d-text-inv d-small">/server_info, /get_model_info</text>
+<rect x="220" y="55" width="160" height="65" rx="8" class="d-block"/>
+<text x="300" y="80" text-anchor="middle" class="d-text-inv d-small">Job Queue</text>
+<text x="300" y="98" text-anchor="middle" class="d-text-inv d-small">async add/remove</text>
+<rect x="400" y="55" width="160" height="65" rx="8" class="d-block"/>
+<text x="480" y="80" text-anchor="middle" class="d-text-inv d-small">Health checker</text>
+<text x="480" y="98" text-anchor="middle" class="d-text-inv d-small">circuit breaker state</text>
+<rect x="580" y="55" width="180" height="65" rx="8" class="d-block"/>
+<text x="670" y="80" text-anchor="middle" class="d-text-inv d-small">K8s service discovery</text>
+<text x="670" y="98" text-anchor="middle" class="d-text-inv d-small">optional, PD-aware selectors</text>
+
+<path d="M120,120 L120,160" class="d-arrow d-dim" marker-end="url(#f2-arr)"/>
+<path d="M480,120 L480,160" class="d-arrow d-dim" marker-end="url(#f2-arr)"/>
+
+<rect x="20" y="165" width="760" height="115" rx="10" class="d-panel d-dashed"/>
+<text x="40" y="187" class="d-title d-bold">Data plane</text>
+<rect x="40" y="200" width="220" height="65" rx="8" class="d-block-2"/>
+<text x="150" y="225" text-anchor="middle" class="d-text-inv d-small">HTTP router (regular + PD)</text>
+<text x="150" y="243" text-anchor="middle" class="d-text-inv d-small">policy-aware selection</text>
+<rect x="280" y="200" width="220" height="65" rx="8" class="d-block-2"/>
+<text x="390" y="225" text-anchor="middle" class="d-text-inv d-small">gRPC router</text>
+<text x="390" y="243" text-anchor="middle" class="d-text-inv d-small">Rust tokenizer/parsers</text>
+<rect x="520" y="200" width="240" height="65" rx="8" class="d-block-accent"/>
+<text x="640" y="225" text-anchor="middle" class="d-text-inv d-small">Resilience layer</text>
+<text x="640" y="243" text-anchor="middle" class="d-text-inv d-small">rate limit / retry / circuit breaker</text>
+</svg>
+<figcaption><b>Figure 2.</b> The control-plane and data-plane split documented for the SGLang Model Gateway (the current name for the sglang-router project Module 2 cites by package version). Worker registration, health, and Kubernetes discovery run separately from the request-serving path so a slow health check never blocks an in-flight request<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+<p>Two details matter for anyone deploying this behind an SGLang fleet rather than reading about it. First, the gateway also has an OpenAI-router mode that proxies requests to remote OpenAI-compatible vendors (OpenAI, xAI, Gemini) and can front a multi-model fleet under one process via <code>--enable-igw</code> (inference-gateway mode), applying a distinct load-balancing policy per model<a class="cite" href="#ref-3">3</a> — this is out of scope for a single-model multi-node SGLang deployment but explains why the project renamed itself from a "router" to a "gateway." Second, the observability surface is large: over 40 Prometheus metrics grouped by layer (<code>smg_http_*</code>, <code>smg_router_*</code>, <code>smg_worker_*</code>, <code>smg_worker_cb_*</code> for circuit breakers, <code>smg_discovery_*</code>), plus OpenTelemetry tracing with W3C trace-context propagation into upstream worker requests<a class="cite" href="#ref-3">3</a>. None of this is itemized on the PyPI page Module 2 could cite in detail; it lives in the project's own README.</p>
+<p>The resilience layer's own defaults are concrete enough to reason about a fleet-wide failure budget from: retries default to a maximum of 5 attempts with exponential backoff, triggered on HTTP 408, 429, 500, 502, 503, and 504 responses from a worker; per-worker circuit breakers open after a configurable failure threshold and half-open after a configurable timeout window; and the upstream HTTP client pools connections with a 50-second idle timeout, a 10-second connect timeout, and up to 500 idle connections per worker host<a class="cite" href="#ref-3">3</a>. None of these numbers were configurable at all in the router design the architecture-improvement proposal in §8 was written against — they are part of what "resilience layer" means for the rewritten gateway specifically, not a carryover from the earlier router.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>The README also documents a <code>--mini-lb</code> mode that "forwards PD requests using simple random routing" with no cache-awareness, health checking, or resilience layer attached, and is explicitly scoped to local debugging<a class="cite" href="#ref-3">3</a>. It is useful for isolating whether a problem is in the PD transfer path (§5) or in the router's own policy logic, but it is not a lightweight production option — it skips every reliability primitive described above.</p></aside>
+<h2 id="load-balancing-policies">3. Five load-balancing policies and the cache-aware algorithm</h2>
+<p>The router ships five selectable policies, set with <code>--policy</code> (or <code>--prefill-policy</code>/<code>--decode-policy</code> independently in PD mode, §4)<a class="cite" href="#ref-3">3</a>:</p>
+<table class="tbl tbl-compare tbl-dense">
+<caption><b>Table 1.</b> sglang-router / SGLang Model Gateway load-balancing policies, their mechanism, and the config knobs that tune them<a class="cite" href="#ref-3">3</a>.</caption>
+<thead><tr><th>Policy</th><th>Mechanism</th><th>Config knobs</th><th>Where it appears in this module's examples</th></tr></thead>
+<tbody>
+<tr><td class="row"><code>random</code></td><td>Uniform random worker selection</td><td>none</td><td>debug / MiniLB only</td></tr>
+<tr><td class="row"><code>round_robin</code></td><td>Sequential rotation via atomic counter</td><td>none</td><td>—</td></tr>
+<tr><td class="row"><code>power_of_two</code></td><td>Samples two random workers, routes to the one the Load Monitor reports as lighter</td><td>integrates with background load monitor</td><td>decode-side policy in the project's own PD quick-start (§4)</td></tr>
+<tr><td class="row"><code>cache_aware</code></td><td data-best>Maintains an approximate prefix tree of routed prompts to predict per-worker cache-hit ratio, rebalancing on load thresholds</td><td><code>--cache-threshold</code> (0.3), <code>--balance-abs-threshold</code> (64), <code>--balance-rel-threshold</code> (1.5), <code>--eviction-interval</code> (120s), <code>--max-tree-size</code> (67,108,864 nodes)</td><td>used in every quick-start example in the project's own README, including the default single-stage and PD examples</td></tr>
+<tr><td class="row"><code>bucket</code></td><td>Divides workers into load buckets with dynamic boundaries</td><td>not itemized beyond "dynamic boundaries" in the current README</td><td>—</td></tr>
+</tbody>
+</table>
+<p><code>cache_aware</code> is the only policy of the five that reasons about KV-cache locality rather than raw load, and it is the one every quick-start command in the project's documentation reaches for first<a class="cite" href="#ref-3">3</a>. Its mechanism was introduced in SGLang v0.4 (December 4, 2024) as a "cache-aware load balancer": the router maintains an <b>approximate radix tree</b> that mirrors the real radix tree each SGLang worker keeps for its own prefix cache, and predicts which worker holds the longest matching prefix for an incoming request without querying the workers directly<a class="cite" href="#ref-4">4</a>. The design goal stated in that announcement is explicitly communication-free: "the tree is lazily updated with almost no overhead," and no worker-to-router synchronization of cache state is required — the router infers the shadow tree's state purely from the requests it has already routed and their observed responses<a class="cite" href="#ref-4">4</a>. This is the same family of idea as Module 2's approximate block-hashing scheme (llm-d's prefix scorer), but at the granularity of a full radix tree over raw prompt text rather than fixed-size token blocks, and built into the router process itself rather than layered on top via a separate event stream.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f3t"><title id="f3t">Cache-aware routing: the router's approximate radix tree predicts the best worker without querying it</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="90" width="180" height="60" rx="8" class="d-block-accent"/>
+<text x="110" y="115" text-anchor="middle" class="d-text-inv d-bold">Request arrives</text>
+<text x="110" y="133" text-anchor="middle" class="d-text-inv d-small">prompt text</text>
+<path d="M200,120 L260,120" class="d-arrow" marker-end="url(#f3-arr)"/>
+
+<rect x="260" y="30" width="240" height="180" rx="8" class="d-panel"/>
+<text x="380" y="50" text-anchor="middle" class="d-title d-bold">Router-side shadow tree</text>
+<text x="380" y="68" text-anchor="middle" class="d-small d-text-light">approximate radix tree, no worker sync</text>
+<rect x="285" y="80" width="190" height="34" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+<text x="380" y="102" text-anchor="middle" class="d-small">match ratio vs. cache-threshold (0.3)</text>
+<rect x="285" y="122" width="190" height="34" rx="6" class="d-fill-cyan-soft"/>
+<text x="380" y="144" text-anchor="middle" class="d-small">per-worker load estimate</text>
+<rect x="285" y="164" width="190" height="34" rx="6" class="d-fill-cyan-soft"/>
+<text x="380" y="186" text-anchor="middle" class="d-small">abs/rel imbalance thresholds</text>
+
+<path d="M500,120 L560,120" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+<rect x="560" y="90" width="200" height="60" rx="8" class="d-block">
+</rect>
+<text x="660" y="115" text-anchor="middle" class="d-text-inv d-bold">Best-match worker</text>
+<text x="660" y="133" text-anchor="middle" class="d-text-inv d-small">request routed here</text>
+
+<path d="M660,150 L660,190" class="d-arrow d-dim" marker-end="url(#f3-arr)"/>
+<rect x="530" y="196" width="260" height="40" rx="8" class="d-surface"/>
+<text x="660" y="220" text-anchor="middle" class="d-small d-text-light">shadow tree updated lazily; evicted every 120s</text>
+</svg>
+<figcaption><b>Figure 3.</b> The cache-aware policy predicts a per-worker prefix-match ratio from a router-local approximate radix tree rather than querying workers, then falls back toward load balancing once the configured imbalance thresholds are crossed. Mechanism and default values from the SGLang Model Gateway README<a class="cite" href="#ref-3">3</a>; the underlying approximate-tree idea and its "no worker sync" design goal from the SGLang v0.4 announcement<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+<p>The v0.4 announcement also published the first measured numbers for this policy against a round-robin baseline: prefill throughput rose from 82,665 to 158,596 tokens/second (a 1.9&times; increase), and the cache hit rate rose from 20% to 75% (a 3.8&times; increase), with the gain reported as increasing with worker count<a class="cite" href="#ref-4">4</a>. Those are two-year-old numbers relative to this module's as-of date and measured on whatever hardware and workload the v0.4 benchmark used — treat them as evidence the mechanism works, not as a number that transfers to an arbitrary deployment.</p>
+<details class="more">
+<summary>Why the policy needs two separate imbalance thresholds, not one</summary>
+<p>The cache-aware policy's rebalancing behavior is governed by two published default constants: <code>--balance-abs-threshold</code> = 64 and <code>--balance-rel-threshold</code> = 1.5<a class="cite" href="#ref-3">3</a>. The documentation does not publish the exact boolean combination of the two, but the reason a single threshold cannot do this job on its own is straightforward arithmetic. Consider two workers with loads \(L_{min}\) and \(L_{max}\) in requests currently in flight:</p>
+<ul>
+<li>At low absolute load (\(L_{min}=10\), \(L_{max}=20\)): the relative ratio \(L_{max}/L_{min} = 2.0\) already exceeds 1.5, even though the absolute gap of 10 requests is nowhere near 64. A relative-only rule would trigger rebalancing here.</li>
+<li>At high absolute load (\(L_{min}=200\), \(L_{max}=260\)): the relative ratio is only \(260/200 = 1.3\), under the 1.5 threshold, even though the absolute gap of 60 requests is close to the 64-request cutoff and represents a much larger real queueing difference. A relative-only rule would <i>not</i> trigger here, and an absolute-only rule set to catch this case would have already over-triggered on much smaller fleets.</li>
+</ul>
+<p>An absolute threshold alone over-triggers at small fleet sizes (a 5-request gap on 2 lightly loaded workers looks huge in relative terms but is operationally meaningless); a relative threshold alone under-triggers at high load (a 30% gap on heavily loaded workers is a large absolute number of misrouted requests). Publishing both and presumably requiring some combination of the two is what lets the same default configuration behave sensibly whether the fleet is idling at single-digit concurrency or saturated at hundreds of requests per worker — the same problem Module 2's llm-d load scorer solves with its own load-aware scoring layered on top of prefix-cache scoring, just with two explicit numeric knobs instead of a weighted-scorer combination.</p>
+</details>
+<h2 id="pd-aware-routing">4. PD-aware routing: per-role policies and worker registration</h2>
+<p>In PD mode the router accepts separate <code>--prefill</code> and <code>--decode</code> worker lists (a prefill entry can carry an optional bootstrap port, e.g. <code>--prefill http://prefill1:30001 9001</code>), and can apply an independent policy to each side via <code>--prefill-policy</code> and <code>--decode-policy</code><a class="cite" href="#ref-3">3</a>. The project's own quick-start for PD mode pairs <code>cache_aware</code> on the prefill side with <code>power_of_two</code> on the decode side<a class="cite" href="#ref-3">3</a>:</p>
+<pre class="code" data-lang="bash" data-title="PD-aware router launch"><code>./target/release/sgl-model-gateway \
+  --pd-disaggregation \
+  --prefill http://prefill1:30001 9001 \
+  --prefill http://prefill2:30002 \
+  --decode http://decode1:30011 \
+  --decode http://decode2:30012 \
+  --policy cache_aware \
+  --prefill-policy cache_aware \
+  --decode-policy power_of_two</code></pre>
+<p>That pairing is not arbitrary. Prefix locality is a prefill-side concern — which worker already holds a matching prefix in its KV cache determines how much of the prompt that worker can skip recomputing, which is exactly what <code>cache_aware</code> predicts. By the time a request reaches the decode side, the bootstrap handshake (Module 4, §3) has already fixed which decode worker receives the transferred KV cache; there is no longer a prefix-match decision to make, only a load-balancing one, which is what <code>power_of_two</code> is for. The router "merges prefill metadata with decode outputs and streams results back to the client," and for gRPC workers a single router process automatically selects the PD pipeline once the worker registry contains prefill and decode workers rather than requiring a separate deployment mode<a class="cite" href="#ref-3">3</a>.</p>
+<p>Workers, including PD-role workers, can also be registered and removed at runtime rather than only via CLI flags at launch, through a small control-plane API<a class="cite" href="#ref-3">3</a>:</p>
+<table class="tbl tbl-dense">
+<caption><b>Table 2.</b> Worker-registration API on the SGLang Model Gateway's control plane<a class="cite" href="#ref-3">3</a>.</caption>
+<thead><tr><th>Method</th><th>Path</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td class="row d-mono">POST</td><td class="d-mono">/workers</td><td>Queue worker registration (prefill/decode/regular); returns <code>202 Accepted</code> while the job queue processes it</td></tr>
+<tr><td class="row d-mono">GET</td><td class="d-mono">/workers</td><td>List workers with health, load, policy metadata, queued-job status</td></tr>
+<tr><td class="row d-mono">PUT</td><td class="d-mono">/workers/{worker_id}</td><td>Queue a worker update by UUID</td></tr>
+<tr><td class="row d-mono">DELETE</td><td class="d-mono">/workers/{worker_id}</td><td>Queue worker removal by UUID</td></tr>
+<tr><td class="row d-mono">POST</td><td class="d-mono">/flush_cache</td><td>Trigger a cache flush across HTTP workers — used before redeploying PD workers</td></tr>
+</tbody>
+</table>
+<figure class="fig">
+<svg viewBox="0 0 800 230" role="img" aria-labelledby="f4t"><title id="f4t">PD-aware routing: independent per-role policy plus dynamic worker registration</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="20" width="200" height="50" rx="8" class="d-block-accent"/>
+<text x="120" y="50" text-anchor="middle" class="d-text-inv d-bold">POST /workers</text>
+<path d="M220,45 L280,45" class="d-arrow" marker-end="url(#f4-arr)"/>
+<rect x="280" y="20" width="220" height="50" rx="8" class="d-panel"/>
+<text x="390" y="50" text-anchor="middle" class="d-small">Job Queue &#8594; registry (async, non-blocking)</text>
+
+<rect x="60" y="110" width="300" height="60" rx="8" class="d-block">
+</rect>
+<text x="210" y="134" text-anchor="middle" class="d-text-inv d-bold">Prefill workers</text>
+<text x="210" y="152" text-anchor="middle" class="d-text-inv d-small">--prefill-policy cache_aware</text>
+
+<rect x="440" y="110" width="300" height="60" rx="8" class="d-block-2">
+</rect>
+<text x="590" y="134" text-anchor="middle" class="d-text-inv d-bold">Decode workers</text>
+<text x="590" y="152" text-anchor="middle" class="d-text-inv d-small">--decode-policy power_of_two</text>
+
+<path d="M390,70 L210,110" class="d-arrow d-dim" marker-end="url(#f4-arr)"/>
+<path d="M390,70 L590,110" class="d-arrow d-dim" marker-end="url(#f4-arr)"/>
+<text x="400" y="200" text-anchor="middle" class="d-small d-text-light">Prefix-match decision on the prefill side; pure load balance on the decode side (KV affinity already fixed by bootstrap handshake, Module 4)</text>
+</svg>
+<figcaption><b>Figure 4.</b> PD-aware routing assigns an independent policy per role and lets workers register dynamically through the control plane rather than only at process launch<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+<p>Dynamic worker registration is a real capability change worth flagging against the project's own history. A router architecture-improvement proposal filed against the pre-rewrite design (June 25, 2025) listed "no dynamic worker management in PD mode" — requiring a full restart to add or remove PD workers — as one of seven concrete gaps, alongside workers being represented internally as bare strings with no health or load tracking<a class="cite" href="#ref-5">5</a>. The <code>POST /workers</code> / <code>DELETE /workers/{worker_id}</code> API documented for the current SGLang Model Gateway directly answers that gap. Section 8 returns to what in that 2025 gap list is and is not yet fully closed.</p>
+<h2 id="transfer-backends">5. Two transfer backends: Mooncake vs. NIXL</h2>
+<p>The router picks which worker pair talks to which; the actual KV cache bytes move over one of two selectable transfer backends, configured on the SGLang engine processes themselves rather than in the router<a class="cite" href="#ref-1">1</a>. Both backends implement the same bootstrap-handshake contract described in Module 4 — they differ only in the transport underneath the handshake.</p>
+<p><b>Mooncake</b> is installed via <code>uv pip install mooncake-transfer-engine</code> and selected as the default backend. Its distinguishing configuration surface is <code>--disaggregation-ib-device</code>, which accepts three forms: a single shared device list (<code>mlx5_0</code> or <code>mlx5_0,mlx5_1</code>), a per-GPU JSON mapping (<code>{"0": "mlx5_0,mlx5_1", "1": "mlx5_2,mlx5_3"}</code>), or a path to a JSON file containing that same per-GPU mapping<a class="cite" href="#ref-1">1</a>. The per-GPU form matters on any node where InfiniBand HCAs are not uniformly reachable from every GPU — common on 8-GPU nodes where NIC placement follows PCIe topology rather than a flat any-GPU-to-any-NIC design — because it lets each GPU's transfer traffic go out its topologically nearest HCA instead of contending on a shared default device. Mooncake itself, its Conductor scheduler, and its own transfer-engine bandwidth numbers are Module 7's subject; here it is one of two backend choices a flag selects.</p>
+<p><b>NIXL</b> is installed via <code>pip install nixl</code> and selected with <code>--disaggregation-transfer-backend nixl</code>. Its own backend choice is a second-level selection controlled by the environment variable <code>SGLANG_DISAGGREGATION_NIXL_BACKEND</code>, defaulting to UCX, with LIBFABRIC or any other installed NIXL plugin available as alternatives<a class="cite" href="#ref-1">1</a>. NIXL's own architecture — Memory Sections, Transfer Backend Interface, Metadata Handler — and its role as the shared substrate under Dynamo's and TensorRT-LLM's default KV transfer paths are Module 8's subject; SGLang treats it as an alternate backend behind the same bootstrap protocol, not its default.</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 3.</b> The two PD transfer backends SGLang selects between, and what each requires<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Property</th><th>Mooncake</th><th>NIXL</th></tr></thead>
+<tbody>
+<tr><td class="row">Install</td><td class="d-mono">uv pip install mooncake-transfer-engine</td><td class="d-mono">pip install nixl</td></tr>
+<tr><td class="row">Select</td><td>default backend</td><td class="d-mono">--disaggregation-transfer-backend nixl</td></tr>
+<tr><td class="row">Device mapping</td><td data-best>per-GPU IB device JSON via <code>--disaggregation-ib-device</code></td><td>backend-internal (UCX/LIBFABRIC plugin selection)</td></tr>
+<tr><td class="row">Sub-backend selector</td><td>&#8212;</td><td class="d-mono">SGLANG_DISAGGREGATION_NIXL_BACKEND (UCX default, LIBFABRIC, or other plugin)</td></tr>
+<tr><td class="row">Full project treatment</td><td>Module 7</td><td>Module 8</td></tr>
+</tbody>
+</table>
+<figure class="fig">
+<svg viewBox="0 0 800 220" role="img" aria-labelledby="f5t"><title id="f5t">Transfer backend selection: Mooncake vs NIXL, chosen per SGLang engine process</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="300" y="16" width="200" height="50" rx="8" class="d-block-accent"/>
+<text x="400" y="46" text-anchor="middle" class="d-text-inv d-bold">--disaggregation-transfer-backend</text>
+<path d="M370,66 L220,110" class="d-arrow" marker-end="url(#f5-arr)"/>
+<path d="M430,66 L580,110" class="d-arrow" marker-end="url(#f5-arr)"/>
+
+<rect x="60" y="110" width="320" height="90" rx="8" class="d-block">
+</rect>
+<text x="220" y="134" text-anchor="middle" class="d-text-inv d-bold">Mooncake (default)</text>
+<text x="220" y="154" text-anchor="middle" class="d-text-inv d-small">--disaggregation-ib-device</text>
+<text x="220" y="172" text-anchor="middle" class="d-text-inv d-small">per-GPU mlx5_x mapping (JSON)</text>
+<text x="220" y="190" text-anchor="middle" class="d-text-inv d-small">full architecture: Module 7</text>
+
+<rect x="420" y="110" width="320" height="90" rx="8" class="d-block-2">
+</rect>
+<text x="580" y="134" text-anchor="middle" class="d-text-inv d-bold">NIXL (nixl)</text>
+<text x="580" y="154" text-anchor="middle" class="d-text-inv d-small">SGLANG_DISAGGREGATION_NIXL_BACKEND</text>
+<text x="580" y="172" text-anchor="middle" class="d-text-inv d-small">UCX (default) or LIBFABRIC</text>
+<text x="580" y="190" text-anchor="middle" class="d-text-inv d-small">full architecture: Module 8</text>
+</svg>
+<figcaption><b>Figure 5.</b> Backend selection is one CLI flag on the engine process, with a second-level environment variable when NIXL itself needs to pick between transport plugins<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<p>Neither backend is documented as the categorically faster choice — the selection is about what is already installed and topologically available rather than a raw-throughput comparison. Mooncake's per-GPU IB device mapping is the more direct control surface when the deployment target's InfiniBand HCA-to-GPU topology is already known and asymmetric; NIXL's environment-variable backend selection is the path already shared with Dynamo (Module 9) and TensorRT-LLM (Module 13), so a fleet that runs more than one of these engines side by side has one fewer transport library to operate if it standardizes on NIXL everywhere it is available.</p>
+<h2 id="deepseek-deployment-recipe">6. Multi-node DeepSeek-class deployment recipe</h2>
+<p>SGLang's documentation gives a concrete multi-node command set for a DeepSeek-class model, splitting prefill and decode onto separate master-node groups<a class="cite" href="#ref-1">1</a>. The core flags on the prefill side:</p>
+<pre class="code" data-lang="bash" data-title="Prefill node 0 (of a 2-node prefill pool)"><code>python3 -m sglang.launch_server \
+  --disaggregation-mode prefill \
+  --host ${local_ip} --port 30000 \
+  --dist-init-addr ${prefill_master_ip}:5000 \
+  --nnodes 2 --node-rank 0 \
+  --tp-size 16 --dp-size 8 --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8</code></pre>
+<p>and on the decode side, the same topology shape with the disaggregation mode and a request-admission cap flipped:</p>
+<pre class="code" data-lang="bash" data-title="Decode node 0 (of a 2-node decode pool)"><code>python3 -m sglang.launch_server \
+  --disaggregation-mode decode \
+  --host ${local_ip} --port 30001 \
+  --dist-init-addr ${decode_master_ip}:5000 \
+  --nnodes 2 --node-rank 0 \
+  --tp-size 16 --dp-size 8 --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --mem-fraction-static 0.8 --max-running-requests 128</code></pre>
+<p>Each pool repeats the command with <code>--node-rank 1</code> (and each additional node it needs) pointed at the same <code>--dist-init-addr</code>, so the master IP is the one piece of address information every rank in a given pool must agree on<a class="cite" href="#ref-1">1</a>. Nothing in these two commands is new mechanism: <code>--tp-size</code>/<code>--dp-size</code>/<code>--enable-dp-attention</code>/<code>--moe-a2a-backend deepep</code> are exactly the attention-DP-plus-expert-parallel flags Module 5 covers mechanically (§5.3), and <code>--disaggregation-mode</code> plus the master-address/rank flags are the multi-node bootstrap plumbing every SGLang worker uses whether or not PD is involved. What this recipe adds is only the fact that prefill and decode are two independently addressed, independently sized pools — a prefill pool can run on different node count, node rank, and even different <code>--mem-fraction-static</code> than a decode pool, because they are separate process groups that only communicate through the transfer backend (§5) and the bootstrap handshake (Module 4), never through a shared distributed-init group.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 260" role="img" aria-labelledby="f6t"><title id="f6t">Multi-node DeepSeek-class deployment: separate prefill and decode master-node groups</title>
+<defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="20" width="360" height="200" rx="10" class="d-panel d-dashed"/>
+<text x="200" y="42" text-anchor="middle" class="d-title d-bold">Prefill pool</text>
+<text x="200" y="60" text-anchor="middle" class="d-small d-text-light">--dist-init-addr prefill_master_ip:5000</text>
+<rect x="40" y="75" width="150" height="60" rx="8" class="d-block"/>
+<text x="115" y="98" text-anchor="middle" class="d-text-inv d-small">node-rank 0</text>
+<text x="115" y="116" text-anchor="middle" class="d-text-inv d-small">(master)</text>
+<rect x="210" y="75" width="150" height="60" rx="8" class="d-block"/>
+<text x="285" y="98" text-anchor="middle" class="d-text-inv d-small">node-rank 1</text>
+<text x="285" y="116" text-anchor="middle" class="d-text-inv d-small">--nnodes 2</text>
+<text x="200" y="160" text-anchor="middle" class="d-small">tp-size 16, dp-size 8</text>
+<text x="200" y="178" text-anchor="middle" class="d-small">--enable-dp-attention</text>
+<text x="200" y="196" text-anchor="middle" class="d-small">--moe-a2a-backend deepep</text>
+
+<rect x="420" y="20" width="360" height="200" rx="10" class="d-panel d-dashed"/>
+<text x="600" y="42" text-anchor="middle" class="d-title d-bold">Decode pool</text>
+<text x="600" y="60" text-anchor="middle" class="d-small d-text-light">--dist-init-addr decode_master_ip:5000</text>
+<rect x="440" y="75" width="150" height="60" rx="8" class="d-block-2"/>
+<text x="515" y="98" text-anchor="middle" class="d-text-inv d-small">node-rank 0</text>
+<text x="515" y="116" text-anchor="middle" class="d-text-inv d-small">(master)</text>
+<rect x="610" y="75" width="150" height="60" rx="8" class="d-block-2"/>
+<text x="685" y="98" text-anchor="middle" class="d-text-inv d-small">node-rank 1</text>
+<text x="685" y="116" text-anchor="middle" class="d-text-inv d-small">--nnodes 2</text>
+<text x="600" y="160" text-anchor="middle" class="d-small">tp-size 16, dp-size 8</text>
+<text x="600" y="178" text-anchor="middle" class="d-small">--max-running-requests 128</text>
+
+<path d="M380,120 L420,120" class="d-arrow-active" marker-end="url(#f6-arr)"/>
+<text x="400" y="110" text-anchor="middle" class="d-mono d-small">transfer backend</text>
+<text x="400" y="245" text-anchor="middle" class="d-small d-text-light">Two independent distributed-init groups, one master address each; only the transfer backend and bootstrap handshake connect them</text>
+</svg>
+<figcaption><b>Figure 6.</b> The prefill and decode pools are separate <code>--dist-init-addr</code> groups with independent node counts and ranks; the flags shown are exactly SGLang's own documented multi-node DeepSeek recipe<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<p>This is the class of recipe SGLang's own team used to reproduce a DeepSeek-scale deployment independently: 12 nodes of 8 H100 GPUs each (96 GPUs total) on Atlas Cloud, with prefill tested at EP32 across 4 nodes and decode tested at EP72 across 9 nodes<a class="cite" href="#ref-6">6</a> — the wide-EP mechanics behind those EP degrees are Module 5's subject and the full reproduction, including its per-node throughput and cost numbers against DeepSeek's own published H800 deployment, is Module 6's subject. What is worth restating here, because it is the direct payoff of this section's flags, is that the reproduction's simulated-optimal-load-balancing prefill throughput landed within 5.6% of DeepSeek's own official profile, decode landed within 6.6%, and the resulting cost came to $0.20 per million output tokens — about one-fifth of the official DeepSeek Chat API price at the time<a class="cite" href="#ref-6">6</a>. Those numbers are evidence that the flags in this section are not a toy example; they are the same shape of command that produced a validated, published, near-DeepSeek-parity deployment.</p>
+<h2 id="heterogeneous-tp-staging">7. Heterogeneous TP with the GPU staging buffer</h2>
+<p>Every example so far uses matching parallelism on both sides of the PD split (TP16/DP8 on both prefill and decode). That symmetry is not required, and SGLang has a specific mechanism for when it is deliberately broken: prefill and decode often want different tensor-parallel degrees, because prefill is compute-bound and benefits from a wider TP group to parallelize the initial forward pass, while decode is memory-bandwidth-bound and can run efficiently — sometimes more efficiently — at a narrower TP degree with more replicas. Running heterogeneous TP across the PD boundary means the KV cache produced by a 16-way-sharded prefill worker has to be reshaped into whatever partition scheme a differently-sized decode worker expects, instead of a direct block-for-block copy.</p>
+<p>SGLang's answer is a GPU-resident staging buffer, enabled with <code>SGLANG_DISAGG_STAGING_BUFFER=1</code> and sized with <code>SGLANG_DISAGG_STAGING_POOL_SIZE_MB</code> (default 4096)<a class="cite" href="#ref-1">1</a>. Rather than transferring KV cache directly per-token-slice across mismatched TP partitions, the staging buffer holds an intermediate GPU-resident copy that both sides can read from and write to at their own partitioning — decoupling the transfer schedule from the reshape. SGLang's own documentation reports this yields a 2&ndash;5&times; throughput improvement over the default per-token slice approach at high concurrency, and gets within roughly 5% of a homogeneous-TP baseline's throughput despite the extra reshape step<a class="cite" href="#ref-1">1</a>.</p>
+<p>The mechanism is explicitly restricted: it "is designed for non-MLA models (e.g. GQA, MHA)," and models using Multi-head Latent Attention — DeepSeek-V2/V3 among them — should not enable the flag<a class="cite" href="#ref-1">1</a>. This is a direct consequence of what MLA does to the KV cache layout: MLA compresses the key/value representation into a single low-rank latent vector shared across all attention heads rather than storing per-head K/V tensors, so there is no per-head partition for a staging buffer built around reshaping a head-sharded tensor to reconcile against. The heterogeneous-TP staging buffer and DeepSeek-class wide-EP deployment (§6) are consequently closer to mutually exclusive than composable: the deployment recipe in §6 is exactly the case — an MLA model at DeepSeek scale — where this section's mechanism does not apply, and heterogeneous TP would need a different reshape strategy or matching TP degrees on both sides instead.</p>
+<p>For non-MLA models — a dense Llama-class or GQA/MHA MoE model without DeepSeek's specific attention design — heterogeneous TP with the staging buffer is the mechanism that lets a deployer size prefill and decode pools independently by compute/memory profile rather than being forced into matching TP degrees purely because the KV transfer path can't otherwise reconcile them.</p>
+<h2 id="failure-detection-and-readiness">8. Failure detection, and what is production-ready versus still hardening</h2>
+<p>Independent of transport backend, the engine layer detects a dead or stuck prefill/decode peer with four environment-variable-tunable defaults<a class="cite" href="#ref-1">1</a>:</p>
+<table class="tbl tbl-compare">
+<caption><b>Table 4.</b> SGLang's PD failure-detection defaults and what each guards against<a class="cite" href="#ref-1">1</a>.</caption>
+<thead><tr><th>Variable</th><th class="num">Default</th><th>What it protects against</th></tr></thead>
+<tbody>
+<tr><td class="row d-mono">SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL</td><td class="num">5.0 s</td><td>How often a decode worker pings a prefill peer it has an in-flight transfer with</td></tr>
+<tr><td class="row d-mono">SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE</td><td class="num">2</td><td>Consecutive missed heartbeats before the peer is declared dead</td></tr>
+<tr><td class="row d-mono">SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT</td><td class="num">300 s</td><td>Ceiling on the bootstrap handshake itself (Module 4, §3) completing before the request is failed</td></tr>
+<tr><td class="row d-mono">SGLANG_DISAGGREGATION_WAITING_TIMEOUT</td><td class="num">300 s</td><td>Ceiling on a decode worker waiting for a KV transfer to complete once bootstrap has finished</td></tr>
+</tbody>
+</table>
+<p>Two consecutive missed 5-second heartbeats (10 seconds) is the fast-path failure signal for a peer that has already established a transfer; the two 300-second timeouts are the slow-path ceilings for a handshake or transfer that never completes cleanly rather than one that stalls after starting successfully. All four are per-request-transfer state, not fleet-wide — a single hung prefill worker triggers failure detection only for the requests actually bound to it.</p>
+<p>Aman asked specifically what in this stack is production-ready versus experimental, and SGLang's own issue tracker gives a dated, first-party answer rather than requiring guesswork from documentation tone. A roadmap issue opened 2026-03-30 to track Q2 2026 PD work opens by stating that "Prefill-Decode Disaggregation has been an important and widely adopted feature for LLM inference production," and that the maintainers consider themselves to have achieved broad compatibility "across different model architectures, all parallel strategies, and almost all advanced features"<a class="cite" href="#ref-7">7</a>. That is a first-party claim, not an independent audit, but it is dated close to this module's as-of date and it is candid about what remains unfinished: the same issue lists open work for new model architectures (hybrid linear-attention models), deeper integration with cache-management features (HiSparse, HiCache, RadixCache for agentic workloads), routing-strategy enhancements for heterogeneous instance pools, and an "Encoder-Prefill-Decode" extension for vision-language models still under active development<a class="cite" href="#ref-7">7</a>. Read together, the core prefill/decode split and the flags in §§4&ndash;7 are the settled part of the stack; new model-architecture coverage and adjacent feature integration are the part still moving.</p>
+<p>The router specifically has its own, separate history here, distinct from the PD mechanism's maturity. A router architecture-improvement proposal filed June 25, 2025 — before the Model Gateway rewrite described in §2 — listed concrete production-readiness gaps: workers represented internally as bare strings with no health or load tracking, routing logic duplicated between the regular and PD code paths, a router-enum design that made adding new policies risky, metrics scattered across files with inconsistent naming, service discovery with no retry logic (so a single transient failure could permanently drop a healthy worker), and no dynamic PD worker management without a full restart<a class="cite" href="#ref-5">5</a>. Every one of those gaps maps onto a feature this module has already described as present in the current SGLang Model Gateway: a typed <code>WorkerManager</code> and shared worker registry (§2), unified metrics under a consistent <code>smg_*</code> prefix (§2), circuit breakers and a documented retry executor with exponential backoff (§2), and the <code>POST /workers</code>/<code>DELETE /workers/{worker_id}</code> dynamic registration API (§4). The rewrite appears to have closed most of the specific 2025 gap list, but there is no independently published changelog confirming each item, item by item, against that original proposal — the correspondence here is this module's own reading of the before/after documentation, not a project-published closure report.</p>
+<h2 id="wide-ep-and-jax-preview">9. Wide-EP deployment patterns and the SGL-JAX preview</h2>
+<p>Everything in §6's deployment recipe that touches expert parallelism — <code>--enable-dp-attention</code> and <code>--moe-a2a-backend deepep</code> — is SGLang's implementation of the attention-DP-plus-expert-parallel layout Module 5 covers mechanically: TP=1-equivalent attention replicated per DP rank against a private KV cache, with MoE layers dispatched across the wider expert-parallel group via DeepEP's kernels<a class="cite" href="#ref-1">1</a>. This module has not re-derived that mechanism; the flags in §6 are the concrete SGLang-side entry point into it, and the EP-degree choices, placement policy (EPLB), and measured DeepEP bandwidth numbers behind them are Module 5's subject. The 96-H100 reproduction cited in §6 is the validated end-to-end proof that this flag combination, at DeepSeek scale, reproduces DeepSeek's own published per-node throughput within single-digit percentage points<a class="cite" href="#ref-6">6</a> — the strongest evidence available that the router, PD, and wide-EP pieces covered separately across this module compose correctly in a real multi-node deployment.</p>
+<p>One extension sits outside the GPU-centric stack this course otherwise assumes: SGLang runs on Google TPUs today through a bridge called <b>SGL-JAX</b>, supporting model families including Gemma, Qwen, DeepSeek, GLM, Mimo, Kimi, Ling, MiniMax, and Grok, plus the diffusion models Wan and Flux<a class="cite" href="#ref-8">8</a>. A second, PyTorch-native TPU backend, SGL-torchtpu, is planned with eager execution, MPMD support, and the same parallelism menu (data, tensor, expert, context, and pipeline parallelism) plus Radix Cache, HiCache, quantization, and speculative decoding running on TPU Pallas kernels<a class="cite" href="#ref-8">8</a>. This module does not cover TPU-side ICI topology, Pathways orchestration, or JetStream — that is Module 18's full treatment — but the existence of SGL-JAX matters here as a scope boundary: the router, PD-disaggregation, and wide-EP mechanisms described in §§2&ndash;7 are documented and versioned against SGLang's GPU backend, and how completely each one carries over to the JAX/TPU backend is not yet itemized in SGL-JAX's own announcement in the way §§4&ndash;7's GPU-side flags are.</p>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>This module's mechanisms do not disagree with each other or with earlier modules on facts. Where the open-source stack genuinely diverges is on a design question this module's evidence bears on directly: should routing and PD-awareness live inside a single lightweight process tightly coupled to one inference engine, the way SGLang builds it, or inside a separate orchestration layer that sits above the inference engine and can span several of them, the way NVIDIA Dynamo and llm-d build it (Modules 9 and 10)? Both are shipping, maintained answers to the same architectural question, not a settled-versus-experimental split.</p>
+<div class="positions">
+<article class="position">
+<h4>Keep routing and PD-awareness in one process</h4>
+<p class="who">SGLang's sglang-router / Model Gateway design<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-2">2</a></p>
+<p>A single Rust binary owns worker discovery, health checking, load-balancing policy, PD-role assignment, retries, circuit breakers, rate limiting, and observability, all as one deployable artifact with no dependency beyond the SGLang workers it fronts. The router is not aware of Kubernetes unless <code>--service-discovery</code> is explicitly turned on, and works identically on bare-metal, VM, or containerized workers.</p>
+<ul class="pros">
+<li>Fewest moving parts: one process to deploy, version, and debug in front of a fleet.</li>
+<li>Fast iteration — the June-2025-to-current rewrite (§8) shows the project can close design gaps by rebuilding the router itself, without coordinating a change across a separate control-plane project.</li>
+<li>No extra network hop between routing decision and the request reaching a worker.</li>
+</ul>
+<ul class="cons">
+<li>Engine-specific: this router only understands SGLang workers, not a mixed vLLM/SGLang/TensorRT-LLM fleet.</li>
+<li>Until the Model Gateway rewrite, it carried real production gaps (untyped workers, no dynamic PD worker management, scattered metrics) that a smaller, less-resourced router project might not fix as quickly (§8).</li>
+</ul>
+</article>
+<article class="position">
+<h4>Pull routing and PD-awareness into a separate orchestration layer</h4>
+<p class="who">NVIDIA Dynamo's Router and Planner<a class="cite" href="#ref-9">9</a> (Module 9); llm-d's Endpoint Picker built on the Kubernetes Gateway API Inference Extension (Module 10)</p>
+<p>Dynamo describes itself explicitly as "the orchestration layer above inference engines," not a replacement for them, and supports vLLM, SGLang, and TensorRT-LLM as interchangeable backends behind the same Router and SLA-driven Planner<a class="cite" href="#ref-9">9</a>. llm-d's Endpoint Picker is a reference implementation of a Kubernetes-standard protocol (Module 10) that any inference engine's pods can sit behind. Both put routing intelligence one layer up, outside any single engine's process.</p>
+<ul class="pros">
+<li>Engine-agnostic: one control plane can front a heterogeneous fleet, or let an operator swap engines without re-architecting routing.</li>
+<li>Kubernetes-native by design (llm-d) or with first-class Kubernetes gang-scheduling (Dynamo's Grove) — fits an already-Kubernetes-standardized platform team's operating model directly.</li>
+<li>More scoring signals available in principle: llm-d's layered filter-score-select pipeline (Module 2) composes several independent scorers rather than one router's fixed policy set.</li>
+</ul>
+<ul class="cons">
+<li>More moving parts and at least one more network hop between the orchestration layer's decision and the engine that serves the request.</li>
+<li>Kubernetes-shaped complexity persists even for a single-cluster, single-engine deployment that does not need multi-engine flexibility.</li>
+</ul>
+</article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>For a fleet that only ever runs SGLang, the embedded-router approach is the better default: it has fewer components to operate, and the specific production gaps a mid-2025 architecture review identified in the pre-rewrite router (§8) appear to have been closed by the same team that owns the inference engine, rather than requiring cross-project coordination. For a fleet that mixes engines, already standardizes on Kubernetes' Gateway API, or wants routing decisions that survive a future engine migration, the orchestration-layer approach is the more defensible choice, at the cost of the extra hop and component count. Neither position is backed by a published head-to-head benchmark comparing sglang-router/Model Gateway against Dynamo's Router or llm-d's EPP under an identical PD topology and identical hardware as of this module's 2026-09-17 as-of date — that comparison, if either project publishes it, would be the evidence that actually settles which architecture wins for a given fleet composition rather than which one is easier to reason about in the abstract.</p></div>
+</section>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+<li id="ref-1"><span class="ref-type">official</span>SGLang contributors. <em>PD Disaggregation (SGLang Documentation)</em>. docs.sglang.io (live), 2026. <a href="https://docs.sglang.io/advanced_features/pd_disaggregation.html">https://docs.sglang.io/advanced_features/pd_disaggregation.html</a>. Accessed 2026-09-17. <span class="ref-use">Used for: two-problem disaggregation motivation, transfer-backend selection flags (Mooncake/NIXL), heterogeneous-TP staging-buffer flags and numbers, failure-detection defaults, multi-node DeepSeek deployment recipe flags.</span></li>
+<li id="ref-2"><span class="ref-type">repo</span>SGLang contributors. <em>sglang-router (PyPI package page)</em>. SGLang / RadixArk, 0.3.2, 2026-01-15. <a href="https://pypi.org/project/sglang-router/">https://pypi.org/project/sglang-router/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: package description and version number (matching Module 2's citation).</span></li>
+<li id="ref-3"><span class="ref-type">repo</span>SGLang / RadixArk contributors. <em>SGLang Model Gateway (README)</em>. sgl-project/sglang repository, main branch. <a href="https://github.com/sgl-project/sglang/blob/main/sgl-model-gateway/README.md">https://github.com/sgl-project/sglang/blob/main/sgl-model-gateway/README.md</a>. Accessed 2026-09-17. <span class="ref-use">Used for: control-plane/data-plane architecture, the five load-balancing policies and their config flags, PD worker-registration API, reliability primitives (retries, circuit breakers, rate limiting), observability metrics.</span></li>
+<li id="ref-4"><span class="ref-type">blog</span>LMSYS Org. <em>SGLang v0.4: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs</em>. lmsys.org, 2024-12-04. <a href="https://www.lmsys.org/blog/2024-12-04-sglang-v0-4/">https://www.lmsys.org/blog/2024-12-04-sglang-v0-4/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the cache-aware load balancer's approximate-radix-tree mechanism and its measured throughput/hit-rate numbers.</span></li>
+<li id="ref-5"><span class="ref-type">repo</span>sgl-project/sglang GitHub. <em>SGLang Router Architecture Improvement Proposal</em>. Issue #7532, opened 2025-06-25. <a href="https://github.com/sgl-project/sglang/issues/7532">https://github.com/sgl-project/sglang/issues/7532</a>. Accessed 2026-09-17. <span class="ref-use">Used for: pre-rewrite router production-readiness gaps (untyped workers, no dynamic PD worker management, scattered observability).</span></li>
+<li id="ref-6"><span class="ref-type">blog</span>LMSYS Org. <em>Deploying DeepSeek with PD Disaggregation and Large-Scale Expert Parallelism on 96 H100 GPUs</em>. lmsys.org, 2025-05-05. <a href="https://www.lmsys.org/blog/2025-05-05-large-scale-ep/">https://www.lmsys.org/blog/2025-05-05-large-scale-ep/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: the 96-H100 reproduction's hardware layout, EP degrees, per-node throughput, cost, and accuracy against DeepSeek's own published profile, cross-referenced from Module 6.</span></li>
+<li id="ref-7"><span class="ref-type">repo</span>sgl-project/sglang GitHub. <em>[Roadmap] Prefill-Decode Disaggregation Roadmap (2026 Q2)</em>. Issue #21703, opened 2026-03-30. <a href="https://github.com/sgl-project/sglang/issues/21703">https://github.com/sgl-project/sglang/issues/21703</a>. Accessed 2026-09-17. <span class="ref-use">Used for: first-party production-adoption claim and the open Q2 2026 gap list (new model architectures, EPD, cache-management integration).</span></li>
+<li id="ref-8"><span class="ref-type">blog</span>LMSYS Org / RadixArk. <em>RadixArk Joins Forces with Google to Bring Full SGLang Features to TPUs</em>. lmsys.org, 2026-07-30. <a href="https://www.lmsys.org/blog/2026-07-30-sglang-google-tpu/">https://www.lmsys.org/blog/2026-07-30-sglang-google-tpu/</a>. Accessed 2026-09-17. <span class="ref-use">Used for: SGL-JAX's supported model families and the planned SGL-torchtpu backend, previewed ahead of Module 18.</span></li>
+<li id="ref-9"><span class="ref-type">repo</span>NVIDIA / ai-dynamo contributors. <em>ai-dynamo/dynamo (README)</em>. GitHub, v1.4.2 (container tags), 2026. <a href="https://github.com/ai-dynamo/dynamo">https://github.com/ai-dynamo/dynamo</a>. Accessed 2026-09-17. <span class="ref-use">Used for: Dynamo's self-description as an orchestration layer above inference engines, in the disagree section.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>
