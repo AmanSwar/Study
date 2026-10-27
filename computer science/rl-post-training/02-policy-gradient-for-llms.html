@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Policy Gradients for Token Sequences · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Derives the policy-gradient estimator for an autoregressive LLM policy under the token-MDP and one-action-per-completion views, shows REINFORCE as reward-weighted SFT, and classifies every later algorithm by its baseline and its step-size control.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 2</p>
+  <h1>Policy Gradients for Token Sequences: the Log-Derivative Trick, Baselines, and Advantages</h1>
+  <p class="lede">Every policy-gradient method in this course, from PPO to GRPO and its 2025-2026 descendants, is one gradient estimator with a different answer to two questions: where does the baseline come from, and what limits the step. This module derives that estimator for an autoregressive policy, shows that it is reward-weighted SFT on the model's own samples, and works the variance arithmetic exactly. Afterwards you can write REINFORCE with a baseline from the equations and place any later method in the (baseline, step control) grid.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>18</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisite: <b>Module 1</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 346" role="img" aria-labelledby="f1t"><title id="f1t">The policy-gradient family as three slots: where samples come from, what the advantage subtracts, and how the step is limited</title>
+    <rect x="20" y="12" width="760" height="52" rx="10" class="d-surface"/>
+    <text x="400" y="35" text-anchor="middle" class="d-title d-bold d-mono">gradient  =  E [ Ψ · ∇θ log πθ( yₜ | x, y&lt;ₜ ) ]</text>
+    <text x="400" y="54" text-anchor="middle" class="d-small d-text-light">Ψ = the credit each sampled token receives (a reward minus a baseline, in most methods)</text>
+
+    <rect x="20" y="84" width="230" height="40" rx="8" class="d-block"/>
+    <text x="135" y="109" text-anchor="middle" class="d-text-inv d-bold">1  Samples come from</text>
+    <rect x="285" y="84" width="230" height="40" rx="8" class="d-block-2"/>
+    <text x="400" y="109" text-anchor="middle" class="d-text-inv d-bold">2  Ψ = reward − baseline</text>
+    <rect x="550" y="84" width="230" height="40" rx="8" class="d-block-accent"/>
+    <text x="665" y="109" text-anchor="middle" class="d-text-inv d-bold">3  Step is limited by</text>
+
+    <rect x="20" y="134" width="230" height="34" rx="6" class="d-surface"/><text x="135" y="156" text-anchor="middle">fixed dataset (SFT, RFT)</text>
+    <rect x="20" y="176" width="230" height="34" rx="6" class="d-surface"/><text x="135" y="198" text-anchor="middle">own policy, one update</text>
+    <rect x="20" y="218" width="230" height="34" rx="6" class="d-surface"/><text x="135" y="240" text-anchor="middle">own policy, reused × N</text>
+    <text x="135" y="278" text-anchor="middle" class="d-small d-text-light">Sections 3 and 6</text>
+
+    <rect x="285" y="134" width="230" height="34" rx="6" class="d-surface"/><text x="400" y="156" text-anchor="middle">none: Ψ = R</text>
+    <rect x="285" y="176" width="230" height="34" rx="6" class="d-surface"/><text x="400" y="198" text-anchor="middle">mean or leave-one-out of R</text>
+    <rect x="285" y="218" width="230" height="34" rx="6" class="d-surface"/><text x="400" y="240" text-anchor="middle">group mean ÷ group std</text>
+    <rect x="285" y="260" width="230" height="34" rx="6" class="d-surface"/><text x="400" y="282" text-anchor="middle">learned V(sₜ), then GAE</text>
+    <text x="400" y="318" text-anchor="middle" class="d-small d-text-light">Sections 4 and 5, Modules 3 and 9</text>
+
+    <rect x="550" y="134" width="230" height="34" rx="6" class="d-surface"/><text x="665" y="156" text-anchor="middle">nothing (vanilla step)</text>
+    <rect x="550" y="176" width="230" height="34" rx="6" class="d-surface"/><text x="665" y="198" text-anchor="middle">one update per rollout</text>
+    <rect x="550" y="218" width="230" height="34" rx="6" class="d-surface"/><text x="665" y="240" text-anchor="middle">ratio clip (PPO family)</text>
+    <rect x="550" y="260" width="230" height="34" rx="6" class="d-surface"/><text x="665" y="282" text-anchor="middle">KL constraint (TRPO)</text>
+    <text x="665" y="318" text-anchor="middle" class="d-small d-text-light">Section 6 and Module 3</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The grid used throughout the course. DeepSeekMath writes SFT, RFT, DPO, PPO and GRPO as one gradient whose pieces are a data source, a reward function and a gradient coefficient<a class="cite" href="#ref-1">1</a>; Schulman et al. list the six interchangeable choices of Ψ (Eq. 1)<a class="cite" href="#ref-2">2</a>. The row labels in each column are the options this module and Modules 3 and 9 develop.</figcaption>
+</figure>
+
+<h2 id="generation-as-decision-process">1. Generation as a decision process</h2>
+<p>A policy-gradient method needs three things fixed before any gradient exists: what the agent observes, what it chooses, and when the reward arrives. For an autoregressive LM there are two defensible answers. The literature moves between them without announcing it, so the first job is to see exactly what they share.</p>
+
+<h3 id="generation-as-decision-process-token-mdp">1.1 The token-level MDP</h3>
+<p>Write \(x\) for the prompt, \(y=(y_1,\dots,y_T)\) for the completion, and \(\pi_\theta\) for the LLM. The state at step \(t\) is \(s_t=(x,y_{\lt t})\): the prompt plus every token generated so far. The action is the next token \(a_t=y_t\). The transition is deterministic, since \(s_{t+1}\) is \(s_t\) with the sampled token appended. The episode ends at EOS or at the length cap. The reward model's score lands on the EOS token; every earlier token carries only the per-token KL term, and the discount is \(\gamma=1\)<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>.</p>
+<p>The probability of a completion is a product of softmax outputs:</p>
+$$\pi_\theta(y\mid x)=\prod_{t=1}^{T}\pi_\theta(y_t\mid x,y_{\lt t}).$$
+<p>Two things follow. The policy network is the LLM itself and the "state" is its context window; nothing is added to the architecture. And because the transition is deterministic and the prompt distribution does not depend on \(\theta\), the environment drops out of \(\nabla_\theta\log p(\tau)\): only the policy's factors survive differentiation<a class="cite" href="#ref-3">3</a>. That is why a unit test, a human click, or an exact-match checker can serve as a reward without being differentiable.</p>
+<p>If you want the software picture, Gymnasium's <code>Env.step(action)</code> returns <code>(observation, reward, terminated, truncated, info)</code> and either flag ends the episode<a class="cite" href="#ref-5">5</a>. The mapping is the writer's, not Gymnasium's: observation is the token ids so far, action is the next token id, <code>terminated</code> is EOS sampled, <code>truncated</code> is <code>max_new_tokens</code> reached. The two cases are not interchangeable. A reward model scoring a truncated answer produces out-of-distribution scores, and Lambert's remedy is to score only at EOS and to penalize overlong generations<a class="cite" href="#ref-3">3</a>. A bootstrapping critic also has a reason to treat the two flags differently (the writer's reasoning: a truncated episode has a future the critic can still estimate, a terminated one does not). Module 17 builds the full environment interface.</p>
+
+<h3 id="generation-as-decision-process-bandit">1.2 The bandit view</h3>
+<p>InstructGPT states the second answer directly: the RL environment "is a bandit environment which presents a random customer prompt and expects a response to the prompt. Given the prompt and response, it produces a reward determined by the reward model and ends the episode"<a class="cite" href="#ref-6">6</a>. Ahmadian et al. argue this is the right abstraction for a pretrained LLM. Because "rewards are only attributed to full generations", they write, "it is more appropriate and efficient to model the entire generation as a single action"<a class="cite" href="#ref-4">4</a> (§1), and their §3.3 observes that deterministic dynamics let the MDP collapse to a bandit with one initial state and one terminal state<a class="cite" href="#ref-4">4</a>. Lambert notes the same convention: many RLHF implementations treat the whole completion as one action, so the \((x,y)\) notation is as valid as \((s,a)\)<a class="cite" href="#ref-3">3</a> (§6.1).</p>
+<p>The action space of the bandit is every possible completion, which is astronomically large. You never enumerate it. You sample \(y\) and evaluate \(\log\pi_\theta(y\mid x)=\sum_t\log\pi_\theta(y_t\mid s_t)\), which the factorization above makes cheap.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 372" role="img" aria-labelledby="f2t"><title id="f2t">A two-token generation tree with reward only at the end-of-sequence leaves, and the same tree collapsed into a single bandit arm</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="10" y="8" width="520" height="352" rx="12" class="d-panel"/>
+    <text x="24" y="30" class="d-bold">Token MDP: one decision per token</text>
+    <!-- root -->
+    <rect x="195" y="44" width="130" height="34" rx="8" class="d-block"/><text x="260" y="66" text-anchor="middle" class="d-text-inv d-bold">s₁ = x</text>
+    <!-- level 1 -->
+    <path d="M230,78 L130,126" class="d-arrow" marker-end="url(#f2-arr)"/><text x="160" y="96" text-anchor="middle" class="d-mono d-small">The 0.6</text>
+    <path d="M290,78 L390,126" class="d-arrow" marker-end="url(#f2-arr)"/><text x="372" y="96" text-anchor="middle" class="d-mono d-small">Let 0.4</text>
+    <rect x="60" y="128" width="140" height="34" rx="8" class="d-block"/><text x="130" y="150" text-anchor="middle" class="d-text-inv d-bold">s₂ = x, The</text>
+    <rect x="320" y="128" width="140" height="34" rx="8" class="d-block"/><text x="390" y="150" text-anchor="middle" class="d-text-inv d-bold">s₂ = x, Let</text>
+    <!-- level 2 -->
+    <path d="M105,162 L65,218" class="d-arrow" marker-end="url(#f2-arr)"/><text x="60" y="190" text-anchor="middle" class="d-mono d-small">sum 0.5</text>
+    <path d="M155,162 L195,218" class="d-arrow" marker-end="url(#f2-arr)"/><text x="216" y="190" text-anchor="middle" class="d-mono d-small">answer 0.5</text>
+    <path d="M365,162 L325,218" class="d-arrow" marker-end="url(#f2-arr)"/><text x="318" y="190" text-anchor="middle" class="d-mono d-small">x 0.75</text>
+    <path d="M415,162 L455,218" class="d-arrow" marker-end="url(#f2-arr)"/><text x="470" y="190" text-anchor="middle" class="d-mono d-small">n 0.25</text>
+    <!-- leaves -->
+    <rect x="15" y="220" width="100" height="64" rx="8" class="d-surface"/><text x="65" y="241" text-anchor="middle" class="d-small">The sum ⟨eos⟩</text><text x="65" y="260" text-anchor="middle" class="d-mono d-small">p = 0.30</text><text x="65" y="277" text-anchor="middle" class="d-bold d-mono">R = 1</text>
+    <rect x="145" y="220" width="100" height="64" rx="8" class="d-surface"/><text x="195" y="241" text-anchor="middle" class="d-small">The answer ⟨eos⟩</text><text x="195" y="260" text-anchor="middle" class="d-mono d-small">p = 0.30</text><text x="195" y="277" text-anchor="middle" class="d-bold d-mono">R = 0</text>
+    <rect x="275" y="220" width="100" height="64" rx="8" class="d-surface"/><text x="325" y="241" text-anchor="middle" class="d-small">Let x ⟨eos⟩</text><text x="325" y="260" text-anchor="middle" class="d-mono d-small">p = 0.30</text><text x="325" y="277" text-anchor="middle" class="d-bold d-mono">R = 0</text>
+    <rect x="405" y="220" width="100" height="64" rx="8" class="d-surface"/><text x="455" y="241" text-anchor="middle" class="d-small">Let n ⟨eos⟩</text><text x="455" y="260" text-anchor="middle" class="d-mono d-small">p = 0.10</text><text x="455" y="277" text-anchor="middle" class="d-bold d-mono">R = 1</text>
+    <text x="260" y="318" text-anchor="middle" class="d-small d-text-light">reward is zero at every interior state; p(y) is the product of edge probabilities</text>
+    <text x="260" y="340" text-anchor="middle" class="d-small d-text-light">J = 0.30·1 + 0.30·0 + 0.30·0 + 0.10·1 = 0.40</text>
+
+    <path d="M540,184 L580,184" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+    <text x="560" y="172" text-anchor="middle" class="d-small d-text-light">collapse</text>
+    <text x="600" y="30" class="d-bold">Bandit: one decision</text>
+    <rect x="590" y="60" width="190" height="52" rx="8" class="d-block"/><text x="685" y="91" text-anchor="middle" class="d-text-inv d-bold">state: prompt x</text>
+    <path d="M685,112 L685,152" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="590" y="154" width="190" height="64" rx="8" class="d-block-accent"/><text x="685" y="181" text-anchor="middle" class="d-text-inv d-bold">action: whole y</text><text x="685" y="203" text-anchor="middle" class="d-text-inv d-mono d-small">y ~ π(y | x)</text>
+    <path d="M685,218 L685,258" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="590" y="260" width="190" height="52" rx="8" class="d-block-2"/><text x="685" y="291" text-anchor="middle" class="d-text-inv d-bold">reward R(x, y)</text>
+    <text x="685" y="338" text-anchor="middle" class="d-small d-text-light">episode ends</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> The same generation problem in the two views. Left: states are prefixes, actions are tokens, the reward appears only at the ⟨eos⟩ leaf (illustrative probabilities; the structure follows InstructGPT §3.5<a class="cite" href="#ref-6">6</a> and Ahmadian et al. §2.1 and §3.3<a class="cite" href="#ref-4">4</a>). Right: the whole completion is one action. The objective is identical, \(J=\sum_y p(y)R(y)\), and both views sample from the same \(\pi_\theta\).</figcaption>
+</figure>
+
+<h3 id="generation-as-decision-process-same-gradient">1.3 When the two views give the same gradient</h3>
+<p>The two views are not rival algorithms. The token-level reward-to-go form of the policy gradient weights each token's score by the return from that token onward, \(G_t=\sum_{t'\ge t}r_{t'}\)<a class="cite" href="#ref-2">2</a>. With reward only at the end and \(\gamma=1\), \(G_t=R\) for every \(t\), so</p>
+$$\mathbb{E}\Big[\sum_{t=1}^{T}G_t\,\nabla_\theta\log\pi_\theta(y_t\mid s_t)\Big]=\mathbb{E}\Big[R\sum_{t=1}^{T}\nabla_\theta\log\pi_\theta(y_t\mid s_t)\Big]=\mathbb{E}\big[R\,\nabla_\theta\log\pi_\theta(y\mid x)\big],$$
+<p>which is the bandit form, term for term. The views differ only where something is allowed to vary across tokens. There are three such places:</p>
+<ol>
+  <li><strong>Per-token rewards.</strong> If KL to the reference is folded into the reward, \(G_t\) depends on \(t\). Lambert records the three conventions: PPO subtracts a per-token KL from the per-token reward before computing the advantage, RLOO sums the KL into the sequence reward, and GRPO keeps a sequence-level advantage and adds a separate per-token KL term to the loss<a class="cite" href="#ref-3">3</a> (§6.2.4).</li>
+  <li><strong>A baseline that depends on the prefix.</strong> A value function \(V(s_t)\) gives each token its own advantage (Section 5).</li>
+  <li><strong>Bootstrapping.</strong> A TD target built from \(V(s_{t+1})\) instead of the observed return, for example GAE with \(\lambda\lt1\) (Section 5 and Module 3).</li>
+</ol>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> The two framings of LLM generation and what each lets you vary. Sources: Lambert §3.1.3 Table 1 and §6.3.2.2<a class="cite" href="#ref-3">3</a>; Ahmadian et al. §2.1-§3.3<a class="cite" href="#ref-4">4</a>; InstructGPT §3.5<a class="cite" href="#ref-6">6</a>.</caption>
+  <thead><tr><th>Aspect</th><th>Token-level MDP</th><th>Bandit (one action per completion)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">State</td><td>\((x,y_{\lt t})\), changes every token</td><td>\(x\) only</td></tr>
+    <tr><td class="row">Action</td><td>One vocabulary token</td><td>The whole completion \(y\)</td></tr>
+    <tr><td class="row">Reward</td><td>Zero until EOS; per-token KL optional</td><td>One scalar \(R(x,y)\), KL summed in if used</td></tr>
+    <tr><td class="row">Discount</td><td>\(\gamma=1\) in practice</td><td>Not applicable</td></tr>
+    <tr><td class="row">Advantage granularity</td><td>Per token (needs \(V(s_t)\) or per-token rewards)</td><td>One scalar, broadcast to all tokens</td></tr>
+    <tr><td class="row">Typical users</td><td>PPO with a learned value model</td><td>REINFORCE, RLOO, GRPO-style advantages</td></tr>
+  </tbody>
+</table>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Bandit REINFORCE is the token-level MDP estimator with no prefix-dependent baseline and no per-token rewards. Choosing between "MDP" and "bandit" is choosing how much credit assignment you pay for, not choosing a different gradient.</p></aside>
+
+<h2 id="policy-gradient-derivation">2. The policy gradient for a sequence</h2>
+
+<h3 id="policy-gradient-derivation-log-derivative">2.1 The log-derivative trick</h3>
+<p>The objective is the expected reward of completions sampled from the current policy:</p>
+$$J(\theta)=\mathbb{E}_{x\sim\mathcal{D}}\,\mathbb{E}_{y\sim\pi_\theta(\cdot\mid x)}\big[R(x,y)\big]=\sum_x p(x)\sum_y \pi_\theta(y\mid x)\,R(x,y).$$
+<p>Differentiating, the reward is a constant with respect to \(\theta\); only the sampling distribution moves. The result \(\sum_y R\,\nabla_\theta\pi_\theta\) is not an expectation under \(\pi_\theta\) because it has no \(\pi_\theta\) factor to sample from. The identity \(\nabla\log u=\nabla u/u\) supplies one. Sutton and Barto introduce the factor by "multiplying and then dividing" by \(\pi(a\mid S_t,\theta)\)<a class="cite" href="#ref-7">7</a> (§13.3, p. 327), and Lambert derives the same line in trajectory form<a class="cite" href="#ref-3">3</a> (§6.2.1, Eqs. 36-38):</p>
+$$\nabla_\theta J=\sum_x p(x)\sum_y \pi_\theta(y\mid x)\,R(x,y)\,\nabla_\theta\log\pi_\theta(y\mid x)=\mathbb{E}\big[R(x,y)\,\nabla_\theta\log\pi_\theta(y\mid x)\big].$$
+<p>Expanding the log of the product from Section 1 turns the sequence score into a sum of token scores:</p>
+$$\nabla_\theta J=\mathbb{E}_{x,\;y\sim\pi_\theta}\Big[R(x,y)\sum_{t=1}^{T}\nabla_\theta\log\pi_\theta(y_t\mid x,y_{\lt t})\Big].\tag{PG}$$
+<p>This is Williams' REINFORCE result. His Theorem 1 states that for an update of the form \(\Delta w=\alpha\,(r-b)\,e\), where \(e=\partial\ln g/\partial w\) is the "characteristic eligibility", the expected update lies along the gradient of expected reinforcement<a class="cite" href="#ref-8">8</a> (§4, Theorem 1). His §5 handles the case where "a single reinforcement value \(r\) is delivered" at the end of an episode of \(k\) steps by summing the eligibilities over time<a class="cite" href="#ref-8">8</a> (§5). That is the LLM setting verbatim: one reward per completion, one eligibility term per token.</p>
+<p>The Monte Carlo estimator draws \(N\) prompt-completion pairs and averages:</p>
+$$\hat g=\frac1N\sum_{i=1}^{N}R_i\sum_{t=1}^{T_i}\nabla_\theta\log\pi_\theta(y_{i,t}\mid s_{i,t}).$$
+
+<h3 id="policy-gradient-derivation-score">2.2 The score has zero mean</h3>
+<p>One identity carries most of the later arguments. For any prompt,</p>
+$$\mathbb{E}_{y\sim\pi_\theta}\big[\nabla_\theta\log\pi_\theta(y\mid x)\big]=\sum_y\nabla_\theta\pi_\theta(y\mid x)=\nabla_\theta\sum_y\pi_\theta(y\mid x)=\nabla_\theta 1=0.$$
+<p>The same holds per token, conditioned on the prefix: \(\mathbb{E}_{y_t\sim\pi_\theta(\cdot\mid s_t)}[\nabla_\theta\log\pi_\theta(y_t\mid s_t)]=0\). Sutton and Barto use exactly this step to show a baseline leaves the update unchanged<a class="cite" href="#ref-7">7</a> (§13.4, p. 329). Section 4 uses it twice: once to license baselines, once to bound the variance of the sequence score.</p>
+
+<h3 id="policy-gradient-derivation-loss">2.3 The loss that autodiff differentiates</h3>
+<p>Nobody codes (PG) as an explicit gradient. PPO's paper describes the standard construction: build an objective whose gradient is the estimator and let autodiff differentiate it, \(L^{PG}(\theta)=\hat{\mathbb{E}}_t[\log\pi_\theta(a_t\mid s_t)\hat A_t]\)<a class="cite" href="#ref-9">9</a> (§2.1, Eqs. 1-2). For a bandit-style advantage, the snippet is short enough to write in full; Lambert gives the same two lines in §6.2.1<a class="cite" href="#ref-3">3</a>.</p>
+<pre class="code" data-lang="python" data-title="reinforce_loss.py"><code>import torch
+import torch.nn.functional as F
+
+def reinforce_loss(logits, tokens, mask, adv):
+    # logits: (B, L, V) policy logits, aligned so logits[:, t] scores tokens[:, t]
+    # tokens: (B, L) sampled ids; mask: (B, L) 1.0 on completion tokens, 0.0 on prompt/padding
+    # adv:    (B,)   one scalar per completion (reward minus baseline)
+    logp = F.log_softmax(logits.float(), dim=-1).gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+    seq_logp = (logp * mask).sum(dim=-1)          # log pi(y | x) = sum of token log-probs
+    return -(adv.detach() * seq_logp).mean()      # descending this ascends E[A * log pi]
+
+def loo_advantage(rewards):                        # rewards: (P, K), K samples per prompt
+    K = rewards.shape[1]
+    baseline = (rewards.sum(dim=1, keepdim=True) - rewards) / (K - 1)
+    return rewards - baseline</code></pre>
+<p>I checked the gradient of <code>reinforce_loss</code> against a token-by-token autograd sum on a toy table model; the maximum absolute difference was \(3\times10^{-8}\) in fp32.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 262" role="img" aria-labelledby="f3t"><title id="f3t">Computation graph of the sequence-level policy gradient: token log-probabilities are summed and multiplied by one detached scalar advantage per completion</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker><marker id="f3-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+    <rect x="20" y="16" width="108" height="64" rx="8" class="d-block-muted"/><text x="74" y="43" text-anchor="middle" class="d-bold">sampled x, y</text><text x="74" y="62" text-anchor="middle" class="d-mono d-small">(B, L) ids</text>
+    <rect x="150" y="16" width="108" height="64" rx="8" class="d-block"/><text x="204" y="43" text-anchor="middle" class="d-text-inv d-bold">πθ forward</text><text x="204" y="62" text-anchor="middle" class="d-text-inv d-mono d-small">(B, L, V)</text>
+    <rect x="280" y="16" width="108" height="64" rx="8" class="d-block"/><text x="334" y="43" text-anchor="middle" class="d-text-inv d-bold">log π(yₜ|sₜ)</text><text x="334" y="62" text-anchor="middle" class="d-text-inv d-mono d-small">(B, L) × mask</text>
+    <rect x="410" y="16" width="108" height="64" rx="8" class="d-block"/><text x="464" y="43" text-anchor="middle" class="d-text-inv d-bold">Σₜ log π</text><text x="464" y="62" text-anchor="middle" class="d-text-inv d-mono d-small">log π(y|x), (B,)</text>
+    <rect x="540" y="16" width="108" height="64" rx="8" class="d-block-accent"/><text x="594" y="43" text-anchor="middle" class="d-text-inv d-bold">× A</text><text x="594" y="62" text-anchor="middle" class="d-text-inv d-mono d-small">(B,)</text>
+    <rect x="670" y="16" width="108" height="64" rx="8" class="d-block"/><text x="724" y="43" text-anchor="middle" class="d-text-inv d-bold">−mean</text><text x="724" y="62" text-anchor="middle" class="d-text-inv d-mono d-small">scalar loss</text>
+    <path d="M128,48 L150,48" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M258,48 L280,48" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M388,48 L410,48" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M518,48 L540,48" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M648,48 L670,48" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M724,92 L204,92" class="d-arrow-active" marker-end="url(#f3-arr2)"/>
+    <text x="464" y="108" text-anchor="middle" class="d-small d-bold">backward: ∇θ flows only through log πθ</text>
+
+    <rect x="20" y="150" width="140" height="64" rx="8" class="d-block-2"/><text x="90" y="177" text-anchor="middle" class="d-text-inv d-bold">reward R</text><text x="90" y="196" text-anchor="middle" class="d-text-inv d-mono d-small">verifier or RM</text>
+    <rect x="200" y="150" width="140" height="64" rx="8" class="d-block-2"/><text x="270" y="177" text-anchor="middle" class="d-text-inv d-bold">baseline b</text><text x="270" y="196" text-anchor="middle" class="d-text-inv d-mono d-small">other samples</text>
+    <rect x="380" y="150" width="140" height="64" rx="8" class="d-block-2"/><text x="450" y="177" text-anchor="middle" class="d-text-inv d-bold">A = R − b</text><text x="450" y="196" text-anchor="middle" class="d-text-inv d-mono d-small">detached</text>
+    <path d="M160,182 L200,182" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M340,182 L380,182" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <path d="M520,182 L620,182 L620,82" class="d-arrow d-dashed" marker-end="url(#f3-arr)"/>
+    <text x="634" y="176" class="d-small">stop-gradient on A</text>
+    <text x="634" y="196" class="d-small d-text-light">no ∇ through the reward</text>
+    <text x="20" y="246" class="d-small d-text-light">B = completions per batch, L = padded length, V = vocabulary; bottom row uses no model parameters</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> One REINFORCE step as a computation graph. The top row is the only differentiable path; the advantage is built from rewards alone and enters as a per-sequence constant, as in PPO's surrogate construction (§2.1)<a class="cite" href="#ref-9">9</a> and Lambert's loss snippet (§6.2.1)<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Three one-line bugs change the estimator without raising an error. Letting gradient flow into the advantage (drop <code>detach</code>) trains the baseline to lower the loss. Forgetting the mask makes the model learn to predict the prompt; Lambert's code masks prompt tokens for exactly this reason<a class="cite" href="#ref-3">3</a> (§6.3.2). Replacing the token sum with a per-sequence mean divides each completion's gradient by its length, so (PG) is no longer the gradient of \(J\); the consequences are the subject of Module 11.</p></aside>
+
+<h2 id="reinforce-as-weighted-sft">3. REINFORCE is SFT with a signed, per-sequence weight</h2>
+<p>You already know the SFT gradient: average the gradient of each token's log-likelihood over human-written data. DeepSeekMath writes it as \(\nabla_\theta\mathcal{J}_{SFT}=\mathbb{E}_{(q,o)\sim P_{sft}}\big[\tfrac1{|o|}\sum_t\nabla_\theta\log\pi_\theta(o_t\mid q,o_{\lt t})\big]\), with a "gradient coefficient" that is "always set to 1"<a class="cite" href="#ref-1">1</a> (App. A.1.1, Eq. 7). Equation (PG) has the same form. Three things change: the sequences come from the current policy instead of a dataset, each sequence carries a scalar weight, and the weight can be negative.</p>
+
+<table class="tbl tbl-dense">
+  <caption><b>Table 2.</b> One gradient, \(\nabla_\theta\mathcal{J}=\mathbb{E}\big[\tfrac1{|o|}\sum_t GC(q,o,t)\,\nabla_\theta\log\pi_\theta(o_t\mid q,o_{\lt t})\big]\), with different data sources and coefficients. Rows SFT, RFT, Online RFT, PPO, GRPO and DPO are from DeepSeekMath Table 10 and App. A.1 (Eqs. 7, 10, 11, 14, 18, 21)<a class="cite" href="#ref-1">1</a>; the two REINFORCE rows follow the same template and are derived here from (PG).</caption>
+  <thead><tr><th>Method</th><th>Samples come from</th><th>Reward</th><th>Gradient coefficient \(GC\)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">SFT</td><td>Human data, fixed</td><td>none (human selection)</td><td>\(1\)</td></tr>
+    <tr><td class="row">RFT</td><td>SFT model, sampled once</td><td>rule</td><td>\(\mathbb{1}[o\text{ correct}]\)</td></tr>
+    <tr><td class="row">Online RFT</td><td>live policy \(\pi_\theta\)</td><td>rule</td><td>\(\mathbb{1}[o\text{ correct}]\)</td></tr>
+    <tr><td class="row">REINFORCE (derived)</td><td>live policy</td><td>any scalar</td><td>\(R(q,o)\)</td></tr>
+    <tr><td class="row">REINFORCE + baseline, RLOO (derived)</td><td>live policy</td><td>any scalar</td><td>\(R(q,o)-b(q)\)</td></tr>
+    <tr><td class="row">PPO</td><td>\(\pi_{\theta_{old}}\)</td><td>reward model</td><td>\(A_t\) from GAE with a learned \(V_\psi\)</td></tr>
+    <tr><td class="row">GRPO</td><td>group \(\{o_i\}\sim\pi_{\theta_{old}}\)</td><td>reward model</td><td>\(\hat A_{i,t}+\beta\big(\tfrac{\pi_{ref}}{\pi_\theta}-1\big)\)</td></tr>
+    <tr><td class="row">DPO</td><td>SFT model, preference pairs</td><td>preference or rule</td><td>\(\sigma\big(\beta\log\tfrac{\pi_\theta(o^-_t)}{\pi_{ref}(o^-_t)}-\beta\log\tfrac{\pi_\theta(o^+_t)}{\pi_{ref}(o^+_t)}\big)\)</td></tr>
+  </tbody>
+</table>
+
+<h3 id="reinforce-as-weighted-sft-online-rft">3.1 Binary-reward REINFORCE is online rejection-sampling SFT</h3>
+<p>Take \(R\in\{0,1\}\), no baseline, samples from the live policy. Then \(\hat g=\frac1N\sum_i R_i\nabla_\theta\log\pi_\theta(y_i\mid x_i)=\frac1N\sum_{i:R_i=1}\nabla_\theta\log\pi_\theta(y_i\mid x_i)\): the failures contribute exactly zero and the successes are an SFT batch (derived). RFT trains once on a frozen set of such filtered samples; Online RFT resamples from the current policy every step. DeepSeekMath found Online RFT comparable to RFT early and ahead later, which they attribute to the actor drifting away from the SFT model so that fresh samples differ more from the frozen ones<a class="cite" href="#ref-1">1</a> (§5.2.1, Fig. 5). The only structural difference between rejection-sampling fine-tuning and the simplest policy gradient is how often the sampler sees new weights.</p>
+
+<h3 id="reinforce-as-weighted-sft-sign">3.2 What a baseline adds: negative weights</h3>
+<p>Subtract the group's mean reward and the coefficients change sign. With binary rewards and group pass rate \(\hat p\), each correct sample gets \(1-\hat p\), each incorrect one gets \(-\hat p\), and the coefficients sum to zero over the group (derived). At \(\hat p=0.75\) the three successes each get \(+0.25\) and the single failure gets \(-0.75\). When most samples succeed the update is dominated by pushing down the few failures; when most fail it is dominated by pulling up the few successes.</p>
+<p>A negative coefficient is gradient descent on that sample's log-likelihood. For a softmax the score with respect to the logits is \(\nabla_z\log\pi_a=e_a-\pi\), so pushing token \(a\) down raises every other token in proportion to its current probability: it removes mass from a completion without saying where the mass should go (derived). DeepSeekMath's Online RFT "does not penalize incorrect responses and uniformly reinforces all responses with correct answers at the same level of intensity", while GRPO "uniquely adjusts its gradient coefficient based on the reward value"; GRPO won the comparison on DeepSeekMath-Instruct 1.3B, which the authors read as evidence for "altering positive and negative gradient coefficients"<a class="cite" href="#ref-1">1</a> (§5.2.1, Fig. 5).</p>
+<p>For someone who has written a fine-tuning loop, this is the practical reading of the whole section: the RL trainer reuses the SFT loss, adds a sampler running the latest weights, and attaches a signed scalar to each sequence. The policy-gradient algorithms in Modules 3 to 12 differ from each other mainly in that scalar and in how the step is limited; choosing the scalar well is the variance problem of Section 4.</p>
+
+<h2 id="baselines">4. Baselines: what may be subtracted, and what it buys</h2>
+
+<h3 id="baselines-legality">4.1 What a baseline may depend on</h3>
+<p>Replace \(R\) in (PG) with \(R-b(x)\). The extra term has zero expectation by the identity in Section 2.2: \(\mathbb{E}_y[b(x)\nabla_\theta\log\pi_\theta(y\mid x)]=b(x)\cdot 0\). Sutton and Barto state the general rule: the baseline "can be any function, even a random variable, as long as it does not vary with \(a\)"<a class="cite" href="#ref-7">7</a> (§13.4, Eq. 13.10, p. 329). Williams' definition of a REINFORCE algorithm requires the baseline to be "conditionally independent" of the unit's sampled output<a class="cite" href="#ref-8">8</a> (§4), and Schulman et al. give the sequential version: \(\hat A_t=Q_t-b_t\) is unbiased when \(b_t\) is "an arbitrary function of the states and actions sampled before \(a_t\)"<a class="cite" href="#ref-2">2</a> (Proposition 1).</p>
+<p>In LLM terms, the baseline may depend on the prompt \(x\) and, token by token, on the prefix \(y_{\lt t}\). That is what a value function \(V(x,y_{\lt t})\) is. It may not depend on the token being credited, on later tokens, or on this completion's own reward. The last restriction is the one that bites in group methods (Section 4.2).</p>
+<p>These results prove unbiasedness only. Williams is explicit that the analysis "offer[s] no basis for comparing various choices of reinforcement baseline"; the superiority of an adaptive baseline is, in his words, "generally believed"<a class="cite" href="#ref-8">8</a> (§4, p. 236). The variance claim rests on later analysis and on experiments, such as Sutton and Barto's short-corridor gridworld where adding a baseline "can make it learn much faster"<a class="cite" href="#ref-7">7</a> (Fig. 13.2, p. 330), and on the exact calculation in Section 4.4.</p>
+
+<h3 id="baselines-own-sample">4.2 Why the group mean is biased and leave-one-out is not</h3>
+<p>Draw \(G\) completions \(y_1,\dots,y_G\) i.i.d. from \(\pi_\theta(\cdot\mid x)\) with scores \(u_i=\nabla_\theta\log\pi_\theta(y_i\mid x)\) and rewards \(R_i\). Use the plain batch mean \(\bar R=\frac1G\sum_jR_j\) as the baseline for every sample, including sample \(i\) itself. The mean depends on \(R_i\), which depends on \(y_i\), so the legality condition fails. The damage is computable. Writing \(R_i-\bar R=(1-\tfrac1G)R_i-\tfrac1G\sum_{j\ne i}R_j\) and using independence and \(\mathbb{E}[u_i]=0\):</p>
+$$\mathbb{E}\big[(R_i-\bar R)\,u_i\big]=\Big(1-\frac1G\Big)\mathbb{E}[R_i u_i]-\frac1G\sum_{j\ne i}\mathbb{E}[R_j]\,\underbrace{\mathbb{E}[u_i]}_{0}=\frac{G-1}{G}\,\nabla_\theta J.$$
+<p>The estimator points the right way and is short by a factor \((G-1)/G\): 75% of the true gradient at \(G=4\), 50% at \(G=2\), 94% at \(G=16\) (derived; the enumeration in Section 4.4 reproduces 0.75 exactly). The leave-one-out baseline \(b_i=\frac1{G-1}\sum_{j\ne i}R_j\) does not depend on \(y_i\), so it is unbiased; Ahmadian et al. describe it as using the other \(k-1\) samples "to create an unbiased estimate of the expected return for the prompt, akin to a parameter-free value-function, but estimated at each training step"<a class="cite" href="#ref-4">4</a> (§2.3). The two advantages differ by a constant:</p>
+$$R_i-b_i=\frac{G}{G-1}\,\big(R_i-\bar R\big),$$
+<p>which is Lambert's Eq. 51<a class="cite" href="#ref-3">3</a> (§6.2.4). For fixed \(G\) the bias is a learning-rate rescaling, not a change of direction; it matters when \(G\) is small or differs between prompts. Lambert makes the related observation that Dr. GRPO's advantage equals RLOO's up to a constant factor<a class="cite" href="#ref-3">3</a> (§6.2.8). Modules 9 and 11 take this thread further.</p>
+
+<h3 id="baselines-variance">4.3 Where the variance comes from</h3>
+<p>Two sources: the spread of \(R\), which the baseline attacks, and the noise of the score itself, which it does not. For the second, write \(S=\sum_{t=1}^{T}u_t\) with \(u_t=\nabla_\theta\log\pi_\theta(y_t\mid s_t)\). Each \(u_t\) has zero mean given the prefix (Section 2.2), and \(u_v\) for \(v\lt t\) is a function of the prefix, so the cross terms vanish: \(\mathbb{E}[u_v^\top u_t]=\mathbb{E}\big[u_v^\top\,\mathbb{E}[u_t\mid y_{\lt t}]\big]=0\). Hence</p>
+$$\mathbb{E}\|S\|^2=\sum_{t=1}^{T}\mathbb{E}\|u_t\|^2,$$
+<p>which grows linearly in \(T\) (derived). I checked it by Monte Carlo on a toy bigram table (vocabulary 8, 2,000 samples per length); the ratio of \(\mathbb{E}\|S\|^2\) to \(\sum_t\mathbb{E}\|u_t\|^2\) came out between 0.988 and 1.007 for \(T=4,8,16,32\). For a fixed advantage magnitude, a completion's gradient norm therefore grows roughly like \(\sqrt T\): a 10,000-token chain of thought is a noisier sample than a 500-token answer. A per-token critic is one response to this, and the length-normalization choices of Module 11 are another.</p>
+
+<h3 id="baselines-worked-example">4.4 A worked example, exactly</h3>
+<p>Figure 4 walks one prompt through a group update. The numbers are illustrative; the arithmetic is what matters.</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+<svg viewBox="0 0 800 292" role="img" aria-label="Four sampled completions for one prompt, their rewards, leave-one-out baselines, advantages, and the advantage broadcast over every token">
+<text x="22" y="66" class="d-bold">y₁</text>
+<rect x="56" y="44" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="102" y="44" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="148" y="44" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="194" y="44" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="240" y="44" width="40" height="34" rx="5" class="d-surface"/>
+<text x="22" y="114" class="d-bold">y₂</text>
+<rect x="56" y="92" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="102" y="92" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="148" y="92" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="194" y="92" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="240" y="92" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="286" y="92" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="332" y="92" width="40" height="34" rx="5" class="d-surface"/>
+<text x="22" y="162" class="d-bold">y₃</text>
+<rect x="56" y="140" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="102" y="140" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="148" y="140" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="194" y="140" width="40" height="34" rx="5" class="d-surface"/>
+<text x="22" y="210" class="d-bold">y₄</text>
+<rect x="56" y="188" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="102" y="188" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="148" y="188" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="194" y="188" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="240" y="188" width="40" height="34" rx="5" class="d-surface"/>
+<rect x="286" y="188" width="40" height="34" rx="5" class="d-surface"/>
+<text x="56" y="28" class="d-small d-text-light">completion tokens</text>
+<g data-step="2"><text x="425" y="28" text-anchor="middle" class="d-small d-bold">R</text>
+<rect x="402" y="44" width="46" height="34" rx="6" class="d-fill-green-soft d-stroke-green"/><text x="425" y="66" text-anchor="middle" class="d-mono d-bold">1</text>
+<rect x="402" y="92" width="46" height="34" rx="6" class="d-fill-red-soft d-stroke-red"/><text x="425" y="114" text-anchor="middle" class="d-mono d-bold">0</text>
+<rect x="402" y="140" width="46" height="34" rx="6" class="d-fill-green-soft d-stroke-green"/><text x="425" y="162" text-anchor="middle" class="d-mono d-bold">1</text>
+<rect x="402" y="188" width="46" height="34" rx="6" class="d-fill-green-soft d-stroke-green"/><text x="425" y="210" text-anchor="middle" class="d-mono d-bold">1</text>
+</g>
+<g data-step="3"><text x="522" y="28" text-anchor="middle" class="d-small d-bold">LOO baseline bᵢ</text>
+<text x="522" y="66" text-anchor="middle" class="d-mono">0.67</text>
+<text x="522" y="114" text-anchor="middle" class="d-mono">1.00</text>
+<text x="522" y="162" text-anchor="middle" class="d-mono">0.67</text>
+<text x="522" y="210" text-anchor="middle" class="d-mono">0.67</text>
+<text x="402" y="250" class="d-small">group mean R̄ = (1 + 0 + 1 + 1) / 4 = 0.75</text></g>
+<g data-step="4"><text x="622" y="28" text-anchor="middle" class="d-small d-bold">A = R − R̄</text><text x="722" y="28" text-anchor="middle" class="d-small d-bold">A = R − bᵢ</text>
+<text x="622" y="66" text-anchor="middle" class="d-mono d-bold">+0.25</text><text x="722" y="66" text-anchor="middle" class="d-mono d-bold">+0.33</text>
+<text x="622" y="114" text-anchor="middle" class="d-mono d-bold">−0.75</text><text x="722" y="114" text-anchor="middle" class="d-mono d-bold">−1.00</text>
+<text x="622" y="162" text-anchor="middle" class="d-mono d-bold">+0.25</text><text x="722" y="162" text-anchor="middle" class="d-mono d-bold">+0.33</text>
+<text x="622" y="210" text-anchor="middle" class="d-mono d-bold">+0.25</text><text x="722" y="210" text-anchor="middle" class="d-mono d-bold">+0.33</text>
+<text x="402" y="270" class="d-small">both columns sum to zero; the LOO column is 4/3 times the mean column</text></g>
+<g data-step="5">
+<rect x="56" y="44" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="102" y="44" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="148" y="44" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="194" y="44" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="240" y="44" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="56" y="92" width="40" height="34" rx="5" class="d-fill-red-soft d-stroke-red"/>
+<rect x="102" y="92" width="40" height="34" rx="5" class="d-fill-red-soft d-stroke-red"/>
+<rect x="148" y="92" width="40" height="34" rx="5" class="d-fill-red-soft d-stroke-red"/>
+<rect x="194" y="92" width="40" height="34" rx="5" class="d-fill-red-soft d-stroke-red"/>
+<rect x="240" y="92" width="40" height="34" rx="5" class="d-fill-red-soft d-stroke-red"/>
+<rect x="286" y="92" width="40" height="34" rx="5" class="d-fill-red-soft d-stroke-red"/>
+<rect x="332" y="92" width="40" height="34" rx="5" class="d-fill-red-soft d-stroke-red"/>
+<rect x="56" y="140" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="102" y="140" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="148" y="140" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="194" y="140" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="56" y="188" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="102" y="188" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="148" y="188" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="194" y="188" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="240" y="188" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<rect x="286" y="188" width="40" height="34" rx="5" class="d-fill-green-soft d-stroke-green"/>
+<text x="56" y="250" class="d-small">green: log-prob of the token is pushed up</text><text x="56" y="270" class="d-small">red: log-prob of the token is pushed down</text></g>
+</svg>
+  <figcaption><b>Figure 4.</b> One group update on one prompt, step by step (illustrative lengths and rewards). The advantages are \(R-\bar R\) and the leave-one-out form of Lambert Eqs. 49-51<a class="cite" href="#ref-3">3</a>; broadcasting one sequence-level scalar over every token is the bandit-style advantage of Lambert §6.3.2.2<a class="cite" href="#ref-3">3</a>.</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><b>Sample.</b> One prompt, \(G=4\) completions from the current policy, of lengths 5, 7, 4 and 6 tokens (illustrative).</li>
+    <li><b>Score.</b> A verifier returns \(R=1,0,1,1\): pass rate 0.75 in this group.</li>
+    <li><b>Baseline.</b> For \(y_1\) the other three rewards are \((0,1,1)\), so \(b_1=2/3\); for \(y_2\) they are \((1,1,1)\), so \(b_2=1\). The plain group mean is 0.75 for everyone.</li>
+    <li><b>Advantage.</b> Subtracting gives \((+0.25,-0.75,+0.25,+0.25)\) with the group mean and \((+0.33,-1.00,+0.33,+0.33)\) leave-one-out. Without any baseline the weights would be \((1,0,1,1)\): the failure would be ignored instead of pushed down.</li>
+    <li><b>Broadcast.</b> Every token of a completion receives that completion's scalar. The weighted sum of token scores is the gradient estimate; the optimizer moves the weights along it.</li>
+  </ol>
+</div>
+
+<p>The stepper shows the advantages but not their effect on variance. For that, take a policy small enough to enumerate. Prompt A has three possible completions with probabilities \((0.2,0.3,0.5)\); the first two are correct, so the pass rate is 0.5. Prompt B has probabilities \((0.1,0.4,0.5)\) and only the first is correct: pass rate 0.1. The policy is a softmax over three logits, so the score of completion \(a\) is \(e_a-\pi\). An estimator averages \(G=4\) i.i.d. single-sample terms. All \(3^4=81\) outcomes are enumerated with their probabilities, so every mean and variance below is exact (derived, not simulated). I report the signal-normalized noise \(\operatorname{tr}\operatorname{Cov}(\hat g)/\lVert\mathbb{E}\hat g\rVert^2\), which is comparable across estimators with different expected step lengths.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 3.</b> Four-sample gradient estimators on the toy softmax policy (exact enumeration, derived by the writer). "Step" is \(\mathbb{E}\hat g\) projected on the true gradient, as a fraction of it; "tr Cov" is the trace of the covariance in logit space; "N/S" is tr Cov divided by \(\lVert\mathbb{E}\hat g\rVert^2\). Oracle \(V(x)\) uses the true expected reward and is not available in practice.</caption>
+  <thead><tr><th>Estimator</th><th class="num">Step (fraction of \(\nabla J\))</th><th class="num">tr Cov, A (0.5)</th><th class="num">tr Cov, B (0.1)</th><th class="num">N/S, A</th><th class="num">N/S, B</th></tr></thead>
+  <tbody>
+    <tr><td class="row">No baseline, \(b=0\)</td><td class="num">1.00</td><td class="num">0.0838</td><td class="num" data-best>0.0274</td><td class="num">0.88</td><td class="num">2.25</td></tr>
+    <tr><td class="row">Group mean incl. self</td><td class="num" data-worst>0.75</td><td class="num">0.0202</td><td class="num">0.0158</td><td class="num">0.38</td><td class="num">2.31</td></tr>
+    <tr><td class="row">Leave-one-out</td><td class="num">1.00</td><td class="num">0.0358</td><td class="num">0.0282</td><td class="num">0.38</td><td class="num">2.31</td></tr>
+    <tr><td class="row">Oracle \(V(x)\)</td><td class="num">1.00</td><td class="num" data-best>0.0150</td><td class="num">0.0228</td><td class="num" data-best>0.16</td><td class="num" data-best>1.87</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig">
+<svg viewBox="0 0 800 304" role="img" aria-labelledby="f5t"><title id="f5t">Noise-to-signal ratio of four-sample policy-gradient estimators on a toy softmax policy, for a prompt with pass rate 0.5 and one with pass rate 0.1</title>
+<line x1="70" y1="240" x2="760" y2="240" class="d-axis"/><text x="62" y="244" text-anchor="end" class="d-mono d-small">0</text>
+<line x1="70" y1="200" x2="760" y2="200" class="d-grid"/><text x="62" y="204" text-anchor="end" class="d-mono d-small">0.5</text>
+<line x1="70" y1="160" x2="760" y2="160" class="d-grid"/><text x="62" y="164" text-anchor="end" class="d-mono d-small">1</text>
+<line x1="70" y1="120" x2="760" y2="120" class="d-grid"/><text x="62" y="124" text-anchor="end" class="d-mono d-small">1.5</text>
+<line x1="70" y1="80" x2="760" y2="80" class="d-grid"/><text x="62" y="84" text-anchor="end" class="d-mono d-small">2</text>
+<line x1="70" y1="40" x2="760" y2="40" class="d-grid"/><text x="62" y="44" text-anchor="end" class="d-mono d-small">2.5</text>
+<line x1="70" y1="30" x2="70" y2="240" class="d-axis"/>
+<text x="80" y="20" class="d-small d-text-light">tr Cov(ĝ) ÷ ‖E ĝ‖²  (lower is better; G = 4 samples, exact enumeration)</text>
+<rect x="120" y="169.6" width="56" height="70.4" rx="3" class="d-fill-blue"/>
+<text x="148" y="163.6" text-anchor="middle" class="d-mono d-small d-bold">0.88</text>
+<text x="148" y="258" text-anchor="middle" class="d-mono d-small">none</text>
+<rect x="190" y="209.6" width="56" height="30.4" rx="3" class="d-fill-orange"/>
+<text x="218" y="203.6" text-anchor="middle" class="d-mono d-small d-bold">0.38</text>
+<text x="218" y="258" text-anchor="middle" class="d-mono d-small">mean/LOO</text>
+<rect x="260" y="227.2" width="56" height="12.8" rx="3" class="d-fill-cyan"/>
+<text x="288" y="221.2" text-anchor="middle" class="d-mono d-small d-bold">0.16</text>
+<text x="288" y="258" text-anchor="middle" class="d-mono d-small">oracle V</text>
+<text x="218" y="284" text-anchor="middle" class="d-small d-text-light">prompt A: pass rate 0.5</text>
+<rect x="470" y="60" width="56" height="180" rx="3" class="d-fill-blue"/>
+<text x="498" y="54" text-anchor="middle" class="d-mono d-small d-bold">2.25</text>
+<text x="498" y="258" text-anchor="middle" class="d-mono d-small">none</text>
+<rect x="540" y="55.2" width="56" height="184.8" rx="3" class="d-fill-orange"/>
+<text x="568" y="49.2" text-anchor="middle" class="d-mono d-small d-bold">2.31</text>
+<text x="568" y="258" text-anchor="middle" class="d-mono d-small">mean/LOO</text>
+<rect x="610" y="90.4" width="56" height="149.6" rx="3" class="d-fill-cyan"/>
+<text x="638" y="84.4" text-anchor="middle" class="d-mono d-small d-bold">1.87</text>
+<text x="638" y="258" text-anchor="middle" class="d-mono d-small">oracle V</text>
+<text x="568" y="284" text-anchor="middle" class="d-small d-text-light">prompt B: pass rate 0.1</text>
+</svg>
+  <figcaption><b>Figure 5.</b> The noise-to-signal column of Table 3 for the unbiased estimators (the group mean and leave-one-out coincide after rescaling by \(G/(G-1)\)). At pass rate 0.5 a baseline cuts relative noise by 2.3x (leave-one-out) to 5.6x (oracle). At pass rate 0.1 nothing helps much: even the oracle only moves 2.25 to 1.87. Derived by exhaustive enumeration of the toy policy described in the text.</figcaption>
+</figure>
+
+<p>Three readings of Table 3 matter for everything that follows.</p>
+<ul>
+  <li><strong>The bias is real and exact.</strong> The group mean including the sample itself delivers 0.75 of the true gradient at \(G=4\), as Section 4.2 predicted. After multiplying by \(G/(G-1)=4/3\) its covariance becomes the leave-one-out covariance: \(0.0202\times(4/3)^2=0.0359\), against 0.0358 (rounding).</li>
+  <li><strong>A baseline helps most when the mean reward is far from zero relative to its spread.</strong> At pass rate 0.5, leave-one-out cuts noise-to-signal from 0.88 to 0.38. At pass rate 0.1, the no-baseline estimator is already close to centered, because most samples have \(R=0\) and contribute nothing; leave-one-out at \(G=4\) is marginally worse than no baseline (2.31 against 2.25); with only three other samples, its baseline is itself a noisy estimate (the writer's reading).</li>
+  <li><strong>Noise-to-signal above 1 means a single step is mostly noise.</strong> With rare successes, a group of four usually contains none: the chance that prompt B's group has a success is \(1-0.9^4=34\%\). Averaging \(N\) independent groups divides noise-to-signal by \(N\) (derived), which is the arithmetic behind large prompt batches and larger \(G\) on hard prompts. Section 7 returns to this.</li>
+</ul>
+
+<h3 id="baselines-psi-menu">4.5 The menu of credit signals, and why advantage is the target</h3>
+<p>Schulman et al. list six interchangeable weights for the score term in the policy gradient, all with the same expectation when exact<a class="cite" href="#ref-2">2</a> (Eq. 1). Table 4 instantiates each for an LLM with deterministic transitions and \(\gamma=1\). For a deterministic policy-transition pair, \(Q(s_t,a_t)=r_t+V(s_{t+1})\), so the advantage equals the TD residual in the last row<a class="cite" href="#ref-3">3</a> (§6.2.1, Eq. 43).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> The six choices of \(\Psi_t\) in \(g=\mathbb{E}[\sum_t\Psi_t\nabla_\theta\log\pi_\theta(a_t\mid s_t)]\) (Schulman et al., Eq. 1)<a class="cite" href="#ref-2">2</a> with the LLM instantiation (writer's mapping; Lambert §6.2.1 lists the same set<a class="cite" href="#ref-3">3</a>).</caption>
+  <thead><tr><th>#</th><th>\(\Psi_t\)</th><th>LLM instantiation</th><th>Needs a learned critic</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>\(\sum_{t=0}^{\infty}r_t\), total reward</td><td>\(R(x,y)\)</td><td>no</td></tr>
+    <tr><td>2</td><td>\(\sum_{t'\ge t}r_{t'}\), reward after \(a_t\)</td><td>\(R\) if only EOS pays; differs once per-token KL rewards exist</td><td>no</td></tr>
+    <tr><td>3</td><td>\(\sum_{t'\ge t}r_{t'}-b(s_t)\)</td><td>\(R-b(x)\) (bandit baselines) or \(R-V(s_t)\)</td><td>only if \(b=V(s_t)\)</td></tr>
+    <tr><td>4</td><td>\(Q^\pi(s_t,a_t)\)</td><td>\(r_t+V^\pi(s_{t+1})\)</td><td>yes</td></tr>
+    <tr><td>5</td><td>\(A^\pi(s_t,a_t)\)</td><td>\(Q^\pi-V^\pi\)</td><td>yes</td></tr>
+    <tr><td>6</td><td>\(r_t+V^\pi(s_{t+1})-V^\pi(s_t)\), TD residual</td><td>\(V(s_{t+1})-V(s_t)\) for interior tokens</td><td>yes</td></tr>
+  </tbody>
+</table>
+
+<p>Of the six, advantage is the target. The GAE paper says the choice \(\Psi_t=A^\pi(s_t,a_t)\) "yields almost the lowest possible variance" and gives the intuition: a gradient step "should increase the probability of better-than-average actions and decrease the probability of worse-than-average actions"<a class="cite" href="#ref-2">2</a> (§2). The same quantity is what makes a policy update provably useful. TRPO's performance-difference identity, \(\eta(\tilde\pi)=\eta(\pi)+\mathbb{E}_{\tilde\pi}[\sum_t\gamma^tA_\pi(s_t,a_t)]\), says any update with non-negative expected advantage at every state cannot reduce performance<a class="cite" href="#ref-10">10</a> (§2, Eq. 1). Module 3 builds the trust-region machinery on that identity. The practical question for LLM RL is how cheaply a usable estimate of \(A\) can be had, and that is where the algorithms diverge: a learned \(V\) (Section 5), or other samples from the same prompt (Modules 9 and 11).</p>
+
+<h2 id="value-functions-last-token">5. Value functions when the reward arrives at the last token</h2>
+
+<h3 id="value-functions-last-token-meaning">5.1 What \(V\) means for an LLM, and what it redistributes</h3>
+<p>With \(\gamma=1\) and a reward only at EOS, the value of a prefix is the expected final reward from it under the current policy: \(V^\pi(x,y_{\lt t})=\mathbb{E}[R\mid x,y_{\lt t}]\). For a 0/1 verifier this is the probability that the finished answer will be correct. Transitions are deterministic and interior rewards are zero, so \(Q(s_t,a_t)=V(s_{t+1})\) and the advantage of a token is the change in predicted success probability that the token caused<a class="cite" href="#ref-3">3</a> (§6.2.1, Eq. 43):</p>
+$$\delta_t=r_t+V(s_{t+1})-V(s_t),\qquad \delta_t=V(s_{t+1})-V(s_t)\ \ (t\lt T),\qquad \delta_T=R-V(s_T).$$
+<p>Summing over the sequence telescopes: \(\sum_{t=1}^{T}\delta_t=R-V(x)\) for any function \(V\) with \(V=0\) at the terminal state (derived). A critic therefore does not create or destroy credit. It redistributes the same total, \(R-V(x)\), along the sequence. If \(V\) is accurate, the tokens where the success probability jumped receive most of it and filler tokens receive almost none. A critic-free method gives every token the same weight, \(R-b(x)\); the filler tokens' updates are then zero-mean noise that averages out only over many samples (Section 4.3).</p>
+<p>This is also the line between a baseline and a critic. Sutton and Barto: a learned state-value function used only as a baseline, with Monte Carlo targets, is REINFORCE with baseline and is unbiased; it becomes an actor-critic only when the value function is used for bootstrapping, and "only through bootstrapping do we introduce bias and an asymptotic dependence on the quality of the function approximation"<a class="cite" href="#ref-7">7</a> (§13.5, p. 331). GAE with \(\lambda=1\) is the first case: "simply the empirical returns minus the value function baseline", unbiased "regardless of the accuracy of \(V\)" but high variance<a class="cite" href="#ref-2">2</a> (§3). Any \(\lambda\lt1\) is the second. Lambert's simplest PPO critic uses Monte Carlo return targets with no GAE, which makes it the first kind<a class="cite" href="#ref-3">3</a> (§6.2.7).</p>
+
+<h3 id="value-functions-last-token-hard">5.2 Why an accurate per-token \(V\) is hard to get</h3>
+<p>DeepSeekMath gives two objections. The value function "is typically another model of comparable size as the policy model", a "substantial memory and computational burden"; and because "usually only the last token is assigned a reward score", training a value function "that is accurate at each token" may be complicated<a class="cite" href="#ref-1">1</a> (§4.1.1). Lambert adds that learning a value function from an LM backbone is a setting "where research hasn't established best practices"<a class="cite" href="#ref-3">3</a> (§6.2.8), and that initialization is an open design choice: InstructGPT starts the value network from the reward model, Tulu 3 follows it for RLVR, and others append a randomly initialized value head to the SFT checkpoint<a class="cite" href="#ref-3">3</a> (§6.3). The initialization matters empirically: in Tulu 3's RLVR ablations, "Initializing RLVR's Value Function from a General RM Works Best"<a class="cite" href="#ref-11">11</a> (§6.2.1). InstructGPT's own constraint was size: a 175B reward model trained unstably and was "less suitable to be used as the value function", so all RMs were 6B<a class="cite" href="#ref-6">6</a> (§3.5, App. C).</p>
+<p>The critic is also a second large training job inside the RL loop, with its own loss (Lambert's Figure 24 trains it by mean-squared error against return targets)<a class="cite" href="#ref-3">3</a>. Module 5 covers the four-model PPO-RLHF system and Module 1 its memory cost. What matters here is the trade: the critic buys token-level credit and lower variance at the price of a second model that must itself be learned from the same sparse signal.</p>
+
+<h2 id="on-policy-and-importance-sampling">6. On-policy sampling and the importance-sampling correction</h2>
+
+<h3 id="on-policy-and-importance-sampling-identity">6.1 Why the samples must come from the policy being differentiated</h3>
+<p>The expectation in (PG) is taken under \(\pi_\theta\) itself. If the completions were drawn by an older policy \(\pi_{old}\), averaging them estimates the wrong quantity. The standard repair is importance sampling:</p>
+$$\mathbb{E}_{y\sim\pi_\theta}[f(y)]=\mathbb{E}_{y\sim\pi_{old}}\big[\rho(y)f(y)\big],\qquad \rho(y)=\frac{\pi_\theta(y\mid x)}{\pi_{old}(y\mid x)}.$$
+<p>Differentiate the surrogate \(\mathbb{E}_{\pi_{old}}[\rho\,A]\) with \(A\) held fixed. Since \(\nabla_\theta\rho=\rho\,\nabla_\theta\log\pi_\theta\) and \(\rho=1\) at \(\theta=\theta_{old}\), the gradient at that point is \(\mathbb{E}[A\,\nabla_\theta\log\pi_\theta]\): the policy gradient (derived). This is the surrogate in TRPO's practical algorithm, where the sum over actions is replaced "by an importance sampling estimator"<a class="cite" href="#ref-10">10</a> (§5, Eq. 14), and PPO's \(L^{CPI}(\theta)=\hat{\mathbb{E}}_t[r_t(\theta)\hat A_t]\) with \(r_t=\pi_\theta/\pi_{\theta_{old}}\)<a class="cite" href="#ref-9">9</a> (§3, Eq. 6). The first optimizer step on a rollout is exactly on-policy. Every further step moves \(\theta\) away from \(\theta_{old}\), the ratio departs from 1, and the estimator is only as good as the ratio stays near 1. PPO's authors warn that taking "multiple steps of optimization on this loss \(L^{PG}\) using the same trajectory" is "not well-justified, and empirically it often leads to destructively large policy updates"<a class="cite" href="#ref-9">9</a> (§2.1). Clipping the ratio or constraining the KL is how Module 3's algorithms keep that departure small.</p>
+
+<h3 id="on-policy-and-importance-sampling-reuse">6.2 How stale the reported recipes let the data get</h3>
+<p>Rollouts are the expensive part of an RL iteration (Module 1), so most recipes reuse each rollout for several optimizer steps and accept some staleness. The reported settings span a wide range.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> Optimizer steps fed by one rollout in three reports. "Staleness at last step" is the number of earlier optimizer steps taken on the same rollout, derived from the reported sizes. DeepSeekMath: §4.2<a class="cite" href="#ref-1">1</a>; R1-Zero: §2.1<a class="cite" href="#ref-12">12</a>; DAPO: §4.1<a class="cite" href="#ref-13">13</a>.</caption>
+  <thead><tr><th>Report</th><th class="num">Outputs per rollout</th><th class="num">Mini-batch (outputs)</th><th class="num">Optimizer steps per rollout</th><th class="num">Staleness at last step</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DeepSeekMath-RL (7B)</td><td class="num">64 per question; batch size 1,024 (unit not stated)</td><td class="num">n/a</td><td class="num" data-best>1</td><td class="num" data-best>0</td></tr>
+    <tr><td class="row">DeepSeek-R1-Zero</td><td class="num">8,192</td><td class="num">512</td><td class="num">16</td><td class="num">15</td></tr>
+    <tr><td class="row">DAPO (Qwen2.5-32B)</td><td class="num">8,192 (512 prompts x 16)</td><td class="num">512</td><td class="num">16</td><td class="num" data-worst>15</td></tr>
+  </tbody>
+</table>
+
+<p>DeepSeekMath-RL took "a single update following each exploration stage", which makes \(\rho\equiv1\) and the clip inert<a class="cite" href="#ref-1">1</a> (§4.2, App. A.1.5). R1-Zero's rollout "generates 8,192 outputs, which are randomly split into 16 mini-batches and trained for only a single inner epoch"<a class="cite" href="#ref-12">12</a> (§2.1), so the last mini-batch is fifteen optimizer steps stale. DAPO's configuration gives the same count: 512 prompts with 16 responses each, a mini-batch of 512, "16 gradient updates for each rollout step"<a class="cite" href="#ref-13">13</a> (§4.1). How much this costs is empirical. Ahmadian et al. measured the PPO loss being clipped "on average &lt; 5% of the time per batch" across their datasets and base models and read it as a regime "close to being 'on-policy'"; removing clipping and the ratio altogether gave "a slight boost"<a class="cite" href="#ref-4">4</a> (§3.2). That result is for short RLHF generations; Module 12 returns to ratios and clipping for long reasoning rollouts, and Modules 14 and 18 cover staleness from asynchronous pipelines and the mismatch between the sampler's and the trainer's probabilities, which makes even the first mini-batch not quite on-policy.</p>
+
+<h3 id="on-policy-and-importance-sampling-seq-ratio">6.3 Why the ratio is per token</h3>
+<p>The sequence-level ratio is a product of per-token ratios, \(\rho(y)=\prod_t\rho_t\), so \(\log\rho=\sum_t\log\rho_t\). If the per-token log-ratios are roughly independent with standard deviation \(\sigma\), the standard deviation of \(\log\rho\) is \(\sigma\sqrt T\) (derived, with that independence assumption). An illustrative \(\sigma=0.01\) gives 0.32 at \(T=1{,}000\) tokens, so sequence weights range over a factor of about \(e^{\pm0.32}=1.4\), and 1.0 at \(T=10{,}000\), a factor of about \(e^{\pm1}=2.7\). The per-token ratio keeps each term near 1; PPO defines \(r_t(\theta)\) per timestep<a class="cite" href="#ref-9">9</a> (§3), while the sequence-level alternative that Lambert's Table 3 lists for GSPO takes the ratio to the power \(1/|a_i|\)<a class="cite" href="#ref-3">3</a> (§6.2.11), a length root that offsets this growth (the writer's reading). Whether token-level or sequence-level is the better trade is one of the open questions of Module 12.</p>
+
+<h2 id="exploration-sparse-rewards">7. Exploration and sparse rewards</h2>
+
+<h3 id="exploration-sparse-rewards-knobs">7.1 Exploration lives in the sampler</h3>
+<p>A policy-gradient method explores by sampling from its own stochastic policy. Sutton and Barto list among the advantages of parameterized policies that they "can learn appropriate levels of exploration and approach deterministic policies asymptotically"<a class="cite" href="#ref-7">7</a> (§13.8, p. 337). An LLM is stochastic by construction, so no \(\epsilon\)-greedy rule or injected noise is needed. The knobs are the ones an inference engineer already owns:</p>
+<ul>
+  <li><strong>Sampling temperature.</strong> R1-Zero rolls out at temperature 1<a class="cite" href="#ref-12">12</a> (§2.1). Kimi K2 treats it as a schedule: a high temperature early "is crucial" for exploration and reduces "the risk of premature convergence", and is decayed because a high temperature late "compromises the reliability and consistency of the model's outputs"<a class="cite" href="#ref-14">14</a> (§3.2.3, Temperature Decay).</li>
+  <li><strong>The policy's own entropy.</strong> Across RL runs without an entropy intervention, policy entropy "dropped sharply at the early training stage, leading to an overly confident policy model", and performance saturates<a class="cite" href="#ref-15">15</a> (Abstract). Module 13 treats the controls.</li>
+  <li><strong>Group size and prompt selection</strong>, which decide how often a rare success is seen at all (Section 7.2).</li>
+</ul>
+<p>One consequence for the sampler is easy to miss. Estimator (PG) is unbiased only when \(y\) is drawn from the distribution whose log-probability is differentiated. A rollout engine that samples from \(\operatorname{softmax}(z/\tau)\) with \(\tau\ne1\), or with top-\(p\) or top-\(k\) truncation, draws from a different distribution than the \(\operatorname{softmax}(z)\) the trainer differentiates (derived). Either the trainer applies the same transform to its logits, or the sampler runs at \(\tau=1\) with no truncation. Olmo 3 states its RL sampler as temperature 1.0 and top-\(p\) 1.0<a class="cite" href="#ref-16">16</a> (§4.4.2). Module 14 covers the remaining ways the two engines disagree.</p>
+
+<h3 id="exploration-sparse-rewards-binary">7.2 A binary reward teaches only on prompts the policy sometimes solves</h3>
+<p>Suppose a prompt has pass rate \(p\) under the current policy and a group has \(G\) independent samples. The group is all-fail with probability \((1-p)^G\) and all-pass with probability \(p^G\). With any baseline built from the group, those groups give every sample the same reward and therefore zero advantage; with no baseline, all-fail groups still give exactly zero. Only mixed groups push the policy anywhere:</p>
+$$P(\text{informative})=1-p^{G}-(1-p)^{G},\qquad G_{95}(p)=\Big\lceil\frac{\ln 0.05}{\ln(1-p)}\Big\rceil,$$
+<p>where \(G_{95}\) is the group size that sees at least one success with probability 0.95 (derived). DAPO states the all-correct case plainly: "if all outputs [...] of a particular prompt are correct and receive the same reward, the resulting advantage for this group is zero. A zero advantage results in zero policy gradients"<a class="cite" href="#ref-13">13</a> (§3.2). They also observe that the number of prompts with accuracy 1 "continues to increase" during training, so the informative share of a fixed prompt set shrinks as the policy improves<a class="cite" href="#ref-13">13</a> (§3.2, Fig. 3b).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> How many samples per prompt a binary reward needs, and how often a group is informative (derived from \(1-(1-p)^G\) and \(1-p^G-(1-p)^G\); no simulation).</caption>
+  <thead><tr><th class="num">Pass rate \(p\)</th><th class="num">\(G\) for 50% chance of a success</th><th class="num">\(G_{95}\)</th><th class="num">Informative, \(G=8\)</th><th class="num">Informative, \(G=16\)</th><th class="num">Informative, \(G=64\)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0.001</td><td class="num">693</td><td class="num">2,995</td><td class="num" data-worst>0.008</td><td class="num">0.016</td><td class="num">0.062</td></tr>
+    <tr><td class="num">0.01</td><td class="num">69</td><td class="num">299</td><td class="num">0.077</td><td class="num">0.149</td><td class="num">0.474</td></tr>
+    <tr><td class="num">0.05</td><td class="num">14</td><td class="num">59</td><td class="num">0.337</td><td class="num">0.560</td><td class="num">0.963</td></tr>
+    <tr><td class="num">0.1</td><td class="num">7</td><td class="num">29</td><td class="num">0.570</td><td class="num">0.815</td><td class="num">0.999</td></tr>
+    <tr><td class="num">0.25</td><td class="num">3</td><td class="num">11</td><td class="num">0.900</td><td class="num">0.990</td><td class="num">1.000</td></tr>
+    <tr><td class="num">0.5</td><td class="num">1</td><td class="num">5</td><td class="num" data-best>0.992</td><td class="num" data-best>1.000</td><td class="num" data-best>1.000</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig">
+<svg viewBox="0 0 800 330" role="img" aria-labelledby="f6t"><title id="f6t">Probability that a group of G samples contains both a success and a failure, versus the prompt pass rate, for G of 4, 8, 16 and 64</title>
+<line x1="80" y1="270" x2="760" y2="270" class="d-axis"/><text x="72" y="274" text-anchor="end" class="d-mono d-small">0.00</text>
+<line x1="80" y1="212.5" x2="760" y2="212.5" class="d-grid"/><text x="72" y="216.5" text-anchor="end" class="d-mono d-small">0.25</text>
+<line x1="80" y1="155" x2="760" y2="155" class="d-grid"/><text x="72" y="159" text-anchor="end" class="d-mono d-small">0.50</text>
+<line x1="80" y1="97.5" x2="760" y2="97.5" class="d-grid"/><text x="72" y="101.5" text-anchor="end" class="d-mono d-small">0.75</text>
+<line x1="80" y1="40" x2="760" y2="40" class="d-grid"/><text x="72" y="44" text-anchor="end" class="d-mono d-small">1.00</text>
+<line x1="80" y1="40" x2="80" y2="270" class="d-axis"/>
+<line x1="80" y1="270" x2="80" y2="275" class="d-axis"/><text x="80" y="290" text-anchor="middle" class="d-mono d-small">0.001</text>
+<line x1="331.948" y1="270" x2="331.948" y2="275" class="d-axis"/><text x="331.948" y="290" text-anchor="middle" class="d-mono d-small">0.01</text>
+<line x1="583.896" y1="270" x2="583.896" y2="275" class="d-axis"/><text x="583.896" y="290" text-anchor="middle" class="d-mono d-small">0.1</text>
+<line x1="760" y1="270" x2="760" y2="275" class="d-axis"/><text x="760" y="290" text-anchor="middle" class="d-mono d-small">0.5</text>
+<text x="420" y="312" text-anchor="middle" class="d-small d-text-light">prompt pass rate p under the current policy (log scale; the curve mirrors about p = 0.5)</text>
+<text x="80" y="24" class="d-small d-text-light">P(group has at least one success and one failure) = 1 − p^G − (1−p)^G</text>
+<polyline points="80.0,269.1 89.7,269.0 99.4,268.9 109.1,268.8 118.9,268.7 128.6,268.6 138.3,268.4 148.0,268.3 157.7,268.1 167.4,268.0 177.1,267.8 186.9,267.6 196.6,267.3 206.3,267.1 216.0,266.8 225.7,266.5 235.4,266.2 245.1,265.9 254.9,265.5 264.6,265.1 274.3,264.6 284.0,264.1 293.7,263.6 303.4,263.0 313.1,262.4 322.9,261.6 332.6,260.9 342.3,260.1 352.0,259.1 361.7,258.2 371.4,257.1 381.1,255.9 390.9,254.6 400.6,253.3 410.3,251.7 420.0,250.1 429.7,248.3 439.4,246.4 449.1,244.3 458.9,242.0 468.6,239.6 478.3,236.9 488.0,234.0 497.7,230.9 507.4,227.6 517.1,223.9 526.9,220.1 536.6,215.9 546.3,211.4 556.0,206.6 565.7,201.4 575.4,196.0 585.1,190.2 594.9,184.0 604.6,177.5 614.3,170.6 624.0,163.4 633.7,155.9 643.4,148.2 653.1,140.1 662.9,131.9 672.6,123.6 682.3,115.3 692.0,107.0 701.7,99.0 711.4,91.4 721.1,84.4 730.9,78.3 740.6,73.3 750.3,70.0 760.0,68.8" class="d-line d-stroke-blue"/>
+<polyline points="80.0,268.2 89.7,268.0 99.4,267.8 109.1,267.6 118.9,267.4 128.6,267.1 138.3,266.9 148.0,266.6 157.7,266.3 167.4,265.9 177.1,265.6 186.9,265.2 196.6,264.7 206.3,264.2 216.0,263.7 225.7,263.1 235.4,262.5 245.1,261.8 254.9,261.1 264.6,260.2 274.3,259.4 284.0,258.4 293.7,257.3 303.4,256.2 313.1,255.0 322.9,253.6 332.6,252.1 342.3,250.5 352.0,248.8 361.7,246.9 371.4,244.9 381.1,242.7 390.9,240.3 400.6,237.7 410.3,234.9 420.0,231.9 429.7,228.7 439.4,225.2 449.1,221.5 458.9,217.5 468.6,213.2 478.3,208.6 488.0,203.7 497.7,198.5 507.4,193.0 517.1,187.1 526.9,180.9 536.6,174.5 546.3,167.7 556.0,160.6 565.7,153.3 575.4,145.8 585.1,138.0 594.9,130.1 604.6,122.1 614.3,114.1 624.0,106.1 633.7,98.3 643.4,90.7 653.1,83.3 662.9,76.4 672.6,70.0 682.3,64.1 692.0,58.8 701.7,54.3 711.4,50.4 721.1,47.3 730.9,44.9 740.6,43.2 750.3,42.2 760.0,41.8" class="d-line d-stroke-cyan"/>
+<polyline points="80.0,266.3 89.7,266.0 99.4,265.6 109.1,265.2 118.9,264.8 128.6,264.3 138.3,263.8 148.0,263.2 157.7,262.6 167.4,262.0 177.1,261.2 186.9,260.4 196.6,259.6 206.3,258.6 216.0,257.6 225.7,256.5 235.4,255.2 245.1,253.9 254.9,252.5 264.6,250.9 274.3,249.2 284.0,247.4 293.7,245.4 303.4,243.2 313.1,240.9 322.9,238.4 332.6,235.7 342.3,232.7 352.0,229.6 361.7,226.2 371.4,222.5 381.1,218.6 390.9,214.4 400.6,210.0 410.3,205.2 420.0,200.2 429.7,194.8 439.4,189.2 449.1,183.2 458.9,176.9 468.6,170.4 478.3,163.6 488.0,156.5 497.7,149.2 507.4,141.7 517.1,134.1 526.9,126.4 536.6,118.6 546.3,110.9 556.0,103.3 565.7,95.8 575.4,88.6 585.1,81.8 594.9,75.3 604.6,69.3 614.3,63.9 624.0,59.0 633.7,54.8 643.4,51.2 653.1,48.2 662.9,45.8 672.6,43.9 682.3,42.5 692.0,41.5 701.7,40.9 711.4,40.5 721.1,40.2 730.9,40.1 740.6,40.0 750.3,40.0 760.0,40.0" class="d-line d-stroke-orange"/>
+<polyline points="80.0,255.7 89.7,254.5 99.4,253.1 109.1,251.6 118.9,249.9 128.6,248.1 138.3,246.2 148.0,244.1 157.7,241.9 167.4,239.5 177.1,236.8 186.9,234.0 196.6,231.0 206.3,227.7 216.0,224.2 225.7,220.4 235.4,216.4 245.1,212.1 254.9,207.5 264.6,202.6 274.3,197.5 284.0,192.0 293.7,186.2 303.4,180.2 313.1,173.9 322.9,167.3 332.6,160.4 342.3,153.4 352.0,146.1 361.7,138.7 371.4,131.2 381.1,123.7 390.9,116.1 400.6,108.6 410.3,101.3 420.0,94.1 429.7,87.2 439.4,80.7 449.1,74.6 458.9,68.9 468.6,63.7 478.3,59.2 488.0,55.1 497.7,51.7 507.4,48.8 517.1,46.4 526.9,44.6 536.6,43.1 546.3,42.1 556.0,41.3 565.7,40.8 575.4,40.5 585.1,40.2 594.9,40.1 604.6,40.1 614.3,40.0 624.0,40.0 633.7,40.0 643.4,40.0 653.1,40.0 662.9,40.0 672.6,40.0 682.3,40.0 692.0,40.0 701.7,40.0 711.4,40.0 721.1,40.0 730.9,40.0 740.6,40.0 750.3,40.0 760.0,40.0" class="d-line d-stroke-green"/>
+<line x1="331.948" y1="40" x2="331.948" y2="270" class="d-line d-dashed d-dim"/>
+<circle cx="331.948" cy="235.8" r="5" class="d-fill-orange"/><text x="341.948" y="239.8" class="d-mono d-small d-bold">0.15</text>
+<circle cx="331.948" cy="160.9" r="5" class="d-fill-green"/><text x="341.948" y="164.9" class="d-mono d-small d-bold">0.47</text>
+<rect x="90" y="44" width="150" height="104" rx="8" class="d-label-bg"/>
+<line x1="100" y1="60" x2="128" y2="60" class="d-line d-stroke-blue"/><text x="138" y="64" class="d-mono d-small">G = 4</text>
+<line x1="100" y1="82" x2="128" y2="82" class="d-line d-stroke-cyan"/><text x="138" y="86" class="d-mono d-small">G = 8</text>
+<line x1="100" y1="104" x2="128" y2="104" class="d-line d-stroke-orange"/><text x="138" y="108" class="d-mono d-small">G = 16</text>
+<line x1="100" y1="126" x2="128" y2="126" class="d-line d-stroke-green"/><text x="138" y="130" class="d-mono d-small">G = 64</text>
+</svg>
+  <figcaption><b>Figure 6.</b> Table 6 as curves. A prompt the policy solves 1% of the time yields an informative group only 15% of the time at G = 16 and 47% at G = 64 (marked). Derived from the formula in the text.</figcaption>
+</figure>
+
+<p>Reports respond to this arithmetic in three ways. Kimi k1.5 observes that "spending a restricted computation budget on very hard problems often yields few correct samples, resulting in lower training efficiency", and answers with a curriculum from easy to hard plus prioritized sampling proportional to \(1-s_i\), where \(s_i\) is the tracked success rate of problem \(i\)<a class="cite" href="#ref-17">17</a> (§2.3.4). DAPO's Dynamic Sampling over-samples and discards prompts whose accuracy is exactly 0 or 1 until the batch is full of informative prompts<a class="cite" href="#ref-13">13</a> (§3.2). Olmo 3 filters offline: it draws eight rollouts per prompt from the starting checkpoint and removes prompts above a 62.5% pass rate (that is, more than 5 of 8 correct), and for the 32B model relies on active sampling that "fills RL batches only on samples with a non-zero GRPO group gradient"<a class="cite" href="#ref-16">16</a> (§4.4.2). Larger \(G\) is the fourth response: R1-Zero uses 16 samples per question<a class="cite" href="#ref-12">12</a> (§2.1) and DeepSeekMath 64<a class="cite" href="#ref-1">1</a> (§4.2). Modules 10 and 11 treat prompt selection and zero-variance groups in depth; the point here is that the prerequisite for learning from a verifier is a base policy that already solves a useful fraction of the training prompts.</p>
+
+<div class="calc">
+  <p class="calc-title">When does a group carry a gradient?</p>
+  <div class="calc-row"><label for="c7p">Pass rate p</label><input type="range" id="c7p" name="p" min="0.005" max="0.995" step="0.005" value="0.05" data-format="fixed:3"></div>
+  <div class="calc-row"><label for="c7g">Samples per prompt G</label><input type="range" id="c7g" name="G" min="2" max="128" step="1" value="16" data-format="int"></div>
+  <div class="calc-out">
+    <div>At least one success<output data-expr="1 - pow(1 - p, G)" data-format="pct"></output></div>
+    <div>Informative group (mixed outcomes)<output data-expr="1 - pow(p, G) - pow(1 - p, G)" data-format="pct"></output></div>
+    <div>G for 95% chance of one success<output data-expr="ceil(log(0.05) / log(1 - p))" data-format="int"></output></div>
+    <div>Group-mean baseline: fraction of true step<output data-expr="(G - 1) / G" data-format="pct"></output></div>
+  </div>
+  <p class="calc-note">Formulas: \(1-(1-p)^G\); \(1-p^G-(1-p)^G\); \(\lceil\ln0.05/\ln(1-p)\rceil\); \((G-1)/G\) from Section 4.2. Assumes independent samples with a fixed per-prompt pass rate.</p>
+</div>
+
+<h2 id="taxonomy">8. Placing any algorithm: baseline source and step control</h2>
+<p>Sections 3 to 7 reduce to four questions that classify a method from its paper's first page. Where does the baseline come from: nothing, a running mean, the other samples for the same prompt, or a learned critic? Is the resulting advantage one scalar broadcast over the sequence or a separate number per token? How are samples reused: not at all, with a ratio and a clip, or under a KL constraint? And where does the KL to a reference sit: in the reward, in the loss, or absent? Table 7 answers them for the methods whose primary sources this module read.</p>
+
+<table class="tbl tbl-dense">
+  <caption><b>Table 7.</b> Policy-gradient methods classified by baseline, credit granularity, step control and KL placement. Sources: RLOO paper §2.1-§2.3<a class="cite" href="#ref-4">4</a>; InstructGPT §3.5<a class="cite" href="#ref-6">6</a>; PPO §3<a class="cite" href="#ref-9">9</a>; DeepSeekMath §4.1 and §5.2.1<a class="cite" href="#ref-1">1</a>; Kimi k1.5 §2.3.2<a class="cite" href="#ref-17">17</a>; Lambert §6.2.4, §6.2.11 and Table 3<a class="cite" href="#ref-3">3</a>. The last column follows from each baseline's definition (derived); group sizes are from R1-Zero<a class="cite" href="#ref-12">12</a> (§2.1) and DeepSeekMath<a class="cite" href="#ref-1">1</a> (§4.2).</caption>
+  <thead><tr><th>Method</th><th>Baseline \(b\)</th><th>Credit</th><th>Step control</th><th>KL to reference</th><th>Extra learned model</th><th>Samples per prompt needed</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Online RFT</td><td>none (0/1 indicator)</td><td>per sequence</td><td>none</td><td>none</td><td>none</td><td>1 or more</td></tr>
+    <tr><td class="row">REINFORCE, moving-average baseline</td><td>mean of all past rewards</td><td>per sequence</td><td>none (no ratio)</td><td>in the reward</td><td>none</td><td>1</td></tr>
+    <tr><td class="row">RLOO</td><td>mean of the other \(k-1\) samples</td><td>per sequence</td><td>none (no ratio)</td><td>in the reward</td><td>none</td><td>\(k\ge2\)</td></tr>
+    <tr><td class="row">PPO (InstructGPT)</td><td>learned \(V(s_t)\), GAE</td><td>per token</td><td>ratio clip, several epochs</td><td>per token, in the reward</td><td>value model</td><td>1 (the critic is the baseline)</td></tr>
+    <tr><td class="row">GRPO</td><td>group mean, divided by group std</td><td>per sequence, broadcast</td><td>token ratio clip</td><td>in the loss</td><td>none</td><td>\(G\ge2\); 16 in R1-Zero, 64 in DeepSeekMath</td></tr>
+    <tr><td class="row">Kimi k1.5</td><td>mean of \(k\) sampled rewards</td><td>per sequence</td><td>online mirror descent, squared-error surrogate</td><td>relative entropy to the current model</td><td>none</td><td>\(k\ge2\)</td></tr>
+  </tbody>
+</table>
+
+<p>Two entries need a gloss. Lambert's own comparison table makes the same point for the larger family: REINFORCE and RLOO "have no importance-sampling ratio", while PPO, GRPO, GSPO and CISPO each introduce one "to enable multiple gradient steps per batch of rollouts, differing in granularity and clipping strategy", and "only PPO requires a learned value function"<a class="cite" href="#ref-3">3</a> (§6.2.11). And the KL column is where reasoning recipes have drifted: with the move to verifiable rewards, Lambert notes the "prevalence of KL penalties has decreased overall, with many reasoning adaptations of RLHF code turning them off entirely"<a class="cite" href="#ref-3">3</a> (§6.2.4), and DAPO removes the term because a long-CoT policy "can diverge significantly from the initial model"<a class="cite" href="#ref-13">13</a> (§2.3). Module 6 returns to KL; Module 9 develops the group-baseline rows and Kimi's objective.</p>
+<p>One lineage point is easy to get wrong. DeepSeek-R1's RL stage uses GRPO, which DeepSeekMath introduced in 2024<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-12">12</a> (§2.1). TRPO<a class="cite" href="#ref-10">10</a> is the 2015 trust-region ancestor of PPO, not the algorithm R1 trains with. Module 3 draws the TRPO, PPO and GRPO lineage, and Module 27 reads R1 stage by stage.</p>
+
+<h3 id="taxonomy-textbook">8.1 Where this sits in the textbook</h3>
+<p>Everything above is Chapter 13 of Sutton and Barto, specialized to a softmax policy whose state is its own prefix. Table 8 maps the sections to the places they appear in an LLM trainer, so you can read the textbook derivations when you need them.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 8.</b> Sutton and Barto, <em>Reinforcement Learning: An Introduction</em>, 2nd ed., Chapter 13 (section and page numbers read from the book's table of contents and text<a class="cite" href="#ref-7">7</a>) mapped to this module (mapping by the writer).</caption>
+  <thead><tr><th>Section</th><th class="num">Page</th><th>Content</th><th>In an LLM trainer</th></tr></thead>
+  <tbody>
+    <tr><td class="row">13.1 Policy approximation and its advantages</td><td class="num">322</td><td>Parameterized stochastic policy, soft-max action preferences</td><td>The LM head; the policy is a softmax over the vocabulary</td></tr>
+    <tr><td class="row">13.2 The policy gradient theorem</td><td class="num">324</td><td>\(\nabla J\propto\sum_s\mu(s)\sum_a q_\pi(s,a)\nabla\pi(a\mid s)\) (Eq. 13.5, p. 326; proof p. 325)</td><td>Equation (PG), Section 2</td></tr>
+    <tr><td class="row">13.3 REINFORCE: Monte Carlo policy gradient</td><td class="num">326</td><td>\(\theta\leftarrow\theta+\alpha G_t\nabla\ln\pi(A_t\mid S_t,\theta)\) (Eq. 13.8, p. 327)</td><td>The reward-weighted token-score sum; Section 3</td></tr>
+    <tr><td class="row">13.4 REINFORCE with baseline</td><td class="num">329</td><td>Subtract \(b(s)\) that does not vary with \(a\) (Eqs. 13.10-13.11)</td><td>Section 4; RLOO and GRPO baselines; PPO's \(V\) at \(\lambda=1\)</td></tr>
+    <tr><td class="row">13.5 Actor-critic methods</td><td class="num">331</td><td>Bootstrapping adds bias and cuts variance</td><td>GAE with \(\lambda\lt1\), Section 5 and Module 3</td></tr>
+  </tbody>
+</table>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The question this module frames is whether an LLM policy needs a learned critic, and how fine its credit assignment should be. The answer is not settled by a single controlled comparison; the positions below rest on different tasks and compute scales. Module 9 takes up the critic-free side in full.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Drop the critic: sequence-level credit with a sample baseline</h4>
+    <p class="who">Ahmadian et al. (RLOO)<a class="cite" href="#ref-4">4</a>; Shao et al. (GRPO)<a class="cite" href="#ref-1">1</a>; Kimi k1.5<a class="cite" href="#ref-17">17</a></p>
+    <p>Rewards arrive only for the full generation, so the whole completion is one action; a pretrained policy's concentrated distribution makes REINFORCE variance "not a practical concern", so extra variance reduction at the cost of bias "is not worth it"<a class="cite" href="#ref-4">4</a> (§3.1). DeepSeekMath adds that the critic is policy-sized and hard to train from a last-token reward<a class="cite" href="#ref-1">1</a>. Kimi k1.5 states the design stance as no "value functions" in its abstract<a class="cite" href="#ref-17">17</a>.</p>
+    <ul class="pros"><li>No second model to hold, train or initialize; the estimator stays unbiased.</li><li>Ahmadian et al. report a 3.2% to 20.3% win-rate margin over PPO, and 10.3, 14.5 and 32.1 points over their PPO for RLOO \(k=4\) on TL;DR and the two HH settings<a class="cite" href="#ref-4">4</a> (§1, §5.2).</li></ul>
+    <ul class="cons"><li>Needs several samples per prompt, which costs sampling time<a class="cite" href="#ref-4">4</a> (§2.3).</li><li>No token-level credit; at low pass rates and small \(G\) the baseline barely reduces noise (Table 3, prompt B).</li></ul>
+  </article>
+  <article class="position">
+    <h4>Keep a learned per-token critic, initialized from a reward model</h4>
+    <p class="who">InstructGPT<a class="cite" href="#ref-6">6</a>; Lambert et al. (Tulu 3)<a class="cite" href="#ref-11">11</a>; Xu et al.<a class="cite" href="#ref-18">18</a></p>
+    <p>Tulu 3's RLVR ablations found that initializing the value function from a general reward model gave the best GSM8K and average scores, and the report lists value-free methods such as GRPO as future work rather than a tested alternative<a class="cite" href="#ref-11">11</a> (§6.2.1, Limitations). Xu et al. report that PPO "is able to surpass other alignment methods in all cases"<a class="cite" href="#ref-18">18</a> (Abstract); their abstract frames the comparison as PPO against DPO, so it bounds what a well-tuned actor-critic can reach, not what a critic adds over a group baseline.</p>
+    <ul class="pros"><li>Token-level advantages that can localize credit, and variance reduction without needing many samples per prompt.</li><li>Xu et al. report state-of-the-art results in challenging code competitions with PPO<a class="cite" href="#ref-18">18</a> (Abstract).</li></ul>
+    <ul class="cons"><li>A second policy-sized model and a value-learning problem with, per Lambert, no established best practice<a class="cite" href="#ref-3">3</a> (§6.2.8).</li><li>Bootstrapping (\(\lambda\lt1\)) reduced reward monotonically in Ahmadian et al.'s RLHF ablation<a class="cite" href="#ref-4">4</a> (§3.1), though GAE's authors found \(\lambda\in[0.92,0.99]\) best on continuous control<a class="cite" href="#ref-2">2</a> (§6).</li></ul>
+  </article>
+  <article class="position">
+    <h4>Finer credit from step labels instead of a critic</h4>
+    <p class="who">Shao et al. (GRPO with process supervision)<a class="cite" href="#ref-1">1</a>, against DeepSeek-R1's rejection of neural reward models<a class="cite" href="#ref-12">12</a></p>
+    <p>DeepSeekMath's GRPO with process supervision "shows superior performance compared to GRPO+OS, indicating the benefits of using fine-grained, step-aware gradient coefficients"<a class="cite" href="#ref-1">1</a> (§5.2.1, Fig. 5): token credit without a value network. R1 then chose rule-based rewards and "abstain[ed] from applying neural reward models—whether outcome-based or process-based—to reasoning tasks", reasoning that neural reward models are susceptible to reward hacking<a class="cite" href="#ref-12">12</a> (§2.2).</p>
+    <ul class="pros"><li>Measured gain over outcome supervision in the DeepSeekMath 1.3B comparison.</li></ul>
+    <ul class="cons"><li>Needs step labels or a process reward model, which R1 judged hackable at scale; Modules 4 and 18 treat both sides.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>No source runs the controlled comparison that would settle this: the same base model, data and sampling budget, with a tuned RM-initialized critic, a \(\lambda=1\) learned baseline and a group baseline, reporting both gradient variance and final pass@k. What exists is consistent with a conditional answer, and the conditions are the writer's reading. For short RLHF generations from a strong initialization, the sample baseline matches or beats a critic at lower cost<a class="cite" href="#ref-4">4</a>. For verifiable-reward reasoning with 8 or more cheap samples per prompt, the large recipes (R1 with GRPO<a class="cite" href="#ref-12">12</a>, Kimi k1.5<a class="cite" href="#ref-17">17</a>, and DAPO<a class="cite" href="#ref-13">13</a>) went critic-free, and the extra model buys little when the signal is one bit at the end. A critic is worth testing again where samples are expensive (long agentic episodes, costly environments) so that \(G\) must stay small, or where reliable step-level labels exist. Table 3 is the quantitative reason: when pass rates are low and \(G\) is small, no baseline of any kind removes most of the noise, so the choice is really between more samples and a better value estimate.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The theory in this module is settled; what moves is convention. Lambert observes that discounting at \(\gamma=1\) is justified because the reward scores the whole completion, and that as agentic RL matures, with tool calls and web actions as genuinely distinct sequential decisions, discounting "may become relevant again"<a class="cite" href="#ref-3">3</a> (§6.3.2.2); Module 18 takes up credit assignment across turns. The KL term, the critic and the ratio are each present in some published recipes and absent in others: DAPO drops the KL term<a class="cite" href="#ref-13">13</a>, GRPO drops the critic<a class="cite" href="#ref-1">1</a>, and REINFORCE and RLOO have no ratio<a class="cite" href="#ref-3">3</a>. And methods that supply a dense per-token teacher signal instead of one end-of-sequence scalar change what \(\Psi_t\) is altogether; Modules 21 and 22 cover them.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R. et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: GRPO definition and the PPO comparison (§4.1.1, Eqs. 1-4), outcome supervision (§4.1.2), training settings (§4.2), the unified gradient and Table 10 (§5.2.1, App. A.1 Eqs. 6-21), Online RFT versus GRPO and process versus outcome supervision (Fig. 5).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Schulman, J., Moritz, P., Levine, S., Jordan, M., Abbeel, P. <em>High-Dimensional Continuous Control Using Generalized Advantage Estimation</em>. ICLR 2016; arXiv v6, 20 Oct 2018. <a href="https://arxiv.org/pdf/1506.02438v6">https://arxiv.org/pdf/1506.02438v6</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the six choices of \(\Psi_t\) (Eq. 1), Proposition 1 on admissible baselines, GAE(\(\gamma,1\)) (Eqs. 15 and 18), the best \(\lambda\) range (§6).</span></li>
+  <li id="ref-3"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback (RLHF Book)</em>. arXiv v12, 11 Sep 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: RLHF as a modified RL setup (§3.1.3, Table 1), the policy-gradient derivation and the Ψ list (§6.2.1), REINFORCE and RLOO (§6.2.3-§6.2.4, Eq. 51), value functions (§6.2.7), GRPO and Dr. GRPO (§6.2.8), algorithm comparison (§6.2.11, Table 3), implementation notes and MDP versus bandit framing (§6.3, §6.3.2.2).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Ahmadian, A., Cremer, C., Gallé, M., Fadaee, M., Kreutzer, J., Pietquin, O., Üstün, A., Hooker, S. <em>Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs</em>. ACL 2024; arXiv v2, 26 Feb 2024. <a href="https://arxiv.org/pdf/2402.14740v2">https://arxiv.org/pdf/2402.14740v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the single-action argument (§1, §3.3), the token-level PPO setup (§2.1), REINFORCE and RLOO (§2.2-§2.3), the GAE-\(\lambda\) ablation (§3.1), the clipping rate (§3.2), win-rates (§5.2, Table 1).</span></li>
+  <li id="ref-5"><span class="ref-type">official</span>Farama Foundation. <em>Gymnasium documentation: Basic Usage</em>. Live documentation, 2026. <a href="https://gymnasium.farama.org/introduction/basic_usage/">https://gymnasium.farama.org/introduction/basic_usage/</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the <code>Env.step</code> return signature and the terminated versus truncated flags.</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Ouyang, L., Wu, J., Jiang, X., Almeida, D. et al. <em>Training language models to follow instructions with human feedback</em>. NeurIPS 2022; arXiv v1, 4 Mar 2022. <a href="https://arxiv.org/pdf/2203.02155v1">https://arxiv.org/pdf/2203.02155v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the bandit-environment description, per-token KL penalty, value function initialized from the RM, and the 6B RM choice (§3.5, Eq. 2).</span></li>
+  <li id="ref-7"><span class="ref-type">textbook</span>Sutton, R. S., Barto, A. G. <em>Reinforcement Learning: An Introduction</em>, 2nd ed. MIT Press, 2018. Read in the PDF copy at <a href="https://www.andrew.cmu.edu/course/10-703/textbook/BartoSutton.pdf">https://www.andrew.cmu.edu/course/10-703/textbook/BartoSutton.pdf</a> (publisher page: https://mitpress.ublish.com/book/reinforcement-learning-an-introduction-2). Accessed 2026-10-27. <span class="ref-use">Used for: Chapter 13, pp. 321-338: the policy gradient theorem (§13.2, Eq. 13.5), REINFORCE (§13.3, Eq. 13.8), baselines (§13.4, Eqs. 13.10-13.11, Fig. 13.2), the baseline versus actor-critic distinction (§13.5, p. 331), the summary (§13.8, p. 337).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Williams, R. J. <em>Simple Statistical Gradient-Following Algorithms for Connectionist Reinforcement Learning</em>. Machine Learning 8, 229-256, 1992. <a href="https://link.springer.com/content/pdf/10.1007/BF00992696.pdf">https://link.springer.com/content/pdf/10.1007/BF00992696.pdf</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the REINFORCE update form and Theorem 1 (§4, pp. 234-235), the statement on baselines (p. 236), episodic REINFORCE with one reward per episode (§5, pp. 236-237).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Schulman, J., Wolski, F., Dhariwal, P., Radford, A., Klimov, O. <em>Proximal Policy Optimization Algorithms</em>. arXiv v2, 28 Aug 2017. <a href="https://arxiv.org/pdf/1707.06347v2">https://arxiv.org/pdf/1707.06347v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the policy-gradient estimator, surrogate-loss construction and the multi-step warning (§2.1, Eqs. 1-2), the ratio and \(L^{CPI}\) (§3, Eq. 6).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Schulman, J., Levine, S., Moritz, P., Jordan, M., Abbeel, P. <em>Trust Region Policy Optimization</em>. ICML 2015; arXiv v5, 20 Apr 2017. <a href="https://arxiv.org/pdf/1502.05477v5">https://arxiv.org/pdf/1502.05477v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the performance-difference identity (§2, Eq. 1) and the importance-sampling surrogate (§5, Eq. 14).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S. et al. <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv v5, 14 Apr 2025. <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the finding that initializing the RLVR value function from a general RM works best (§6.2.1) and GRPO named as future work (Limitations).</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv v2, 4 Jan 2026 (expanded Nature version, Nature 645, 633-638, 2025). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: GRPO use, 16 samples per question, rollout temperature 1, the 8,192-output rollout split into 16 mini-batches (§2.1), and the rejection of neural reward models (§2.2).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Yu, Q., Zhang, Z., Zhu, R., Yuan, Y. et al. <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv v2, 20 May 2025. <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: zero-advantage groups and Dynamic Sampling (§3.2, Fig. 3b), KL removal (§2.3), the 512-prompt by 16-response rollout with 16 updates (§4.1).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Kimi Team (Bai, Y., Bao, Y., Charles, Y. et al.). <em>Kimi K2: Open Agentic Intelligence</em>. arXiv v2, 3 Feb 2026. <a href="https://arxiv.org/pdf/2507.20534v2">https://arxiv.org/pdf/2507.20534v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the temperature-decay schedule from exploration to exploitation (§3.2.3).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Cui, G., Zhang, Y., Chen, J., Yuan, L. et al. <em>The Entropy Mechanism of Reinforcement Learning for Reasoning Language Models</em>. arXiv v1, 28 May 2025. <a href="https://arxiv.org/pdf/2505.22617v1">https://arxiv.org/pdf/2505.22617v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the early entropy drop and performance saturation (Abstract).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Team Olmo (Ettinger, A., Bertsch, A. et al.). <em>Olmo 3</em>. arXiv v2, 14 Apr 2026. <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: sampler temperature 1.0 and top-p 1.0, offline difficulty filtering above a 62.5% pass rate, active sampling for non-zero group gradients (§4.4.2).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Kimi Team (Du, A., Gao, B., Xing, B. et al.). <em>Kimi k1.5: Scaling Reinforcement Learning with LLMs</em>. arXiv v4, 3 Jun 2025. <a href="https://arxiv.org/pdf/2501.12599v4">https://arxiv.org/pdf/2501.12599v4</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the no-value-function design stance (Abstract), the mean-reward baseline and mirror-descent objective (§2.3.2), curriculum and prioritized sampling (§2.3.4).</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Xu, S., Fu, W., Gao, J., Ye, W. et al. <em>Is DPO Superior to PPO for LLM Alignment? A Comprehensive Study</em>. ICML 2024; arXiv v3, 10 Oct 2024. <a href="https://arxiv.org/abs/2404.10719">https://arxiv.org/abs/2404.10719</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the claim that PPO surpasses other alignment methods in all cases (Abstract; only the abstract was read).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

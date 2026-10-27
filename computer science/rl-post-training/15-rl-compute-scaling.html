@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RL Compute Scaling: Sigmoidal Fits, the ScaleRL Recipe, and What Longer Runs Actually Buy · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="How to read RL training curves as compute-performance sigmoids, which design choices move the asymptote and which move only the efficiency, what ScaleRL's 100,000 GPU-hour validation shows, and how to normalize the compute claims in R1, DAPO, MiniMax-M1, Olmo 3, ProRL and DeepSeek-V3.2.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 15</p>
+  <h1>RL Compute Scaling: Sigmoidal Fits, the ScaleRL Recipe, and What Longer Runs Actually Buy</h1>
+  <p class="lede">ScaleRL's study of more than 400,000 GPU-hours fits its RL runs with a saturating sigmoid, and the fit separates what raises a recipe's ceiling from what only gets it there sooner. This module derives the fit and its limits, audits each ScaleRL design choice against the paper's own numbers, shows how little of the curve the 100,000 GPU-hour validation actually extrapolates, and gives a procedure for normalizing the compute claims in R1, DAPO, MiniMax-M1, Olmo 3, ProRL and DeepSeek-V3.2. You can fit a saturating curve to a run's early data and say whether a change moved the ceiling or only the speed.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>20</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 1</b>, <b>Module 11</b>, <b>Module 13</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 360" role="img" aria-labelledby="f1t"><title id="f1t">Three sigmoid compute-performance curves with asymptote A, steepness B and midpoint C_mid labelled; the curve with the higher asymptote starts slower and crosses the other near 28,000 GPU-hours, and a third curve has the same asymptote as the first but a later midpoint</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<line x1="80" y1="253.8" x2="740" y2="253.8" class="d-grid"/>
+<text x="72" y="257.8" text-anchor="end" class="d-small d-mono d-text-light">0.45</text>
+<line x1="80" y1="207.7" x2="740" y2="207.7" class="d-grid"/>
+<text x="72" y="211.7" text-anchor="end" class="d-small d-mono d-text-light">0.50</text>
+<line x1="80" y1="161.5" x2="740" y2="161.5" class="d-grid"/>
+<text x="72" y="165.5" text-anchor="end" class="d-small d-mono d-text-light">0.55</text>
+<line x1="80" y1="115.4" x2="740" y2="115.4" class="d-grid"/>
+<text x="72" y="119.4" text-anchor="end" class="d-small d-mono d-text-light">0.60</text>
+<line x1="80" y1="69.2" x2="740" y2="69.2" class="d-grid"/>
+<text x="72" y="73.2" text-anchor="end" class="d-small d-mono d-text-light">0.65</text>
+<text x="72" y="304.0" text-anchor="end" class="d-small d-mono d-text-light">0.40</text>
+<line x1="80" y1="60" x2="80" y2="300" class="d-axis"/>
+<line x1="80" y1="300" x2="740" y2="300" class="d-axis"/>
+<line x1="80.0" y1="300" x2="80.0" y2="305" class="d-axis"/>
+<text x="80.0" y="319" text-anchor="middle" class="d-small d-mono d-text-light">1k</text>
+<line x1="179.3" y1="300" x2="179.3" y2="305" class="d-axis"/>
+<text x="179.3" y="319" text-anchor="middle" class="d-small d-mono d-text-light">2k</text>
+<line x1="310.7" y1="300" x2="310.7" y2="305" class="d-axis"/>
+<text x="310.7" y="319" text-anchor="middle" class="d-small d-mono d-text-light">5k</text>
+<line x1="410.0" y1="300" x2="410.0" y2="305" class="d-axis"/>
+<text x="410.0" y="319" text-anchor="middle" class="d-small d-mono d-text-light">10k</text>
+<line x1="509.3" y1="300" x2="509.3" y2="305" class="d-axis"/>
+<text x="509.3" y="319" text-anchor="middle" class="d-small d-mono d-text-light">20k</text>
+<line x1="640.7" y1="300" x2="640.7" y2="305" class="d-axis"/>
+<text x="640.7" y="319" text-anchor="middle" class="d-small d-mono d-text-light">50k</text>
+<line x1="740.0" y1="300" x2="740.0" y2="305" class="d-axis"/>
+<text x="740.0" y="319" text-anchor="middle" class="d-small d-mono d-text-light">100k</text>
+<text x="410" y="342" text-anchor="middle" class="d-small d-text-light">RL compute, GPU-hours (log scale)</text>
+<text x="24" y="180" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 24 180)">validation pass rate</text>
+<line x1="80" y1="106.2" x2="740" y2="106.2" class="d-line d-dashed d-stroke-blue" style="stroke-width:1"/>
+<line x1="80" y1="73.8" x2="740" y2="73.8" class="d-line d-dashed d-stroke-orange" style="stroke-width:1"/>
+<text x="736" y="68.8" text-anchor="end" class="d-small d-mono">A = 0.645</text>
+<text x="736" y="120.2" text-anchor="end" class="d-small d-mono">A = 0.610</text>
+<polyline points="138.1,248.4 154.4,239.7 170.6,230.3 186.8,220.3 203.1,210.0 219.3,199.4 235.6,189.0 251.8,178.9 268.0,169.3 284.3,160.4 300.5,152.3 316.8,145.1 333.0,138.8 349.3,133.3 365.5,128.6 381.7,124.6 398.0,121.3 414.2,118.5 430.5,116.2 446.7,114.3 462.9,112.8 479.2,111.5 495.4,110.5 511.7,109.7 527.9,109.0 544.2,108.4 560.4,108.0 576.6,107.6 592.9,107.4 609.1,107.1 625.4,106.9 641.6,106.8 657.9,106.7 674.1,106.6 690.3,106.5 706.6,106.4 722.8,106.4 739.1,106.3" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<circle cx="213.7" cy="203.1" r="5" class="d-fill-amber"/>
+<polyline points="138.1,295.1 154.4,294.0 170.6,292.6 186.8,290.9 203.1,288.8 219.3,286.3 235.6,283.3 251.8,279.6 268.0,275.3 284.3,270.2 300.5,264.2 316.8,257.2 333.0,249.3 349.3,240.4 365.5,230.5 381.7,219.8 398.0,208.4 414.2,196.5 430.5,184.5 446.7,172.4 462.9,160.7 479.2,149.6 495.4,139.2 511.7,129.7 527.9,121.2 544.2,113.7 560.4,107.1 576.6,101.5 592.9,96.7 609.1,92.7 625.4,89.3 641.6,86.5 657.9,84.1 674.1,82.2 690.3,80.7 706.6,79.4 722.8,78.3 739.1,77.5" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+<circle cx="427.2" cy="186.9" r="5" class="d-fill-amber"/>
+<polyline points="138.1,266.9 154.4,260.7 170.6,253.6 186.8,245.7 203.1,237.0 219.3,227.7 235.6,217.9 251.8,207.9 268.0,197.7 284.3,187.8 300.5,178.2 316.8,169.3 333.0,161.0 349.3,153.5 365.5,146.8 381.7,141.0 398.0,135.9 414.2,131.6 430.5,128.0 446.7,124.9 462.9,122.3 479.2,120.2 495.4,118.5 511.7,117.0 527.9,115.9 544.2,114.9 560.4,114.1 576.6,113.5 592.9,113.0 609.1,112.5 625.4,112.2 641.6,111.9 657.9,111.7 674.1,111.5 690.3,111.4 706.6,111.3 722.8,111.2 739.1,111.1" class="d-line d-stroke-cyan d-dashed" style="stroke-width:2"/>
+<text x="222.7" y="207.1" class="d-small d-mono">C_mid 2,542</text>
+<text x="436.2" y="200.9" class="d-small d-mono">C_mid 11,272</text>
+<circle cx="558.2" cy="108.1" r="6" class="d-outline d-stroke-red" style="stroke-width:2"/>
+<path d="M518.2,160.1 L554.2,117.1" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="498.2" y="174.1" text-anchor="middle" class="d-small d-bold">curves cross, about 28k</text>
+<rect x="440" y="208" width="296" height="84" rx="6" class="d-label-bg"/>
+<line x1="450" y1="224" x2="480" y2="224" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<text x="488" y="228" class="d-small">14k tokens: B 1.92, A 0.610</text>
+<line x1="450" y1="242" x2="480" y2="242" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+<text x="488" y="246" class="d-small">32k tokens: B 1.89, A 0.645</text>
+<line x1="450" y1="260" x2="480" y2="260" class="d-line d-stroke-cyan d-dashed" style="stroke-width:2"/>
+<text x="488" y="264" class="d-small">PPO schedule: B 1.89, A 0.605</text>
+<circle cx="465" cy="278" r="5" class="d-fill-amber"/><text x="488" y="282" class="d-small">half of the gain (C_mid)</text>
+</svg>
+  <figcaption><b>Figure 1.</b> Equation 1 of ScaleRL drawn for two of its runs, using the (C<sub>mid</sub>, B, A) printed in the paper's Table 1: the base run with a 14k-token generation budget (C<sub>mid</sub> 2,542, B 1.92, A 0.610) and the run with a longer budget, listed as 32k (C<sub>mid</sub> 11,272, B 1.89, A 0.645)<a class="cite" href="#ref-1">1</a>. The pass rate at zero compute, R<sub>0</sub>, is not printed; I use R<sub>0</sub> = 0.40, near where the 8B curve starts in the paper's Figure 1, so heights are illustrative while the midpoints, shapes and the crossover follow from the printed parameters (derived). The solid curves cross at about 28k GPU-hours (24k to 31.5k for R<sub>0</sub> between 0.45 and 0.35, derived): the run with the higher ceiling stays behind until then. The dashed curve is the same full recipe with the PPO-off-policy-8 schedule (C<sub>mid</sub> 3,409, B 1.89, A 0.605; Fig. 7): the same ceiling within the 0.02 margin, reached with 34% more compute to the midpoint.</figcaption>
+</figure>
+
+<h2 id="study-design">1. What the study measured</h2>
+<p>ScaleRL (Khatri, Madaan et al.; Meta, UT Austin, UCL, Berkeley, Harvard, Periodic Labs) is the only study in this course's source set that treats RL compute as a quantity to fit rather than a budget to spend. It reports more than 400,000 GPU-hours of experiments on NVIDIA GB200 GPUs, almost all on one 8B dense model trained on a verifiable math task, and uses them to separate recipes by where their curves flatten and how quickly they get there<a class="cite" href="#ref-1">1</a> (abstract, §1). Everything in Sections 2 to 6 rests on that one paper, so the setup matters.</p>
+
+<dl class="spec-grid">
+  <div class="spec"><dt>Model</dt><dd>8B dense (main); Llama-4 Scout 17B&times;16 MoE (scale check)<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Start point</dt><dd>SFT checkpoint: about 4 epochs, 32B tokens, 32 H100 nodes<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Data and reward</dt><dd>Polaris-53K math; &plusmn;1 from Sympy or Math-Verify checkers<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Batch</dt><dd>768 completions <small>= 48 prompts &times; 16</small><a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Sequence budget</dt><dd>16,384 tokens <small>= 12,288 thinking + 2,048 solution + 2,048 prompt</small><a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Optimizer</dt><dd>AdamW, constant 5&times;10<sup>&minus;7</sup>, &epsilon; = 10<sup>&minus;15</sup>, 100 warmup steps<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>GPUs per run</dt><dd>80 GB200: 64 generators, 16 trainers<a class="cite" href="#ref-1">1</a></dd></div>
+  <div class="spec"><dt>Budget tiers</dt><dd>3.5-4K GPU-hours per design-choice run; 16K per leave-one-out run; 30K-100K for large runs<a class="cite" href="#ref-1">1</a></dd></div>
+</dl>
+
+<p>What is fitted is not a downstream benchmark. 1,000 prompts are held out from Polaris-53K, and every 100 training steps the model samples 16 generations per held-out prompt; the mean pass rate is the y value<a class="cite" href="#ref-1">1</a> (§2.1, App. A.5). The authors follow pre-training practice in fitting in-distribution held-out performance and report AIME-24 curves only as a downstream check<a class="cite" href="#ref-1">1</a> (§2.1, §7). Fits start after about 1.5k GPU-hours, roughly one epoch, because the early near-linear phase and transient instabilities do not follow the sigmoid<a class="cite" href="#ref-1">1</a> (App. A.6, A.7).</p>
+
+<h3 id="study-design-claims">1.1 Three claims, and the one this module audits</h3>
+<p>The abstract states three findings: recipes differ in their asymptotic performance; "loss aggregation, normalization, curriculum, and off-policy algorithm primarily modulate compute efficiency without materially shifting the asymptote"; and stable recipes follow predictable trajectories that extrapolate from small runs<a class="cite" href="#ref-1">1</a>. Module 11 (Section 7.2) audited the aggregation and normalization part and found the spreads inside the paper's own run-to-run margin. Section 3 here checks the rest, in particular the off-policy-algorithm clause, against the paper's forward and leave-one-out numbers, and finds that the paper itself is not consistent about it.</p>
+<p>The authors motivate the work with the growth of RL budgets: R1-Zero used 100,000 H800 GPU-hours, which they put at 3.75% of its pre-training compute, and they cite <mark class="unverified" title="Second-hand: ScaleRL §1 attributes this to OpenAI (2025) and the Grok-3 to Grok-4 comparison to xAI (2025). The OpenAI page returned HTTP 403 and the xAI page was not fetched.">more than a 10&times; increase in RL compute from o1 to o3 and a similar leap from Grok-3 to Grok-4</mark><a class="cite" href="#ref-1">1</a> (§1). The R1-Zero figure is checkable and Section 7 does so; the o1-to-o3 and Grok figures are not primary data in this course.</p>
+
+<h2 id="sigmoid-fit">2. The sigmoid and what each parameter buys</h2>
+
+<h3 id="sigmoid-fit-equation">2.1 The equation</h3>
+<p>ScaleRL's Equation 1 models the held-out pass rate \(R_C\) after \(C\) GPU-hours as</p>
+$$R_C - R_0 \;=\; (A - R_0)\,\underbrace{\frac{1}{1+(C_{mid}/C)^{B}}}_{g(C)}$$
+<p>with \(0 \le A \le 1\) the asymptotic pass rate, \(B&gt;0\) a scaling exponent that sets the steepness, and \(C_{mid}\) the compute at which half of the total gain \(A-R_0\) has been realized<a class="cite" href="#ref-1">1</a> (Eq. 1, Fig. 3). I write \(g(C)\) for the factor, the fraction of the asymptotic gain realized at compute \(C\). The text I read does not say how \(R_0\) is obtained. The authors group the parameters by role: \(B\) and \(C_{mid}\) "primarily affect the efficiency of the run" and \(A\) is the ceiling<a class="cite" href="#ref-1">1</a> (§2.1, App. A.8). Their advice follows from that split: raise \(A\) first and tune efficiency second, because a less efficient design can still end higher (Fig. 13b)<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="sigmoid-fit-derivation">2.2 What the curve implies, worked through</h3>
+<p>Three consequences follow from Equation 1 by algebra (derived), and they are what you use when reading any fit. First, the compute needed to realize a fraction \(p\) of the asymptotic gain is found by setting \(g(C)=p\):</p>
+$$C_p \;=\; C_{mid}\Big(\frac{p}{1-p}\Big)^{1/B}$$
+<p>For the base ScaleRL run (\(C_{mid}=2{,}542\), \(B=1.92\)<a class="cite" href="#ref-1">1</a>, Table 1) the 90% point is \(2{,}542\times 9^{1/1.92}=7{,}983\) GPU-hours. For the longer-context run (\(C_{mid}=11{,}272\), \(B=1.89\)) it is \(11{,}272\times 9^{1/1.89}=36{,}049\) GPU-hours, 4.5 times more. Second, the marginal return of compute, per unit of \(\ln C\), is</p>
+$$\frac{dR}{d\ln C} \;=\; (A-R_0)\,B\,g(1-g),$$
+<p>which peaks at \(g=\tfrac12\) with value \((A-R_0)B/4\). With the assumed \(R_0=0.40\), the base run gains 7.0 pass-rate points from doubling compute at \(C_{mid}\), 2.5 points at 8,000 GPU-hours (\(g=0.90\)), 0.77 points at 16,000 and 0.09 points at 50,000. Third, for \(C\gg C_{mid}\) the curve becomes \(R_C\approx A-D/C^{B}\) with \(D=(A-R_0)C_{mid}^{B}\), the identity the authors give in their Appendix A.4<a class="cite" href="#ref-1">1</a>; each doubling of compute then divides the remaining gap to \(A\) by \(2^{B}\), which is 3.78 for the base run.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 330" role="img" aria-labelledby="f2t"><title id="f2t">Share of the total asymptotic gain bought by each doubling of compute for the 14k-token and 32k-token ScaleRL runs</title>
+<line x1="70" y1="260.0" x2="760" y2="260.0" class="d-grid"/>
+<text x="62" y="264.0" text-anchor="end" class="d-small d-mono d-text-light">0</text>
+<line x1="70" y1="223.3" x2="760" y2="223.3" class="d-grid"/>
+<text x="62" y="227.3" text-anchor="end" class="d-small d-mono d-text-light">10</text>
+<line x1="70" y1="186.7" x2="760" y2="186.7" class="d-grid"/>
+<text x="62" y="190.7" text-anchor="end" class="d-small d-mono d-text-light">20</text>
+<line x1="70" y1="150.0" x2="760" y2="150.0" class="d-grid"/>
+<text x="62" y="154.0" text-anchor="end" class="d-small d-mono d-text-light">30</text>
+<line x1="70" y1="113.3" x2="760" y2="113.3" class="d-grid"/>
+<text x="62" y="117.3" text-anchor="end" class="d-small d-mono d-text-light">40</text>
+<line x1="70" y1="76.7" x2="760" y2="76.7" class="d-grid"/>
+<text x="62" y="80.7" text-anchor="end" class="d-small d-mono d-text-light">50</text>
+<line x1="70" y1="40.0" x2="760" y2="40.0" class="d-grid"/>
+<text x="62" y="44.0" text-anchor="end" class="d-small d-mono d-text-light">60</text>
+<line x1="70" y1="40" x2="70" y2="260" class="d-axis"/>
+<line x1="70" y1="260" x2="760" y2="260" class="d-axis"/>
+<text x="22" y="150" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 22 150)">% of total gain (A minus R0)</text>
+<rect x="84.0" y="162.3" width="46" height="97.7" class="d-fill-blue"/>
+<text x="107.0" y="157.3" text-anchor="middle" class="d-small d-mono">26.6</text>
+<rect x="136.0" y="252.1" width="46" height="7.9" class="d-fill-orange"/>
+<text x="159.0" y="247.1" text-anchor="middle" class="d-small d-mono">2.2</text>
+<text x="119.3" y="278" text-anchor="middle" class="d-small d-mono d-text-light">below 1.5k</text>
+<rect x="182.6" y="145.4" width="46" height="114.6" class="d-fill-blue"/>
+<text x="205.6" y="140.4" text-anchor="middle" class="d-small d-mono">31.2</text>
+<rect x="234.6" y="240.2" width="46" height="19.8" class="d-fill-orange"/>
+<text x="257.6" y="235.2" text-anchor="middle" class="d-small d-mono">5.4</text>
+<text x="217.9" y="278" text-anchor="middle" class="d-small d-mono d-text-light">1.5-3k</text>
+<rect x="281.1" y="164.7" width="46" height="95.3" class="d-fill-blue"/>
+<text x="304.1" y="159.7" text-anchor="middle" class="d-small d-mono">26.0</text>
+<rect x="333.1" y="202.4" width="46" height="57.6" class="d-fill-orange"/>
+<text x="356.1" y="197.4" text-anchor="middle" class="d-small d-mono">15.7</text>
+<text x="316.4" y="278" text-anchor="middle" class="d-small d-mono d-text-light">3-6k</text>
+<rect x="379.7" y="218.6" width="46" height="41.4" class="d-fill-blue"/>
+<text x="402.7" y="213.6" text-anchor="middle" class="d-small d-mono">11.3</text>
+<rect x="431.7" y="151.2" width="46" height="108.8" class="d-fill-orange"/>
+<text x="454.7" y="146.2" text-anchor="middle" class="d-small d-mono">29.7</text>
+<text x="415.0" y="278" text-anchor="middle" class="d-small d-mono d-text-light">6-12k</text>
+<rect x="478.3" y="247.1" width="46" height="12.9" class="d-fill-blue"/>
+<text x="501.3" y="242.1" text-anchor="middle" class="d-small d-mono">3.5</text>
+<rect x="530.3" y="158.4" width="46" height="101.6" class="d-fill-orange"/>
+<text x="553.3" y="153.4" text-anchor="middle" class="d-small d-mono">27.7</text>
+<text x="513.6" y="278" text-anchor="middle" class="d-small d-mono d-text-light">12-24k</text>
+<rect x="576.9" y="256.4" width="46" height="3.6" class="d-fill-blue"/>
+<text x="599.9" y="251.4" text-anchor="middle" class="d-small d-mono">1.0</text>
+<rect x="628.9" y="211.4" width="46" height="48.6" class="d-fill-orange"/>
+<text x="651.9" y="206.4" text-anchor="middle" class="d-small d-mono">13.3</text>
+<text x="612.1" y="278" text-anchor="middle" class="d-small d-mono d-text-light">24-48k</text>
+<rect x="675.4" y="259.0" width="46" height="1.0" class="d-fill-blue"/>
+<text x="698.4" y="254.0" text-anchor="middle" class="d-small d-mono">0.3</text>
+<rect x="727.4" y="244.0" width="46" height="16.0" class="d-fill-orange"/>
+<text x="750.4" y="239.0" text-anchor="middle" class="d-small d-mono">4.4</text>
+<text x="710.7" y="278" text-anchor="middle" class="d-small d-mono d-text-light">48-96k</text>
+<text x="415" y="300" text-anchor="middle" class="d-small d-text-light">compute interval, GPU-hours (each interval is one doubling)</text>
+<rect x="560" y="46" width="190" height="52" rx="6" class="d-label-bg"/>
+<rect x="570" y="56" width="14" height="12" class="d-fill-blue"/><text x="592" y="66" class="d-small">14k-token run</text>
+<rect x="570" y="76" width="14" height="12" class="d-fill-orange"/><text x="592" y="86" class="d-small">32k-token run</text>
+</svg>
+  <figcaption><b>Figure 2.</b> Share of each run's total asymptotic gain realized in each doubling of compute, for the 14k-token and 32k-token runs. Bars are \(g(2C)-g(C)\) from the printed (C<sub>mid</sub>, B) of the paper's Table 1; the first group is \(g(1500)\), everything realized before the fits begin. No R<sub>0</sub> is needed, so the bars are exact functions of the printed parameters (derived)<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+<p>Figure 2 makes the cost of the higher ceiling concrete. The base run has realized 26.6% of its gain before 1.5k GPU-hours, takes 57% in the next two doublings, and gains under 5% after 12k. The long-context run has realized 2.2% by 1.5k and takes 57% between 6k and 24k. A leave-one-out experiment at 16,000 GPU-hours (Section 3) therefore examines a base-recipe curve that has already realized \(g(16{,}000)=0.972\) of its gain: such experiments compare approaches to the ceiling more than rises toward it.</p>
+
+<h3 id="sigmoid-fit-power">2.3 Why a sigmoid and not a power law</h3>
+<p>Pre-training curves are usually fitted with \(R_C=A-D/C^{B}\) beyond a threshold compute. ScaleRL's Appendix A.4 gives three reasons to prefer a sigmoid for RL. Accuracy is bounded. A power law is unbounded at low compute and must be fitted past a threshold, which throws away points when a run has only about 75 evaluations to fit. And empirically it extrapolates badly: on the 100,000 GPU-hour 8B run, a power law fitted on 1.5k to 50k GPU-hours predicts \(A=1.0\) against an observed plateau near 0.65, a fit on 5k to 50k predicts 0.74, and the sigmoid gives 0.645 in both windows; the power law recovers the right asymptote only when fitted on 30k to 60k, the regime one is trying to predict<a class="cite" href="#ref-1">1</a> (App. A.4). The two forms coincide at high compute, as the identity above shows, so the sigmoid's advantage is the mid-range where most runs live.</p>
+<p>A second scaling study uses a power law and no ceiling. Tan et al. trained 63 models from the Qwen2.5 family (0.5B to 72B) with GRPO on more than 50k math problems, define test loss as \(L=1-R/R_{max}\), and fit \(\log L(N,X)=-k(N)\log X+E(N)\) for compute or data \(X\), with a learning-efficiency term \(k(N)\) that saturates at a limit \(K_{max}\) as model size grows<a class="cite" href="#ref-2">2</a> (Eqs. 1-2, §3.1). Loss falling as a pure power of compute implies the pass rate tends to 1, the behavior ScaleRL's Appendix A.4 reports failing on its data. The papers fit different quantities over different ranges and neither tests the other; the forms agree only while \(1-R\gg 1-A\) (derived reading).</p>
+
+<h3 id="sigmoid-fit-procedure">2.4 The fitting procedure, its margin, and code</h3>
+<p>The paper fits by grid search: \(A\in\{0.450,0.455,\dots,0.800\}\) and 100 linearly spaced values of \(C_{mid}\) in \([100, 40{,}000]\); for each pair, \(B\) is fitted with SciPy's <code>curve_fit</code>, and the pair with the lowest sum of squared residuals wins<a class="cite" href="#ref-1">1</a> (App. A.5). The authors release a fitting repository; its URL is printed in the paper. The function below is my transcription of that procedure; it takes \(R_0\) as an input because the paper does not say how it sets it.</p>
+<pre class="code" data-lang="python" data-title="fit_scaling_curve.py"><code>import numpy as np
+from scipy.optimize import curve_fit
+
+def sigmoid(C, B, A, Cmid, R0):
+    return R0 + (A - R0) / (1.0 + (Cmid / C) ** B)
+
+def fit_scaling_curve(C, R, R0, c_start=1500.0):
+    """Grid over (A, Cmid) as in ScaleRL App. A.5; B by least squares.
+    C: GPU-hours at each evaluation; R: held-out pass rate (mean@16)."""
+    keep = C &gt;= c_start               # fits skip the first ~1.5k GPU-hours
+    C, R = C[keep], R[keep]
+    best = None
+    for A in np.arange(0.450, 0.8001, 0.005):
+        for Cmid in np.linspace(100, 40000, 100):
+            f = lambda c, B: sigmoid(c, B, A, Cmid, R0)
+            try:
+                (B,), _ = curve_fit(f, C, R, p0=[2.0], bounds=(0.1, 20.0))
+            except RuntimeError:
+                continue
+            sse = float(np.sum((f(C, B) - R) ** 2))
+            if best is None or sse &lt; best[0]:
+                best = (sse, float(A), float(B), float(Cmid))
+    return dict(sse=best[0], A=best[1], B=best[2], Cmid=best[3])</code></pre>
+<p>The margin comes from replication. Three independent ScaleRL runs with the same settings gave fitted \(A\) varying by at most \(\pm0.015\), so the authors adopt 0.02 as the error margin on \(A\); their printed fits are (B, A) = (1.92, 0.610), (1.97, 0.610) and (2.20, 0.595)<a class="cite" href="#ref-1">1</a> (App. A.5, Fig. 8a). They do not give a margin for \(B\), because algorithms with different \(A\) have different \(B\) errors. Their rule is that if two methods have \(A\) within 0.02, the one with the higher \(B\) after refitting with a common \(A\) is at least as efficient<a class="cite" href="#ref-1">1</a> (App. A.5). One consequence: across three identical runs \(B\) spans 1.92 to 2.20, 15% of its smallest value (derived), so efficiency differences of that size cannot be separated from replication noise.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> Sensitivity of the fit to its window, 100,000 GPU-hour run on the 8B dense model<a class="cite" href="#ref-1">1</a> (App. A.7). The asymptote moves by 0.010; the exponent by 0.14.</caption>
+  <thead><tr><th>Fitting window (GPU-hours)</th><th class="num">B</th><th class="num">A</th></tr></thead>
+  <tbody>
+    <tr><td>1.5k to 50k (the paper's default)</td><td class="num">1.70</td><td class="num">0.645</td></tr>
+    <tr><td>5k to 50k</td><td class="num">1.67</td><td class="num">0.645</td></tr>
+    <tr><td>0 to 50k</td><td class="num">1.7</td><td class="num">0.645</td></tr>
+    <tr><td>0 to 100k</td><td class="num">1.56</td><td class="num">0.655</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>The procedure transfers to your own runs with four changes of habit taken from the paper: hold out about 1,000 prompts and evaluate every 100 steps with 16 samples each; discard the first epoch before fitting; fit the first half of the run and check the second half (every leave-one-out run was fitted to 8,000 GPU-hours and extrapolated to 16,000); and watch the truncation rate, because at batch 768 truncation of 10% to 15% of generations destabilized training and did not recover without intervention<a class="cite" href="#ref-1">1</a> (§3, App. A.6, A.15). A fitted \(A\) is only meaningful for a run that stays stable long enough for the fit to see the bend.</p></aside>
+
+<h2 id="asymptote">3. Which choices move the asymptote</h2>
+<p>Two things are tangled in every recipe comparison: where the curve flattens (\(A\)) and how fast it gets there (\(B\), \(C_{mid}\)). Figure 3 collects every fitted \(A\) the paper prints for a before-and-after pair, with the 0.02 replication margin as a scale bar. The abstract's claim about "details" survives in the leave-one-out block and for aggregation and normalization, and fails for loss type, precision and the lag bound.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 460" role="img" aria-labelledby="f3t"><title id="f3t">Fitted asymptote A before and after each design change in ScaleRL, with the plus or minus 0.02 run-to-run margin shown as a scale bar</title>
+<line x1="397.7" y1="50" x2="397.7" y2="394" class="d-grid"/>
+<text x="397.7" y="44" text-anchor="middle" class="d-small d-mono d-text-light">0.50</text>
+<line x1="482.3" y1="50" x2="482.3" y2="394" class="d-grid"/>
+<text x="482.3" y="44" text-anchor="middle" class="d-small d-mono d-text-light">0.55</text>
+<line x1="566.9" y1="50" x2="566.9" y2="394" class="d-grid"/>
+<text x="566.9" y="44" text-anchor="middle" class="d-small d-mono d-text-light">0.60</text>
+<line x1="651.5" y1="50" x2="651.5" y2="394" class="d-grid"/>
+<text x="651.5" y="44" text-anchor="middle" class="d-small d-mono d-text-light">0.65</text>
+<line x1="736.2" y1="50" x2="736.2" y2="394" class="d-grid"/>
+<text x="736.2" y="44" text-anchor="middle" class="d-small d-mono d-text-light">0.70</text>
+<text x="14" y="74.0" class="d-small">Loss type: DAPO to CISPO</text>
+<line x1="431.5" y1="70.0" x2="558.5" y2="70.0" class="d-line d-stroke-orange" style="stroke-width:3"/>
+<circle cx="431.5" cy="70.0" r="5" class="d-outline d-stroke-orange" style="stroke-width:2"/>
+<circle cx="558.5" cy="70.0" r="4" class="d-fill-orange"/>
+<text x="14" y="98.0" class="d-small">LM-head precision: BF16 to FP32</text>
+<line x1="431.5" y1="94.0" x2="583.8" y2="94.0" class="d-line d-stroke-orange" style="stroke-width:3"/>
+<circle cx="431.5" cy="94.0" r="5" class="d-outline d-stroke-orange" style="stroke-width:2"/>
+<circle cx="583.8" cy="94.0" r="4" class="d-fill-orange"/>
+<text x="14" y="122.0" class="d-small">Zero-variance filtering: off to on</text>
+<line x1="431.5" y1="118.0" x2="465.4" y2="118.0" class="d-line d-stroke-blue" style="stroke-width:3"/>
+<circle cx="431.5" cy="118.0" r="5" class="d-outline d-stroke-blue" style="stroke-width:2"/>
+<circle cx="465.4" cy="118.0" r="4" class="d-fill-blue"/>
+<text x="14" y="146.0" class="d-small">Prompt curriculum: uniform to NPR</text>
+<line x1="431.5" y1="142.0" x2="456.9" y2="142.0" class="d-line d-stroke-blue" style="stroke-width:3"/>
+<circle cx="431.5" cy="142.0" r="5" class="d-outline d-stroke-blue" style="stroke-width:2"/>
+<circle cx="456.9" cy="142.0" r="4" class="d-fill-blue"/>
+<text x="14" y="170.0" class="d-small">Loss aggregation: sample to prompt</text>
+<line x1="431.5" y1="166.0" x2="456.9" y2="166.0" class="d-line d-stroke-blue" style="stroke-width:3"/>
+<circle cx="431.5" cy="166.0" r="5" class="d-outline d-stroke-blue" style="stroke-width:2"/>
+<circle cx="456.9" cy="166.0" r="4" class="d-fill-blue"/>
+<text x="14" y="194.0" class="d-small">Advantage norm: prompt to batch</text>
+<line x1="431.5" y1="190.0" x2="448.5" y2="190.0" class="d-line d-stroke-blue" style="stroke-width:3"/>
+<circle cx="431.5" cy="190.0" r="5" class="d-outline d-stroke-blue" style="stroke-width:2"/>
+<circle cx="448.5" cy="190.0" r="4" class="d-fill-blue"/>
+<text x="14" y="218.0" class="d-small">Async: PPO-off-pol-8 to PipelineRL-8</text>
+<circle cx="431.5" cy="214.0" r="5" class="d-outline d-stroke-blue" style="stroke-width:2"/>
+<circle cx="431.5" cy="214.0" r="4" class="d-fill-blue"/>
+<text x="440.5" y="218.0" class="d-small d-mono d-text-light">equal</text>
+<text x="14" y="242.0" class="d-small">PipelineRL max lag k: 8 to 12</text>
+<line x1="431.5" y1="238.0" x2="380.8" y2="238.0" class="d-line d-stroke-orange" style="stroke-width:3"/>
+<circle cx="431.5" cy="238.0" r="5" class="d-outline d-stroke-orange" style="stroke-width:2"/>
+<circle cx="380.8" cy="238.0" r="4" class="d-fill-orange"/>
+<text x="14" y="266.0" class="d-small">Generation length: 14k to 32k</text>
+<line x1="583.8" y1="262.0" x2="643.1" y2="262.0" class="d-line d-stroke-orange" style="stroke-width:3"/>
+<circle cx="583.8" cy="262.0" r="5" class="d-outline d-stroke-orange" style="stroke-width:2"/>
+<circle cx="643.1" cy="262.0" r="4" class="d-fill-orange"/>
+<text x="14" y="290.0" class="d-small">Batch: 768 to 2048</text>
+<line x1="583.8" y1="286.0" x2="643.1" y2="286.0" class="d-line d-stroke-orange" style="stroke-width:3"/>
+<circle cx="583.8" cy="286.0" r="5" class="d-outline d-stroke-orange" style="stroke-width:2"/>
+<circle cx="643.1" cy="286.0" r="4" class="d-fill-orange"/>
+<text x="14" y="314.0" class="d-small">Generations per prompt: 8 to 32</text>
+<line x1="541.5" y1="310.0" x2="583.8" y2="310.0" class="d-line d-stroke-orange" style="stroke-width:3"/>
+<circle cx="541.5" cy="310.0" r="5" class="d-outline d-stroke-orange" style="stroke-width:2"/>
+<circle cx="583.8" cy="310.0" r="4" class="d-fill-orange"/>
+<text x="14" y="338.0" class="d-small">Model: 8B dense to 17Bx16 MoE</text>
+<line x1="583.8" y1="334.0" x2="753.1" y2="334.0" class="d-line d-stroke-orange" style="stroke-width:3"/>
+<circle cx="583.8" cy="334.0" r="5" class="d-outline d-stroke-orange" style="stroke-width:2"/>
+<circle cx="753.1" cy="334.0" r="4" class="d-fill-orange"/>
+<text x="14" y="362.0" class="d-small">Leave one out, eight reversions</text>
+<line x1="550.0" y1="358.0" x2="583.8" y2="358.0" class="d-line d-stroke-blue" style="stroke-width:3"/>
+<circle cx="550.0" cy="358.0" r="5" class="d-outline d-stroke-blue" style="stroke-width:2"/>
+<circle cx="583.8" cy="358.0" r="4" class="d-fill-blue"/>
+<text x="14" y="386.0" class="d-small">Recipe: DeepSeek GRPO to ScaleRL</text>
+<line x1="380.8" y1="382.0" x2="583.8" y2="382.0" class="d-line d-stroke-orange" style="stroke-width:3"/>
+<circle cx="380.8" cy="382.0" r="5" class="d-outline d-stroke-orange" style="stroke-width:2"/>
+<circle cx="583.8" cy="382.0" r="4" class="d-fill-orange"/>
+<line x1="397.7" y1="408" x2="465.4" y2="408" class="d-line d-stroke-red" style="stroke-width:3"/>
+<text x="475.4" y="412" class="d-small">scale bar: ±0.02 run-to-run (three identical ScaleRL runs)</text>
+<circle cx="22.0" cy="432" r="5" class="d-outline d-stroke-blue" style="stroke-width:2"/><text x="34.0" y="436" class="d-small">before</text>
+<circle cx="98.0" cy="432" r="4" class="d-fill-blue"/><text x="110.0" y="436" class="d-small">after (blue: within 0.02; orange: beyond)</text>
+<text x="14" y="454" class="d-small d-text-light">top block: forward tests; then scaling axes; then leave one out; then whole recipe</text>
+</svg>
+  <figcaption><b>Figure 3.</b> Fitted asymptote \(A\) before (open circle) and after (filled) each change in ScaleRL, 8B dense model unless the row says otherwise. Blue segments are within the 0.02 run-to-run margin, orange segments exceed it. Forward tests start from a baseline with \(A=0.520\); scaling axes and leave-one-out start from the full recipe (\(A=0.610\)); the leave-one-out row spans the eight reversions of Table 3. One run per point. Values transcribed from the paper's Figs. 2, 4, 5, 6, 7, 14 and Table 1<a class="cite" href="#ref-1">1</a>; the whole-recipe row compares the authors' re-implementation of the R1 recipe with ScaleRL (Table 2).</figcaption>
+</figure>
+
+<h3 id="asymptote-recipes">3.1 Recipes differ in ceiling</h3>
+<p>The authors re-implemented four published recipes inside their own framework and fitted them next to ScaleRL (Figure 2 and Appendix A.16 of the paper). The ceilings differ by 0.12, six times the replication margin.</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 2.</b> Prevalent recipes as re-run by the ScaleRL authors on the 8B dense model and Polaris-53K, with fitted B and A<a class="cite" href="#ref-1">1</a> (Fig. 2, App. A.16). These are re-implementations in one codebase, not the original labs' systems.</caption>
+  <thead><tr><th>Recipe</th><th>Loss</th><th>Off-policy scheme</th><th>Batch (completions)</th><th class="num">B</th><th class="num" data-best>A</th></tr></thead>
+  <tbody>
+    <tr><td class="row">ScaleRL</td><td>CISPO, prompt average</td><td>PipelineRL-8</td><td>768</td><td class="num">1.97</td><td class="num" data-best>0.610</td></tr>
+    <tr><td class="row">MiniMax-M1<a class="cite" href="#ref-3">3</a></td><td>CISPO, FP32 LM head, prompt average</td><td>PPO-off-policy</td><td>1,280 (80 &times; 16), zero-variance prompts dropped</td><td class="num">1.77</td><td class="num" data-best>0.610</td></tr>
+    <tr><td class="row">Magistral</td><td>DAPO-style</td><td>PipelineRL</td><td>not stated in the passage read</td><td class="num">1.44</td><td class="num">0.535</td></tr>
+    <tr><td class="row">Qwen2.5 recipe (DAPO)<a class="cite" href="#ref-4">4</a></td><td>DAPO loss, &epsilon;<sub>max</sub> 0.26, prompt average</td><td>PPO-off-policy-8</td><td>1,280, zero-variance prompts dropped</td><td class="num">1.85</td><td class="num">0.515</td></tr>
+    <tr><td class="row">DeepSeek recipe (GRPO)<a class="cite" href="#ref-5">5</a></td><td>GRPO, &epsilon; 0.2, sample average</td><td>PPO-off-policy-8</td><td>not stated; base setup is 768</td><td class="num">1.17</td><td class="num" data-worst>0.490</td></tr>
+  </tbody>
+</table>
+<p>Two details qualify the table. DAPO and MiniMax were given a larger batch because the authors' codebase could not refill a batch as DAPO's dynamic sampling does, which if anything advantaged DAPO<a class="cite" href="#ref-1">1</a> (App. A.16). The GRPO run became unstable after about 6k GPU-hours as truncations rose, and extended runs "align closely with the extrapolated curves for stable recipes like ScaleRL and MiniMax"<a class="cite" href="#ref-1">1</a> (Fig. 2 caption). Whether the original labs' systems show the same ceilings is untested here.</p>
+
+<h3 id="asymptote-forward">3.2 Forward tests: large moves, from a weak baseline</h3>
+<p>The forward ablations start from a GRPO-like baseline without a KL term and with DAPO's asymmetric clip, adopt PipelineRL-8, and fit each variant at 3.5k to 4k GPU-hours<a class="cite" href="#ref-1">1</a> (§2, §3.2). The legends of the paper's Figures 5a, 5b, 6a and 6b print: DAPO loss \(A=0.520\) (\(B=4.55\)), GSPO 0.590 (1.80), CISPO 0.595 (2.18); BF16 head 0.520 (4.55) against FP32 head 0.610 (1.79); no zero-variance filtering 0.520 (4.55) against filtering 0.540 (2.68); uniform prompt sampling 0.520 (4.55) against No-Positive-Resampling 0.535 (3.85)<a class="cite" href="#ref-1">1</a>. Aggregation and normalization (App. A.9) span only 0.015 and 0.010 in \(A\); Module 11 (Section 7.2) reads them against the margin and Module 12 (Table 2) tabulates the loss-type comparison.</p>
+<p>Two features matter for reading these fits. First, \(B\) moves opposite to \(A\): the baseline (\(A=0.520\), \(B=4.55\)) is the control in each pair, every variant with a higher \(A\) has a lower \(B\) (1.79 to 3.85), and the lag-bound variants at or below baseline \(A\) have \(B\) of 4.14 and 4.22. A curve that flattens early at a low ceiling is steep, which is why the paper pins \(A\) before comparing efficiency. Second, the clip constant alone moves the ceiling: sweeping \(\epsilon_{max}\) in the DAPO-style loss gave \(A=0.500, 0.500, 0.510, 0.520, 0.530, 0.480\) for \(\epsilon_{max}=0.20, 0.22, 0.23, 0.25, 0.26, 0.27\), with \(B\) wandering between 1.78 and 7.32<a class="cite" href="#ref-1">1</a> (Fig. 19a). The authors read this as \(\epsilon_{max}\) governing "the asymptotic error itself"; one run per value and a 0.05 range (2.5 times the margin) make it real but coarse, and the spread in \(B\) shows how little a short fit says about efficiency.</p>
+
+<h3 id="asymptote-loo">3.3 Leave-one-out: ceilings converge, costs do not</h3>
+<p>Starting from the full recipe and reverting one choice at a time, at 16,000 GPU-hours each, all eight variants have a fitted \(A\) between 0.590 and 0.610<a class="cite" href="#ref-1">1</a> (Fig. 7). The paper compares efficiency by averaging \(A\) over the runs (0.605), refitting, and comparing the slope \(B\); Module 11 (Figure 7 there) plots those pinned values. The paper never converts them to GPU-hours, so I do: from the printed \(C_{mid}\), \(B\), \(A\) of each variant, the compute to reach a fixed pass rate of 0.57 is \(C_{mid}\,(p/(1-p))^{1/B}\) with \(p=(0.57-R_0)/(A-R_0)\), using the assumed \(R_0=0.40\) and checking \(R_0\in\{0.35,0.45\}\).</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 3.</b> What each reversion costs in GPU-hours to reach a held-out pass rate of 0.57, 8B dense model, leave-one-out runs<a class="cite" href="#ref-1">1</a> (Fig. 7 values for C<sub>mid</sub>, B, A). The last two columns are derived with an assumed R<sub>0</sub>; the full recipe needs 5,401 GPU-hours at R<sub>0</sub> = 0.40 (6,177 at 0.35; 4,505 at 0.45). No margin is printed for B.</caption>
+  <thead><tr><th>Reversion from the full recipe</th><th class="num">C<sub>mid</sub> (GPU-h)</th><th class="num">B</th><th class="num">A</th><th class="num">GPU-hours to 0.57 (R<sub>0</sub> 0.40)</th><th class="num">Cost vs full recipe</th><th class="num">Range over R<sub>0</sub> 0.35-0.45</th></tr></thead>
+  <tbody>
+    <tr><td class="row">PPO-off-policy-8 instead of PipelineRL-8</td><td class="num">3,409</td><td class="num">1.89</td><td class="num">0.605</td><td class="num">7,867</td><td class="num" data-worst>1.46&times;</td><td class="num">1.45 to 1.46</td></tr>
+    <tr><td class="row">No zero-variance filtering</td><td class="num">2,583</td><td class="num">1.84</td><td class="num">0.595</td><td class="num">7,321</td><td class="num">1.36&times;</td><td class="num">1.34 to 1.36</td></tr>
+    <tr><td class="row">DAPO loss instead of CISPO</td><td class="num">3,093</td><td class="num">1.77</td><td class="num">0.610</td><td class="num">7,005</td><td class="num">1.30&times;</td><td class="num">1.28 to 1.31</td></tr>
+    <tr><td class="row">Uniform prompt sampling (no NPR)</td><td class="num">2,621</td><td class="num">1.62</td><td class="num">0.605</td><td class="num">6,953</td><td class="num">1.29&times;</td><td class="num">1.24 to 1.32</td></tr>
+    <tr><td class="row">Prompt-level advantage normalization</td><td class="num">2,463</td><td class="num">2.09</td><td class="num">0.590</td><td class="num">6,857</td><td class="num">1.27&times;</td><td class="num">1.26 to 1.29</td></tr>
+    <tr><td class="row">Sample-average loss aggregation</td><td class="num">2,621</td><td class="num">1.93</td><td class="num">0.600</td><td class="num">6,439</td><td class="num">1.19&times;</td><td class="num">1.19</td></tr>
+    <tr><td class="row">Length penalty instead of interruptions</td><td class="num">2,660</td><td class="num">1.68</td><td class="num">0.610</td><td class="num">6,294</td><td class="num">1.17&times;</td><td class="num">1.14 to 1.19</td></tr>
+    <tr><td class="row">No FP32 at the LM head</td><td class="num">2,857</td><td class="num">1.88</td><td class="num">0.610</td><td class="num" data-best>6,168</td><td class="num" data-best>1.14&times;</td><td class="num">1.14 to 1.15</td></tr>
+  </tbody>
+</table>
+<p>Read with the replication caveat of Section 2.4, the table supports three statements. The ceilings converge once the stability fixes are in place. The off-policy scheme and the loss type are the costliest reversions, matching the paper's list of "the most important decisions": off-policy algorithm, loss function and model precision<a class="cite" href="#ref-1">1</a> (§7). Precision is the exception inside this recipe: the FP32 head is the cheapest reversion on a dense 8B model, where the paper says the fix "makes little difference" within ScaleRL but gives "large gains in GRPO/DAPO-style losses"<a class="cite" href="#ref-1">1</a> (§4), and on the 17B&times;16 MoE its removal lowers the fitted \(A\) from 0.710 to 0.700 (Fig. 8b); Module 14 covers why the head matters. What the table does not support is reading "efficiency only" as unimportant: aggregation, normalization and curriculum, which the abstract files under efficiency, cost 19% to 29% more GPU-hours to a fixed score, though a gap in \(B\) under about 15% cannot be separated from replication (derived).</p>
+
+<h3 id="asymptote-cautions">3.4 Two cautions on the forward numbers</h3>
+<p>The paper is not consistent about the off-policy algorithm. The abstract lists it among the details that "primarily modulate compute efficiency"<a class="cite" href="#ref-1">1</a>, while Appendix A.11 says the PipelineRL-versus-PPO distinction "affects the asymptotic performance c of the scaling curve, not just the efficiency exponent b. Very few axes shift the asymptote in this way". The numbers favor the abstract for the choice of schedule (\(A=0.520\) for PPO-off-policy-1, PPO-off-policy-8 and PipelineRL-8, Fig. 4a) and A.11 for the lag bound (\(A=0.490\) at \(k=12\) against 0.520 at \(k=4\) and \(k=8\), Fig. 4b)<a class="cite" href="#ref-1">1</a>.</p>
+<p>The forward \(A\) values are also extrapolations from runs that were about to fail. The baseline destabilizes beyond about 3,500 GPU-hours as truncations exceed 10% of generations; variants survive to about 5k (\(\epsilon_{max}=0.26\)), 6k (FP32 head) and 7k (CISPO) GPU-hours<a class="cite" href="#ref-1">1</a> (App. A.6). A fitted \(A=0.520\) is where an unstable recipe's curve bent before it broke, not a measured ceiling. The leave-one-out numbers, from a recipe stable to 100k, are the cleaner evidence about a single choice; the forward numbers measure "survives longer and flattens higher" jointly.</p>
+
+<h2 id="recipe">4. The ScaleRL recipe, component by component</h2>
+<p>ScaleRL achieves predictable scaling "by integrating existing methods, rather than inventing novel methods": an asynchronous PipelineRL setup with a maximum lag of 8, forced length interruptions, the CISPO loss, prompt-level loss averaging, batch-level advantage normalization, FP32 logits, zero-variance filtering and No-Positive-Resampling<a class="cite" href="#ref-1">1</a> (§1, §4). Its objective, with \(\mathrm{sg}\) the stop-gradient and \(\rho_{i,t}\) the token-level ratio of trainer to generator probability, is</p>
+$$\mathcal J_{\text{ScaleRL}}(\theta)=\mathbb E\Bigg[\frac{1}{\sum_{g=1}^{G}|y_g|}\sum_{i=1}^{G}\sum_{t=1}^{|y_i|}\mathrm{sg}\big(\min(\rho_{i,t},\epsilon)\big)\,\hat A_i^{\mathrm{norm}}\,\log\pi^{\theta}_{train}(y_{i,t})\Bigg],\qquad \hat A_i^{\mathrm{norm}}=\hat A_i/\hat A_{std},$$
+<p>restricted to prompts with \(0&lt;\mathrm{mean}(r)&lt;1\) and a historical pass rate below 0.9<a class="cite" href="#ref-1">1</a> (§4). Here \(\hat A_i=r_i-\mathrm{mean}(r)\) is the group-centered advantage and \(\hat A_{std}\) the standard deviation of all such advantages in the batch. Module 11 derives the token weights this implies and Module 12 covers CISPO's gradient; Table 4 records what each component is for and what the paper printed for it.</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 4.</b> ScaleRL components, the paper's stated reason, and the evidence it prints (8B dense, math)<a class="cite" href="#ref-1">1</a> (§3-§4, App. A.9-A.11, A.17). Forward = from the weak baseline (A 0.520); LOO = reverted from the full recipe (A 0.610); costs from Table 3.</caption>
+  <thead><tr><th>Component</th><th>Setting</th><th>Paper's reason</th><th>Evidence</th><th>See</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Off-policy schedule</td><td>PipelineRL, lag k = 8</td><td>Streaming generation cuts idle time and stays closer to on-policy</td><td>Forward: B 4.55 vs 2.68, A equal at 0.520. LOO: 1.46&times; GPU-hours</td><td>Section 5; Module 1</td></tr>
+    <tr><td class="row">Length control</td><td>Forced interruption: append "Okay, time is up. Let me stop thinking and formulate a final answer now. &lt;/think&gt;" at a random position in 10k-12k tokens</td><td>Truncated generations destabilize training</td><td>LOO length penalty: A 0.610, 1.17&times;. Swapping in a length penalty "does not improve performance"</td><td>Module 23</td></tr>
+    <tr><td class="row">Loss type</td><td>CISPO, token level, \(\mathrm{sg}(\min(\rho,\epsilon))\)</td><td>Clip the importance weight, keep every token's gradient; robust to \(\epsilon_{max}\in\{4,5,8\}\)</td><td>Forward: A 0.595 vs DAPO 0.520; GSPO 0.590. LOO DAPO: 1.30&times;</td><td>Module 12</td></tr>
+    <tr><td class="row">Loss aggregation</td><td>Prompt average</td><td>"Achieves the highest asymptotic performance"</td><td>Forward A: prompt 0.535, token 0.535, sample 0.520. LOO sample: 1.19&times;</td><td>Module 11</td></tr>
+    <tr><td class="row">Advantage normalization</td><td>Batch level: divide group-centered advantages by the std of all advantages in the batch</td><td>"Theoretically sound and marginally better"; all three variants "similar"</td><td>Forward A: none 0.525, batch 0.530, prompt 0.520. LOO prompt-level: 1.27&times;</td><td>Module 11</td></tr>
+    <tr><td class="row">Precision</td><td>FP32 at the LM head, generator and trainer</td><td>Generator and trainer kernels disagree most at the head</td><td>Forward A 0.520 to 0.610. LOO dense: 1.14&times;. Scout LOO: A 0.710 vs 0.700</td><td>Module 14</td></tr>
+    <tr><td class="row">Zero-variance filtering</td><td>Drop prompts with all-equal rewards from the loss; no refill</td><td>Zero advantage means zero gradient; shrinks the effective batch</td><td>Forward A 0.520 to 0.540. LOO: 1.36&times;</td><td>Module 11</td></tr>
+    <tr><td class="row">Curriculum</td><td>No-Positive-Resampling: drop prompts whose historical pass rate reaches 0.9</td><td>Once easy, a prompt stays easy and costs compute without signal</td><td>Forward A 0.520 to 0.535. LOO uniform sampling: 1.29&times;</td><td>Module 11</td></tr>
+  </tbody>
+</table>
+<p>Two points about the table. "Batch-level" normalization means different things in two codebases. ScaleRL divides the group-centered advantages by the standard deviation of the advantages in the batch; TRL's <code>scale_rewards="batch"</code> pairs the group mean with a batch-level standard deviation, of the rewards in Module 11's reading of the source<a class="cite" href="#ref-6">6</a>. Both apply one scalar per batch, but they are not the same scalar (Module 11, Section 3.2). And the loss-type row hides a stability result that Module 12 (Section 4.5) develops: the paper's GSPO runs "diverged mid-training" on multiple occasions, restarting from a stable checkpoint recovered the 8B runs, and on the 17B&times;16 MoE "instability persisted despite repeated resetting to a stable checkpoint", with no implementation bug found<a class="cite" href="#ref-1">1</a> (App. A.17.4). The GSPO ceiling (0.590) is within 0.005 of CISPO's, so the choice of CISPO rests on stability and on robustness to its clip constant, not on the asymptote.</p>
+<p>What the recipe leaves out is also a choice. The base algorithm has no KL term "in line with large-scale training reports", rewards are \(\pm1\), and generations per prompt stay at 16<a class="cite" href="#ref-1">1</a> (§2, App. A.3). Module 13 covers the keep-or-remove-KL disagreement. The one monitoring signal the authors insist on is the truncation rate, because instabilities in their runs "were often linked to truncations"<a class="cite" href="#ref-1">1</a> (App. A.15).</p>
+<div class="kpis">
+  <div class="kpi kpi-red"><b>10-15%</b><span>truncation at batch 768 destabilized training<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-green"><b>&lt; 5%</b><span>ScaleRL, 8B dense, for over 90% of training<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-amber"><b>about 7%</b><span>ScaleRL at batch 2048, occasionally<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-cyan"><b>&lt; 2%</b><span>ScaleRL on the 17B&times;16 MoE throughout<a class="cite" href="#ref-1">1</a></span></div>
+</div>
+
+<h2 id="pipeline">5. PipelineRL against PPO-off-policy: where the efficiency comes from</h2>
+<p>The one design choice the paper treats as independent of all the others is the asynchronous schedule<a class="cite" href="#ref-1">1</a> (§3.1). PPO-off-policy-k, the default asynchronous scheme in Qwen3 and ProRL, has the old policy generate for a batch of \(B\) prompts; each gradient update consumes a minibatch of \(\hat B=48\) prompts, so one generation batch feeds \(k=B/\hat B\) updates, and the paper tests \(k\in\{1,8\}\). PipelineRL-k, from Piche et al. and used by Magistral, streams: generators run continuously, whenever the trainers finish an update the new weights are pushed to them at once, and they continue "with the updated weights but a stale KV cache from the old policy"; the trainers wait only if they get \(k\) steps ahead of the generators<a class="cite" href="#ref-1">1</a> (§3.1).</p>
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f4t"><title id="f4t">Schematic of two asynchronous RL schedules: alternating generation and training phases with idle lanes, against streaming generation with in-flight weight updates</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="14" y="22" class="d-bold">a. PPO-off-policy-k: alternating phases</text>
+<text x="14" y="62" class="d-small">generators</text><text x="14" y="102" class="d-small">trainers</text>
+<rect x="120" y="48" width="150" height="26" rx="3" class="d-block"/><text x="195.0" y="65.0" text-anchor="middle" class="d-small d-text-inv">batch of k x 48 prompts</text>
+<rect x="270" y="48" width="60" height="26" rx="3" class="d-fill-blue-soft"/><text x="300.0" y="65.0" text-anchor="middle" class="d-small">tail</text>
+<rect x="330" y="48" width="120" height="26" rx="3" class="d-outline d-dashed"/><text x="390.0" y="65.0" text-anchor="middle" class="d-small d-text-light">idle</text>
+<rect x="450" y="48" width="150" height="26" rx="3" class="d-block"/><text x="525.0" y="65.0" text-anchor="middle" class="d-small d-text-inv">next batch</text>
+<rect x="600" y="48" width="60" height="26" rx="3" class="d-fill-blue-soft"/><text x="630.0" y="65.0" text-anchor="middle" class="d-small">tail</text>
+<rect x="660" y="48" width="120" height="26" rx="3" class="d-outline d-dashed"/><text x="720.0" y="65.0" text-anchor="middle" class="d-small d-text-light">idle</text>
+<rect x="120" y="88" width="210" height="26" rx="3" class="d-outline d-dashed"/><text x="225.0" y="105.0" text-anchor="middle" class="d-small d-text-light">idle</text>
+<rect x="332" y="88" width="27" height="26" rx="3" class="d-block-accent"/><text x="345.5" y="105.0" text-anchor="middle" class="d-small d-text-inv">1</text>
+<rect x="361" y="88" width="27" height="26" rx="3" class="d-block-accent"/><text x="374.5" y="105.0" text-anchor="middle" class="d-small d-text-inv">2</text>
+<rect x="390" y="88" width="27" height="26" rx="3" class="d-block-accent"/><text x="403.5" y="105.0" text-anchor="middle" class="d-small d-text-inv">3</text>
+<rect x="419" y="88" width="27" height="26" rx="3" class="d-block-accent"/><text x="432.5" y="105.0" text-anchor="middle" class="d-small d-text-inv">4</text>
+<rect x="450" y="88" width="210" height="26" rx="3" class="d-outline d-dashed"/><text x="555.0" y="105.0" text-anchor="middle" class="d-small d-text-light">idle</text>
+<rect x="662" y="88" width="27" height="26" rx="3" class="d-block-accent"/><text x="675.5" y="105.0" text-anchor="middle" class="d-small d-text-inv">1</text>
+<rect x="691" y="88" width="27" height="26" rx="3" class="d-block-accent"/><text x="704.5" y="105.0" text-anchor="middle" class="d-small d-text-inv">2</text>
+<rect x="720" y="88" width="27" height="26" rx="3" class="d-block-accent"/><text x="733.5" y="105.0" text-anchor="middle" class="d-small d-text-inv">3</text>
+<rect x="749" y="88" width="27" height="26" rx="3" class="d-block-accent"/><text x="762.5" y="105.0" text-anchor="middle" class="d-small d-text-inv">4</text>
+<line x1="450" y1="40" x2="450" y2="122" class="d-line d-stroke-red d-dashed" style="stroke-width:1.5"/>
+<text x="454" y="136" class="d-small d-mono">weights pushed after k updates</text>
+<text x="14" y="150" class="d-bold">b. PipelineRL-k: streaming generation, in-flight updates</text>
+<text x="14" y="208" class="d-small">generators</text><text x="14" y="248" class="d-small">trainers</text>
+<rect x="120" y="190" width="660" height="26" rx="3" class="d-block"/>
+<line x1="250" y1="184" x2="250" y2="222" class="d-line d-stroke-red" style="stroke-width:1.5"/>
+<line x1="380" y1="184" x2="380" y2="222" class="d-line d-stroke-red" style="stroke-width:1.5"/>
+<line x1="510" y1="184" x2="510" y2="222" class="d-line d-stroke-red" style="stroke-width:1.5"/>
+<line x1="640" y1="184" x2="640" y2="222" class="d-line d-stroke-red" style="stroke-width:1.5"/>
+<text x="256" y="207" class="d-small d-text-inv">new weights</text>
+<text x="516" y="207" class="d-small d-text-inv">new weights</text>
+<path d="M180,178 L585,178" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+<text x="383" y="172" text-anchor="middle" class="d-small">one sequence spans three weight updates</text>
+<rect x="150" y="230" width="100" height="26" rx="3" class="d-block-accent"/><text x="200.0" y="247.0" text-anchor="middle" class="d-small d-text-inv">step</text>
+<rect x="282" y="230" width="100" height="26" rx="3" class="d-block-accent"/><text x="332.0" y="247.0" text-anchor="middle" class="d-small d-text-inv">step</text>
+<rect x="414" y="230" width="100" height="26" rx="3" class="d-block-accent"/><text x="464.0" y="247.0" text-anchor="middle" class="d-small d-text-inv">step</text>
+<rect x="546" y="230" width="100" height="26" rx="3" class="d-block-accent"/><text x="596.0" y="247.0" text-anchor="middle" class="d-small d-text-inv">step</text>
+<rect x="678" y="230" width="100" height="26" rx="3" class="d-block-accent"/><text x="728.0" y="247.0" text-anchor="middle" class="d-small d-text-inv">step</text>
+<text x="14" y="278" class="d-small d-text-light">gaps between steps: trainers wait only if they are k = 8 steps ahead of the generators</text>
+<rect x="14" y="300" width="14" height="12" class="d-block"/><text x="34" y="310" class="d-small">generation</text>
+<rect x="124" y="300" width="14" height="12" class="d-fill-blue-soft"/><text x="144" y="310" class="d-small">few long sequences left</text>
+<rect x="304" y="300" width="14" height="12" class="d-block-accent"/><text x="324" y="310" class="d-small">optimizer step</text>
+<rect x="434" y="300" width="14" height="12" class="d-outline d-dashed"/><text x="454" y="310" class="d-small">idle lane</text>
+</svg>
+  <figcaption><b>Figure 4.</b> Schematic of the two schedules; durations are not to scale. Panel a follows the paper's description of alternating generation and training phases with one weight push per \(k\) updates<a class="cite" href="#ref-1">1</a> (§3.1, App. A.11); the "few long sequences left" tail follows Olmo 3's account of long-tail generation<a class="cite" href="#ref-8">8</a> (§4.4.3). Panel b follows the paper and the PipelineRL write-up: weights are updated in the inference servers after each optimizer step without stopping generation, so a sequence in flight continues with a stale KV cache<a class="cite" href="#ref-7">7</a>.</figcaption>
+</figure>
+<p>The ServiceNow write-up of PipelineRL adds the mechanism an inference engineer would ask about. Inference is paused only "for just the time needed to receive the new weights", the in-flight sequences "proceed with stale keys and values in the KV cache", and the authors report that this "does not adversely affect stability"<a class="cite" href="#ref-7">7</a>. Lag there is counted in optimizer steps. The write-up reports no speedup figure and says more analysis is needed to measure it<a class="cite" href="#ref-7">7</a>, so ScaleRL's fits are the quantitative evidence in the source set. Whether ScaleRL stores per-token probabilities from whichever weights were live is not stated in the passages I read.</p>
+
+<h3 id="pipeline-numbers">5.1 What the fits say</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> Off-policy schedules fitted on the same baseline, 8B dense model<a class="cite" href="#ref-1">1</a> (Figs. 4a, 4b, 7). The first five rows are forward tests at 3.5k-4k GPU-hours; the last two are leave-one-out runs inside the full recipe, with the GPU-hours to a pass rate of 0.57 derived as in Table 3.</caption>
+  <thead><tr><th>Setup</th><th class="num">B</th><th class="num">A</th><th class="num">C<sub>mid</sub> (GPU-h)</th><th class="num">GPU-hours to 0.57</th></tr></thead>
+  <tbody>
+    <tr><td class="row">PPO-off-policy-1</td><td class="num">2.15</td><td class="num">0.520</td><td class="num">not printed</td><td class="num">not derived</td></tr>
+    <tr><td class="row">PPO-off-policy-8</td><td class="num">2.68</td><td class="num">0.520</td><td class="num">not printed</td><td class="num">not derived</td></tr>
+    <tr><td class="row">PipelineRL-4</td><td class="num">4.14</td><td class="num">0.520</td><td class="num">not printed</td><td class="num">not derived</td></tr>
+    <tr><td class="row">PipelineRL-8</td><td class="num" data-best>4.55</td><td class="num">0.520</td><td class="num">not printed</td><td class="num">not derived</td></tr>
+    <tr><td class="row">PipelineRL-12</td><td class="num">4.22</td><td class="num" data-worst>0.490</td><td class="num">not printed</td><td class="num">not derived</td></tr>
+    <tr><td class="row">Full recipe (PipelineRL-8)</td><td class="num">1.92</td><td class="num">0.610</td><td class="num">2,542</td><td class="num" data-best>5,401</td></tr>
+    <tr><td class="row">Full recipe with PPO-off-policy-8</td><td class="num">1.89</td><td class="num">0.605</td><td class="num">3,409</td><td class="num" data-worst>7,867</td></tr>
+  </tbody>
+</table>
+<p>On the weak baseline, PipelineRL-8 has a steepness 1.70 times that of PPO-off-policy-8 (4.55 against 2.68) at the same ceiling<a class="cite" href="#ref-1">1</a> (Fig. 4a). Inside the full recipe the gap is smaller and clearer in compute units: \(C_{mid}\) is 34% higher (3,409 against 2,542) and the compute to a pass rate of 0.57 is 46% higher (derived). The authors attribute the advantage to reduced idle time and to a "tighter feedback loop" that keeps "training closer to the on-policy regime"<a class="cite" href="#ref-1">1</a> (§3.1, App. A.11). No experiment separates the two. One feature of Table 5 argues against reading it as a pure staleness effect: within PPO-off-policy, the 8-update setting beats the 1-update setting (2.68 against 2.15). With \(k=1\) the generation batch is just 48 prompts, and small generation batches underuse the generators, the effect the PipelineRL authors describe as "producing small amounts of data with many GPUs is inefficient because this means the per-GPU batch size is small"<a class="cite" href="#ref-7">7</a>. So utilization and staleness trade against each other, and the best \(k\) is where they balance (derived reading).</p>
+<p>The systems side is measurable independently. Olmo 3 ablated its RL infrastructure on a 2-hour benchmark, one 8&times;A100 node for training and one for inference, and reports utilization for inference only because inference is the bottleneck<a class="cite" href="#ref-8">8</a> (Table 23, p. 51).</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> Olmo 3's RL infrastructure ablation: each row adds one component to the row above<a class="cite" href="#ref-8">8</a> (Table 23). Ratios derived.</caption>
+  <thead><tr><th>Configuration</th><th class="num">Total tokens (Mtok)</th><th class="num">Tokens/s</th><th class="num">MFU (%)</th><th class="num">MBU (%)</th><th class="num">Tokens/s vs previous row</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Olmo 2 infrastructure</td><td class="num">6.34</td><td class="num">881</td><td class="num">0.30</td><td class="num">12.90</td><td class="num">&mdash;</td></tr>
+    <tr><td class="row">+ continuous batching</td><td class="num">7.02</td><td class="num">975</td><td class="num">0.33</td><td class="num">14.29</td><td class="num">1.11&times;</td></tr>
+    <tr><td class="row">+ better threading</td><td class="num">9.77</td><td class="num">1,358</td><td class="num">0.46</td><td class="num">19.89</td><td class="num">1.39&times;</td></tr>
+    <tr><td class="row">+ inflight updates (Olmo 3)</td><td class="num">21.23</td><td class="num" data-best>2,949</td><td class="num">1.01</td><td class="num" data-best>43.21</td><td class="num">2.17&times;</td></tr>
+  </tbody>
+</table>
+<p>In-flight updates are the largest single step, 2.17 times the token rate, and the full change is 3.35 times (2,949 against 881; derived). The same report puts the idle compute of static batching at "up to 54%" for a 32K cap and a 14,628-token mean, which is \((L_{max}-\bar L)/L_{max}\): 54.3% with a 32,000 cap and 55.4% with 32,768 (derived; Module 1, Section 6)<a class="cite" href="#ref-8">8</a> (§4.4.3). Its footnote 41 gives one measured step from a representative run: about 1,000 seconds, of which 125 were training, so generation was the bottleneck (Module 1, Section 5.1). The MFU column is the reminder from inference practice: decode is memory-bound, so 1.01% MFU at 43.21% MBU is the healthy end of this table, not a failure (Module 1, Section 5.3). The generator-to-trainer split is tuned too: ScaleRL runs 64 generators to 16 trainers (4 to 1)<a class="cite" href="#ref-1">1</a>, and Olmo 3's Table 49 gives 3.5 to 1 for 7B Think, 2.5 to 1 for 32B Think, 7 to 1 for 7B Instruct and 8 to 1 for 7B RL-Zero (derived ratios)<a class="cite" href="#ref-8">8</a>. Kimi K3 attacks the same idle time differently: generation pauses once a fraction \(\lambda\) of trajectories has finished, unfinished ones resume next iteration, and staleness is left to a per-token regularization in the loss<a class="cite" href="#ref-9">9</a> (§4.1.2; Module 12, Section 5.1).</p>
+
+<h2 id="scaling-axes">6. The 100,000 GPU-hour run and the scaling axes</h2>
+
+<h3 id="scaling-axes-validation">6.1 What the validation extrapolates</h3>
+<p>The headline test fits the sigmoid on one run and checks it against the same run extended. For the 8B dense model the fit uses data up to 50,000 GPU-hours and the run continues to 100,000; for the 17B&times;16 Llama-4 Scout MoE the fit uses up to 16,000 and the run continues to 50,000, with the extrapolation checked to 45,000. The runs took 7,400 and 7,100 steps, which the authors put at 3.5 times ProRL's length<a class="cite" href="#ref-1">1</a> (Fig. 1 caption). The caption says the extrapolated curve "closely follows extended training".</p>
+<p>How much does that test extrapolate? The 100,000 GPU-hour run is the batch-2048 configuration (§5), and its fit in Appendix A.7 (B 1.70, A 0.645) matches the batch-2048 row of Table 7 (\(C_{mid}=10{,}909\))<a class="cite" href="#ref-1">1</a>. Evaluating \(g\) there gives 0.930 at 50,000 GPU-hours and 0.977 at 100,000: the check spans the last 4.7 points of the gain, about 1.2 pass-rate points with the assumed \(R_0=0.40\) (0.9 to 1.4 for \(R_0\) from 0.45 to 0.35), a test of the approach to the ceiling (derived). For Scout it runs from \(g=0.899\) at 16,000 to 0.980 at 45,000 (derived). The test rules out a curve that keeps climbing, as the power-law fit of Section 2.3 predicted; it cannot distinguish ceilings 0.01 apart, and the authors' own fit of \(A\) moves from 0.645 to 0.655 when the window changes (Table 1).</p>
+<p>Units are the weak point of the headline. "7,400 steps" cannot be turned into a sample count: the batch-size sweep of §5 is headed "prompts" while the base setup's 768 is completions (48 times 16), and the completions per step of the 100,000 GPU-hour run are not given<a class="cite" href="#ref-1">1</a>. Cost per step can be derived: 100,000 GPU-hours over 7,400 steps is 13.5 GPU-hours per step, against about 1.5 in the base setup (about 1,000 steps per 1.5k GPU-hours, App. A.6), a factor of 9. A step is not a unit of work, even inside one paper.</p>
+
+<h3 id="scaling-axes-table">6.2 Which axes raise the ceiling, and what each costs</h3>
+<table class="tbl tbl-dense">
+  <caption><b>Table 7.</b> Fits for the large-scale runs of ScaleRL's Section 5<a class="cite" href="#ref-1">1</a> (Table 1: C<sub>mid</sub>, B, A as printed). The last column is derived: \(C_{mid}\,9^{1/B}\), the GPU-hours to realize 90% of each run's own gain. The table lists the long-context run as "32k"; the legend of the paper's Fig. 9a prints "34k" with B 1.86 and A 0.650.</caption>
+  <thead><tr><th>Run</th><th>What changed</th><th class="num">C<sub>mid</sub> (GPU-h)</th><th class="num">B</th><th class="num">A</th><th class="num">GPU-hours to 90% of gain</th></tr></thead>
+  <tbody>
+    <tr><td class="row">ScaleRL (base)</td><td>8B dense; 14k tokens; batch 768; 16 generations</td><td class="num">2,542</td><td class="num">1.92</td><td class="num">0.610</td><td class="num">7,983</td></tr>
+    <tr><td class="row">ScaleRL-32k</td><td>generation budget 14k to 32k</td><td class="num">11,272</td><td class="num">1.89</td><td class="num" data-best>0.645</td><td class="num">36,049</td></tr>
+    <tr><td class="row">ScaleRL-bs512</td><td>batch 512</td><td class="num">2,818</td><td class="num">1.77</td><td class="num">0.605</td><td class="num">9,751</td></tr>
+    <tr><td class="row">ScaleRL-bs2048</td><td>batch 2048 (the 100k-GPU-hour run)</td><td class="num">10,909</td><td class="num">1.70</td><td class="num" data-best>0.645</td><td class="num" data-worst>39,729</td></tr>
+    <tr><td class="row">ScaleRL-8gen</td><td>8 generations per prompt, same total batch</td><td class="num">2,542</td><td class="num">2.44</td><td class="num">0.585</td><td class="num">6,255</td></tr>
+    <tr><td class="row">ScaleRL-24gen</td><td>24 generations per prompt</td><td class="num">3,054</td><td class="num">2.22</td><td class="num">0.590</td><td class="num">8,217</td></tr>
+    <tr><td class="row">ScaleRL-32gen</td><td>32 generations per prompt</td><td class="num">2,936</td><td class="num">2.07</td><td class="num">0.595</td><td class="num">8,487</td></tr>
+    <tr><td class="row">ScaleRL-Scout</td><td>17B&times;16 MoE</td><td class="num">4,242</td><td class="num">1.65</td><td class="num" data-best>0.710</td><td class="num">16,066</td></tr>
+    <tr><td class="row">Math+code, math curve</td><td>joint math and code run</td><td class="num">2,896</td><td class="num">2.05</td><td class="num">0.595</td><td class="num">8,458</td></tr>
+    <tr><td class="row">Math+code, code curve</td><td>joint math and code run</td><td class="num">1,675</td><td class="num">1.09</td><td class="num">0.615</td><td class="num">12,574</td></tr>
+  </tbody>
+</table>
+<p><strong>Every axis that raised the ceiling also moved the midpoint right.</strong> Context length raised \(A\) by 0.035 and moved \(C_{mid}\) 4.4 times to the right; a 2048 batch raised \(A\) by the same 0.035 and moved it 4.3 times; the MoE raised \(A\) by 0.100 and moved it 1.7 times (derived from Table 7). The authors describe the pattern for batch size as an inverse trend: small batches look better at low compute and are overtaken as compute grows<a class="cite" href="#ref-1">1</a> (§5, Fig. 10). They call long context a "ceiling-raising knob rather than a mere efficiency trade-off", and it is one only past a break-even. With the assumed \(R_0\), the 14k-token curve and the long-context curve cross at about 28,000 GPU-hours (Figure 1), so a 16,000 GPU-hour budget is better spent on the shorter generation limit and a 50,000 GPU-hour budget on the longer one (derived; the shorter run has flattened at 0.61 by then). Two other reports reached the same direction without fitting curves: Kimi k1.5 scaled the RL context window to 128k and calls context length "a key dimension of the continued scaling of RL with LLMs", and found that a smaller model can match a larger one with longer chains while the larger model is more token-efficient<a class="cite" href="#ref-10">10</a> (§1, ablations); MiniMax-M1 raised its output limit in steps from 40K to 80K<a class="cite" href="#ref-3">3</a> (§5).</p>
+<p>The remaining axes are smaller. Generations per prompt at fixed total batch (8, 16, 24, 32) gave \(A\) between 0.585 and 0.610, which the authors call "essentially unchanged" and a "second-order choice"<a class="cite" href="#ref-1">1</a> (§5); the 0.025 spread sits just outside the replication margin and is not monotone in group size. Model scale is the largest effect (\(A\) 0.710 against 0.610): the MoE exceeds the 8B model's performance with one sixth of its RL compute, at truncation rates below 2%<a class="cite" href="#ref-1">1</a> (§5, App. A.15). The math-plus-code run fits each domain on its own curve, math with \(A=0.595\) and code with \(A=0.615\) but a shallow \(B=1.09\): the code curve has realized 92% of its gain at 16,000 GPU-hours against 97% for math (derived). The authors call the multi-task results preliminary<a class="cite" href="#ref-1">1</a> (§7).</p>
+
+<h3 id="scaling-axes-limits">6.3 Limits of the evidence</h3>
+<p>Three limits apply to everything above. Each axis is one run, and the paper's error margin covers \(A\) and not \(B\) or \(C_{mid}\). The data are one math set plus one code set, the dense model is a single 8B model (its base is not named in the sections I read) and the MoE one Llama-4 Scout run, so nothing here says the sigmoid fits agentic or multi-turn RL, which the authors list as future work<a class="cite" href="#ref-1">1</a> (§7). And the fitted ceiling is an extrapolation by construction: \(A\) is searched on a grid that stops at 0.800 and the longest fit window is 50,000 GPU-hours<a class="cite" href="#ref-1">1</a> (App. A.5). The other scaling study in the source set varies model size at fixed method and finds learning efficiency saturating, with the 32B model ahead of the 72B at equal compute because it takes more steps<a class="cite" href="#ref-2">2</a> (§3.1); it does not use ScaleRL's recipe, so the two cannot be merged into one law.</p>
+
+<h2 id="reading-claims">7. Reading a report's compute claim</h2>
+<p>Module 1 (Sections 3 and 4) derives the GPU-hour and sample arithmetic for R1-Zero, MiniMax-M1 and Olmo 3. This section places those budgets against what ScaleRL fitted and adds two normalizations: hardware and steps.</p>
+
+<h3 id="reading-claims-gpu-hours">7.1 GPU-hours and percent of pretraining</h3>
+<p>GPU-hours depend on the GPU. NVIDIA lists a GB200 NVL72 rack at 180 PFLOPS dense FP16/BF16 for 72 GPUs ("dense is one-half sparse"), which is 2.5 PFLOPS per GPU<a class="cite" href="#ref-11">11</a>, and an H100 SXM at 1,979 TFLOPS BF16 "with sparsity", 989.5 TFLOPS dense under the same one-half rule<a class="cite" href="#ref-12">12</a>. One GB200 GPU-hour is then 2.53 times an H100 GPU-hour in peak dense BF16 (derived), so ScaleRL's 100,000 GPU-hour run is about 253,000 H100-hour equivalents. I did not fetch an H800 specification and treat it as H100-class, an assumption. Peak ratios overstate the difference in work done, since rollout decode runs near 1% MFU (Table 6); read them as a bound on comparability.</p>
+<p>Percent of pretraining depends on a denominator that is rarely defined. DeepSeek-V3.2 says its RL "allocates a post-training computational budget exceeding 10% of the pre-training cost"<a class="cite" href="#ref-13">13</a> (§1) without defining the denominator. R1-Zero's 100,000 H800 GPU-hours are 3.75% of the 2,664K H800 GPU-hours of DeepSeek-V3's pre-training (derived)<a class="cite" href="#ref-14">14</a> (Table 1). If V3.2's denominator is also V3's 2,664K, then 10% is 266,400 H800 GPU-hours, 2.6 times R1-Zero's 101,376 (derived, under that assumption). Olmo 3 shows both ends in one family: Module 1 (Section 4.4) derives about 2.8% of pretraining for the initial 5-day RL run of the 32B Think model and 11.6% after the 21-day continuation<a class="cite" href="#ref-8">8</a>. The 3.75% and the "more than 10%" are two settings of a dial, not a conflict.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 390" role="img" aria-labelledby="f5t"><title id="f5t">Reported and derived RL compute budgets on a log GPU-hour axis, with the range ScaleRL fitted shaded</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="290.0" y="50" width="232.5" height="268" class="d-fill-blue-soft"/>
+<line x1="290.0" y1="50" x2="290.0" y2="318" class="d-grid"/>
+<text x="290.0" y="42" text-anchor="middle" class="d-small d-mono d-text-light">3k</text>
+<line x1="389.5" y1="50" x2="389.5" y2="318" class="d-grid"/>
+<text x="389.5" y="42" text-anchor="middle" class="d-small d-mono d-text-light">10k</text>
+<line x1="480.3" y1="50" x2="480.3" y2="318" class="d-grid"/>
+<text x="480.3" y="42" text-anchor="middle" class="d-small d-mono d-text-light">30k</text>
+<line x1="579.7" y1="50" x2="579.7" y2="318" class="d-grid"/>
+<text x="579.7" y="42" text-anchor="middle" class="d-small d-mono d-text-light">100k</text>
+<line x1="670.5" y1="50" x2="670.5" y2="318" class="d-grid"/>
+<text x="670.5" y="42" text-anchor="middle" class="d-small d-mono d-text-light">300k</text>
+<line x1="770.0" y1="50" x2="770.0" y2="318" class="d-grid"/>
+<text x="770.0" y="42" text-anchor="middle" class="d-small d-mono d-text-light">1M</text>
+<line x1="579.7" y1="50" x2="579.7" y2="318" class="d-line d-dashed d-stroke-red" style="stroke-width:1.5"/>
+<text x="14" y="73.0" class="d-small">ScaleRL design-choice runs</text>
+<rect x="302.7" y="63.0" width="11.0" height="12" rx="3" class="d-fill-blue"/>
+<circle cx="313.8" cy="69.0" r="6" class="d-fill-blue"/>
+<text x="14" y="99.0" class="d-small">ScaleRL leave-one-out runs</text>
+<circle cx="428.3" cy="95.0" r="6" class="d-fill-blue"/>
+<text x="14" y="125.0" class="d-small">ProRL, 1.5B model</text>
+<circle cx="428.3" cy="121.0" r="6" class="d-fill-cyan"/>
+<text x="14" y="151.0" class="d-small">Qwen3-8B RL stage</text>
+<circle cx="437.7" cy="147.0" r="6" class="d-block-muted"/>
+<text x="14" y="177.0" class="d-small">ScaleRL 17Bx16 MoE run</text>
+<circle cx="522.5" cy="173.0" r="6" class="d-fill-blue"/>
+<text x="14" y="203.0" class="d-small">ScaleRL 8B dense run</text>
+<circle cx="579.7" cy="199.0" r="6" class="d-fill-blue"/>
+<text x="14" y="229.0" class="d-small">DeepSeek-R1-Zero</text>
+<circle cx="580.9" cy="225.0" r="6" class="d-fill-orange"/>
+<text x="14" y="255.0" class="d-small">Olmo 3.1 Think 32B extension</text>
+<circle cx="589.8" cy="251.0" r="6" class="d-fill-cyan"/>
+<text x="14" y="281.0" class="d-small">MiniMax-M1</text>
+<circle cx="658.1" cy="277.0" r="6" class="d-fill-orange"/>
+<text x="14" y="307.0" class="d-small">DeepSeek-V3.2 (lower bound)</text>
+<circle cx="660.7" cy="303.0" r="6" class="d-fill-orange"/>
+<path d="M669.7,303.0 L706.7,303.0" class="d-arrow" marker-end="url(#f5-arr)"/>
+<text x="530.0" y="332" text-anchor="middle" class="d-small d-text-light">GPU-hours (log scale); shaded: range ScaleRL fitted (up to 50k)</text>
+<circle cx="20" cy="354" r="6" class="d-fill-blue"/><text x="32" y="358" class="d-small">GB200</text>
+<circle cx="98" cy="354" r="6" class="d-fill-cyan"/><text x="110" y="358" class="d-small">H100</text>
+<circle cx="169" cy="354" r="6" class="d-fill-orange"/><text x="181" y="358" class="d-small">H800</text>
+<circle cx="241" cy="354" r="6" class="d-block-muted"/><text x="253" y="358" class="d-small">hardware unstated</text>
+<text x="396.0" y="358" class="d-small d-text-light">dashed red: largest validated run (100k)</text>
+</svg>
+  <figcaption><b>Figure 5.</b> RL compute on a log GPU-hour axis. ScaleRL's tiers and its two large runs are as printed<a class="cite" href="#ref-1">1</a>; ProRL used about 16k GPU-hours on 4 nodes of 8 H100<a class="cite" href="#ref-15">15</a> (§3.2); the Qwen3-8B RL stage used 17,920 GPU-hours<a class="cite" href="#ref-16">16</a> (Table 21, hardware not stated). R1-Zero is 64&times;8 H800 for about 198 hours, 101,376 GPU-hours<a class="cite" href="#ref-5">5</a> (Supp. B.4.4). Olmo 3.1 Think 32B is the 21-day continuation on 224 H100 GPUs, 112,896 GPU-hours<a class="cite" href="#ref-8">8</a> (§2.4, Table 49; derived). MiniMax-M1 is 512 H800 for three weeks, 258,048 GPU-hours<a class="cite" href="#ref-3">3</a> (derived from the report's figures; $534,700 stated). DeepSeek-V3.2 is plotted at the lower bound that "exceeding 10%" implies if the denominator is V3's 2,664K H800 GPU-hours<a class="cite" href="#ref-13">13</a><a class="cite" href="#ref-14">14</a> (assumption). Units are not equal across hardware (text above).</figcaption>
+</figure>
+<p>The ruler shows where the evidence stops. ScaleRL's fits cover up to 50,000 GPU-hours and its largest validated run is 100,000 GB200 GPU-hours. R1-Zero sits at that scale in nominal GPU-hours; MiniMax-M1 and DeepSeek-V3.2 sit about 2.6 times above it, on different hardware, with no published fit. No source in the set fits a compute curve to a production run.</p>
+
+<h3 id="reading-claims-steps">7.2 Claims stated in steps</h3>
+<p>The efficiency claims in the literature are mostly in steps, and a step is not a unit of work. Table 8 lists each claim with what its step contains; Module 1 (Table 3 and the common-error box in its Section 3.1) carries the full run-size vocabulary.</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 8.</b> Compute claims stated in steps, and what each step is. "Completions per step" is the number of sampled responses consumed by one counted step. Derived entries marked.</caption>
+  <thead><tr><th>Claim</th><th>What a counted step is</th><th class="num">Completions per step</th><th>Max response (tokens)</th><th>Not stated</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DAPO: 50 AIME-24 points in 50% of R1-Zero-Qwen-32B's steps<a class="cite" href="#ref-4">4</a> (Fig. 1, §3.2, §4.1)</td><td>Gradient update: 512 prompts &times; 16 = 8,192 completions per rollout step, minibatch 512, so 16 updates per rollout step</td><td class="num">512 (derived)</td><td>20,480</td><td>GPU-hours; dynamic sampling oversamples and discards prompts</td></tr>
+    <tr><td class="row">R1-Zero-Qwen-32B: over 10K steps<a class="cite" href="#ref-5">5</a> (Supp. B.4.1, F.1)</td><td>32 questions &times; 16 samples, 16 minibatches per 8,192-output rollout</td><td class="num">512</td><td>32,768</td><td>GPU-hours for this run (Table 7 covers R1-Zero and R1)</td></tr>
+    <tr><td class="row">CISPO: matches DAPO with 50% of the steps<a class="cite" href="#ref-3">3</a> (§3.1)</td><td>An update inside "16 rounds of off-policy updates per generation batch"</td><td class="num">not stated</td><td>not stated</td><td>Samples per step; GPU-hours; seeds</td></tr>
+    <tr><td class="row">ProRL: over 2k steps, about 16k GPU-hours<a class="cite" href="#ref-15">15</a> (§1, §3.2)</td><td>Batch 256 and minibatch 64, 16 samples per prompt, 4 updates per rollout; read here as prompts, which the text does not say</td><td class="num">1,024 per update; 4,096 per rollout (if prompts)</td><td>8,096; 16k in the last ~200 steps</td><td>Whether "steps" are rollouts or updates; derived 8 GPU-hours per step</td></tr>
+    <tr><td class="row">Qwen3-235B-A22B: AIME-24 70.1 to 85.1 in 170 steps<a class="cite" href="#ref-16">16</a> (§4.2)</td><td>Not defined; 3,995 query-verifier pairs in the RL set</td><td class="num">not stated</td><td>not stated</td><td>Batch, rollouts per query, GPU-hours</td></tr>
+    <tr><td class="row">Olmo 3 Think: 750 steps (32B), 1,400 (7B)<a class="cite" href="#ref-8">8</a> (Table 49)</td><td>One minibatch per rollout; 128 &times; 8 prompts (32B), 64 &times; 8 (7B)</td><td class="num">1,024 (32B); 512 (7B)</td><td>32,768</td><td>GPU-hours per run (day counts only)</td></tr>
+    <tr><td class="row">ScaleRL: 7,400 steps (8B), 7,100 (Scout)<a class="cite" href="#ref-1">1</a> (Fig. 1)</td><td>One PipelineRL trainer update</td><td class="num">768 in the base setup; not stated for the 100k run</td><td>14,336 generation</td><td>Completions per step in the large runs; 13.5 GPU-hours per step (derived)</td></tr>
+    <tr><td class="row">Kimi K3 and K2.5: "scaling RL FLOPs" improves scores<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-17">17</a> (K3 Fig. 8; K2.5 Fig. 2)</td><td>No steps: the axis is RL FLOPs</td><td class="num">&mdash;</td><td>&mdash;</td><td>The RL-FLOPs axes carry no tick values, so no FLOP figure can be read</td></tr>
+  </tbody>
+</table>
+<p>Convert before comparing. R1-Zero-Qwen-32B's "over 10K steps" at 512 completions each is over 5.12 million completions (derived). DAPO's 50% of that is half the gradient updates at the same 512 completions per update, but the updates are fed by oversampling: DAPO keeps sampling until the batch holds only prompts whose accuracy is neither 0 nor 1<a class="cite" href="#ref-4">4</a> (§3.2), and the extra generation depends on the dead-group fraction, which Module 11 (Section 4.1) derives as \(p^G+(1-p)^G\) and which grows during training. DAPO's only compute statement is that training time was "not significantly affected"<a class="cite" href="#ref-4">4</a> (§4.2), so "50% of the steps" is not "50% of the compute". Olmo 3's Figure 38 plots its 7B RL-Zero run against DAPO by gradient step and by GPU-hour, with DAPO's GPU-hours "taken from the DAPO reproduction on verl"<a class="cite" href="#ref-8">8</a>; the gap between the curves is about 2.5 times on the step axis and about 5 times on the GPU-hour axis (read off the plot; different base models). ScaleRL's fit sidesteps this by working in GPU-hours, the unit that does not depend on how a lab counts steps.</p>
+
+<h3 id="reading-claims-alternatives">7.3 Against the alternative use of the same GPU-hours</h3>
+<p>A compute claim also needs a comparator. Qwen3's report ran both options from the same off-policy-distilled 8B checkpoint (AIME-24 55.0, AIME-25 42.8): further RL reached 67.6 and 55.5 at 17,920 GPU-hours, and on-policy distillation reached 74.4 and 65.5 at 1,800 GPU-hours, 9.96 times fewer (derived); on AIME-24 pass@64, RL stayed at 90.0 and distillation reached 93.3<a class="cite" href="#ref-16">16</a> (Table 21). The passage I read does not say whether the teacher's forward passes are in the 1,800. R1's supplementary comparison is the same direction at larger scale: Qwen2.5-32B trained for over 10K RL steps scored 47.0 on AIME-24 against 72.6 for the R1-distilled 32B model<a class="cite" href="#ref-5">5</a> (Supp. F.1, Table 16). Module 21 covers on-policy distillation itself; the point here is that the cost of an RL recipe has to be read against a recipe that uses a stronger signal, not only against another RL recipe.</p>
+
+<h2 id="not-said">8. What a saturating pass-rate curve does not say</h2>
+<p>The fitted quantity is a mean pass rate over 16 samples per held-out prompt, an estimate of expected pass@1 on prompts from the training distribution<a class="cite" href="#ref-1">1</a> (§2.1). Anything that moves probability mass toward answers the model could already reach raises it, so \(A\) is a ceiling on pass@1-type performance and says nothing about pass@k at large \(k\). Yue et al. report the pattern that matters here: RLVR-trained models beat their base models at small \(k\), base models win at large \(k\), and across training pass@256 falls while pass@1 rises (their Fig. 1), with six RLVR algorithms performing similarly and "far from optimal"<a class="cite" href="#ref-18">18</a>. ProRL reports the opposite for a 1.5B model trained over 2,000 steps with KL control, reference resets and diverse tasks, with boundary gains that correlate with how weak the base model was and with training duration<a class="cite" href="#ref-15">15</a>, and a later analysis proposes that both are partly right, as an exploitation stage followed by an exploration stage<a class="cite" href="#ref-19">19</a>. ScaleRL measures no pass@k, so a difference in fitted \(A\) between two recipes could be a difference in sharpening and not in what the model can solve; Module 20 treats that evidence.</p>
+<p>The paper also cuts against a popular predictor. Entropy fell in every run it tracked, across batch sizes, tasks, generation lengths and model sizes, and the batch-768 and batch-2048 runs followed nearly identical entropy trajectories per step although the larger-batch run was much stronger downstream. The authors conclude that entropy "may not always offer a predictive insight into the performance, as proposed by some recent works like Cui et al."<a class="cite" href="#ref-1">1</a> (App. A.12, Fig. 16). Cui et al.'s law \(R=-a\exp(H)+b\) fits performance against entropy along a run and puts the ceiling where entropy reaches zero<a class="cite" href="#ref-20">20</a>. The two statements concern different comparisons, a trajectory within one configuration against the same entropy curve across configurations, and neither paper tests the other (my reading). Module 13 develops the entropy law.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Two questions divide the sources. Do the details of an RL recipe move the ceiling or only the speed? And is more RL compute the right use of the next GPU-hours? The first is the Module 11 normalization debate seen through compute curves; the second is the question behind every budget in Figure 5.</p>
+<div class="positions">
+  <article class="position">
+    <h4>A. Details move the speed, not the ceiling</h4>
+    <p class="who">Khatri et al., ScaleRL<a class="cite" href="#ref-1">1</a> (abstract, App. A.8)</p>
+    <p>Loss aggregation, normalization, curriculum and the off-policy scheme "primarily modulate compute efficiency without materially shifting the asymptote". Pick choices that raise \(A\) first and tune \(B\) and \(C_{mid}\) second; stable recipes extrapolate, so small runs can rank them.</p>
+    <ul class="pros"><li>A replicated margin (\(\pm0.02\) on \(A\), three identical runs) and eight leave-one-out runs with \(A\) between 0.590 and 0.610.</li><li>Predictions held to 100,000 GPU-hours, and it agrees with Module 11's reading of the aggregation and normalization spreads.</li></ul>
+    <ul class="cons"><li>No margin for \(B\); a 15% spread across identical runs is as large as most reversions' efficiency gaps.</li><li>The leave-one-out starts from a recipe whose stability fixes already absorb the choices that move \(A\), and the same paper's forward tests move \(A\) by up to 0.09.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B. Details decide whether the run survives and where it flattens</h4>
+    <p class="who">DAPO<a class="cite" href="#ref-4">4</a> (Table 1); MiniMax-M1<a class="cite" href="#ref-3">3</a> (§1, §3.2); ScaleRL's forward tests<a class="cite" href="#ref-1">1</a> (Figs. 5, 6, App. A.11)</p>
+    <p>DAPO's four techniques lift AIME-24 from 30 to 50 on one base; MiniMax found that a precision mismatch between training and inference kernels "prevents reward growth" until the LM head runs in FP32; ScaleRL's own forward tests move \(A\) from 0.520 to 0.595 (loss type) and 0.610 (FP32 head), and its Appendix A.11 says the off-policy choice shifts the asymptote.</p>
+    <ul class="pros"><li>Gaps of 0.07 to 0.09 in \(A\) are 3.5 to 4.5 times the replication margin.</li><li>The GRPO recipe became unstable after about 6k GPU-hours and the forward-test baseline beyond about 3.5k, so survival is itself an outcome.</li></ul>
+    <ul class="cons"><li>DAPO's ladder is cumulative, one run per rung and one benchmark (Module 11, Section 7.1).</li><li>The forward \(A\) values extrapolate from runs that were breaking (Section 3.4), and the effects shrink inside a full recipe (Table 3's FP32 row).</li></ul>
+  </article>
+  <article class="position">
+    <h4>C. Spend more RL compute: it still pays</h4>
+    <p class="who">DeepSeek-V3.2<a class="cite" href="#ref-13">13</a> (§1, §4.1); Kimi K3<a class="cite" href="#ref-9">9</a> (§4.1.2); ProRL<a class="cite" href="#ref-15">15</a>; ScaleRL's scaling axes<a class="cite" href="#ref-1">1</a></p>
+    <p>V3.2 spends more than 10% of its pre-training cost on RL, reports "consistent performance improvements correlating with extended RL training budget" and hypothesizes more would help. K3 reports that scaling RL FLOPs improves knowledge, reasoning, vision, agent and coding scores, and ProRL's gains continued past 2,000 steps.</p>
+    <ul class="pros"><li>Production budgets keep rising, and ScaleRL identifies three axes (context, batch, model) that lift \(A\).</li><li>The fitted curve gives a way to forecast a budget's return.</li></ul>
+    <ul class="cons"><li>No published fit at production scale, and K3's and K2.5's FLOP axes have no ticks (Section 7.2).</li><li>The base recipe has realized 97% of its gain by 16,000 GPU-hours (Section 2.2); later gains come from changing axes, each of which moves \(C_{mid}\) right 1.7 to 4.4 times (Table 7).</li></ul>
+  </article>
+  <article class="position">
+    <h4>D. For small models, spend it on distillation</h4>
+    <p class="who">DeepSeek-R1<a class="cite" href="#ref-5">5</a> (Supp. F.1); Qwen3<a class="cite" href="#ref-16">16</a> (Table 21)</p>
+    <p>R1 found that 10K+ steps of RL on Qwen2.5-32B only matched QwQ-32B-Preview while distilling R1 was "significantly better"; Qwen3-8B reached higher scores with on-policy distillation at about a tenth of the GPU-hours of RL.</p>
+    <ul class="pros"><li>9.96 times fewer GPU-hours for higher AIME scores in the one measured pair (derived), and a higher pass@64.</li><li>Cheap enough to repeat for every model size.</li></ul>
+    <ul class="cons"><li>The teacher is itself an RL product, so compute is moved, not removed; R1 says going beyond "the boundaries of human intelligence may still require more powerful base models and larger-scale reinforcement learning".</li><li>One pair, one model size, and no statement in the passage read of whether teacher compute is counted.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>A and B describe different regimes, and both are right where they are measured. Inside a recipe that already carries the stability fixes (an asynchronous scheme with bounded lag, a weight-clipped or sequence-level loss, an FP32 head, zero-variance filtering), the evidence supports A about the ceiling: eight reversions land within 0.02 of each other. B is right about the failure side, where the fitted \(A\) is the point at which an unstable run bent. Neither licenses "efficiency does not matter": the reversions cost 14% to 46% more GPU-hours to reach the same pass rate (derived, with an assumed \(R_0\)), a tax on every ablation and sweep, and Olmo 3 reports running each post-training stage several times to sweep hyperparameters<a class="cite" href="#ref-8">8</a>; it does not change the ceiling. The ranking among the efficiency choices is the weakest part, because \(B\) has no margin. What would settle it: three seeds per leave-one-out variant, the same table on a second model family and a non-math domain, and a fit on a production run's held-out curve.</p>
+<p>C and D answer different questions. If a stronger teacher exists and the target is a smaller model, D has the only compute-matched evidence in the source set. If you are building the model that sets the frontier, there is no teacher above you and C is the only option. For that case the fits say to choose by ceiling once the budget exceeds the crossover between candidate recipes (about 28,000 GPU-hours for context length in Figure 1) and by efficiency below it. The compute-matched comparison that would settle C against D, with teacher compute included, has not been published in the sources read.</p>
+<p><strong>Source-level conflict.</strong> ScaleRL cites RL at 3.75% of pre-training for R1-Zero and V3.2 reports more than 10%<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-13">13</a>. These are not contradictory: the shares are settings of one dial, differ in denominator and hardware, and Olmo 3's own day counts span 2.8% to 11.6% inside one model family (Section 7.1).</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>As of 2026-10-27, ScaleRL is a single arXiv version (v1, 15 Oct 2025, 28 pages and 20 figures) with no venue listed on its arXiv page, and none of the sources read reproduces it<a class="cite" href="#ref-1">1</a>. Tan et al. is at v4 (17 Apr 2026) and states acceptance at the ACL 2026 main conference<a class="cite" href="#ref-2">2</a>; the two scaling frameworks have not been compared on common data. The authors list the next uses of their framework as multi-turn and agentic RL, dense rewards and compute-heavy generative verifiers<a class="cite" href="#ref-1">1</a> (§7), settings that Kimi K3 and DeepSeek-V3.2 both train on at scale<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-13">13</a>, so a sigmoid fit to an agentic run would be the most informative missing result. Two production reports plot RL FLOPs without axis values<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-17">17</a> and one states its budget as a share of pre-training<a class="cite" href="#ref-13">13</a>; either form leaves the comparison in Section 7 unresolved until a report prints GPU-hours, steps and completions together. The GSPO instability ScaleRL reports (Section 4) rests on one lab's framework and is the finding most likely to be confirmed or overturned by a second replication.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Khatri, D., Madaan, L., Tiwari, R., Bansal, R., Duvvuri, S. S., Zaheer, M., Dhillon, I. S., Brandfonbrener, D., Agarwal, R. <em>The Art of Scaling Reinforcement Learning Compute for LLMs</em>. arXiv:2510.13786v1, 15 Oct 2025. <a href="https://arxiv.org/pdf/2510.13786v1">https://arxiv.org/pdf/2510.13786v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Eq. 1 and its parameters (§1-§2.1, Fig. 3), fitting procedure and margin (App. A.4-A.8), forward ablations (§3, Figs. 4-6, 14, 19), leave-one-out (§4, Fig. 7, Fig. 15), scaling axes (§5, Figs. 9-11, Table 1), truncation analysis (App. A.15), compared recipes (Fig. 2, App. A.16), GSPO instability (App. A.17.4).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Tan, Z., Geng, H., Yu, X., Zhang, M. et al. <em>Scaling Behaviors of LLM Reinforcement Learning Post-Training: An Empirical Study in Mathematical Reasoning</em>. arXiv:2509.25300v4 (v1 29 Sep 2025, v4 17 Apr 2026; ACL 2026 Main per arXiv comments). <a href="https://arxiv.org/abs/2509.25300">https://arxiv.org/abs/2509.25300</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the power-law form with saturating k(N), 63 Qwen2.5 models, test-loss definition (Eqs. 1-2, 6; §2-§3.1).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>MiniMax (Chen, A., Li, A. et al.). <em>MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention</em>. arXiv:2506.13585v1, 16 Jun 2025. <a href="https://arxiv.org/pdf/2506.13585v1">https://arxiv.org/pdf/2506.13585v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: 3 weeks on 512 H800 and $534,700 (abstract, §1, §3), CISPO versus DAPO "50% of the steps" and 16 off-policy rounds (§3.1), precision mismatch (§3.2), staged 40K to 80K length extension (§5).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Yu, Q., Zhang, Z., Zhu, R., Yuan, Y. et al. <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv:2503.14476v2. <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: 50 AIME points in 50% of steps (Fig. 1), ablation ladder (Table 1), dynamic sampling (§3.2), batch and minibatch sizes and 20,480 maximum length (§4.1), training-time statement (§4.2).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv:2501.12948v2 (Nature version). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: R1-Zero GPU-hours, 64&times;8 H800 for about 198 hours (Supp. B.4.4, Table 7); R1-Zero-Qwen-32B settings (Supp. B.4.1); distillation versus RL on Qwen2.5-32B (Supp. F.1, Table 16); GRPO recipe the ScaleRL authors re-implemented (via ref 1).</span></li>
+  <li id="ref-6"><span class="ref-type">official</span>Hugging Face. <em>TRL documentation: GRPO Trainer</em>, main branch. <a href="https://huggingface.co/docs/trl/main/en/grpo_trainer">https://huggingface.co/docs/trl/main/en/grpo_trainer</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the <code>scale_rewards</code> options and the description of "batch" as group mean with batch-level standard deviation (first 100,000 characters read).</span></li>
+  <li id="ref-7"><span class="ref-type">blog</span>Piche, A., Pardinas, R., Kamalloo, E., Bahdanau, D. (ServiceNow). <em>PipelineRL</em>. Hugging Face blog, 25 Apr 2025. <a href="https://huggingface.co/blog/ServiceNow/pipelinerl">https://huggingface.co/blog/ServiceNow/pipelinerl</a>. Accessed 2026-10-27. <span class="ref-use">Used for: in-flight weight updates, pause only to receive weights, stale KV cache, lag counted in optimizer steps, no speedup reported (sections "Conventional RL vs PipelineRL", the stability discussion, and "What's next").</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Team Olmo (Ettinger, A., Bertsch, A. et al.; Allen Institute for AI). <em>Olmo 3</em>. arXiv:2512.13961v2 (14 Apr 2026; v1 15 Dec 2025). <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: infrastructure ablation (Table 23, p. 51), static-batching waste and long-tail description (§4.4.3), day counts and RL allocation (§2.4, Table 49, p. 109), Fig. 38 (p. 107).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Kimi Team (Moonshot AI). <em>Kimi K3: Open Frontier Intelligence</em>. arXiv:2607.24653v2. <a href="https://arxiv.org/pdf/2607.24653v2">https://arxiv.org/pdf/2607.24653v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: partial rollouts and staleness tolerance (§4.1.2), scaling RL FLOPs claim and Fig. 8 (p. 12-13).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Kimi Team (Moonshot AI). <em>Kimi k1.5: Scaling Reinforcement Learning with LLMs</em>. arXiv:2501.12599v4. <a href="https://arxiv.org/pdf/2501.12599v4">https://arxiv.org/pdf/2501.12599v4</a>. Accessed 2026-10-27. <span class="ref-use">Used for: RL context window scaled to 128k and the context-length observation (§1), model-size versus context ablation (ablation studies).</span></li>
+  <li id="ref-11"><span class="ref-type">official</span>NVIDIA. <em>NVIDIA GB200 NVL72</em> product page, specifications table. <a href="https://www.nvidia.com/en-us/data-center/gb200-nvl72/">https://www.nvidia.com/en-us/data-center/gb200-nvl72/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: 360 PFLOPS sparse FP16/BF16 per 72-GPU rack and the "dense is one-half sparse" note. The page may change.</span></li>
+  <li id="ref-12"><span class="ref-type">official</span>NVIDIA. <em>NVIDIA H100 Tensor Core GPU</em> product page, specifications table. <a href="https://www.nvidia.com/en-us/data-center/h100/">https://www.nvidia.com/en-us/data-center/h100/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: H100 SXM BF16 Tensor Core 1,979 TFLOPS "with sparsity".</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>DeepSeek-AI (Liu, A., Mei, A., Lin, B. et al.). <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv:2512.02556v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: post-training budget "exceeding 10% of the pre-training cost" (§1, §4.1), the hypothesis that more budget helps (§4.1).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3 Technical Report</em>. arXiv:2412.19437. <a href="https://arxiv.org/abs/2412.19437">https://arxiv.org/abs/2412.19437</a>. Accessed 2026-10-27. <span class="ref-use">Used for: pre-training 2,664K H800 GPU-hours and total 2,788K (Table 1, §1).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Liu, M., Diao, S., Lu, X. et al. (NVIDIA). <em>ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models</em>. arXiv:2505.24864v1. <a href="https://arxiv.org/pdf/2505.24864v1">https://arxiv.org/pdf/2505.24864v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: over 2k steps (§1), 16k GPU-hours on 4 nodes of 8 H100, batch and minibatch sizes and context window (§3.2), boundary-expansion claims (abstract).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Yang, A., Li, A., Yang, B., Zhang, B. et al. (Alibaba Qwen Team). <em>Qwen3 Technical Report</em>. arXiv:2505.09388v1, 14 May 2025. <a href="https://arxiv.org/pdf/2505.09388v1">https://arxiv.org/pdf/2505.09388v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: 170 RL steps and 3,995 query-verifier pairs (§4.2), RL versus on-policy distillation on Qwen3-8B with GPU-hours (Table 21, p. 21).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Kimi Team (Moonshot AI). <em>Kimi K2.5: Visual Agentic Intelligence</em>. arXiv:2602.02276v2. <a href="https://arxiv.org/pdf/2602.02276v2">https://arxiv.org/pdf/2602.02276v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: vision-RL curves plotted against RL FLOPs (Fig. 2).</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Yue, Y., Chen, Z., Lu, R., Zhao, A. et al. (Tsinghua LeapLab / SJTU). <em>Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?</em> arXiv:2504.13837v5. <a href="https://arxiv.org/pdf/2504.13837v5">https://arxiv.org/pdf/2504.13837v5</a>. Accessed 2026-10-27. <span class="ref-use">Used for: pass@k crossover between RLVR and base models, pass@256 falling as pass@1 rises (abstract, Fig. 1).</span></li>
+  <li id="ref-19"><span class="ref-type">paper</span>Yao, X., Yu, L., Hu, X., Teng, F. et al. <em>The Debate on RLVR Reasoning Capability Boundary: Shrinkage, Expansion, or Both? A Two-Stage Dynamic View</em>. arXiv:2510.04028, 5 Oct 2025. <a href="https://arxiv.org/abs/2510.04028">https://arxiv.org/abs/2510.04028</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the exploitation-then-exploration reconciliation (abstract only).</span></li>
+  <li id="ref-20"><span class="ref-type">paper</span>Cui, G., Zhang, Y., Chen, J. et al. <em>The Entropy Mechanism of Reinforcement Learning for Reasoning Language Models</em>. arXiv:2505.22617v1. <a href="https://arxiv.org/pdf/2505.22617v1">https://arxiv.org/pdf/2505.22617v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the entropy-performance law R = -a exp(H) + b (abstract).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

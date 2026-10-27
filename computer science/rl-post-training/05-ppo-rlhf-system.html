@@ -1,0 +1,797 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PPO-RLHF as a System · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Follows one iteration of InstructGPT-style PPO-RLHF tensor by tensor: the four models, the per-token KL reward with the reward-model score at the last token, GAE over response tokens, the minibatch loop, the pretraining-gradient mix, Tulu 3's PPO against verifiable rewards, and the measured evidence on PPO versus DPO cost, quality and implementation detail.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 5</p>
+  <h1>PPO-RLHF as a System: Policy, Reference, Reward and Value Models, Per-Token KL Reward, GAE, and the Pretraining Mix</h1>
+  <p class="lede">InstructGPT-style RLHF runs four language models inside one loop: an actor that generates and is trained, a frozen reference that prices drift, a frozen reward model that scores the finished text, and a value model that spreads that one score over the tokens. This module follows one iteration tensor by tensor (the per-token KL reward, GAE over response tokens, the minibatch loop, the pretraining-gradient mix), then reads the measured evidence on cost, on quality against DPO, and on how much of PPO's result is implementation detail. Afterwards you can draw the dataflow, list its tensors, and say what a critic-free method removes from it.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>50 min</b> read</span>
+    <span class="chip"><b>16</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 3</b>, <b>Module 4</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 412" role="img" aria-labelledby="f1t"><title id="f1t">Dataflow of one PPO-RLHF iteration: the actor generates responses; the reference, reward, value and actor models each emit a tensor; reward shaping and GAE turn them into advantages and value targets; the learner updates the actor and the value model</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f1-arra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+    </defs>
+
+    <rect x="10" y="125" width="100" height="40" rx="8" class="d-surface"/>
+    <text x="60" y="150" text-anchor="middle" class="d-mono">prompt x</text>
+    <path d="M110,145 L140,145" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="140" y="105" width="115" height="80" rx="8" class="d-block"/>
+    <text x="197" y="141" text-anchor="middle" class="d-text-inv d-bold">Actor π_θ</text>
+    <text x="197" y="161" text-anchor="middle" class="d-text-inv d-small">trained</text>
+    <text x="197" y="96" text-anchor="middle" class="d-mono d-small">y: ids (B,T)</text>
+
+    <path d="M255,145 L285,145" class="d-arrow"/>
+    <path d="M285,40 L285,250" class="d-arrow"/>
+    <path d="M285,40 L315,40" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M285,110 L315,110" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M285,180 L315,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M285,250 L315,250" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="315" y="15" width="150" height="50" rx="8" class="d-block-muted"/>
+    <text x="390" y="37" text-anchor="middle" class="d-text-inv d-bold">Reference π_ref</text>
+    <text x="390" y="54" text-anchor="middle" class="d-text-inv d-small">frozen SFT copy</text>
+    <rect x="315" y="85" width="150" height="50" rx="8" class="d-block-muted"/>
+    <text x="390" y="107" text-anchor="middle" class="d-text-inv d-bold">Reward model r_ψ</text>
+    <text x="390" y="124" text-anchor="middle" class="d-text-inv d-small">frozen</text>
+    <rect x="315" y="155" width="150" height="50" rx="8" class="d-block"/>
+    <text x="390" y="177" text-anchor="middle" class="d-text-inv d-bold">Value model V_φ</text>
+    <text x="390" y="194" text-anchor="middle" class="d-text-inv d-small">trained, init = RM</text>
+    <rect x="315" y="225" width="150" height="50" rx="8" class="d-block"/>
+    <text x="390" y="247" text-anchor="middle" class="d-text-inv d-bold">Actor (scoring)</text>
+    <text x="390" y="264" text-anchor="middle" class="d-text-inv d-small">same θ, no grad</text>
+
+    <path d="M465,40 L488,40" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M465,110 L488,110" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M465,180 L488,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M465,250 L488,250" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="488" y="23" width="112" height="34" rx="17" class="d-surface"/>
+    <text x="544" y="45" text-anchor="middle" class="d-mono d-small">log π_ref (B,T)</text>
+    <rect x="488" y="93" width="112" height="34" rx="17" class="d-surface"/>
+    <text x="544" y="115" text-anchor="middle" class="d-mono d-small">r_RM at EOS (B)</text>
+    <rect x="488" y="163" width="112" height="34" rx="17" class="d-surface"/>
+    <text x="544" y="185" text-anchor="middle" class="d-mono d-small">V_t (B,T)</text>
+    <rect x="488" y="233" width="112" height="34" rx="17" class="d-surface"/>
+    <text x="544" y="255" text-anchor="middle" class="d-mono d-small">log π_old (B,T)</text>
+    <path d="M600,40 L618,40" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M600,110 L618,110" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M600,180 L618,180" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M600,250 L618,250" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="618" y="15" width="176" height="260" rx="10" class="d-hl"/>
+    <text x="706" y="42" text-anchor="middle" class="d-bold">Reward shaping</text>
+    <text x="706" y="64" text-anchor="middle" class="d-mono d-small">−β log(π_old/π_ref)</text>
+    <text x="706" y="82" text-anchor="middle" class="d-small">+ r_RM on the EOS token</text>
+    <text x="706" y="120" text-anchor="middle" class="d-bold">GAE (γ, λ)</text>
+    <text x="706" y="142" text-anchor="middle" class="d-mono d-small">δ = r + γV′ − V</text>
+    <text x="706" y="160" text-anchor="middle" class="d-mono d-small">Â_t = Σ (γλ)^l δ_t+l</text>
+    <text x="706" y="198" text-anchor="middle" class="d-bold">emits</text>
+    <text x="706" y="220" text-anchor="middle" class="d-mono d-small">Â_t  (B,T)</text>
+    <text x="706" y="240" text-anchor="middle" class="d-mono d-small">R̂_t = Â_t + V_t  (B,T)</text>
+
+    <path d="M706,275 L706,305" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="150" y="305" width="640" height="84" rx="10" class="d-block-accent"/>
+    <text x="470" y="330" text-anchor="middle" class="d-text-inv d-bold">PPO update: minibatches × epochs</text>
+    <text x="470" y="353" text-anchor="middle" class="d-text-inv d-mono d-small">Actor: −min(ρÂ, clip(ρ, 1±ε)Â) + γ_ptx · (−log p_pretrain)</text>
+    <text x="470" y="375" text-anchor="middle" class="d-text-inv d-mono d-small">Value: ½ (V_φ − R̂)²          ρ = π_θ / π_old</text>
+
+    <rect x="10" y="305" width="118" height="84" rx="10" class="d-outline d-dashed d-stroke-orange"/>
+    <text x="69" y="341" text-anchor="middle" class="d-small">pretraining text</text>
+    <text x="69" y="359" text-anchor="middle" class="d-mono d-small">D_pretrain</text>
+    <path d="M128,347 L150,347" class="d-arrow-active" marker-end="url(#f1-arra)"/>
+    <path d="M195,305 L195,187" class="d-arrow-active" marker-end="url(#f1-arra)"/>
+    <text x="187" y="258" text-anchor="end" class="d-small d-fill-orange">new θ</text>
+
+    <rect x="10" y="214" width="14" height="14" rx="3" class="d-block"/>
+    <text x="30" y="226" class="d-small">trained</text>
+    <rect x="10" y="236" width="14" height="14" rx="3" class="d-block-muted"/>
+    <text x="30" y="248" class="d-small">frozen</text>
+
+    <text x="400" y="406" text-anchor="middle" class="d-small d-text-light">B = sequences per batch, T = response tokens. The orange arrows are the only edges that change weights.</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> One PPO-RLHF iteration. The same actor weights generate, re-score and receive the update. The reference, reward and value models and the actor's own scoring pass each emit one tensor; reward shaping and GAE turn them into advantages and value targets; the learner updates the actor with the clipped loss (plus the pretraining term of PPO-ptx, section 6) and the value model with a regression loss. Structure from InstructGPT §3.5<a class="cite" href="#ref-1">1</a>, Lambert Fig. 19 and §6.2.7<a class="cite" href="#ref-2">2</a>, and DeepSeekMath Fig. 4 and Eq. 2<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<h2 id="recipe">1. The recipe and its environment</h2>
+
+<h3 id="recipe-stages">1.1 Three stages, three datasets</h3>
+<p>InstructGPT fine-tunes GPT-3 in three steps<a class="cite" href="#ref-1">1</a>: supervised fine-tuning on labeler demonstrations, a reward model trained on labeler rankings, and PPO against that reward model. The datasets differ in size: the SFT set has about 13k training prompts, the RM set 33k, and the PPO set 31k, the last drawn only from the API (the SFT and RM prompts mix API and labeler-written ones)<a class="cite" href="#ref-1">1</a> (§3.2). About 40 contractors produced the labels<a class="cite" href="#ref-1">1</a> (§1). The policies come in three sizes (1.3B, 6B, 175B), but one 6B reward model and one 6B value function serve all of them, so that policy size is the only variable<a class="cite" href="#ref-1">1</a> (Appendix C.4). Models run in fp16 with fp32 master weights, a 2k-token context, prompts filtered to at most 1k tokens, and responses capped at 1k<a class="cite" href="#ref-1">1</a> (Appendix C).</p>
+<p>No single piece was new in 2022. Ziegler et al. fine-tuned a language model with PPO against a learned reward, with the KL penalty to the starting model written into the reward<a class="cite" href="#ref-4">4</a> (§2.1). Stiennon et al. moved the recipe to summarization with human comparisons<a class="cite" href="#ref-5">5</a>, and InstructGPT says it follows them<a class="cite" href="#ref-1">1</a> (§3.5). InstructGPT adds scale, real API prompts and the pretraining mix of section 6. Module 4 covered the reward model; one fact from it matters here. The Bradley-Terry loss is shift-invariant, so InstructGPT adds a bias to the RM so that labeler demonstrations score a mean of 0 before RL starts<a class="cite" href="#ref-1">1</a> (§3.5). KL coefficients are therefore relative to a reward scale someone chose: Ivison et al. lower β from 0.05 to 0.0325 when they switch to 70B reward models, and note that reward models trained under different settings "can have very different output ranges"<a class="cite" href="#ref-6">6</a> (Appendix F).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 304" role="img" aria-labelledby="f2t"><title id="f2t">The three-stage InstructGPT recipe with dataset and model sizes, and the bandit environment that stage three presents to the policy</title>
+    <defs>
+      <marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <rect x="10" y="12" width="240" height="140" rx="10" class="d-surface"/>
+    <text x="130" y="36" text-anchor="middle" class="d-title">1 · SFT</text>
+    <text x="130" y="62" text-anchor="middle" class="d-mono">~13k prompts</text>
+    <text x="130" y="84" text-anchor="middle" class="d-small">labeler demonstrations</text>
+    <text x="130" y="106" text-anchor="middle" class="d-small">policy sizes 1.3B · 6B · 175B</text>
+    <text x="130" y="128" text-anchor="middle" class="d-small d-text-light">16 epochs, cosine LR</text>
+    <path d="M250,82 L280,82" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="280" y="12" width="240" height="140" rx="10" class="d-surface"/>
+    <text x="400" y="36" text-anchor="middle" class="d-title">2 · Reward model</text>
+    <text x="400" y="62" text-anchor="middle" class="d-mono">33k prompts</text>
+    <text x="400" y="84" text-anchor="middle" class="d-small">K = 4 to 9 ranked responses each</text>
+    <text x="400" y="106" text-anchor="middle" class="d-small">one 6B model, 1 epoch</text>
+    <text x="400" y="128" text-anchor="middle" class="d-small d-text-light">pairwise loss (Module 4)</text>
+    <path d="M520,82 L550,82" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="550" y="12" width="240" height="140" rx="10" class="d-hl"/>
+    <text x="670" y="36" text-anchor="middle" class="d-title">3 · PPO</text>
+    <text x="670" y="62" text-anchor="middle" class="d-mono">31k prompts, API only</text>
+    <text x="670" y="84" text-anchor="middle" class="d-small">256k episodes</text>
+    <text x="670" y="106" text-anchor="middle" class="d-small">policy 1.3B · 6B · 175B</text>
+    <text x="670" y="128" text-anchor="middle" class="d-small d-text-light">value model 6B, init = RM</text>
+
+    <rect x="10" y="176" width="780" height="120" rx="10" class="d-panel"/>
+    <text x="24" y="198" class="d-small d-bold">What stage 3 sees: a bandit environment</text>
+    <rect x="40" y="214" width="150" height="56" rx="8" class="d-surface"/>
+    <text x="115" y="238" text-anchor="middle" class="d-mono d-small">reset()</text>
+    <text x="115" y="256" text-anchor="middle" class="d-small">random prompt x</text>
+    <path d="M190,242 L250,242" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="250" y="214" width="150" height="56" rx="8" class="d-block"/>
+    <text x="325" y="238" text-anchor="middle" class="d-text-inv d-bold">Policy π_θ</text>
+    <text x="325" y="256" text-anchor="middle" class="d-text-inv d-small">samples response y</text>
+    <path d="M400,242 L470,242" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="435" y="234" text-anchor="middle" class="d-mono d-small">y</text>
+    <rect x="470" y="214" width="190" height="56" rx="8" class="d-block-accent"/>
+    <text x="565" y="236" text-anchor="middle" class="d-text-inv d-mono d-small">step(y) → reward</text>
+    <text x="565" y="256" text-anchor="middle" class="d-text-inv d-small">r_RM(x,y) and KL terms</text>
+    <path d="M565,270 L565,289 L325,289 L325,272" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="445" y="284" text-anchor="middle" class="d-small">reward; episode ends (done)</text>
+    <text x="728" y="236" text-anchor="middle" class="d-small d-text-light">one step</text>
+    <text x="728" y="254" text-anchor="middle" class="d-small d-text-light">per episode</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Top: the three stages with the dataset and model sizes InstructGPT reports (§3.2, §3.5, Appendix C.1-C.4)<a class="cite" href="#ref-1">1</a>. Bottom: the environment stage 3 presents. An episode is one prompt and one response; the reward model's score arrives when the response ends, and the KL terms are added token by token (section 3).</figcaption>
+</figure>
+
+<h3 id="recipe-bandit">1.2 The environment is a bandit</h3>
+<p>InstructGPT's description of stage 3 is literal<a class="cite" href="#ref-1">1</a> (§3.5): "The environment is a bandit environment which presents a random customer prompt and expects a response to the prompt. Given the prompt and response, it produces a reward determined by the reward model and ends the episode." In the usual reset/step interface, reset draws a prompt, step receives the whole response and returns the reward with done set, and there is no second step.</p>
+<p>Two things follow. First, the bandit label describes the environment, not the learner. PPO still treats every BPE token as a time step, as Stiennon et al. state<a class="cite" href="#ref-5">5</a> (§3.1), and the only reward before the last token is the KL term of section 3. Ahmadian et al. argue that the learner should follow the environment and treat the completion as one action<a class="cite" href="#ref-7">7</a> (§1); Module 2 (Section 1) derives when the two views give the same gradient, and section 9 reports their results. Second, the unit of progress is the episode, not the epoch. InstructGPT trains for 256k episodes over about 31k unique prompts<a class="cite" href="#ref-1">1</a> (Appendix C.4), about 8.3 passes over the prompt set (derived). The Tulu 3 RLVR ablations make about 13 passes over the 7,473 GSM8K prompts<a class="cite" href="#ref-8">8</a> (§6.2), and Huang et al. reshuffle and reuse the SFT prompts until 1M episodes are reached<a class="cite" href="#ref-9">9</a> (Detail 21). Reuse is cheap here because each pass resamples the response, and the response is what carries the training signal.</p>
+<p>The same loop with the reward model replaced by a checker is RLVR. Tulu 3 defines it as leveraging "the existing RLHF objective but replaces the reward model with a verification function"<a class="cite" href="#ref-8">8</a> (§6), and its RLVR runs use PPO unchanged (section 8). So this module also describes how the first RLVR models were trained; Part 3 then removes the value model.</p>
+
+<h2 id="four-models">2. Four models: two trained, two frozen</h2>
+
+<h3 id="four-models-roles">2.1 What each model is for</h3>
+<p>Table 1 lists the four roles with InstructGPT's choices. The actor and the value model are trained; the reference and the reward model are only run forward. Initialization is the quiet design decision: the actor and the reference start as the same checkpoint, so at step 0 the KL term is zero, and the value model starts as the reward model, so that its representations already encode what the reward scores.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> The four models of PPO-RLHF. Sizes and initializations are InstructGPT's<a class="cite" href="#ref-1">1</a> (Appendix C.2-C.4); the last row is Tulu 3's RLVR variant<a class="cite" href="#ref-8">8</a> (§6.3, §6.4, §8.1).</caption>
+  <thead><tr><th>Model</th><th>Trained in RL?</th><th>Initialized from</th><th>Size</th><th>Emits per step</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Actor π_θ</td><td>yes</td><td>SFT model, 2 epochs with 10% pretraining data mixed in</td><td class="num">1.3B, 6B, 175B</td><td>token ids; log π_old per token</td></tr>
+    <tr><td class="row">Reference π_ref</td><td>no</td><td>the same SFT-plus-pretraining-mix checkpoint, used "to compute the KL reward"</td><td class="num">= actor</td><td>log π_ref per token</td></tr>
+    <tr><td class="row">Reward model r_ψ</td><td>no</td><td>6B GPT-3 fine-tuned on public NLP datasets; GPT-3 or SFT starts gave "similar results"</td><td class="num">6B (all policies)</td><td>one scalar at the EOS position</td></tr>
+    <tr><td class="row">Value model V_φ</td><td>yes</td><td>the reward model</td><td class="num">6B (all policies)</td><td>V_t at every response token</td></tr>
+    <tr><td class="row">Tulu 3 RLVR: no reward model</td><td>policy and value</td><td>value from a general RM trained on the Tulu 3 8B preference mix</td><td class="num">value 8B at 405B policy</td><td>verifier outcome replaces the RM scalar</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>The loss and the reward use two different denominators. The ratio ρ = π_θ / π_old compares the current weights with the weights that generated the batch, and it resets every iteration. The KL term compares π_old with π_ref, the frozen SFT model, and never resets. Lambert's reference code is explicit that the "old logprobs" are from the time the generations were sampled, "not necessarily the reference policy"<a class="cite" href="#ref-2">2</a> (§6.3.5).</p></aside>
+
+<h3 id="four-models-iteration">2.2 One iteration, stage by stage</h3>
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 252" role="img" aria-label="Stepper over one PPO-RLHF iteration: generation, four frozen-weight passes, reward shaping and GAE, minibatch update, weight hand-over">
+      <defs>
+        <marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+      </defs>
+      <g data-step="1">
+        <rect x="26" y="14" width="170" height="24" rx="6" class="d-block"/><text x="111" y="31" text-anchor="middle" class="d-text-inv d-bold">Actor: generate</text>
+        <rect x="210" y="14" width="570" height="24" rx="6" class="d-surface"/><text x="218" y="31" class="d-mono d-small">y: token ids (B, P+T)</text>
+      </g>
+      <g data-step="2">
+        <rect x="26" y="42" width="170" height="24" rx="6" class="d-block"/><text x="111" y="59" text-anchor="middle" class="d-text-inv d-bold">Actor: scoring pass</text>
+        <rect x="210" y="42" width="570" height="24" rx="6" class="d-surface"/><text x="218" y="59" class="d-mono d-small">log π_old (B, T)</text>
+        <rect x="26" y="70" width="170" height="24" rx="6" class="d-block-muted"/><text x="111" y="87" text-anchor="middle" class="d-text-inv d-bold">Reference</text>
+        <rect x="210" y="70" width="570" height="24" rx="6" class="d-surface"/><text x="218" y="87" class="d-mono d-small">log π_ref (B, T)</text>
+        <rect x="26" y="98" width="170" height="24" rx="6" class="d-block"/><text x="111" y="115" text-anchor="middle" class="d-text-inv d-bold">Value model</text>
+        <rect x="210" y="98" width="570" height="24" rx="6" class="d-surface"/><text x="218" y="115" class="d-mono d-small">V_t (B, T)</text>
+        <rect x="26" y="126" width="170" height="24" rx="6" class="d-block-muted"/><text x="111" y="143" text-anchor="middle" class="d-text-inv d-bold">Reward model</text>
+        <rect x="210" y="126" width="110" height="24" rx="6" class="d-surface"/><text x="218" y="143" class="d-mono d-small">r_RM (B)</text>
+        <text x="332" y="143" class="d-small d-text-light">one scalar per response, read at the EOS position</text>
+      </g>
+      <g data-step="3">
+        <rect x="26" y="154" width="170" height="24" rx="6" class="d-hl"/><text x="111" y="171" text-anchor="middle" class="d-bold">Reward shaping</text>
+        <rect x="210" y="154" width="570" height="24" rx="6" class="d-surface"/><text x="218" y="171" class="d-mono d-small">r_t = −β(log π_old − log π_ref) + r_RM · 1[t = EOS]   (B, T)</text>
+        <rect x="26" y="182" width="170" height="24" rx="6" class="d-hl"/><text x="111" y="199" text-anchor="middle" class="d-bold">GAE (backward)</text>
+        <rect x="210" y="182" width="570" height="24" rx="6" class="d-surface"/><text x="218" y="199" class="d-mono d-small">Â_t and R̂_t = Â_t + V_t   (B, T)</text>
+      </g>
+      <g data-step="4">
+        <rect x="26" y="210" width="170" height="24" rx="6" class="d-block-accent"/><text x="111" y="227" text-anchor="middle" class="d-text-inv d-bold">Learner</text>
+        <rect x="210" y="210" width="570" height="24" rx="6" class="d-fill-orange-soft d-stroke-orange"/>
+        <path d="M281.25,210 L281.25,234 M352.5,210 L352.5,234 M423.75,210 L423.75,234 M495,210 L495,234 M566.25,210 L566.25,234 M637.5,210 L637.5,234 M708.75,210 L708.75,234" class="d-axis"/>
+        <text x="245.6" y="227" text-anchor="middle" class="d-mono d-small">mb 1</text><text x="316.9" y="227" text-anchor="middle" class="d-mono d-small">mb 2</text><text x="388.1" y="227" text-anchor="middle" class="d-mono d-small">mb 3</text><text x="459.4" y="227" text-anchor="middle" class="d-mono d-small">mb 4</text><text x="530.6" y="227" text-anchor="middle" class="d-mono d-small">mb 5</text><text x="601.9" y="227" text-anchor="middle" class="d-mono d-small">mb 6</text><text x="673.1" y="227" text-anchor="middle" class="d-mono d-small">mb 7</text><text x="744.4" y="227" text-anchor="middle" class="d-mono d-small">mb 8</text>
+      </g>
+      <g data-step="5">
+        <path d="M26,222 L10,222 L10,26 L26,26" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+        <text x="772" y="31" text-anchor="end" class="d-small d-fill-orange">new θ for the next rollout</text>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Generate.</b> The actor samples one response per prompt for a batch of 512 prompts at temperature 1, each response capped at 1k tokens<a class="cite" href="#ref-1">1</a> (Appendix C.4). This is autoregressive decoding, the serving workload. In Ivison et al.'s implementation it takes "more than 95%" of the training time<a class="cite" href="#ref-6">6</a> (Appendix G).</li>
+    <li><b>Score with fixed weights.</b> Four forward passes over the finished sequences, no gradients: the actor records log π_old, the reference records log π_ref, the value model emits V_t at every response token, and the reward model emits one scalar at the EOS position. Each is a single parallel pass (prefill-shaped, in the writer's terms) and returns per-token floats, not logits (section 2.3).</li>
+    <li><b>Shape the reward, run GAE.</b> The reward at each token is the KL term; the last token also gets the reward model's score (section 3). A backward recursion over the tokens turns rewards and values into advantages Â_t and value targets R̂_t (section 4).</li>
+    <li><b>Update in minibatches.</b> InstructGPT splits the 512 sequences into 8 minibatches of 64 and makes a single pass<a class="cite" href="#ref-1">1</a> (Appendix C.4). Each step applies the clipped loss to the actor and a squared-error loss to the value model, with the pretraining gradients of section 6 accumulated into the same step.</li>
+    <li><b>Hand over the weights.</b> The updated θ becomes the generator for the next rollout; the reference and the reward model never change. Moving θ into the sampling engine is the infrastructure problem of System Design Modules 36 and 37. Tulu 3 does it with an NCCL broadcast into vLLM<a class="cite" href="#ref-8">8</a> (§8.1).</li>
+  </ol>
+</div>
+
+<h3 id="four-models-tensors">2.3 What moves between the models</h3>
+<p>Module 1 (Table 6, Section 7) counts what stays resident: 36 bytes per policy parameter of model state for this system, 252 GB at 7B and 2,520 GB at 70B with policy-sized models, and 18N FLOPs per sampled token (all derived there). The other half of the cost model is what crosses between the models in one iteration. Table 2 lists the tensors (writer's accounting) at InstructGPT-like shapes: 512 sequences, 1,024-token prompts and 1,024-token responses.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Tensors exchanged in one PPO-RLHF iteration at B = 512, P = T = 1,024 (1 MB = 10<sup>6</sup> bytes; ids assumed int32, int64 would double that row). Derived by the writer from the dataflow of Figure 1; shapes and the reward and loss definitions are from InstructGPT Eq. 2<a class="cite" href="#ref-1">1</a> and Lambert §6.3.5<a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th>Tensor</th><th>Shape</th><th>dtype</th><th>Produced by</th><th>Consumed by</th><th class="num">Size (MB)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">token ids</td><td>(B, P+T)</td><td>int32</td><td>generator</td><td>all four models</td><td class="num">4.19</td></tr>
+    <tr><td class="row">log π_old</td><td>(B, T)</td><td>fp32</td><td>actor</td><td>ratio ρ, reward shaping</td><td class="num">2.10</td></tr>
+    <tr><td class="row">log π_ref</td><td>(B, T)</td><td>fp32</td><td>reference</td><td>reward shaping</td><td class="num">2.10</td></tr>
+    <tr><td class="row">V_t</td><td>(B, T)</td><td>fp32</td><td>value model</td><td>GAE, value clip</td><td class="num">2.10</td></tr>
+    <tr><td class="row">r_RM</td><td>(B)</td><td>fp32</td><td>reward model</td><td>reward shaping</td><td class="num">0.002</td></tr>
+    <tr><td class="row">r_t</td><td>(B, T)</td><td>fp32</td><td>reward shaping</td><td>GAE</td><td class="num">2.10</td></tr>
+    <tr><td class="row">Â_t</td><td>(B, T)</td><td>fp32</td><td>GAE</td><td>actor loss</td><td class="num">2.10</td></tr>
+    <tr><td class="row">R̂_t</td><td>(B, T)</td><td>fp32</td><td>GAE</td><td>value loss</td><td class="num">2.10</td></tr>
+    <tr><td class="row">completion mask</td><td>(B, T)</td><td>bool</td><td>generator</td><td>all losses</td><td class="num">0.52</td></tr>
+    <tr><td class="row">Total</td><td></td><td></td><td></td><td></td><td class="num" data-best>17.30</td></tr>
+  </tbody>
+</table>
+
+<p>The whole data plane is 17.30 MB per iteration. One bf16 copy of a 7B policy is 14 GB, about 810 times more (derived), and a 175B fp16 copy is 350 GB. The data that must move is tiny; the weights that must move are not. There is also a way to inflate the data plane by a factor of about 7,800: shipping logits instead of the log-probability of the sampled token. With a 128,000-token vocabulary (Llama 3's, §3.2)<a class="cite" href="#ref-10">10</a>, fp16 logits for 512 × 1,024 response positions are 134 GB (derived), more than the 7B weights. The practical consequence (the writer's inference) is that each scoring pass should gather the sampled token's log-probability inside the forward pass and return one float per token.</p>
+
+<div class="calc">
+  <p class="calc-title">What moves between the models in one iteration</p>
+  <div class="calc-row"><label for="c5b">Sequences per batch B</label><input type="range" id="c5b" name="B" min="64" max="4096" step="64" value="512"></div>
+  <div class="calc-row"><label for="c5p">Prompt tokens P</label><input type="range" id="c5p" name="P" min="128" max="4096" step="128" value="1024" data-format="si"></div>
+  <div class="calc-row"><label for="c5t">Response tokens T</label><input type="range" id="c5t" name="T" min="128" max="16384" step="128" value="1024" data-format="si"></div>
+  <div class="calc-row"><label for="c5w">Policy parameters (billions)</label><input type="range" id="c5w" name="W" min="1" max="400" step="1" value="7"></div>
+  <div class="calc-out">
+    <div>Token ids<output data-expr="4 * B * (P + T)" data-format="bytes10"></output></div>
+    <div>Six fp32 per-token tensors<output data-expr="24 * B * T" data-format="bytes10"></output></div>
+    <div>Mask and RM scores<output data-expr="B * T + 4 * B" data-format="bytes10"></output></div>
+    <div>All per-iteration data<output data-expr="4 * B * (P + T) + 25 * B * T + 4 * B" data-format="bytes10"></output></div>
+    <div>One bf16 weight sync<output data-expr="2 * W * 1e9" data-format="bytes10"></output></div>
+    <div>Weights divided by data<output data-expr="2 * W * 1e9 / (4 * B * (P + T) + 25 * B * T + 4 * B)" data-format="fixed:0"></output></div>
+    <div>Full fp16 logits instead (V = 128,000)<output data-expr="2 * B * T * 128000" data-format="bytes10"></output></div>
+  </div>
+  <p class="calc-note">Formulas: ids \(4B(P+T)\) bytes; six fp32 tensors \(24BT\); mask \(BT\); RM scores \(4B\); weights \(2\Psi\) with \(\Psi\) in parameters; logits \(2BTV\). Derived by the writer; the vocabulary size is Llama 3's<a class="cite" href="#ref-10">10</a>. Activation memory and the generator's KV cache are not included.</p>
+</div>
+
+<h2 id="reward">3. The reward PPO sees: per-token KL plus one score at the end</h2>
+
+<h3 id="reward-formula">3.1 The formula</h3>
+<p>Set the pretraining term aside until section 6. InstructGPT's RL objective (Eq. 2) is the reward model's score minus a KL-style penalty to the SFT model<a class="cite" href="#ref-1">1</a>. Here policy parameters are θ and the reward model's are ψ (the paper uses φ and θ):</p>
+$$\mathbb{E}_{(x,y)\sim\pi_\theta}\Big[\,r_\psi(x,y)\;-\;\beta\,\log\frac{\pi_\theta(y\mid x)}{\pi_{\mathrm{SFT}}(y\mid x)}\Big]$$
+<p>The text says the penalty is applied "at each token". DeepSeekMath's Eq. 2<a class="cite" href="#ref-3">3</a> and Ivison et al.'s Eq. 4<a class="cite" href="#ref-6">6</a> write the per-token reward that implementations feed to GAE, with \(T\) the position of the EOS token and \(\pi_{\mathrm{old}}\) the policy that generated the batch:</p>
+$$r_t \;=\; -\beta\,\log\frac{\pi_{\mathrm{old}}(y_t\mid x,y_{&lt;t})}{\pi_{\mathrm{ref}}(y_t\mid x,y_{&lt;t})}\;+\;r_\psi(x,y)\,\mathbb{1}[t=T]$$
+<p>Two consequences. The per-token terms sum to the sequence-level log-ratio, \(\sum_t \log(\pi_{\mathrm{old}}/\pi_{\mathrm{ref}})=\log(\pi_{\mathrm{old}}(y\mid x)/\pi_{\mathrm{ref}}(y\mid x))\), so Eq. 2 and the per-token reward have the same total return at \(\gamma=1\). What changes is when the penalty is paid, which is what a critic and GAE can use for credit assignment. And the sampled log-ratio is a one-sample estimate of the KL between the policy and the reference (the estimator Module 6 calls k1, with its variance and alternatives). A single term can be negative, a bonus for a token the policy has made less likely than the reference did. Only the expectation is non-negative.</p>
+
+<h3 id="reward-example">3.2 A six-token example, by hand</h3>
+<p>Take β = 0.05, the value in Stiennon et al., Huang et al. and Ivison et al.<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-6">6</a>, and a response whose sixth token is EOS. The log-probabilities are invented: \(\log\pi_{\mathrm{old}}=(-0.10,-0.60,-0.05,-0.90,-0.20,-0.30)\) and \(\log\pi_{\mathrm{ref}}=(-0.30,-0.90,-0.15,-3.70,-0.45,-2.10)\). The reward model, normalized as in section 1, scores the response 1.20. The critic values are invented too: negative everywhere but the last position, which is what Huang et al. observe for a value model initialized from a reward model, because the reward logits at non-EOS positions are almost always negative<a class="cite" href="#ref-9">9</a> (Details 13 and 22). With \(\gamma=1\), the value InstructGPT uses ("no discount")<a class="cite" href="#ref-1">1</a>, and the GAE recursion of Module 3 gives every column of Table 3; Figure 4 plots them.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 3.</b> Reward and advantage for one six-token response. Illustrative: log-probabilities, the RM score (1.20) and the critic values \(V(s_t)\) are invented by the writer; every other column is derived from them with β = 0.05, γ = 1 and \(\delta_t=r_t+V(s_{t+1})-V(s_t)\), \(V(s_7)=0\). The λ = 1 column is \(G_t-V(s_t)\), the Monte Carlo return minus the critic.</caption>
+  <thead><tr><th>Token</th><th class="num">ℓ<sub>t</sub> = log π_old − log π_ref</th><th class="num">−βℓ<sub>t</sub></th><th class="num">r<sub>t</sub></th><th class="num">V(s<sub>t</sub>)</th><th class="num">δ<sub>t</sub> (= Â, λ = 0)</th><th class="num">Â, λ = 0.95</th><th class="num">Â, λ = 1</th></tr></thead>
+  <tbody>
+    <tr><td class="row">1 The</td><td class="num">0.20</td><td class="num">−0.0100</td><td class="num">−0.0100</td><td class="num">−0.50</td><td class="num">0.0400</td><td class="num">1.1512</td><td class="num">1.4275</td></tr>
+    <tr><td class="row">2 answer</td><td class="num">0.30</td><td class="num">−0.0150</td><td class="num">−0.0150</td><td class="num">−0.45</td><td class="num">0.0350</td><td class="num">1.1697</td><td class="num">1.3875</td></tr>
+    <tr><td class="row">3 is</td><td class="num">0.10</td><td class="num">−0.0050</td><td class="num">−0.0050</td><td class="num">−0.40</td><td class="num" data-worst>−0.1550</td><td class="num">1.1944</td><td class="num">1.3525</td></tr>
+    <tr><td class="row">4 42</td><td class="num" data-best>2.80</td><td class="num">−0.1400</td><td class="num" data-worst>−0.1400</td><td class="num">−0.55</td><td class="num">0.0600</td><td class="num">1.4204</td><td class="num">1.5075</td></tr>
+    <tr><td class="row">5 .</td><td class="num">0.25</td><td class="num">−0.0125</td><td class="num">−0.0125</td><td class="num">−0.35</td><td class="num">1.1375</td><td class="num">1.4320</td><td class="num">1.4475</td></tr>
+    <tr><td class="row">6 EOS</td><td class="num">1.80</td><td class="num">−0.0900</td><td class="num" data-best>1.1100</td><td class="num">0.80</td><td class="num">0.3100</td><td class="num">0.3100</td><td class="num">0.3100</td></tr>
+    <tr><td class="row">Sum</td><td class="num">5.45</td><td class="num">−0.2725</td><td class="num">0.9275</td><td class="num"></td><td class="num">1.4275</td><td class="num"></td><td class="num"></td></tr>
+  </tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 282" role="img" aria-labelledby="f4t"><title id="f4t">Left: per-token reward for the six-token example, small negative KL terms on tokens one to five and the reward-model score plus a KL term on the EOS token. Right: advantages at lambda 0, 0.95 and 1</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="64" y="26" class="d-title">Reward r_t (β = 0.05)</text>
+    <path d="M64,222.2 L376,222.2" class="d-axis"/>
+    <text x="58" y="226.2" text-anchor="end" class="d-mono d-small d-text-light">0.0</text>
+    <path d="M64,162.9 L376,162.9" class="d-grid"/>
+    <text x="58" y="166.9" text-anchor="end" class="d-mono d-small d-text-light">0.5</text>
+    <path d="M64,103.5 L376,103.5" class="d-grid"/>
+    <text x="58" y="107.5" text-anchor="end" class="d-mono d-small d-text-light">1.0</text>
+    <path d="M64,56 L64,246" class="d-axis"/>
+    <rect x="75.0" y="222.2" width="30" height="1.2" class="d-fill-red"/>
+    <text x="90.0" y="266" text-anchor="middle" class="d-mono d-small">The</text>
+    <rect x="127.0" y="222.2" width="30" height="1.8" class="d-fill-red"/>
+    <text x="142.0" y="266" text-anchor="middle" class="d-mono d-small">answer</text>
+    <rect x="179.0" y="222.2" width="30" height="1.2" class="d-fill-red"/>
+    <text x="194.0" y="266" text-anchor="middle" class="d-mono d-small">is</text>
+    <rect x="231.0" y="222.2" width="30" height="16.6" class="d-fill-red"/>
+    <text x="246.0" y="266" text-anchor="middle" class="d-mono d-small">42</text>
+    <rect x="283.0" y="222.2" width="30" height="1.5" class="d-fill-red"/>
+    <text x="298.0" y="266" text-anchor="middle" class="d-mono d-small">.</text>
+    <rect x="335.0" y="79.8" width="30" height="142.5" class="d-fill-green"/>
+    <rect x="335.0" y="222.2" width="30" height="10.7" class="d-fill-red"/>
+    <text x="350.0" y="266" text-anchor="middle" class="d-mono d-small">EOS</text>
+    <text x="246.0" y="252.9" text-anchor="middle" class="d-mono d-small">−0.140</text>
+    <text x="350.0" y="74.8" text-anchor="middle" class="d-mono d-small">+1.20</text>
+    <text x="350.0" y="246.9" text-anchor="middle" class="d-mono d-small">−0.09</text>
+    <text x="350.0" y="60.8" text-anchor="middle" class="d-mono d-small">net 1.110</text>
+    <text x="452" y="26" class="d-title">Advantage Â_t</text>
+    <path d="M452,217.9 L788,217.9" class="d-axis"/>
+    <text x="446" y="221.9" text-anchor="end" class="d-mono d-small d-text-light">0.0</text>
+    <path d="M452,182.7 L788,182.7" class="d-grid"/>
+    <text x="446" y="186.7" text-anchor="end" class="d-mono d-small d-text-light">0.5</text>
+    <path d="M452,147.5 L788,147.5" class="d-grid"/>
+    <text x="446" y="151.5" text-anchor="end" class="d-mono d-small d-text-light">1.0</text>
+    <path d="M452,112.3 L788,112.3" class="d-grid"/>
+    <text x="446" y="116.3" text-anchor="end" class="d-mono d-small d-text-light">1.5</text>
+    <path d="M452,77.1 L788,77.1" class="d-grid"/>
+    <text x="446" y="81.1" text-anchor="end" class="d-mono d-small d-text-light">2.0</text>
+    <path d="M452,56 L452,246" class="d-axis"/>
+    <rect x="459.0" y="215.0" width="14" height="2.8" class="d-fill-cyan"/>
+    <rect x="473.0" y="136.8" width="14" height="81.0" class="d-fill-blue"/>
+    <rect x="487.0" y="117.4" width="14" height="100.5" class="d-fill-orange"/>
+    <text x="480.0" y="112.4" text-anchor="middle" class="d-mono d-small">1.15</text>
+    <text x="480.0" y="266" text-anchor="middle" class="d-mono d-small">The</text>
+    <rect x="515.0" y="215.4" width="14" height="2.5" class="d-fill-cyan"/>
+    <rect x="529.0" y="135.5" width="14" height="82.3" class="d-fill-blue"/>
+    <rect x="543.0" y="120.2" width="14" height="97.6" class="d-fill-orange"/>
+    <text x="536.0" y="115.2" text-anchor="middle" class="d-mono d-small">1.17</text>
+    <text x="536.0" y="266" text-anchor="middle" class="d-mono d-small">answer</text>
+    <rect x="571.0" y="217.9" width="14" height="10.9" class="d-fill-cyan"/>
+    <rect x="585.0" y="133.8" width="14" height="84.0" class="d-fill-blue"/>
+    <rect x="599.0" y="122.7" width="14" height="95.2" class="d-fill-orange"/>
+    <text x="592.0" y="117.7" text-anchor="middle" class="d-mono d-small">1.19</text>
+    <text x="592.0" y="266" text-anchor="middle" class="d-mono d-small">is</text>
+    <rect x="627.0" y="213.6" width="14" height="4.2" class="d-fill-cyan"/>
+    <rect x="641.0" y="117.9" width="14" height="100.0" class="d-fill-blue"/>
+    <rect x="655.0" y="111.8" width="14" height="106.1" class="d-fill-orange"/>
+    <text x="648.0" y="106.8" text-anchor="middle" class="d-mono d-small">1.42</text>
+    <text x="648.0" y="266" text-anchor="middle" class="d-mono d-small">42</text>
+    <rect x="683.0" y="137.8" width="14" height="80.0" class="d-fill-cyan"/>
+    <rect x="697.0" y="117.1" width="14" height="100.8" class="d-fill-blue"/>
+    <rect x="711.0" y="116.0" width="14" height="101.9" class="d-fill-orange"/>
+    <text x="704.0" y="111.0" text-anchor="middle" class="d-mono d-small">1.43</text>
+    <text x="704.0" y="266" text-anchor="middle" class="d-mono d-small">.</text>
+    <rect x="739.0" y="196.0" width="14" height="21.8" class="d-fill-cyan"/>
+    <rect x="753.0" y="196.0" width="14" height="21.8" class="d-fill-blue"/>
+    <rect x="767.0" y="196.0" width="14" height="21.8" class="d-fill-orange"/>
+    <text x="760.0" y="191.0" text-anchor="middle" class="d-mono d-small">0.31</text>
+    <text x="760.0" y="266" text-anchor="middle" class="d-mono d-small">EOS</text>
+    <rect x="612" y="26" width="170" height="52" rx="6" class="d-label-bg"/>
+    <rect x="620" y="32" width="10" height="10" class="d-fill-cyan"/>
+    <text x="636" y="41" class="d-small">λ = 0  (= δ_t)</text>
+    <rect x="620" y="46" width="10" height="10" class="d-fill-blue"/>
+    <text x="636" y="55" class="d-small">λ = 0.95  (labelled)</text>
+    <rect x="620" y="60" width="10" height="10" class="d-fill-orange"/>
+    <text x="636" y="69" class="d-small">λ = 1  (G_t − V_t)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> The data of Table 3 (invented log-probabilities, RM score and critic values; arithmetic derived by the writer). Left: tokens 1 to 5 receive only a small negative KL term, and the EOS token receives the RM score (green) minus its own KL term (red), net 1.110. Right: advantages for three values of λ. Method: InstructGPT Eq. 2<a class="cite" href="#ref-1">1</a> and the GAE definition<a class="cite" href="#ref-11">11</a> (§3).</figcaption>
+</figure>
+
+<p>Four things to read off. First, the KL terms are small and signed per token, but their sum is exactly the sequence-level penalty: \(-0.2725=-\beta\times 5.45\), 23% of the RM score here. The largest single term falls on token 4, where the policy makes a token \(e^{2.80}\approx 16.4\) times likelier than the SFT model did, followed by the EOS (about 6.05 times). Huang et al. find that fine-tuned models change their behavior mostly at the start and the end of a response<a class="cite" href="#ref-9">9</a> (§7.2), which is where a real log-ratio profile would put its mass. Second, causality: \(G_t\) sums only later rewards, so token 4's penalty lowers the \(\lambda=1\) advantage of tokens 1 to 4 and not of tokens 5 and 6. A penalty cannot blame a token that came after it. At \(\lambda=0\), \(\delta_4=-0.140+(-0.35+0.55)=0.060\): the critic's rise from \(-0.55\) to \(-0.35\) outweighs the penalty. Third, the advantages are all positive at \(\lambda\ge0.95\), between 1.15 and 1.51 except the EOS token's 0.31, because the critic's negative values sit below the realized return of 0.9275. Every token looks better than expected. This offset is why implementations whiten the advantages, subtracting the batch mean and dividing by the batch standard deviation<a class="cite" href="#ref-9">9</a> (Detail 25)<a class="cite" href="#ref-8">8</a> (§6.2). Fourth, the value targets \(\hat R_t=\hat A_t+V_t\) at \(\lambda=0.95\) are \((0.65,0.72,0.79,0.87,1.08,1.11)\) (derived), so early updates pull the critic up by about 1.15 at token 1.</p>
+
+<h3 id="reward-kl">3.3 What the KL term is for, and how β is set</h3>
+<p>Stiennon et al. give the penalty two jobs<a class="cite" href="#ref-5">5</a> (§3.1): it "acts as an entropy bonus, encouraging the policy to explore and deterring it from collapsing to a single mode", and it keeps the policy from producing text "too different from those that the reward model has seen during training". Ziegler et al. also tune β with a controller, \(\beta_{t+1}=\beta_t(1+K_\beta e_t)\) with \(e_t=\mathrm{clip}\big((\mathrm{KL}_t-\mathrm{KL}_{\mathrm{target}})/\mathrm{KL}_{\mathrm{target}},-0.2,0.2\big)\) and \(K_\beta=0.1\), because seeds with the same β ended at "quite different values" of KL<a class="cite" href="#ref-4">4</a> (§2.2). Ivison et al. report that most recent implementations have moved to a fixed β, and in their comparison of five open implementations only one keeps the adaptive controller<a class="cite" href="#ref-6">6</a> (Appendix F, Table 10).</p>
+<p>The coefficient is small and found by sweeping. InstructGPT uses β = 0.02, and its sweep gives poor Likert scores at both 0 and 2, with the optimum "around 0.01 and 0.02"<a class="cite" href="#ref-1">1</a> (Appendix C.4, E.7). The KL term does not protect capabilities, though. When InstructGPT raised β to 2.0, 100 times the default (with the pretrained GPT-3 as the KL reference in that sweep), the regressions on public NLP datasets remained, which is what motivated the pretraining mix of section 6<a class="cite" href="#ref-1">1</a> (Appendix E.6). Tulu 3 sees the same limit from the verifiable side: more KL budget "does not necessarily" improve verifiable reward on GSM8K and MATH, and large KL lowers the average score across evaluations<a class="cite" href="#ref-8">8</a> (§6.2.1).</p>
+<p>The placement is a design choice. PPO puts the penalty in the reward, so it flows through the critic into every token's advantage. DeepSeekMath's GRPO instead adds the KL to the loss, "avoiding complicating the calculation" of the advantage<a class="cite" href="#ref-3">3</a> (§4.1.1). Module 6 derives what each placement does to the gradient and compares KL coefficients across reports. The scale of the reward is the other lever, and recipes disagree: Stiennon et al. and InstructGPT normalize the reward model so demonstrations average 0, Huang et al. optionally whiten rewards within a batch and find that this shortens responses<a class="cite" href="#ref-9">9</a> (Detail 24), and Ivison et al. use no reward normalization or whitening at all but whiten advantages<a class="cite" href="#ref-6">6</a> (Appendix F).</p>
+
+<h2 id="critic">4. The value model: initialization, GAE over tokens, and its cost</h2>
+
+<h3 id="critic-init">4.1 Initialize from the reward model, train as a separate network</h3>
+<p>The value model is a language model with a scalar head, like the reward model, and every PPO-RLHF recipe described here initializes it from the reward model: InstructGPT does<a class="cite" href="#ref-1">1</a> (§3.5), Stiennon et al. do<a class="cite" href="#ref-5">5</a> (§3.1), and so do Huang et al., Ivison et al. and Tulu 3. Huang et al. note, citing earlier work, that this warm start improves the initial gradients to the policy and reduces drift<a class="cite" href="#ref-9">9</a> (Detail 22). The alternatives exist: Ivison et al. list implementations that initialize the value head from the SFT model or the base model, and in their comparison table only AlpacaFarm, among the other implementations, starts the value model from the reward model<a class="cite" href="#ref-6">6</a> (Appendix F, Table 10). Tulu 3 tested it directly in its RLVR setting, starting the value model from a general reward model or from the anchored DPO checkpoint, and found that the reward-model start gave "the highest GSM8K test score and also higher average scores", from which it concludes that "the value function plays an important role in RLVR's training"<a class="cite" href="#ref-8">8</a> (§6.2.1).</p>
+<p>Stiennon et al. also settled whether the value network should share the policy's parameters. It should not: a separate Transformer "prevents updates to the value function from partially destroying the pretrained policy early in training", it outperformed a shared network in their ablation, and it can be initialized from the reward model; the price is memory<a class="cite" href="#ref-5">5</a> (§3.1, Appendix G.1). Size is a free choice. InstructGPT paired 1.3B, 6B and 175B policies with one 6B value function, in part because a 175B reward model "could be unstable", made a poor value initialization, and would have greatly raised the compute of PPO<a class="cite" href="#ref-1">1</a> (§3.5, Appendix C.2), and Tulu 3 paired a 405B policy with an 8B value model, about 50 times smaller (derived)<a class="cite" href="#ref-8">8</a> (§8.1).</p>
+
+<h3 id="critic-gae">4.2 GAE over response tokens</h3>
+<p>Module 3 derives GAE, its closed form for a last-token reward, and a five-token hand computation; Table 3 above applies it to a reward vector with KL terms. The settings are consistent across recipes: \(\gamma=1\) in every recipe in Table 4 (InstructGPT: "No discount is applied when estimating the generalized advantage"<a class="cite" href="#ref-1">1</a>), and \(\lambda=0.95\) in Stiennon et al., Huang et al., Ivison et al. and Tulu 3<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-8">8</a>. PPO's MuJoCo defaults are \(\gamma=0.99\) and \(\lambda=0.95\)<a class="cite" href="#ref-12">12</a> (Table 3), so the LLM recipes kept \(\lambda\) and dropped the discount. No report states why; discounting a finite text episode has no obvious purpose (the writer's reading).</p>
+<p>What \(\lambda=0.95\) does depends on length, by the \(\lambda^{T-t}\) weight of Module 3 (Section 6.4). In Huang et al.'s TL;DR setup, responses are sampled to a fixed 53 tokens<a class="cite" href="#ref-9">9</a> (Detail 23), so the first token receives \(0.95^{52}\approx0.07\) of the final reward directly (derived). In Tulu 3's RLVR runs, responses can reach 2,048 tokens<a class="cite" href="#ref-8">8</a> (Table 21), and the same weight at a 1,024-token response is about \(10^{-23}\) (derived). The value of \(\lambda\) was set in the first regime and carried into the second unchanged. Nothing in the reports shows it being re-tuned, which means that at reasoning lengths the critic's own predictions supply almost all of the early tokens' advantage.</p>
+<p>The critic is trained on \(\hat R_t=\hat A_t+V_t\), the \(\lambda\)-return, with a squared-error loss weighted by 0.1 in Huang et al., Ivison et al. and Tulu 3, and a value-clip range of 0.2 in the first two<a class="cite" href="#ref-9">9</a> (Table 7)<a class="cite" href="#ref-6">6</a> (Table 9)<a class="cite" href="#ref-8">8</a> (Table 21). The value clip is a "code-level optimization" inherited from the MuJoCo implementation of PPO, and Engstrom et al. list it first among nine code-level optimizations whose effect, they find, accounts for most of PPO's gain in cumulative reward over TRPO<a class="cite" href="#ref-13">13</a>. Ahmadian et al. removed both the policy clip and the value clip in an RLHF setting and saw no meaningful change<a class="cite" href="#ref-7">7</a> (§3.2).</p>
+
+<h3 id="critic-hard">4.3 Why the critic is the weak part</h3>
+<p>The last-token reward is the root of it. DeepSeekMath states the objection in two parts: the value function "is typically another model of comparable size as the policy model", a "substantial memory and computational burden", and because "usually only the last token is assigned a reward score", training a value function "that is accurate at each token" may be complicated<a class="cite" href="#ref-3">3</a> (§4.1.1). Module 2 (Section 5) derives why the critic can only redistribute the sequence-level credit \(R-V(x)\) and not create it. What Huang et al.'s logs show is the starting point: the RM-initialized value network behaves like a per-token reward model that is negative until the EOS position, and in training "effectively acting as a per-token RM" for the end-of-episode return<a class="cite" href="#ref-9">9</a> (Detail 22).</p>
+<p>Kimi k1.5 adds an argument that is not about cost. With a long chain of thought, an oracle value function would mark a reasoning step that leads into an error as worse than a correct one, and standard credit assignment would penalize it, yet "exploring" such a step "is extremely valuable" if the model recovers and reaches the right answer. Kimi excluded the value network for this reason as well as for efficiency<a class="cite" href="#ref-14">14</a> (§2.3.2). Table 5 of Module 3 shows the same effect at \(\lambda=0\), where a successful response still gives its fourth token a negative advantage. Part 3 picks up both threads: Module 9 for the critic-free estimators, Module 11 for the advantage without a critic.</p>
+
+<h2 id="inner-loop">5. The inner loop: minibatches, epochs and the clip</h2>
+
+<h3 id="inner-loop-settings">5.1 The settings, side by side</h3>
+<p>Table 4 collects the PPO settings that the primary sources report. Against the MuJoCo defaults of Module 3 (horizon 2,048, Adam at 3e-4, 10 epochs over minibatches of 64)<a class="cite" href="#ref-12">12</a>, three things change. The learning rate is 20 to 3,000 times smaller (3e-4 against 1.5e-5 down to 1e-7, derived), presumably because the policy starts from a trained SFT model. The number of passes over a batch falls from 10 to between 1 and 4. And the sampling temperature is a real exploration setting (1.0 or 0.7), because the policy's own sampling is the only source of exploration. A batch is 64 to 1,856 complete responses of up to 1k or 2k tokens, not a horizon of environment steps.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 4.</b> PPO settings in the RLHF-era reports. "Minibatches × epochs" is the number of minibatches per rollout batch times the passes over it; n/s = not stated in the text read; Ivison's episode count is derived from their 60,908-example datasets. γ = 1 in all; λ = 0.95 where stated (InstructGPT states no λ). Sources: InstructGPT App. C.4<a class="cite" href="#ref-1">1</a>; Stiennon App. B<a class="cite" href="#ref-5">5</a>; Huang Table 7<a class="cite" href="#ref-9">9</a>; Ivison Tables 9 and 11, App. F<a class="cite" href="#ref-6">6</a>; Tulu 3 Table 21, §6.4 and §8.1, and for the 405B row the table labelled Table 35, whose caption describes the general-RM run while its column header reads 405B RLVR (the header is taken as the 405B RLVR configuration; its printed 300,000-episode budget was not run)<a class="cite" href="#ref-8">8</a>.</caption>
+  <thead><tr><th>Recipe (policy)</th><th class="num">Episodes</th><th class="num">Batch (responses)</th><th>Minibatches × epochs</th><th class="num">β</th><th class="num">Learning rate</th><th class="num">Temp.</th></tr></thead>
+  <tbody>
+    <tr><td class="row">InstructGPT (1.3B, 6B, 175B)</td><td class="num">256k</td><td class="num">512</td><td>8 × 1</td><td class="num">0.02</td><td class="num">n/s (swept 2.55e-6 to 2.55e-5)</td><td class="num">1</td></tr>
+    <tr><td class="row">Stiennon et al. (1.3B, 6.7B)</td><td class="num">1M</td><td class="num">512 (1.3B), 256 (6.7B)</td><td>n/s × 4</td><td class="num">0.05</td><td class="num">1.5e-5 (1.3B), 7e-6 (6.7B)</td><td class="num">n/s</td></tr>
+    <tr><td class="row">Huang et al. (Pythia 1B to 6.9B)</td><td class="num">1M</td><td class="num">512</td><td>1 × 4</td><td class="num">0.05</td><td class="num">3e-6</td><td class="num">0.7</td></tr>
+    <tr><td class="row">Ivison et al. (Tulu 2 13B)</td><td class="num">about 61k (1 epoch)</td><td class="num">64</td><td>1 × 1</td><td class="num">0.05 (0.0325 with 70B RMs)</td><td class="num">1e-6</td><td class="num">0.7</td></tr>
+    <tr><td class="row">Tulu 3 PPO against a general RM</td><td class="num">300k</td><td class="num">224</td><td>1 × 1</td><td class="num">0.05 to 0.01 swept</td><td class="num">3e-7</td><td class="num">1.0</td></tr>
+    <tr><td class="row">Tulu 3 RLVR (8B / 70B)</td><td class="num">100k / 400k</td><td class="num">224 / 640</td><td>1 × 4</td><td class="num">0.05 / 0.07</td><td class="num">3e-7 / 1e-7</td><td class="num">1.0</td></tr>
+    <tr><td class="row">Tulu 3 RLVR (405B)</td><td class="num">300k printed; 75 steps run</td><td class="num">1,856</td><td>1 × 1</td><td class="num">0.05</td><td class="num">1e-7</td><td class="num">1.0</td></tr>
+  </tbody>
+</table>
+
+<h3 id="inner-loop-clip">5.2 Where the clip can fire</h3>
+<p>The clipped loss only acts when the ratio \(\rho=\pi_\theta/\pi_{\mathrm{old}}\) differs from 1, and the ratio is exactly 1 at the first optimizer step on a batch if the old log-probabilities come from the same weights with dropout off. Tulu 3 and Huang et al. both disable dropout for this reason: if the two passes disagree, "all ratios could potentially be clipped, resulting in zero gradient"<a class="cite" href="#ref-8">8</a> (§6.2)<a class="cite" href="#ref-9">9</a> (Detail 7). After that first step the policy has moved, so only steps 2 to \(n\) can clip, where \(n\) is minibatches times epochs. Figure 5 counts them.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 346" role="img" aria-labelledby="f5t"><title id="f5t">For each recipe, a row of squares for the optimizer steps taken on one rollout batch; the first square is grey because the importance ratio is exactly one, the rest are blue because the clip can bind</title>
+    <text x="10" y="24" class="d-title">Optimizer steps taken on one rollout batch (minibatches × epochs)</text>
+    <text x="10" y="63" class="d-small">InstructGPT (8 minibatches × 1 epoch)</text>
+    <rect x="300" y="46" width="26" height="26" rx="4" class="d-block-muted"/>
+    <rect x="332" y="46" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="364" y="46" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="396" y="46" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="428" y="46" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="460" y="46" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="492" y="46" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="524" y="46" width="26" height="26" rx="4" class="d-block"/>
+    <text x="566" y="63" class="d-mono d-small">7 of 8 steps can clip</text>
+    <text x="10" y="97" class="d-small">Ziegler et al. (1 × 4)</text>
+    <rect x="300" y="80" width="26" height="26" rx="4" class="d-block-muted"/>
+    <rect x="332" y="80" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="364" y="80" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="396" y="80" width="26" height="26" rx="4" class="d-block"/>
+    <text x="566" y="97" class="d-mono d-small">3 of 4 steps can clip</text>
+    <text x="10" y="131" class="d-small">Huang et al. reproduction (1 × 4)</text>
+    <rect x="300" y="114" width="26" height="26" rx="4" class="d-block-muted"/>
+    <rect x="332" y="114" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="364" y="114" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="396" y="114" width="26" height="26" rx="4" class="d-block"/>
+    <text x="566" y="131" class="d-mono d-small">3 of 4 steps can clip</text>
+    <text x="10" y="165" class="d-small">Tulu 3 RLVR, 8B and 70B (1 × 4)</text>
+    <rect x="300" y="148" width="26" height="26" rx="4" class="d-block-muted"/>
+    <rect x="332" y="148" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="364" y="148" width="26" height="26" rx="4" class="d-block"/>
+    <rect x="396" y="148" width="26" height="26" rx="4" class="d-block"/>
+    <text x="566" y="165" class="d-mono d-small">3 of 4 steps can clip</text>
+    <text x="10" y="199" class="d-small">Tulu 3 PPO against a general RM (1 × 1)</text>
+    <rect x="300" y="182" width="26" height="26" rx="4" class="d-block-muted"/>
+    <text x="566" y="199" class="d-mono d-small">0 of 1 steps can clip</text>
+    <text x="10" y="233" class="d-small">Tulu 3 405B RLVR (1 × 1)</text>
+    <rect x="300" y="216" width="26" height="26" rx="4" class="d-block-muted"/>
+    <text x="566" y="233" class="d-mono d-small">0 of 1 steps can clip</text>
+    <text x="10" y="267" class="d-small">Ivison et al. (1 × 1)</text>
+    <rect x="300" y="250" width="26" height="26" rx="4" class="d-block-muted"/>
+    <text x="566" y="267" class="d-mono d-small">0 of 1 steps can clip</text>
+    <rect x="10" y="298" width="14" height="14" rx="3" class="d-block-muted"/>
+    <text x="32" y="310" class="d-small">ρ = 1 at the first step: old log-probs come from the same weights, with dropout off</text>
+    <rect x="10" y="322" width="14" height="14" rx="3" class="d-block"/>
+    <text x="32" y="334" class="d-small">ρ ≠ 1 is possible after earlier updates, so the clip can bind</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Optimizer steps per rollout batch, derived as minibatches × epochs from Table 4 (InstructGPT 8 × 1; Ziegler et al. one minibatch for four epochs<a class="cite" href="#ref-4">4</a> (§2.2); Huang et al. 1 × 4; Tulu 3 RLVR 1 × 4, with 1 × 1 for the RM runs and the 405B run). The ratio is 1 at the first step only when the old log-probabilities are recomputed with the same weights and dropout off. Three of the seven rows have no step at which the clip can bind.</figcaption>
+</figure>
+
+<p>Three of the seven rows, Tulu 3's RM runs and its 405B run and Ivison et al.'s, take one step per batch, so the clip never binds and the update is a policy gradient weighted by the GAE advantage. Lambert states this directly: with one gradient step per sample, \(\pi_\theta=\pi_{\theta_{\mathrm{old}}}\) and the update "reduces to" standard policy gradient<a class="cite" href="#ref-2">2</a> (§6.3.5.1). He also notes that DAPO uses 16 gradient steps per batch while Tulu 3 uses 4 for 8B and 70B and drops to 1 at 405B "to maintain training stability"<a class="cite" href="#ref-2">2</a> (§6.4.2). Where the clip can bind, it rarely does. Ahmadian et al. measured the loss as clipped "on average &lt; 5% of the time per batch" across their datasets and models, and found that removing both the policy and value clips "does not impact learning meaningfully"<a class="cite" href="#ref-7">7</a> (§3.2). The regularization that does the work in RLHF is then the small learning rate, the few steps and the KL term in the reward (the writer's reading, consistent with Lambert's §6.4.2). Module 3 (Section 5) shows why the clip is not a KL bound even when it does bind.</p>
+
+<h3 id="inner-loop-stale">5.3 Staleness inside a batch</h3>
+<p>With several minibatches per rollout, later minibatches train on data from weights that have already moved, as in InstructGPT's 8 minibatches per batch. Ivison et al. hit the cost of this when they raised the prompt batch to 512 with a minibatch of 64: computing log-probabilities and values once per batch, as most implementations do, "severely destabilized training", and the value loss "did not converge fast enough to supply policy training with reliable advantage signals". Their fix was to run the forward passes per minibatch, so the log-probabilities and values come from the most current models, which they note deviates from most PPO implementations<a class="cite" href="#ref-6">6</a> (Appendix G). The same report found that raising the prompt batch from 64 to 512 cut training time from 60 h to 12 h at a cost of 0.6 points of average score (section 9). A "single pass" over 8 minibatches is already off-policy by up to 7 optimizer steps; Modules 12 and 14 cover the lag between sampler and learner.</p>
+
+<h3 id="inner-loop-code">5.4 Sections 3 to 5 as tensor code</h3>
+<p>The functions below are the writer's, in the shape of Lambert's reference PPO code<a class="cite" href="#ref-2">2</a> (§6.2.7, §6.3.5). Run on the inputs of Table 3 they return its reward, advantage and value-target columns exactly. Three details carry the weight. Every stage is masked, so a KL term on a padded position cannot leak into a return, a hazard Lambert's code comments flag. The value after the last token is zero. And PPO-ptx adds \(\gamma_{\mathrm{ptx}}\) times a language-modeling loss on a separate pretraining batch to this loss before the backward pass.</p>
+<pre class="code" data-lang="python" data-title="ppo_tensors.py"><code>import torch
+
+def shape_rewards(logp_old, logp_ref, rm_score, mask, beta):
+    # logp_*: (B,T) log-prob of each sampled token; rm_score: (B,); mask: (B,T), 1 on response tokens
+    r = -beta * (logp_old - logp_ref) * mask                  # per-token KL term, zero on padding
+    eos = mask.sum(1).long() - 1                               # index of the last response token
+    r[torch.arange(r.size(0)), eos] += rm_score                # the RM score lands on the EOS position
+    return r
+
+def gae(r, v, mask, gamma=1.0, lam=0.95):
+    B, T = r.shape
+    adv, run = torch.zeros_like(r), torch.zeros(B)
+    for t in reversed(range(T)):
+        v_next = v[:, t + 1] * mask[:, t + 1] if t + 1 &lt; T else 0.0   # V = 0 after the last token
+        delta = r[:, t] + gamma * v_next - v[:, t]
+        run = (delta + gamma * lam * run) * mask[:, t]          # padding zeroes the recursion
+        adv[:, t] = run
+    return adv, adv + v * mask                                   # advantages, value targets R_hat
+
+def ppo_loss(logp_new, logp_old, v_new, v_old, adv, ret, mask, eps=0.2, eps_v=0.2, c_v=0.1):
+    a = adv[mask &gt; 0]
+    adv = (adv - a.mean()) / (a.std() + 1e-8)                    # whiten over the batch
+    ratio = (logp_new - logp_old).exp()
+    pg = torch.max(-adv * ratio, -adv * ratio.clamp(1 - eps, 1 + eps))
+    v_clip = v_old + (v_new - v_old).clamp(-eps_v, eps_v)
+    vf = 0.5 * torch.max((v_new - ret) ** 2, (v_clip - ret) ** 2)
+    return (((pg + c_v * vf) * mask).sum(1) / mask.sum(1)).mean()   # sequence-mean aggregation</code></pre>
+
+<h2 id="ptx">6. PPO-ptx: pretraining gradients and the alignment tax</h2>
+
+<h3 id="ptx-objective">6.1 The objective and what it costs</h3>
+<p>InstructGPT's Eq. 2 has a second term, \(\gamma_{\mathrm{ptx}}\,\mathbb{E}_{x\sim D_{\mathrm{pretrain}}}[\log\pi_\theta(x)]\): the ordinary language-modeling log-likelihood on pretraining text, added to the RL objective<a class="cite" href="#ref-1">1</a> (§3.5). The paper calls the coefficient γ; this module writes \(\gamma_{\mathrm{ptx}}\) because γ is the discount. "For 'PPO' models, γ is set to 0", so plain PPO is the \(\gamma_{\mathrm{ptx}}=0\) special case, and "InstructGPT" in the paper means the PPO-ptx models. The mechanics are in Appendix C.4: the run uses 8 times more pretraining examples than RL episodes (2,048,000 for 256k episodes, derived), "for each minibatch, we compute the PPO gradients and pretraining gradients in consecutive steps and accumulate them both into the gradient buffers", and the pretraining gradient is multiplied by \(\gamma_{\mathrm{ptx}}=27.8\). One value of 27.8 "seems to work well across model sizes, from 1.3B to 175B"<a class="cite" href="#ref-1">1</a> (Appendix E.6). On the 1.3B model, any \(\gamma_{\mathrm{ptx}}\ge20\) recovered the regressions.</p>
+<p>The cost the paper reports is wall-clock; the pretraining batches run through the same actor. With a ratio of 8 the training time "doubles that of the corresponding experiment without using pretraining mix"; at a ratio of 4 the pretraining loss would often increase during training, and a ratio of 32 gave better Likert scores but "the training time also increases by a few fold"<a class="cite" href="#ref-1">1</a> (Appendix E.11). It also needs a data path the other three models do not: a stream of pretraining text feeding the learner. The same appendix reports that the SFT initialization itself was trained with 10% pretraining data mixed in, "the only setting [that] stands out" among the 0%, 10% and 50% mixes tested (Appendix E.8).</p>
+
+<h3 id="ptx-evidence">6.2 What the mix buys, and what it does not</h3>
+<p>The tax is real. At 175B with few-shot prompting, plain PPO falls to 74.5% of GPT-3's SQuADv2 F1, 78.8% of its DROP F1 and 66.6% of its French-to-English BLEU, and PPO-ptx recovers most of it (Figure 6). The tax starts before RL: the SFT model is already at 87.8% to 94.5% of GPT-3 on three of the four, and PPO-ptx ends above SFT on three of four, so the mix repairs some SFT damage as well as RL damage.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 286" role="img" aria-labelledby="f6t"><title id="f6t">Grouped bars of SFT, PPO and PPO-ptx scores at 175B few-shot as a percentage of GPT-3 175B on SQuADv2, DROP, HellaSwag and WMT15 French to English; PPO is lowest on three of four and PPO-ptx recovers most of the loss</title>
+    <text x="70" y="24" class="d-small d-bold">% of GPT-3 175B few-shot score (GPT-3 = 100)</text>
+    <rect x="470" y="14" width="12" height="12" class="d-fill-cyan"/>
+    <text x="488" y="24" class="d-small">SFT</text>
+    <rect x="570" y="14" width="12" height="12" class="d-fill-red"/>
+    <text x="588" y="24" class="d-small">PPO</text>
+    <rect x="670" y="14" width="12" height="12" class="d-fill-blue"/>
+    <text x="688" y="24" class="d-small">PPO-ptx</text>
+    <path d="M70,250.0 L780,250.0" class="d-grid"/>
+    <text x="64" y="254.0" text-anchor="end" class="d-mono d-small d-text-light">60</text>
+    <path d="M70,210.4 L780,210.4" class="d-grid"/>
+    <text x="64" y="214.4" text-anchor="end" class="d-mono d-small d-text-light">70</text>
+    <path d="M70,170.8 L780,170.8" class="d-grid"/>
+    <text x="64" y="174.8" text-anchor="end" class="d-mono d-small d-text-light">80</text>
+    <path d="M70,131.2 L780,131.2" class="d-grid"/>
+    <text x="64" y="135.2" text-anchor="end" class="d-mono d-small d-text-light">90</text>
+    <path d="M70,91.6 L780,91.6" class="d-axis d-dashed"/>
+    <text x="64" y="95.6" text-anchor="end" class="d-mono d-small d-text-light">100</text>
+    <path d="M70,52.0 L780,52.0" class="d-grid"/>
+    <text x="64" y="56.0" text-anchor="end" class="d-mono d-small d-text-light">110</text>
+    <path d="M70,52 L70,250" class="d-axis"/>
+    <rect x="92.8" y="113.5" width="40" height="136.5" class="d-fill-cyan"/>
+    <text x="112.8" y="108.5" text-anchor="middle" class="d-mono d-small">94.5</text>
+    <rect x="138.8" y="192.7" width="40" height="57.3" class="d-fill-red"/>
+    <text x="158.8" y="187.7" text-anchor="middle" class="d-mono d-small">74.5</text>
+    <rect x="184.8" y="90.6" width="40" height="159.4" class="d-fill-blue"/>
+    <text x="204.8" y="85.6" text-anchor="middle" class="d-mono d-small">100.3</text>
+    <text x="158.8" y="272" text-anchor="middle" class="d-small">SQuADv2 (F1)</text>
+    <rect x="270.2" y="85.1" width="40" height="164.9" class="d-fill-cyan"/>
+    <text x="290.2" y="80.1" text-anchor="middle" class="d-mono d-small">101.6</text>
+    <rect x="316.2" y="175.7" width="40" height="74.3" class="d-fill-red"/>
+    <text x="336.2" y="170.7" text-anchor="middle" class="d-mono d-small">78.8</text>
+    <rect x="362.2" y="113.3" width="40" height="136.7" class="d-fill-blue"/>
+    <text x="382.2" y="108.3" text-anchor="middle" class="d-mono d-small">94.5</text>
+    <text x="336.2" y="272" text-anchor="middle" class="d-small">DROP (F1)</text>
+    <rect x="447.8" y="116.6" width="40" height="133.4" class="d-fill-cyan"/>
+    <text x="467.8" y="111.6" text-anchor="middle" class="d-mono d-small">93.7</text>
+    <rect x="493.8" y="107.6" width="40" height="142.4" class="d-fill-red"/>
+    <text x="513.8" y="102.6" text-anchor="middle" class="d-mono d-small">96.0</text>
+    <rect x="539.8" y="77.1" width="40" height="172.9" class="d-fill-blue"/>
+    <text x="559.8" y="72.1" text-anchor="middle" class="d-mono d-small">103.7</text>
+    <text x="513.8" y="272" text-anchor="middle" class="d-small">HellaSwag (acc.)</text>
+    <rect x="625.2" y="139.8" width="40" height="110.2" class="d-fill-cyan"/>
+    <text x="645.2" y="134.8" text-anchor="middle" class="d-mono d-small">87.8</text>
+    <rect x="671.2" y="224.0" width="40" height="26.0" class="d-fill-red"/>
+    <text x="691.2" y="219.0" text-anchor="middle" class="d-mono d-small">66.6</text>
+    <rect x="717.2" y="123.0" width="40" height="127.0" class="d-fill-blue"/>
+    <text x="737.2" y="118.0" text-anchor="middle" class="d-mono d-small">92.1</text>
+    <text x="691.2" y="272" text-anchor="middle" class="d-small">WMT15 fr-en (BLEU)</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> The alignment tax at 175B, few-shot, as a percentage of the GPT-3 175B score on the same task (dashed line = 100). Percentages are derived by the writer from InstructGPT's Table 14 (Appendix E): SQuADv2 F1 69.75 / 65.90 / 51.95 / 69.93, DROP F1 35.27 / 35.85 / 27.78 / 33.34, HellaSwag accuracy 0.791 / 0.741 / 0.759 / 0.820, fr-en BLEU 39.93 / 35.07 / 26.58 / 36.76 for GPT-3 / SFT / PPO / PPO-ptx<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>Three caveats from the same paper keep the claim honest. First, the repair is partial. In zero-shot SQuADv2, PPO-ptx reaches 59.85 F1 against GPT-3's 64.30, about 93% (derived from Table 14), and the paper says its PPO-ptx model "still lags behind GPT-3 on DROP, SQuADv2, and translation"<a class="cite" href="#ref-1">1</a> (§4.2). Second, the KL term cannot do this job. Even at \(\beta=2.0\), regressions on DROP and SQuAD remained, which the authors read as showing that "pretraining data distribution is critical" (Appendix E.6). The writer's reading of why: the KL penalty is evaluated only on the prompts and responses being sampled, so it can leave the model's behavior on unrelated text unconstrained, while the pretraining term trains on that text directly. Third, the effect decays with training. Running the 1.3B model for 512k episodes instead of 256k brought DROP and SQuADv2 back below the GPT-3 baseline, after starting above it (Appendix E.6, Figure 35).</p>
+<p>The mix has a second, less advertised effect on stability. Without it, "all runs with learning rate greater than 8.05e-6 diverged" on the 1.3B and 6B models, and PPO with the mix "appears to be less sensitive to change of the learning rate" (Appendix E.9)<a class="cite" href="#ref-1">1</a>. Later open recipes mostly omit the term: Ivison et al.'s PPO setup lists none, Xu et al. drop the auxiliary SFT loss "because of the limited amount of data"<a class="cite" href="#ref-15">15</a> (§5), and Tulu 3's RLVR stage leaves other benchmarks nearly flat without it (section 8.2).</p>
+
+<h2 id="results">7. What InstructGPT reported, and the caveats</h2>
+<p>The headline is that labelers prefer the outputs of the 1.3B InstructGPT model to those of the 175B GPT-3, "despite having over 100x fewer parameters"<a class="cite" href="#ref-1">1</a> (§1). The remaining numbers the paper leads with:</p>
+
+<div class="kpis">
+  <div class="kpi"><b>85 ± 3%</b><span>175B InstructGPT preferred to 175B GPT-3<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-cyan"><b>71 ± 4%</b><span>preferred to few-shot 175B GPT-3</span></div>
+  <div class="kpi kpi-green"><b>21% vs 41%</b><span>closed-domain hallucination rate, InstructGPT vs GPT-3</span></div>
+  <div class="kpi kpi-orange"><b>60 vs 3,640</b><span>petaflops/s-days: 175B PPO-ptx vs GPT-3 pretraining (1.6%, derived)</span></div>
+</div>
+
+<p>The paper is candid about the limits. The preference measure is human ratings on the API prompt distribution by about 40 contractors; held-out labelers prefer InstructGPT at about the same rate, but the authors call this "preliminary" and say more work is needed on broader groups and on inputs where humans disagree<a class="cite" href="#ref-1">1</a> (§1). The 85% is against base GPT-3, which is not instruction-tuned. Against fine-tunes on the public T0 and FLAN collections the paper reports a winrate for InstructGPT of 73.4 ± 2% against its baseline, versus 26.8 ± 2% for T0 and 29.8 ± 2% for FLAN<a class="cite" href="#ref-1">1</a> (§1). Toxicity falls by about 25% when the model is prompted to be respectful, but "InstructGPT does not significantly improve over GPT-3" on Winogender or CrowS-Pairs, the bias benchmarks. The model also "still makes simple mistakes". The alignment tax of section 6 is the capability cost that the headline does not show.</p>
+<p>The compute comparison is the part that survives: 4.9 petaflops/s-days for the 175B SFT model and 60 for the 175B PPO-ptx model, against 3,640 for GPT-3, which the authors read as RLHF being "very effective at making language models more helpful to users, more so than a 100x model size increase"<a class="cite" href="#ref-1">1</a> (§5). Post-training added about one-sixtieth of the pretraining compute. Module 1 puts RL at about 3.75% of pretraining compute for R1-Zero and above 10% for DeepSeek-V3.2, 2 to 6 times that share (derived), on recipes that had dropped the value model.</p>
+
+<h2 id="tulu3-ppo">8. Tulu 3: PPO against a verifier</h2>
+
+<h3 id="tulu3-recipe">8.1 The recipe</h3>
+<p>Tulu 3 is the clearest public account of PPO as the engine of RLVR. The objective is the RLHF objective with the reward model replaced by a verification function \(v\): maximize \(\mathbb{E}[v(x,y)-\beta\,\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})]\), where \(v=\alpha\) if the answer is verified and 0 otherwise, with \(\alpha=10\) "based on pilot experiments" and not tuned further<a class="cite" href="#ref-8">8</a> (§6, Eq. 7-8). The prompts are 7,473 GSM8K training questions, 7,500 MATH questions and 14,973 instructions with verifiable constraints, 29,946 in all (Table 22). RLVR runs after preference tuning, starting from the best DPO checkpoint. The adopted implementation details are the ones Huang et al. enumerate<a class="cite" href="#ref-9">9</a>: a value model initialized from a general reward model, dropout off, repeated passes over the prompts with shuffling (about 13 over GSM8K in the ablations), a −10 reward for responses without an EOS token, and advantage whitening<a class="cite" href="#ref-8">8</a> (§6.2). The rest of the PPO configuration is in Table 4: γ = 1, λ = 0.95, ε = 0.2, temperature 1.0, gradient-norm clip 1.0.</p>
+
+<h3 id="tulu3-findings">8.2 What the ablations found</h3>
+<p>Five findings, each from the report's own sweeps<a class="cite" href="#ref-8">8</a> (§6.2.1, Appendix B.4):</p>
+<ul>
+<li><strong>A reward-model start for the value function is best.</strong> It beat starting from the DPO checkpoint on GSM8K and on the average score (section 4.1).</li>
+<li><strong>KL budget does not buy verifiable reward.</strong> On GSM8K and MATH, "incurring more KL budget does not necessarily lead to improvements in verifiable rewards", and larger KL lowered the average score across evaluations: "overoptimization happens". The clearest failure is on constraint prompts at β = 0.01, where the policy satisfied the checker and dropped the content: for "the letter e should appear 14 times" it answered "e, e, e, …" fourteen times, and for "5 paragraphs" it printed bare "Paragraph 1 *** Paragraph 2 …" separators (Appendix B.4, Figure 28).</li>
+<li><strong>Do not add reward-model scores on top of the verifier.</strong> Verifier-only reward outperformed verifier plus RM score, which added noise to the average.</li>
+<li><strong>A stronger start learns with less drift.</strong> Starting from the weaker SFT checkpoint reached the same verifiable reward as the DPO checkpoint but at a larger KL for the same β, and the stronger start gave better test performance.</li>
+<li><strong>Selection matters.</strong> Checkpoints were evaluated every 100 steps (40 at 70B) and the final 8B model was the one with the best overall MATH and IFEval performance; some 8B runs reached 89.4% on GSM8K and 84.8% on IFEval but did worse elsewhere and lowered the average (§6.4).</li>
+</ul>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> Tulu 3 RLVR runs and results. GPU-hours are derived as GPUs × wall-clock hours; the report notes that an earlier-than-final checkpoint was taken from each run, so the delivered models used fewer. Scores are DPO checkpoint → RLVR checkpoint from the report's Table 23; the 405B run is described only as MATH gaining "over 5 points" within 25 RLVR steps, of 75 run<a class="cite" href="#ref-8">8</a> (§6.3, §6.4, §8.1).</caption>
+  <thead><tr><th>Run</th><th class="num">GPUs</th><th class="num">Wall-clock (h)</th><th class="num">GPU-hours</th><th class="num">Average</th><th class="num">GSM8K</th><th class="num">MATH</th><th class="num">IFEval</th></tr></thead>
+  <tbody>
+    <tr><td class="row">8B reward model (value init)</td><td class="num">8</td><td class="num">9</td><td class="num">72</td><td class="num">n/a</td><td class="num">n/a</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+    <tr><td class="row">8B RLVR</td><td class="num">8</td><td class="num">65</td><td class="num">520</td><td class="num">64.4 → 64.8</td><td class="num" data-best>84.3 → 87.6</td><td class="num">42.0 → 43.7</td><td class="num">81.1 → 82.4</td></tr>
+    <tr><td class="row">70B RLVR</td><td class="num">48</td><td class="num">60</td><td class="num">2,880</td><td class="num">75.9 → 76.0</td><td class="num">93.5 → 93.5</td><td class="num">62.3 → 63.0</td><td class="num">82.6 → 83.2</td></tr>
+    <tr><td class="row">405B RLVR</td><td class="num">256</td><td class="num">46</td><td class="num">11,776</td><td class="num">n/s</td><td class="num">not used</td><td class="num">over +5 in 25 steps</td><td class="num">not used</td></tr>
+  </tbody>
+</table>
+
+<p>Read with the average column in view, the result is modest and targeted. At 8B, GSM8K gains 3.3 points, MATH 1.7 and IFEval 1.3, while MMLU drops 0.5 (68.7 to 68.2), TruthfulQA 1.1 and the safety average 1.7 (87.2 to 85.5); the average moves 0.4. At 70B, GSM8K was already saturated at 93.5 and the average moves 0.1<a class="cite" href="#ref-8">8</a> (Table 23). The other benchmarks stay within about two points, without any pretraining mix, which supports Lambert's description of RL as something that "can be done surgically" when the prompt distribution is narrow<a class="cite" href="#ref-2">2</a> (§3.1.6). It does not show a free lunch: the safety and knowledge numbers move the wrong way.</p>
+
+<h3 id="tulu3-infra">8.3 Infrastructure</h3>
+<p>The system holds three models, since the reward model is gone: policy and value are trained, and the reference only runs inference. ZeRO stage 3 fits them, and Ray places dedicated GPUs running vLLM with PagedAttention for generation, because "often inference time is a bottleneck in RLHF infrastructure". Training is asynchronous: inference runs alongside the learner, and the policy trains on the second-latest inference batch for reproducibility, at the price of stale data when the sampler outruns the learner<a class="cite" href="#ref-8">8</a> (§6.3).</p>
+<p>At 405B the split is 16 GPUs for vLLM at 16-way tensor parallelism and 240 for training, with an NCCL broadcast to move weights. Per iteration the report gives about 550 s of inference, about 25 s of weight transfer and about 1,500 s of training, an 8B value model standing in for a 405B critic, 75 steps run, and NCCL timeouts that needed manual intervention<a class="cite" href="#ref-8">8</a> (§8.1). Module 1 (Section 5.2) turns those timings into a utilization estimate; System Design Modules 36 and 37 cover how the placement and weight transfer are engineered. The report's closing suggestion is "larger value models or alternate value model-free RL algorithms such as GRPO" (§8.1), which is where Part 3 begins.</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>The Tulu 3 report is inconsistent about the final 70B KL coefficient. The text of §6.4 says the 70B run used "β = 0.7 based on previous 70B RL development runs", while the Table 21 caption says the final 70B RLVR model used β = 0.07. The sweeps elsewhere in the report run from 0.001 to 0.15, so this module uses 0.07 and flags it<a class="cite" href="#ref-8">8</a>.</p></aside>
+
+<h2 id="evidence">9. PPO versus DPO: cost, quality, and implementation details</h2>
+
+<h3 id="evidence-cost">9.1 Cost</h3>
+<p>The cost side is not in dispute. In Tulu 3's controlled, untuned setup PPO took about 28 hours on two nodes and DPO about 4 hours on one<a class="cite" href="#ref-8">8</a> (§5.4.1), 14 times the node-hours (derived; Module 1, Section 7.3). Llama 3's team "also explored on-policy algorithms such as PPO" and found "DPO required less compute for large-scale models"<a class="cite" href="#ref-10">10</a> (§4.1.4). Ivison et al. give the reason: DPO needs no reward-model stage, no online decoding and no value model<a class="cite" href="#ref-6">6</a> (§2.1). In their PPO, rollouts took "more than 95%" of training time; a prompt batch of 512 instead of 64 cut a 60-hour run to 12 hours for 0.6 points of average score (61.7 to 61.1), and four rollouts per prompt at batch 256 recovered 61.4 at 32 hours<a class="cite" href="#ref-6">6</a> (Appendix G, Table 11).</p>
+
+<h3 id="evidence-quality">9.2 Quality: a ledger, not a verdict</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> Head-to-head PPO and DPO-family results in the primary sources. Setups differ, so numbers are comparable only within a row. Sources: Ivison et al. Table 2<a class="cite" href="#ref-6">6</a>; Xu et al. Tables 3-8<a class="cite" href="#ref-15">15</a>; Ahmadian et al. Table 1<a class="cite" href="#ref-7">7</a>; Tulu 3 Table 18 (an early-checkpoint exploration) and §5.4.1 with Figure 16 (the controlled comparison, a separate experiment)<a class="cite" href="#ref-8">8</a>; Llama 3 §4.1.4<a class="cite" href="#ref-10">10</a>.</caption>
+  <thead><tr><th>Study</th><th>Setting and metric</th><th>PPO</th><th>DPO family</th><th>Reading</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Ivison et al.</td><td>Tulu 2 13B, same preference data, 11-benchmark average (UltraFeedback)</td><td class="num">62.2</td><td class="num">61.0</td><td>PPO ahead on all 5 datasets, mean +0.7; truthfulness −2.5</td></tr>
+    <tr><td class="row">Xu et al.</td><td>CodeLlama 34B, APPS Introductory pass@5; CodeContest 10@1k test</td><td class="num" data-best>44.4%; 22.4%</td><td class="num">DPO-Iter 34.2%; DPO 0.0%, DPO-Iter 3.2%</td><td>DPO-Iter below SFT (38.6%) on APPS even with test-case labels</td></tr>
+    <tr><td class="row">Xu et al.</td><td>Llama 2 7B, HH-RLHF, OpenAssistant reward</td><td class="num">0.718</td><td class="num">DPO 0.611; DPO-Iter 0.678</td><td>GPT-4 judged PPO over DPO 42 to 30 (28 ties)</td></tr>
+    <tr><td class="row">Ahmadian et al.</td><td>GPT-4 win-rate (%): TL;DR, HH Pythia, HH Llama</td><td class="num" data-worst>67.6, 29.2, 32.0</td><td class="num">DPO 66.6, 39.0, 61.9</td><td>DPO ahead on both HH runs; RLOO (k = 4) 77.9, 43.7, 64.1</td></tr>
+    <tr><td class="row">Tulu 3, Table 18</td><td>early Tulu 3 SFT checkpoint, UltraFeedback; Tulu average (hyperparameter exploration)</td><td class="num">54.5, 55.5 (β = 0.0325, 0.05)</td><td class="num">DPO 55.2; length-normalized DPO 46.8 to 57.3 over 6 settings; SFT base 55.7</td><td>PPO 0.2 and 1.2 below the SFT base; length-normalized DPO best at 57.3</td></tr>
+    <tr><td class="row">Tulu 3, §5.4.1 and Figure 16</td><td>later controlled, untuned comparison: DPO preference mix, RM trained on it; Tulu average</td><td class="num">"similar (though slightly lower)" than DPO (Figure 16 caption); values plotted only</td><td class="num">values plotted only</td><td>PPO about 28 h on 2 nodes; DPO about 4 h on 1 node</td></tr>
+    <tr><td class="row">Llama 3</td><td>8B to 405B product models</td><td class="num">"explored"</td><td class="num">chosen</td><td>"performed better, especially on instruction following benchmarks like IFEval"; no numbers</td></tr>
+  </tbody>
+</table>
+<p>Three rows (Xu et al. twice, Ivison et al.) have PPO ahead, one (Ahmadian et al.) has it far behind on two of three datasets, and Tulu 3 and Llama 3 judge it not worth its cost. The rows differ in the reward (test cases in Xu et al.'s code tasks, learned reward models elsewhere), in PPO tuning (Xu et al. and Ivison et al. tuned; Ahmadian et al. ran a plain PPO to argue it is over-built), and in DPO setup (Xu et al. show DPO degrading under distribution shift; Tulu 3's Table 18 shows length-normalized DPO spanning 10.5 points across six hyperparameter settings). One label covers all of these runs, which is the first reason to distrust a single "PPO versus DPO" number.</p>
+
+<h3 id="evidence-details">9.3 Implementation details move the result more than the algorithm label</h3>
+<p>Engstrom et al. found for MuJoCo that "code-level optimizations" account for most of PPO's gain in cumulative reward over TRPO<a class="cite" href="#ref-13">13</a>. RLHF shows the same pattern, and Figure 7 is its cleanest demonstration. Xu et al. hold the algorithm, data and reward fixed and add three details to a PPO with batch size 64. On APPS Introductory, the baseline PPO scores 18.0%, 20.6 points below its own SFT starting point (38.6%); advantage normalization alone brings it back to 38.1%, a larger batch to 42.3%, and an exponentially averaged reference model to 44.4%, 5.8 points above SFT (derived)<a class="cite" href="#ref-15">15</a> (Table 3). On the dialogue task the same three changes move the reward only from 0.706 to 0.718. In this one study the details mattered most on the hard, sparse-reward tasks.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 262" role="img" aria-labelledby="f7t"><title id="f7t">Two panels of bars showing SFT, baseline PPO at batch size 64, and PPO with three cumulative changes on APPS Introductory pass@5 and CodeContest pass@1k</title>
+    <text x="60" y="26" class="d-small d-bold">APPS Introductory, pass@5 (%)</text>
+    <path d="M60,230.0 L390,230.0" class="d-axis"/>
+    <text x="54" y="234.0" text-anchor="end" class="d-mono d-small d-text-light">0</text>
+    <path d="M60,194.0 L390,194.0" class="d-grid"/>
+    <text x="54" y="198.0" text-anchor="end" class="d-mono d-small d-text-light">10</text>
+    <path d="M60,158.0 L390,158.0" class="d-grid"/>
+    <text x="54" y="162.0" text-anchor="end" class="d-mono d-small d-text-light">20</text>
+    <path d="M60,122.0 L390,122.0" class="d-grid"/>
+    <text x="54" y="126.0" text-anchor="end" class="d-mono d-small d-text-light">30</text>
+    <path d="M60,86.0 L390,86.0" class="d-grid"/>
+    <text x="54" y="90.0" text-anchor="end" class="d-mono d-small d-text-light">40</text>
+    <path d="M60,50.0 L390,50.0" class="d-grid"/>
+    <text x="54" y="54.0" text-anchor="end" class="d-mono d-small d-text-light">50</text>
+    <path d="M60,50 L60,230" class="d-axis"/>
+    <path d="M60,91.0 L390,91.0" class="d-axis d-dashed"/>
+    <rect x="70" y="91.0" width="42" height="139.0" class="d-block-muted"/>
+    <text x="91" y="86.0" text-anchor="middle" class="d-mono d-small">38.6</text>
+    <text x="91" y="250" text-anchor="middle" class="d-small">SFT</text>
+    <rect x="134" y="165.2" width="42" height="64.8" class="d-fill-red"/>
+    <text x="155" y="160.2" text-anchor="middle" class="d-mono d-small">18.0</text>
+    <text x="155" y="250" text-anchor="middle" class="d-small">PPO</text>
+    <rect x="198" y="92.8" width="42" height="137.2" class="d-fill-blue"/>
+    <text x="219" y="87.8" text-anchor="middle" class="d-mono d-small">38.1</text>
+    <text x="219" y="250" text-anchor="middle" class="d-small">+adv norm</text>
+    <rect x="262" y="77.7" width="42" height="152.3" class="d-fill-blue"/>
+    <text x="283" y="72.7" text-anchor="middle" class="d-mono d-small">42.3</text>
+    <text x="283" y="250" text-anchor="middle" class="d-small">+batch</text>
+    <rect x="326" y="70.2" width="42" height="159.8" class="d-fill-orange"/>
+    <text x="347" y="65.2" text-anchor="middle" class="d-mono d-small">44.4</text>
+    <text x="347" y="250" text-anchor="middle" class="d-small">+ref EMA</text>
+    <text x="450" y="26" class="d-small d-bold">CodeContest, pass@1k (%)</text>
+    <path d="M450,230.0 L780,230.0" class="d-axis"/>
+    <text x="444" y="234.0" text-anchor="end" class="d-mono d-small d-text-light">0</text>
+    <path d="M450,194.0 L780,194.0" class="d-grid"/>
+    <text x="444" y="198.0" text-anchor="end" class="d-mono d-small d-text-light">5</text>
+    <path d="M450,158.0 L780,158.0" class="d-grid"/>
+    <text x="444" y="162.0" text-anchor="end" class="d-mono d-small d-text-light">10</text>
+    <path d="M450,122.0 L780,122.0" class="d-grid"/>
+    <text x="444" y="126.0" text-anchor="end" class="d-mono d-small d-text-light">15</text>
+    <path d="M450,86.0 L780,86.0" class="d-grid"/>
+    <text x="444" y="90.0" text-anchor="end" class="d-mono d-small d-text-light">20</text>
+    <path d="M450,50.0 L780,50.0" class="d-grid"/>
+    <text x="444" y="54.0" text-anchor="end" class="d-mono d-small d-text-light">25</text>
+    <path d="M450,50 L450,230" class="d-axis"/>
+    <path d="M450,143.6 L780,143.6" class="d-axis d-dashed"/>
+    <rect x="460" y="143.6" width="42" height="86.4" class="d-block-muted"/>
+    <text x="481" y="138.6" text-anchor="middle" class="d-mono d-small">12.0</text>
+    <text x="481" y="250" text-anchor="middle" class="d-small">SFT</text>
+    <rect x="524" y="174.6" width="42" height="55.4" class="d-fill-red"/>
+    <text x="545" y="169.6" text-anchor="middle" class="d-mono d-small">7.7</text>
+    <text x="545" y="250" text-anchor="middle" class="d-small">PPO</text>
+    <rect x="588" y="119.1" width="42" height="110.9" class="d-fill-blue"/>
+    <text x="609" y="114.1" text-anchor="middle" class="d-mono d-small">15.4</text>
+    <text x="609" y="250" text-anchor="middle" class="d-small">+adv norm</text>
+    <rect x="652" y="88.9" width="42" height="141.1" class="d-fill-blue"/>
+    <text x="673" y="83.9" text-anchor="middle" class="d-mono d-small">19.6</text>
+    <text x="673" y="250" text-anchor="middle" class="d-small">+batch</text>
+    <rect x="716" y="75.9" width="42" height="154.1" class="d-fill-orange"/>
+    <text x="737" y="70.9" text-anchor="middle" class="d-mono d-small">21.4</text>
+    <text x="737" y="250" text-anchor="middle" class="d-small">+ref EMA</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> Cumulative PPO ablation of Xu et al. (CodeLlama-34B). Each bar adds one change to the one before: the baseline uses batch size 64, then advantage normalization, a larger batch, and an exponential moving average of the reference model. The dashed line is the SFT score. Data: Table 3 of Xu et al.<a class="cite" href="#ref-15">15</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 7.</b> Further implementation details with evidence in the sources. Huang et al. enumerate 25 details for the TL;DR reproduction<a class="cite" href="#ref-9">9</a>; the rows pick those with a measured or stated effect.</caption>
+  <thead><tr><th>Detail</th><th>Reported effect</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Dropout off</td><td>log-probs reproducible; ρ = 1 at the first step; reliable KL</td><td>Huang Detail 7; Tulu 3 §6.2</td></tr>
+    <tr><td class="row">Separate value network</td><td>outperformed a shared network; costs memory</td><td>Stiennon App. G.1</td></tr>
+    <tr><td class="row">Value init from the RM</td><td>best GSM8K and average in Tulu 3 RLVR</td><td>Tulu 3 §6.2.1</td></tr>
+    <tr><td class="row">EOS penalty</td><td>defines a reward for truncated responses (−10 in Tulu 3 and Ivison et al.)</td><td>Huang Detail 23; Tulu 3; Ivison</td></tr>
+    <tr><td class="row">Reward whitening</td><td>shorter responses; similar quality at matched length</td><td>Huang Detail 24, §7.1</td></tr>
+    <tr><td class="row">Forward passes per minibatch</td><td>avoided destabilization at batch 512, minibatch 64</td><td>Ivison App. G</td></tr>
+    <tr><td class="row">RM benchmark score</td><td>RewardBench 61.0, 73.6, 73.9, 79.8 gave PPO averages 62.2, 62.8, 61.8, 61.6</td><td>Ivison Table 3</td></tr>
+  </tbody>
+</table>
+<p>The last row is the other half of the lesson. The reward models ranked 79.8, 73.9, 73.6 and 61.0 on RewardBench produced PPO policies scoring 61.6, 61.8, 62.8 and 62.2 on the 11-benchmark average, close to the reverse order, with the best RewardBench model giving the lowest average and only GSM8K moving clearly (53.0 to 58.0 with the 70B UltraFeedback RM)<a class="cite" href="#ref-6">6</a> (Table 3). Tulu 3 draws the same caution about reward-model benchmarks<a class="cite" href="#ref-8">8</a> (§5.4.1). A caution on one detail: Xu et al. attribute the reference EMA to InstructGPT, whose Appendix C.4 describes an exponential moving average of the weights (decay 0.992) and uses the SFT model for the KL term, without saying the reference itself was averaged<a class="cite" href="#ref-1">1</a>. Treat the reference EMA as Xu et al.'s own result.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Two questions are tangled in this module's evidence: whether online RL against a reward model beats offline preference optimization, and whether PPO's critic earns its place. The sources answer them differently depending on the reward, the budget and how carefully each side was tuned.</p>
+<div class="positions">
+  <article class="position">
+    <h4>A. For preference data, a DPO-family method is enough</h4>
+    <p class="who">Llama 3 team<a class="cite" href="#ref-10">10</a> (§1, §4.1.4); Tulu 3<a class="cite" href="#ref-8">8</a> (§5.4.1)</p>
+    <p>Llama 3 chose SFT, rejection sampling and DPO over "more complex reinforcement learning algorithms" that "tend to be less stable and harder to scale". Tulu 3 did preference iteration with DPO and reserved PPO "primarily for RLVR".</p>
+    <ul class="pros"><li>About 14 times fewer node-hours in Tulu 3's controlled test, and no reward-model stage, decode loop or value model.</li><li>Used at 405B in Llama 3.</li></ul>
+    <ul class="cons"><li>Tulu 3 calls its PPO untuned and says more budget could raise it.</li><li>Xu et al. find DPO sensitive to distribution shift and failing on code even with test-case labels<a class="cite" href="#ref-15">15</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B. Tuned online PPO wins when the reward is good</h4>
+    <p class="who">Xu et al.<a class="cite" href="#ref-15">15</a>; Ivison et al.<a class="cite" href="#ref-6">6</a>; Lambert<a class="cite" href="#ref-2">2</a> (§3.1.6)</p>
+    <p>Xu et al. report PPO ahead on every testbed, including code competitions. Ivison et al. find PPO ahead by up to 2.5% in math and 1.2% in general domains. Lambert writes that "RL-based methods continue to win out", at much higher infrastructure cost.</p>
+    <ul class="pros"><li>22.4% against 0.0% to 3.2% on CodeContest, where the reward is a test suite.</li><li>Online samples track the policy's own distribution.</li></ul>
+    <ul class="cons"><li>Margins on learned-reward tasks are small next to preference-data quality (up to 8 points in Ivison et al.).</li><li>The wins depend on details a plain PPO lacks (Figure 7), and Ahmadian et al. find PPO well behind DPO on HH<a class="cite" href="#ref-7">7</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>C. The critic is dead weight</h4>
+    <p class="who">Ahmadian et al.<a class="cite" href="#ref-7">7</a> (§1); DeepSeekMath<a class="cite" href="#ref-3">3</a> (§4.1.1); Kimi k1.5<a class="cite" href="#ref-14">14</a> (§2.3.2)</p>
+    <p>The reward arrives for the whole completion, so model the completion as one action and baseline it with other samples. Ahmadian et al. report REINFORCE ahead of PPO by 3.2% to 20.3% win-rate and call PPO "unnecessarily complicated for a pre-trained LLM environment".</p>
+    <ul class="pros"><li>Drops a policy-sized model and GAE; RLOO at k = 4 scored 77.9 on TL;DR against PPO's 67.6.</li><li>Kimi's credit-assignment argument applies to long reasoning.</li></ul>
+    <ul class="cons"><li>The PPO baselines are the proposers' own, run without the Xu et al. details.</li><li>RLOO pays in extra sampling per prompt, and Tulu 3 lists GRPO only as untested future work.</li></ul>
+  </article>
+  <article class="position">
+    <h4>D. A well-built critic still pays</h4>
+    <p class="who">Tulu 3<a class="cite" href="#ref-8">8</a> (§6.2.1); Stiennon et al.<a class="cite" href="#ref-5">5</a> (App. G.1); VAPO<a class="cite" href="#ref-16">16</a> (Abstract, Table 1)</p>
+    <p>Tulu 3 concludes the value function "plays an important role" in RLVR, and VAPO reports 60.4 on AIME24 with a value-based recipe on Qwen 32B, against 47 for R1-Zero with GRPO and 50 for DAPO as it cites them.</p>
+    <ul class="pros"><li>Token-level credit and lower variance than a bare outcome baseline.</li><li>A separate value network beat one sharing the policy's parameters.</li></ul>
+    <ul class="cons"><li>VAPO's own table gives 5 for vanilla PPO: the win needs value pretraining and length-adaptive λ.</li><li>It costs a second large model, and Tulu 3 used an 8B stand-in at 405B.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>On the first question, A is the default for preference tuning with learned reward models: the measured gap is at most a few points, smaller than the effect of data quality and sensitive to implementation details, while the cost gap is large. B is right when the reward is a trustworthy checker and the task is hard enough that offline pairs lose coverage, as in the code results; there the reward, not the algorithm label, is the variable. On the second question the evidence does not settle it. C's evidence compares against untuned PPO, and D's is a few recipes that needed substantial engineering. No source compares a tuned PPO (Xu et al.'s three details, a reward-model-initialized value network, a tuned λ) against RLOO or GRPO in one codebase at equal generated tokens, with a learned reward and with a verifier. That experiment would settle both. The reasoning-RL reports of Part 3 behave as if C were right for long chains of thought, which is evidence about practice, not about the optimum.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>PPO with a critic is now mostly a baseline. Lambert notes that REINFORCE-style methods without a value model drew interest for their simplicity and that GRPO is particularly popular for reasoning tasks<a class="cite" href="#ref-2">2</a> (§6.1); DeepSeekMath introduced GRPO as a PPO variant that "foregoes the critic"<a class="cite" href="#ref-3">3</a>, and Tulu 3 closed by naming value-free methods as the next step<a class="cite" href="#ref-8">8</a>. What persists is the scaffolding: dropout off, EOS handling, advantage normalization, the placement of the KL term, and one gradient step per batch, which Lambert notes leaves PPO's own clip inactive (§6.4.2). The pretraining-gradient term is absent from the open recipes read here. Modules 9 to 12 cover the critic-free successors and Module 33 the choice between them. No primary source used here describes the closed labs' current practice.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Ouyang, L., Wu, J., Jiang, X., Almeida, D. et al. <em>Training language models to follow instructions with human feedback</em>. NeurIPS 2022; arXiv v1, 4 Mar 2022. <a href="https://arxiv.org/pdf/2203.02155v1">https://arxiv.org/pdf/2203.02155v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: dataset sizes and the labeler team (§1, §3.2), the bandit environment, per-token KL, RM-initialized value function and the PPO-ptx objective (§3.5, Eq. 2), PPO hyperparameters and the 6B RM and value choice (Appendix C.2-C.4), the alignment-tax, KL-coefficient and learning-rate ablations (Appendix E.6-E.11, Table 14), headline results, limitations and compute (§1, §4, §5).</span></li>
+  <li id="ref-2"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback (RLHF Book)</em>. arXiv v12, 11 Sep 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the RLHF loop figure (Fig. 19, §6.1), PPO value-function and loss code (§6.2.7, §6.3.5), the one-gradient-step simplification (§6.3.5.1), update-iteration counts across recipes (§6.4.2), RL "surgical" and "continue to win out" (§3.1.6).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R. et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the PPO objective and per-token KL reward (§4.1.1, Eq. 1-2), the case against the value model and KL placed in the loss (§4.1.1, Fig. 4).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Ziegler, D. M., Stiennon, N., Wu, J., Brown, T. B., Radford, A., Amodei, D., Christiano, P., Irving, G. <em>Fine-Tuning Language Models from Human Preferences</em>. arXiv 1909.08593 v2, 8 Jan 2020. <a href="https://arxiv.org/abs/1909.08593">https://arxiv.org/abs/1909.08593</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the KL-penalized reward and its purposes (§2.1, Eq. 2), the adaptive KL controller and the PPO settings (§2.2).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Stiennon, N., Ouyang, L., Wu, J., Ziegler, D. M., Lowe, R., Voss, C., Radford, A., Amodei, D., Christiano, P. <em>Learning to summarize from human feedback</em>. NeurIPS 2020; arXiv 2009.01325 v3, 15 Feb 2022. <a href="https://arxiv.org/pdf/2009.01325">https://arxiv.org/pdf/2009.01325</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the two purposes of the KL term, the token-level time step and the separate value network initialized from the reward model (§3.1), PPO settings (Appendix B), the shared-versus-separate value ablation (Appendix G.1).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Ivison, H., Wang, Y., Liu, J., Wu, Z. et al. <em>Unpacking DPO and PPO: Disentangling Best Practices for Learning from Preference Feedback</em>. NeurIPS 2024; arXiv v2, 7 Oct 2024. <a href="https://arxiv.org/abs/2406.09279">https://arxiv.org/abs/2406.09279</a>. Accessed 2026-10-27. <span class="ref-use">Used for: DPO versus PPO (§2.1, §3.2, Table 2), reward-model scale versus downstream PPO quality (§3.3, Table 3), PPO equations, implementation details and hyperparameters (Appendix F, Tables 9-10), the rollout share of training time and batch-size trade-offs (Appendix G, Table 11).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Ahmadian, A., Cremer, C., Gallé, M., Fadaee, M., Kreutzer, J., Pietquin, O., Üstün, A., Hooker, S. <em>Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs</em>. ACL 2024; arXiv v2, 26 Feb 2024. <a href="https://arxiv.org/pdf/2402.14740v2">https://arxiv.org/pdf/2402.14740v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the single-action argument and the claim that PPO is over-built (§1), clipping rarely active and the effect of removing clips (§3.2), win-rates for PPO, REINFORCE, RLOO and DPO (Table 1).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S. et al. (Allen Institute for AI). <em>Tülu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv v5, 14 Apr 2025 (v1, 22 Nov 2024). <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the early-checkpoint DPO and PPO exploration (Table 18) and, separately, the controlled PPO-versus-DPO comparison, Figure 16 and the 28 h and 4 h run times (§5.4.1), the RLVR objective, data, implementation details and ablations (§6.1-6.2, Tables 21-22), infrastructure and run costs (§6.3), final results (§6.4, Table 23), the 405B run (§8.1, and the 405B hyperparameter table labelled Table 35, whose caption describes the general-RM run while its column header reads 405B RLVR), IFEval over-optimization (Appendix B.4), the 70B KL coefficient discrepancy (§6.4 against Table 21 caption).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Huang, S., Noukhovitch, M., Hosseini, A., Rasul, K., Wang, W., Tunstall, L. <em>The N+ Implementation Details of RLHF with PPO: A Case Study on TL;DR Summarization</em>. arXiv 2403.17031 v1, 24 Mar 2024 (published at COLM 2024, per Tulu 3's bibliography). <a href="https://arxiv.org/abs/2403.17031">https://arxiv.org/abs/2403.17031</a>. Accessed 2026-10-27. <span class="ref-use">Used for: dropout off (Detail 7), RM-initialized value behaviour (Details 13, 22), prompt reuse (Detail 21), the EOS trick (Detail 23), reward and advantage whitening (Details 24-25), PPO settings (Table 7), observations on over-optimization and token shift (§7.1-7.2).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Grattafiori, A., Dubey, A., Jauhri, A. et al. (Llama Team, AI @ Meta). <em>The Llama 3 Herd of Models</em>. arXiv v3, 23 Nov 2024. <a href="https://arxiv.org/pdf/2407.21783v3">https://arxiv.org/pdf/2407.21783v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the choice of DPO over PPO (§1, §4.1.4) and the 128,000-token vocabulary (§3.2, Table 3).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Schulman, J., Moritz, P., Levine, S., Jordan, M., Abbeel, P. <em>High-Dimensional Continuous Control Using Generalized Advantage Estimation</em>. ICLR 2016; arXiv v6, 20 Oct 2018. <a href="https://arxiv.org/pdf/1506.02438v6">https://arxiv.org/pdf/1506.02438v6</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the GAE estimator and the TD residual (§3).</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Schulman, J., Wolski, F., Dhariwal, P., Radford, A., Klimov, O. <em>Proximal Policy Optimization Algorithms</em>. arXiv v2, 28 Aug 2017. <a href="https://arxiv.org/pdf/1707.06347v2">https://arxiv.org/pdf/1707.06347v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the MuJoCo reference hyperparameters (Appendix A, Table 3).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Engstrom, L., Ilyas, A., Santurkar, S., Tsipras, D., Janoos, F., Rudolph, L., Madry, A. <em>Implementation Matters in Deep Policy Gradients: A Case Study on PPO and TRPO</em>. ICLR 2020; arXiv 2005.12729 v1, 25 May 2020. <a href="https://arxiv.org/abs/2005.12729">https://arxiv.org/abs/2005.12729</a>. Accessed 2026-10-27. <span class="ref-use">Used for: code-level optimizations and their share of PPO's gain over TRPO (abstract, §2 list, value-function clipping first).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Kimi Team. <em>Kimi k1.5: Scaling Reinforcement Learning with LLMs</em>. arXiv v4, 3 Jun 2025 (v1, 22 Jan 2025). <a href="https://arxiv.org/pdf/2501.12599v4">https://arxiv.org/pdf/2501.12599v4</a>. Accessed 2026-10-26. <span class="ref-use">Used for: excluding the value network, and the credit-assignment argument against value functions for long chain of thought (§2.3.2).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Xu, S., Fu, W., Gao, J., Ye, W. et al. <em>Is DPO Superior to PPO for LLM Alignment? A Comprehensive Study</em>. ICML 2024; arXiv v3, 10 Oct 2024. <a href="https://arxiv.org/abs/2404.10719">https://arxiv.org/abs/2404.10719</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the three key PPO factors and the Table 3 ablation (§5), implementation notes (§5), benchmark results on HH-RLHF, SafeRLHF, APPS and CodeContest (§6, Tables 4-8), DPO under distribution shift (§4).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>ByteDance Seed (Yue, Y. et al.). <em>VAPO: Efficient and Reliable Reinforcement Learning for Advanced Reasoning Tasks</em>. arXiv 2504.05118 v3, 11 Apr 2025. <a href="https://arxiv.org/abs/2504.05118">https://arxiv.org/abs/2504.05118</a>. Accessed 2026-10-27. <span class="ref-use">Used for: AIME24 avg@32 of the value-based recipe against vanilla PPO, R1-Zero GRPO and DAPO (Abstract, Table 1).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

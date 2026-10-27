@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>On-Policy Distillation as Dense-Reward RL: Per-Token Reverse KL, Cost Arithmetic, and When It Beats RL · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Why sampling from the student and scoring every token against a teacher gives a dense on-policy signal that plugs into an RL trainer: the objective and its gradient, the reported cost and capability comparisons with RL (Thinking Machines, Qwen3), what makes it fail, and when distillation rather than RL is the cheaper route.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 21</p>
+  <h1>On-Policy Distillation as Dense-Reward RL: Per-Token Reverse KL, Cost Arithmetic, and When It Beats RL</h1>
+  <p class="lede">On-policy distillation (OPD) keeps the part of RL that matters for a small model, training on its own samples, and replaces the one scalar reward per episode with a teacher's verdict on every token. This module derives the objective and its gradient, reads the two reported cost comparisons against RL (Thinking Machines and Qwen3) with their arithmetic and their gaps, and collects what later papers found about when the recipe fails. Afterwards you can implement OPD on top of an RL trainer and say, for a given teacher and budget, whether distillation or RL is the cheaper route.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>50 min</b> read</span>
+    <span class="chip"><b>17</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 9</b>, <b>Module 10</b>, <b>Module 20</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">Two-by-two grid: columns are off-policy and on-policy trajectories, rows are dense per-token signal and sparse per-episode signal; SFT sits in off-policy dense, RL in on-policy sparse, on-policy distillation in on-policy dense, and the off-policy sparse cell is empty in the source's table</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+
+    <text x="320" y="24" text-anchor="middle" class="d-title">Off-policy</text>
+    <text x="320" y="42" text-anchor="middle" class="d-small d-text-light">teacher's or dataset's trajectories</text>
+    <text x="630" y="24" text-anchor="middle" class="d-title">On-policy</text>
+    <text x="630" y="42" text-anchor="middle" class="d-small d-text-light">the student's own trajectories</text>
+
+    <text x="150" y="112" text-anchor="end" class="d-title">Dense</text>
+    <text x="150" y="130" text-anchor="end" class="d-small d-text-light">signal on every token</text>
+    <text x="150" y="242" text-anchor="end" class="d-title">Sparse</text>
+    <text x="150" y="260" text-anchor="end" class="d-small d-text-light">one scalar per episode</text>
+
+    <rect x="170" y="54" width="300" height="118" rx="10" class="d-surface"/>
+    <text x="320" y="88" text-anchor="middle" class="d-title">SFT, off-policy distillation</text>
+    <text x="320" y="112" text-anchor="middle" class="d-small">forward KL on teacher traces</text>
+    <text x="320" y="136" text-anchor="middle" class="d-small d-fill-red">trains on states the teacher visits</text>
+    <text x="320" y="156" text-anchor="middle" class="d-small d-text-light">exposure bias</text>
+
+    <rect x="480" y="54" width="300" height="118" rx="10" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="630" y="88" text-anchor="middle" class="d-title">On-policy distillation</text>
+    <text x="630" y="112" text-anchor="middle" class="d-small">reverse KL on each sampled token</text>
+    <text x="630" y="136" text-anchor="middle" class="d-small d-mono">O(N) bits per episode</text>
+    <text x="630" y="156" text-anchor="middle" class="d-small d-text-light">student's states, teacher's grade</text>
+
+    <rect x="170" y="182" width="300" height="118" rx="10" class="d-panel d-dashed"/>
+    <text x="320" y="236" text-anchor="middle" class="d-small d-text-light">empty in the source's table</text>
+
+    <rect x="480" y="182" width="300" height="118" rx="10" class="d-surface"/>
+    <text x="630" y="216" text-anchor="middle" class="d-title">Reinforcement learning</text>
+    <text x="630" y="240" text-anchor="middle" class="d-small">reward on the finished response</text>
+    <text x="630" y="264" text-anchor="middle" class="d-small d-mono">O(1) bits per episode</text>
+    <text x="630" y="284" text-anchor="middle" class="d-small d-text-light">student's states, no per-token grade</text>
+
+    <path d="M470,113 L478,113" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <path d="M630,182 L630,174" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+
+    <text x="400" y="326" text-anchor="middle" class="d-small d-text-light">who generated the trajectory that is being graded</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The taxonomy the Thinking Machines post uses: SFT is off-policy and dense, RL is on-policy and sparse, on-policy distillation is on-policy and dense<a class="cite" href="#ref-1">1</a>. The two arrows are the two moves that produce OPD: sample from the student instead of the teacher, or grade every token instead of the whole response. The post's table has no entry for the fourth cell. The per-episode bit counts are the post's information-theoretic argument<a class="cite" href="#ref-1">1</a>, examined in section 3.</figcaption>
+</figure>
+
+<h2 id="two-axes">1. Two axes: whose trajectories, and how dense the signal</h2>
+<p>Post-training methods differ along two axes that are easy to conflate. One is where the sequences come from: a fixed dataset or a teacher's samples (off-policy), or the model being trained (on-policy). The other is how much of each sequence receives a training signal: one number for the whole response, or a number per token. Thinking Machines' post, which is the reference DeepSeek-V4 cites for OPD<a class="cite" href="#ref-2">2</a>, uses exactly this grid<a class="cite" href="#ref-1">1</a>. This module is about the cell that SFT and RL each cover half of.</p>
+
+<h3 id="two-axes-taxonomy">1.1 The taxonomy and what each row optimizes</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> The three rows of the Thinking Machines taxonomy<a class="cite" href="#ref-1">1</a>, with the objective each one minimizes on the student \(\pi_\theta\) against a teacher \(\pi_T\). The forward-KL identity for SFT-style distillation is Lambert's (§12.3.1, p. 150)<a class="cite" href="#ref-3">3</a>.</caption>
+  <thead><tr><th>Method</th><th>Who samples</th><th>Signal</th><th>Objective on the student</th><th>Known weakness</th></tr></thead>
+  <tbody>
+    <tr><td class="row">SFT / off-policy distillation</td><td>dataset or teacher</td><td>dense: teacher's token at every position</td><td>forward KL \(\mathrm{KL}(\pi_T\|\pi_\theta)\) on teacher-sampled prefixes (cross-entropy differs from it by the constant \(H(\pi_T)\))</td><td>trains on states the teacher visits, not the student<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">RL (RLVR, RLHF)</td><td>student</td><td>sparse: one reward per episode</td><td>maximize expected reward, with the credit machinery of Modules 2 and 9</td><td>"a fixed number of bits per training episode regardless of the number of tokens used"<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">On-policy distillation</td><td>student</td><td>dense: teacher's verdict on every sampled token</td><td>reverse KL \(\mathrm{KL}(\pi_\theta\|\pi_T)\) along the student's own samples</td><td>needs a teacher whose distribution the student can reach (section 5)</td></tr>
+  </tbody>
+</table>
+
+<p>The distinction in the last column of the first row is the reason the field cared. Cross-entropy on teacher samples is the forward KL up to a constant that depends only on the fixed teacher<a class="cite" href="#ref-3">3</a>; the student is graded on the teacher's prefixes. In the OPD row the expectation is taken under the student, which is the one-line change in the objective and, as section 2 shows, the reason it can reuse an RL trainer.</p>
+
+<h3 id="two-axes-exposure">1.2 Exposure bias and the DAgger bound</h3>
+<p>The off-policy student never sees its own mistakes. The post's description: "if the student makes an early mistake that the teacher never makes, it finds itself diverging ever farther from the states it observed in training"<a class="cite" href="#ref-1">1</a>. Imitation learning has a formal version of this. Ross, Gordon and Bagnell show that a learner whose per-step 0-1 loss is \(\epsilon\) on the expert's state distribution can cost \(J(\pi)\le J(\pi^*)+T^2\epsilon\) over a horizon of \(T\) steps (their Theorem 2.1), and that DAgger, which labels the states the learner itself visits, reaches \(J(\hat\pi)\le J(\pi^*)+uT\epsilon_N+O(1)\) (Theorem 3.2), where \(\epsilon_N\) is a loss measured under the learner's own state distribution<a class="cite" href="#ref-4">4</a>. For equal \(\epsilon\) and \(u=O(1)\) the ratio of the two bounds is \(T\): at 4,000 tokens the quadratic bound is 4,000 times the linear one (derived).</p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Lambert reads these bounds as \(O(\epsilon L^2)\) versus \(O(\epsilon L)\) for response length \(L\), and says in the same passage that for LLMs the discrete-action bound "should be read as an analogy rather than a theoretical guarantee", because next-token prediction is scored with distributional losses, not a 0-1 action disagreement<a class="cite" href="#ref-3">3</a> (§12.3.2, p. 151). The intuition survives, the constants do not transfer.</p></aside>
+
+<h3 id="two-axes-lineage">1.3 Lineage</h3>
+<ol class="timeline">
+  <li><time>2011</time><b>DAgger</b><p>The student acts, the expert labels the states the student reached, and the student retrains on the aggregate dataset<a class="cite" href="#ref-4">4</a>.</p></li>
+  <li><time>2023</time><b>GKD and MiniLLM</b><p>Generalized Knowledge Distillation trains the student on its own samples with teacher probabilities, does "not backpropagate through the student's sampling distribution", mixes on-policy and dataset sequences through a student-data fraction \(\lambda\), and allows other divergences such as reverse KL and generalized JSD; it reports relative gains over baseline distillation of 2.1&times; on summarization, 1.7&times; on translation and 1.9&times; on arithmetic reasoning, averaged across T5 student sizes<a class="cite" href="#ref-5">5</a> (ICLR 2024). MiniLLM minimizes the sequence-level reverse KL with a policy gradient and three stabilizers, covered in section 2.5<a class="cite" href="#ref-6">6</a>.</p></li>
+  <li><time>May 2025</time><b>Qwen3 strong-to-weak</b><p>Small Qwen3 models get an off-policy distillation phase and then an on-policy phase that aligns student logits with a teacher<a class="cite" href="#ref-7">7</a> (§4.5).</p></li>
+  <li><time>Oct 2025</time><b>Thinking Machines post</b><p>OPD recast as an RL-shaped objective: advantage equals negative per-token reverse KL, so an RL trainer runs it with one changed line<a class="cite" href="#ref-1">1</a>.</p></li>
+  <li><time>2026</time><b>OPD as a final stage</b><p>DeepSeek-V4's mixed-RL stage is "entirely replaced" by OPD<a class="cite" href="#ref-2">2</a> (§5.1) and the MOPD paper integrates domain teachers into one student by the same mechanism<a class="cite" href="#ref-8">8</a>. Module 22 covers the multi-teacher case.</p></li>
+</ol>
+<p>Two facts matter for what follows. GKD uses the teacher's full next-token distribution at every visited prefix and back-propagates it directly<a class="cite" href="#ref-5">5</a>, while the Thinking Machines recipe uses only the sampled token's log-ratio as a reward<a class="cite" href="#ref-1">1</a>; section 5.2 returns to the cost of that choice. And the Qwen3 report describes its on-policy phase as fine-tuning "by aligning its logits with those of a teacher model (Qwen3-32B or Qwen3-235B-A22B) to minimize the KL divergence"<a class="cite" href="#ref-7">7</a> (§4.5), without stating the KL direction or the estimator, so the two headline results in section 4 come from related but not identical objectives.</p>
+
+<h2 id="objective">2. The objective as a reward in an RL trainer</h2>
+
+<h3 id="objective-kl">2.1 Per-token reverse KL along the student's sample</h3>
+<p>Write \(c_t=(x,y_{&lt;t})\) for the context at position \(t\). The sequence-level reverse KL from student to teacher splits exactly, by the chain rule, into per-token terms evaluated on contexts the student generated<a class="cite" href="#ref-3">3</a> (§12.3.2, Eq. 136):</p>
+$$ \mathrm{KL}\big(\pi_\theta(\cdot|x)\,\|\,\pi_T(\cdot|x)\big)=\mathbb{E}_{y\sim\pi_\theta}\sum_{t=1}^{T}\mathrm{KL}_t,\qquad \mathrm{KL}_t=\sum_{v}\pi_\theta(v|c_t)\log\frac{\pi_\theta(v|c_t)}{\pi_T(v|c_t)}. $$
+<p>The Thinking Machines recipe estimates each \(\mathrm{KL}_t\) from the one token the student sampled, uses it as a negative reward, and sets the discount factor to zero: "the student only optimizes the immediate next token, with no consideration for future tokens". The post adds that a positive discount is "more mathematically correct" but that "we do not find discount factors > 0 to improve performance in practice"<a class="cite" href="#ref-1">1</a>. The per-token advantage is the negative sampled log-ratio:</p>
+$$ A_t=\log\pi_T(y_t|c_t)-\log\pi_\theta(y_t|c_t). $$
+<p>Nothing else is needed from the environment. No verifier, no reward model, no critic: the teacher's log-probabilities on the student's tokens are the entire reward. The post notes two consequences: a rollout need not finish before it is scored, so partial or shorter rollouts work, and the teacher is queried with a single forward pass while the cheaper student does the generating<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="objective-gradient">2.2 The gradient, and what discount zero drops</h3>
+<p>At a fixed context the policy-gradient identity applies position by position. Because \(\mathbb{E}_{v\sim\pi_\theta}[\nabla\log\pi_\theta(v)]=0\), the constant in \(\nabla(\pi\log\pi)\) vanishes and</p>
+$$ \nabla_\theta\mathrm{KL}_t=\mathbb{E}_{y_t\sim\pi_\theta}\Big[\big(\log\pi_\theta(y_t)-\log\pi_T(y_t)\big)\nabla_\theta\log\pi_\theta(y_t)\Big]=-\,\mathbb{E}\big[A_t\,\nabla_\theta\log\pi_\theta(y_t)\big]. $$
+<p>So an RL trainer that multiplies \(\nabla\log\pi_\theta(y_t)\) by \(A_t\) follows an unbiased estimate of \(-\nabla\mathrm{KL}_t\) at that context (derived; Module 6 section 3.3 shows the same identity for the \(k_2\) estimator). What it does not follow is the gradient of the whole sum, because the token \(y_t\) also changes which contexts \(c_{t+1},\dots\) the student visits next, and so changes their KL terms. The estimator that keeps this dependence uses the return-to-go. Fu et al. define the interpolation<a class="cite" href="#ref-9">9</a> (Eq. 1 to 3), with \(r_t=\log\pi_\theta(y_t|c_t)-\log\pi_T(y_t|c_t)=-A_t\) and \(s_t=\nabla_\theta\log\pi_\theta(y_t|c_t)\):</p>
+$$ \hat g_\gamma=\sum_{t=1}^{T}\Big(\sum_{t'=t}^{T}\gamma^{t'-t}\,r_{t'}\Big)s_t,\qquad \gamma\in[0,1]. $$
+<p>With \(\gamma=0\) the inner sum collapses to \(r_t\) alone, so no return-to-go over later tokens enters the weight on \(s_t\); this is the token-level estimator, which is what the Thinking Machines recipe computes; with \(\gamma=1\) it is the causal sequence-level policy gradient, which is what MiniLLM derives (its Eq. 2, with reward-to-go \(R_t\))<a class="cite" href="#ref-6">6</a>. The two cost the teacher the same payload, one log-probability per sampled token. They differ in bias and variance. Fu et al. show that under bounded rewards and gradients the worst-case variance bound of the token-level estimator grows as \(O(T^2)\) in the response length and that of the sequence-level estimator as \(O(T^4)\), and their toy experiment shows variance rising with \(\gamma\)<a class="cite" href="#ref-9">9</a> (§2.1, Appendix D). Tang and Munos find the opposite ordering on a different metric: distilling a Llama 3.1 70B policy into an 8B one on 7,500 MATH prompts with \(n=4\) samples per gradient estimate, a properly implemented sequence-level estimator lowered the sequence-level KL faster than the best token-level one, and leave-one-out and cumulative variance reduction lowered it further<a class="cite" href="#ref-10">10</a> (§5.2 to §5.3, Figure 8). The first result is about gradient noise and stability, the second is about how fast the KL objective itself falls. Neither measures downstream accuracy, so they do not contradict each other; the recent recipes in Table 2 all keep supervision per token (section 5.2).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Four ways to turn "grade the student's sample with a teacher" into a loss. "Payload" is what the teacher must return per generated token. Sources for each row are in the last column; the tensor sizes are derived in section 5.2.</caption>
+  <thead><tr><th>Form</th><th>Per-token signal</th><th>Teacher payload</th><th>Used or analyzed in</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Sampled token, \(\gamma=0\)</td><td>\(A_t=\log\pi_T(y_t)-\log\pi_\theta(y_t)\)</td><td>one log-probability</td><td>Thinking Machines<a class="cite" href="#ref-1">1</a>; MOPD's policy-gradient form, with the advantage clipped to \([-A_{\max},A_{\max}]\)<a class="cite" href="#ref-8">8</a> (Eqs. 3 and 4)</td></tr>
+    <tr><td class="row">Sampled token, \(\gamma=1\)</td><td>\(\sum_{t'\ge t}A_{t'}\) (reward-to-go)</td><td>one log-probability</td><td>MiniLLM, with single-step decomposition, teacher-mixed sampling and length normalization<a class="cite" href="#ref-6">6</a>; Tang and Munos<a class="cite" href="#ref-10">10</a></td></tr>
+    <tr><td class="row">Top-\(k\) of the teacher</td><td>reverse KL over \(k\) tokens, renormalized or bias-corrected</td><td>\(k\) token ids and \(k\) log-probabilities</td><td>MOPD, \(k=64\) in its comparison<a class="cite" href="#ref-8">8</a> (§3.2.2, Eq. 5; §4.4.1); Fu et al.'s local support matching<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">Full vocabulary</td><td>exact \(\mathrm{KL}_t\)</td><td>\(|V|\) values, or last-layer hidden states to rebuild them</td><td>GKD<a class="cite" href="#ref-5">5</a>; DeepSeek-V4<a class="cite" href="#ref-2">2</a> (§5.1.2); Qwen3 describes "aligning its logits"<a class="cite" href="#ref-7">7</a></td></tr>
+  </tbody>
+</table>
+
+<h3 id="objective-example">2.3 A worked trajectory</h3>
+<p>Table 3 is a constructed eight-token response, scored by a hypothetical teacher. It mirrors the illustration in the Thinking Machines post, where the teacher penalizes the tokens that start the wrong approach and does not penalize the final wrong answer, "though wrong, isn't penalized — it is entirely predictable conditional on the whole preceding sequence"<a class="cite" href="#ref-1">1</a>. The probabilities are the probabilities each model assigns to the token the student sampled, in the same context; \(G_t\) is the \(\gamma=1\) return-to-go. Values are computed from the probabilities (derived).</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 3.</b> Constructed example: per-token advantage under \(\gamma=0\) (\(A_t\)) and \(\gamma=1\) (\(G_t=\sum_{t'\ge t}A_{t'}\)), in nats. Token 5 is the fork where the student and teacher disagree.</caption>
+  <thead><tr><th class="num">\(t\)</th><th>token</th><th class="num">\(\pi_\theta(y_t)\)</th><th class="num">\(\pi_T(y_t)\)</th><th class="num">\(A_t=\ln(\pi_T/\pi_\theta)\)</th><th class="num">\(G_t\)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td>The</td><td class="num">0.40</td><td class="num">0.38</td><td class="num">&minus;0.051</td><td class="num">&minus;2.470</td></tr>
+    <tr><td class="num">2</td><td>ice</td><td class="num">0.55</td><td class="num">0.60</td><td class="num">+0.087</td><td class="num">&minus;2.419</td></tr>
+    <tr><td class="num">3</td><td>cubes</td><td class="num">0.90</td><td class="num">0.92</td><td class="num">+0.022</td><td class="num">&minus;2.506</td></tr>
+    <tr><td class="num">4</td><td>will</td><td class="num">0.30</td><td class="num">0.45</td><td class="num">+0.405</td><td class="num">&minus;2.528</td></tr>
+    <tr><td class="num">5</td><td>just</td><td class="num">0.35</td><td class="num">0.02</td><td class="num" data-worst>&minus;2.862</td><td class="num">&minus;2.933</td></tr>
+    <tr><td class="num">6</td><td>multiply</td><td class="num">0.85</td><td class="num">0.80</td><td class="num">&minus;0.061</td><td class="num">&minus;0.071</td></tr>
+    <tr><td class="num">7</td><td>to</td><td class="num">0.95</td><td class="num">0.95</td><td class="num">0.000</td><td class="num">&minus;0.010</td></tr>
+    <tr><td class="num">8</td><td>20</td><td class="num">0.97</td><td class="num">0.96</td><td class="num">&minus;0.010</td><td class="num">&minus;0.010</td></tr>
+  </tbody>
+</table>
+<p>Three readings. First, \(\sum_tA_t=-2.470\): the sum of the advantages is minus the single-sample estimate of the sequence reverse KL, 2.470 nats, and 2.862 of the magnitude sits on token 5. Under \(\gamma=0\) the update lowers the probability of "just" in that context and leaves the final answer token almost untouched (\(-0.010\)), which is the behavior the post highlights. Second, under \(\gamma=1\) tokens 1 to 4 receive a return of \(-2.42\) to \(-2.53\) although their own log-ratios are \(-0.051\), \(+0.087\), \(+0.022\) and \(+0.405\): the fork's penalty is charged back to every earlier token. That is correct credit assignment in the sense of the exact gradient, since those tokens did lead the student to the fork, and it is also the source of the extra variance in \(O(T^4)\) versus \(O(T^2)\). Third, the expectation of \(A_t\) at any context is \(-\mathrm{KL}_t\le0\) (derived), so the average signal is negative by construction. Fu et al. report the sharper empirical fact that "most sampled tokens receive negative reward"<a class="cite" href="#ref-9">9</a> (§2.2, Figure 2), with Qwen2.5-7B-Instruct as student and OpenThinker3-7B as teacher.</p>
+
+<h3 id="objective-loop">2.4 The loop, as a stepper and as code</h3>
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 250" role="img" aria-label="Stepper over one on-policy distillation iteration: student decode, teacher prefill, per-token advantage, policy-gradient update, weight sync back to the sampler">
+      <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+      <g data-step="1">
+        <rect x="14" y="40" width="128" height="76" rx="10" class="d-block"/><text x="78" y="84" text-anchor="middle" class="d-text-inv d-bold">Student decode</text>
+        <text x="78" y="140" text-anchor="middle" class="d-mono d-small">y, log π_S(y_t)</text>
+      </g>
+      <g data-step="2">
+        <path d="M142,78 L170,78" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <rect x="170" y="40" width="128" height="76" rx="10" class="d-block-2"/><text x="234" y="84" text-anchor="middle" class="d-text-inv d-bold">Teacher prefill</text>
+        <text x="234" y="140" text-anchor="middle" class="d-mono d-small">log π_T(y_t)</text>
+      </g>
+      <g data-step="3">
+        <path d="M298,78 L326,78" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <rect x="326" y="40" width="128" height="76" rx="10" class="d-hl"/><text x="390" y="84" text-anchor="middle" class="d-bold">Advantage</text>
+        <text x="390" y="140" text-anchor="middle" class="d-mono d-small">A_t = log π_T</text><text x="390" y="156" text-anchor="middle" class="d-mono d-small">− log π_S</text>
+      </g>
+      <g data-step="4">
+        <path d="M454,78 L482,78" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <rect x="482" y="40" width="128" height="76" rx="10" class="d-block-accent"/><text x="546" y="84" text-anchor="middle" class="d-text-inv d-bold">PG update</text>
+        <text x="546" y="140" text-anchor="middle" class="d-mono d-small">no critic,</text><text x="546" y="156" text-anchor="middle" class="d-mono d-small">no reward model</text>
+      </g>
+      <g data-step="5">
+        <path d="M610,78 L638,78" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <rect x="638" y="40" width="128" height="76" rx="10" class="d-block-muted"/><text x="702" y="84" text-anchor="middle" class="d-text-inv d-bold">New weights</text>
+        <path d="M702,118 L702,206 L78,206 L78,120" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <text x="390" y="226" text-anchor="middle" class="d-small d-text-light">next rollout samples from the updated student</text>
+      </g>
+    </svg>
+    <figcaption><b>Figure 2.</b> One iteration of sampled-token OPD in an RL trainer. Stage structure from the Thinking Machines pseudocode<a class="cite" href="#ref-1">1</a> and the MOPD infrastructure description<a class="cite" href="#ref-8">8</a> (§3.3).</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><b>Student decode.</b> The student samples responses exactly as in RL, and the sampler records \(\log\pi_\theta(y_t)\) for each token, "as part of the importance-sampling loss"<a class="cite" href="#ref-1">1</a>. This is the serving workload and the expensive half of the loop (Module 1, section 5).</li>
+    <li><b>Teacher prefill.</b> The teacher scores the finished sequence in one forward pass with no gradient and returns \(\log\pi_T(y_t)\) on the student's tokens. MOPD calls this "teacher prefill" and notes it is the one operation added to an RL loop<a class="cite" href="#ref-8">8</a>.</li>
+    <li><b>Advantage.</b> \(A_t=\log\pi_T(y_t)-\log\pi_\theta(y_t)\), the negative of the sampled reverse-KL term<a class="cite" href="#ref-1">1</a>. MOPD clips it two-sided to \([-A_{\max},A_{\max}]\) "for training stability"<a class="cite" href="#ref-8">8</a> (Eq. 3).</li>
+    <li><b>Policy-gradient update.</b> The advantages go into the trainer's ordinary loss. The post calls its importance-sampling loss<a class="cite" href="#ref-1">1</a>; MOPD says the form "drops directly into existing PPO/GRPO training frameworks; the advantage computation is the only change"<a class="cite" href="#ref-8">8</a>.</li>
+    <li><b>Weight sync.</b> The updated student replaces the sampler's weights. How that hand-over is organized, and where the teacher is placed, is System Design Modules 36 and 37.</li>
+  </ol>
+</div>
+
+<p>The mechanism is small enough that the code is the specification. This is the pseudocode from the post, which runs on Tinker's API, with comments added:</p>
+<pre class="code" data-lang="python" data-title="sampled-token OPD (Thinking Machines pseudocode, comments added)"><code>teacher_client = service_client.create_sampling_client(
+    base_model=teacher_config.base_model,
+    model_path=teacher_config.load_checkpoint_path,
+)
+trajectories = do_group_rollout(student_client, env_group_builder)   # student samples, as in RL
+sampled_logprobs = trajectories.loss_fn_inputs["logprobs"]           # log pi_student(y_t), from the sampler
+teacher_logprobs = teacher_client.compute_logprobs(trajectories)     # log pi_teacher(y_t): one forward pass
+reverse_kl = sampled_logprobs - teacher_logprobs
+trajectories["advantages"] = -reverse_kl                             # A_t = log pi_T - log pi_S
+training_client.forward_backward(trajectories, loss_fn="importance_sampling")</code></pre>
+<p>The post describes this as "a one-line change on top of RL implementations which use KL regularization: we merely swap out the regularizer model"<a class="cite" href="#ref-1">1</a>. That is the cleanest way to hold the idea: KL-regularized RL has a reward plus a small penalty \(\beta\,\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})\) (Module 6); OPD sets the reward to zero, sets \(\beta=1\), and replaces the reference with the teacher. Lambert notes the advantage can also be combined with other advantage terms, such as GRPO's group normalization, for more elaborate reward shaping<a class="cite" href="#ref-3">3</a> (§12.3.3, p. 153).</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>The student log-probability in \(A_t\) comes from the sampler, the gradient flows through the trainer's own forward pass, and the teacher's log-probability comes from a third engine. Any sampler-trainer gap of the kind Module 14 measures therefore enters \(A_t\) once per token. I found no source that measures this for OPD, so check it in your own stack (derived, not a reported result).</p></aside>
+
+<h3 id="objective-reverse">2.5 Why the direction is reverse, and what that does not protect</h3>
+<p>Minimizing the forward KL against a teacher the student cannot fully represent produces a student that covers the teacher's modes and places mass between them; minimizing the reverse KL produces one that locks onto a mode. MiniLLM states the consequence for text generation: the forward KL "causes q&theta; to place large probability masses on the zero-probability regions of p", "corresponding to the generation of low-quality text in practice", while the reverse KL "focuses on p's major modes"<a class="cite" href="#ref-6">6</a> (§2.1); and Module 6 section 1.3 draws the geometry on a two-mode example. The Thinking Machines post adds that the target is "unhackable" because "low KL always corresponds to a high probability of desirable behavior from the teacher model's point of view", unlike a learned reward model<a class="cite" href="#ref-1">1</a>.</p>
+<p>Two papers qualify "unhackable". MiniLLM observed reward hacking when it trained with the sequence-level policy gradient: the student sometimes produced degenerate sentences, such as repeated phrases, that the teacher scored highly, "especially for small student models". Its fix is teacher-mixed sampling, \(\tilde p=\alpha\,p_T+(1-\alpha)\,q_\theta\) at each step, with an importance weight, plus length normalization because the return-to-go favored short outputs and the student learned to emit empty responses<a class="cite" href="#ref-6">6</a> (§2.2). Fu et al. show the same family of failure for the sampled-token form: in one run the student fell into a repetition loop while "the teacher remains locally aligned with the student on repeated tokens", so the sampled-token signal did not penalize it<a class="cite" href="#ref-9">9</a> (Figure 3). My reading: the teacher's probability is a trustworthy grade only on prefixes the teacher could have produced, and a student that drifts off them is where it stops being one. "Unhackable" holds for the objective's optimum, which is the teacher, not for the path to it.</p>
+<p>Two links to Module 6. The sampled-token advantage is the negative of the \(k_1\) estimator of the per-token reverse KL (Module 6 section 2.2); used as a detached reward it is gradient-equivalent on-policy to backpropagating \(k_2\) (section 3.3), and Shao et al. confirm the same direction for the OPD loss in the form Kimi K3 uses, which clips the reward for stability<a class="cite" href="#ref-11">11</a>. So the \(k_3\) trap of Module 6, regularizing toward the wrong KL direction, does not apply here. The partial-gradient caveat does, and \(\gamma=0\) adopts it on purpose.</p>
+
+<h2 id="bits">3. What the extra signal is worth: bits per episode</h2>
+<p>The Thinking Machines post justifies the cost claims with an information argument it takes from an earlier post by Schulman and colleagues, "LoRA Without Regret". The argument for RL: the policy-gradient update has the form (score function) times (advantage), the score is independent of the reward given the history, so the only channel through which reward information reaches the weights is the scalar advantage. By the data-processing inequality the information about the reward function is at most the entropy of the advantage; quantize it into \(B\) bins and that is about \(\log B\) bits, which the post summarizes as "\(O(1)\) bits per episode", independent of model size<a class="cite" href="#ref-12">12</a>. Supervised learning, by contrast, "arguably provides \(O(\text{number of tokens})\) bits per episode"<a class="cite" href="#ref-12">12</a>. The distillation post applies the second count to OPD<a class="cite" href="#ref-1">1</a>.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 270" role="img" aria-labelledby="f3t"><title id="f3t">One 20-token trajectory shown twice: with RL a single scalar reward arrives after the last token; with on-policy distillation every token carries its own advantage, drawn as bars of uneven height</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+    <text x="30" y="30" class="d-title">RL: one scalar after the last token</text>
+    <rect x="30" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="58" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="86" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="114" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="142" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="170" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="198" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="226" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="254" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="282" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="310" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="338" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="366" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="394" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="422" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="450" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="478" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="506" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="534" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <rect x="562" y="44" width="24" height="26" rx="3" class="d-block-muted"/>
+    <path d="M586,57 L612,57" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+    <rect x="614" y="44" width="62" height="26" rx="6" class="d-hl"/><text x="645" y="62" text-anchor="middle" class="d-bold d-mono">r</text>
+    <text x="690" y="62" class="d-small d-text-light">O(1) bits</text>
+    <text x="30" y="122" class="d-title">OPD: one signal on every sampled token</text>
+    <rect x="30" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="58" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="86" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="114" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="142" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="170" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="198" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="226" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="254" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="282" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="310" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="338" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="366" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="394" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="422" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="450" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="478" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="506" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="534" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="562" y="136" width="24" height="26" rx="3" class="d-block"/>
+    <rect x="30" y="204" width="24" height="6" class="d-fill-orange"/>
+    <rect x="58" y="201" width="24" height="9" class="d-fill-orange"/>
+    <rect x="86" y="206" width="24" height="4" class="d-fill-orange"/>
+    <rect x="114" y="198" width="24" height="12" class="d-fill-orange"/>
+    <rect x="142" y="202" width="24" height="8" class="d-fill-orange"/>
+    <rect x="170" y="200" width="24" height="10" class="d-fill-orange"/>
+    <rect x="198" y="176" width="24" height="34" class="d-fill-orange"/>
+    <rect x="226" y="205" width="24" height="5" class="d-fill-orange"/>
+    <rect x="254" y="203" width="24" height="7" class="d-fill-orange"/>
+    <rect x="282" y="204" width="24" height="6" class="d-fill-orange"/>
+    <rect x="310" y="170" width="24" height="40" class="d-fill-orange"/>
+    <rect x="338" y="201" width="24" height="9" class="d-fill-orange"/>
+    <rect x="366" y="202" width="24" height="8" class="d-fill-orange"/>
+    <rect x="394" y="205" width="24" height="5" class="d-fill-orange"/>
+    <rect x="422" y="188" width="24" height="22" class="d-fill-orange"/>
+    <rect x="450" y="204" width="24" height="6" class="d-fill-orange"/>
+    <rect x="478" y="203" width="24" height="7" class="d-fill-orange"/>
+    <rect x="506" y="205" width="24" height="5" class="d-fill-orange"/>
+    <rect x="534" y="206" width="24" height="4" class="d-fill-orange"/>
+    <rect x="562" y="207" width="24" height="3" class="d-fill-orange"/>
+    <line x1="24" y1="210" x2="592" y2="210" class="d-axis"/>
+    <text x="604" y="150" class="d-small d-text-light">schematic |A_t|, uneven:</text>
+    <text x="604" y="168" class="d-small d-text-light">a few forking tokens</text>
+    <text x="604" y="186" class="d-small d-text-light">carry most of it</text>
+    <text x="690" y="204" class="d-small d-text-light">O(N) bits</text>
+    <text x="30" y="236" class="d-small d-text-light">token position t = 1 ... N (N = 20 here)</text>
+    <text x="30" y="256" class="d-small d-text-light">bar height: magnitude of the per-token advantage (schematic, not measured)</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The information-theoretic argument as a picture. In policy-gradient RL the reward information in an episode is a single scalar advantage, "O(1) bits per episode"<a class="cite" href="#ref-12">12</a>; the Thinking Machines post counts "O(N) bits per episode" for distillation, where N is the number of tokens<a class="cite" href="#ref-1">1</a>. Bar heights are illustrative; Table 3 gives a computed example in which one token of eight holds 82% of the total absolute advantage (derived).</figcaption>
+</figure>
+<div class="kpis">
+  <div class="kpi"><b>320,000 bits</b><span>whole MATH RL run: about 10,000 problems &times; 32 samples &times; 1 bit<a class="cite" href="#ref-12">12</a></span></div>
+  <div class="kpi kpi-cyan"><b>5.3M bits</b><span>R1-Zero: 5.3M episodes, one bit each<a class="cite" href="#ref-12">12</a></span></div>
+  <div class="kpi kpi-orange"><b>~1,000&times;</b><span>less information per token for RL than for supervised learning, at thousands of tokens per episode<a class="cite" href="#ref-12">12</a></span></div>
+</div>
+
+<p>The arithmetic is worth doing once because it changes how you read the RL cost figures of Module 1. If a whole RL run on MATH absorbs about 320,000 bits, the information content of the training signal is smaller than the parameter count of a rank-1 LoRA adapter for Llama-3.1-8B, which the post puts at roughly 3M parameters<a class="cite" href="#ref-12">12</a>. RL's compute goes into finding which samples to reward, not into delivering bits to the weights. The distillation post draws that conclusion directly: RL should be thought of as "spending most of its compute on search", meaning rolling out a policy and assigning credit rather than making updates, and once a good strategy exists, on-policy distillation need not model the intermediate strategies of the RL curriculum but "only the final strategy learned"<a class="cite" href="#ref-1">1</a>.</p>
+<p>Three limits, none hidden by the posts. First, it is an upper bound on what the signal can carry. The LoRA post says its capacity figures concern "the maximum amount of information absorbed in the long-training limit", not compute efficiency or learning speed, and that the one-bit figure "may only apply narrowly to policy gradient algorithms"<a class="cite" href="#ref-12">12</a>. Second, \(O(N)\) counts positions, not realized information. A token on which teacher and student agree carries an advantage near zero (tokens 1 to 3, 7 and 8 in Table 3), and in that example one token of eight holds 82% of the total absolute advantage (derived: \(2.862/3.498\)). The post's illustration agrees: the penalized tokens are "forking tokens" that start a wrong phrase<a class="cite" href="#ref-1">1</a>. Third, the sampled-token advantage is a single-sample estimate with mean \(-\mathrm{KL}_t\), noisy enough that DeepSeek-V4 replaced it (section 5.2). OPD's signal has far more degrees of freedom per episode than a scalar reward; it does not teach a bit per token.</p>
+
+<h2 id="numbers">4. The reported numbers, and what each one does and does not count</h2>
+<p>Two sources report that OPD reaches an RL-level or better result at a fraction of the cost: the Thinking Machines post (October 2025, with a June 2026 update) and the Qwen3 report (May 2025). They are not independent in the way the phrase "replicated" suggests. The post says it uses Tinker to "replicate Qwen3's result of achieving equivalent performance on reasoning benchmarks with on-policy distillation for a fraction the cost of RL", and it takes its RL cost from the Qwen3 report<a class="cite" href="#ref-1">1</a>. Each has its own accounting, and neither is a controlled study with repeated seeds.</p>
+
+<h3 id="numbers-tm">4.1 Thinking Machines: Qwen3-8B-Base on math</h3>
+<p>The setting<a class="cite" href="#ref-1">1</a>: student Qwen3-8B-Base, off-policy initialization by SFT on OpenThoughts-3 (reasoning traces generated by QwQ-32B), benchmark AIME'24. Full fine-tuning on 400K prompts gives 60%. SFT performance then rises log-linearly in the number of prompts after the first 50K to 100K, and extrapolating that line the post estimates about 70% at about 2M prompts, with the caveat that this "requires the scaling law to hold up without stalling" and is "an optimistic estimate" for off-policy distillation. Two reference points bound it: DeepSeek-R1-0528-Qwen3-8B reaches 86% with an unstated number of prompts, and Qwen2.5-7B and 14B reach 55.5% and 69.7% after 800K R1 distillation prompts. For RL, the post takes the Qwen3 report's 67.6% at 17,920 GPU-hours and estimates that "given some reasonable assumptions about the SFT training stack" this is similar to the cost of 2M off-policy prompts, while saying it "is hard to compare this directly to the cost of distillation".</p>
+<p>OPD from the 400K checkpoint "achieves an AIME'24 of 70% in about 150 steps", which the post equates to about 77K prompts at 4 samples per prompt. The teacher actually used was Qwen3-8B, "as it performs slightly better"; the FLOPs in the cost table are nonetheless those of the 32B model<a class="cite" href="#ref-1">1</a>. A LoRA run at rank 32 trails full fine-tuning by 13% after SFT but by only 6% after OPD<a class="cite" href="#ref-1">1</a>.</p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>The post's default configuration is 64 prompts per batch with 4 samples per prompt, and "all methods shown are trained with 256 samples / batch"<a class="cite" href="#ref-1">1</a>. At 64 prompts per step, 150 steps is 9,600 prompts, not 77K. The post does not reconcile the two. The FLOPs table supports the larger number (section 4.2), so my reading is that the reasoning run used a larger batch than the default; the post's own remark that a weak SFT initialization requires "a significantly larger batch size" is consistent with that. This is an inference, not a statement in the source.</p></aside>
+
+<h3 id="numbers-cost">4.2 The FLOPs table and the 9&times;, 18&times;, 30&times;</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> The Thinking Machines cost table for lifting Qwen3-8B-Base from 60% to about 70% on AIME'24, as printed<a class="cite" href="#ref-1">1</a>, with the last column derived here. "Teacher FLOPs" is the cost of generating the off-policy data for SFT rows, and of the log-probability pass for OPD.</caption>
+  <thead><tr><th>Method</th><th class="num">AIME'24 (%)</th><th class="num">Teacher (FLOPs)</th><th class="num">Student (FLOPs)</th><th class="num">CE vs SFT-2M (printed)</th><th class="num">Cost vs OPD, student+teacher (derived)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">SFT-400K (initialization)</td><td class="num">60</td><td class="num">8.5&times;10<sup>20</sup></td><td class="num">3.8&times;10<sup>20</sup></td><td class="num">&ndash;</td><td class="num">&ndash;</td></tr>
+    <tr><td class="row">SFT-2M (extrapolated)</td><td class="num">~70</td><td class="num">3.4&times;10<sup>21</sup></td><td class="num">1.5&times;10<sup>21</sup></td><td class="num">1&times;</td><td class="num">29.5&times; with teacher, 9.0&times; without</td></tr>
+    <tr><td class="row">RL (Qwen3 report)</td><td class="num">68</td><td class="num">&ndash;</td><td class="num">&ndash;</td><td class="num">&asymp;1&times;</td><td class="num">not reported in FLOPs</td></tr>
+    <tr><td class="row">On-policy distillation</td><td class="num" data-best>70</td><td class="num">8.4&times;10<sup>19</sup></td><td class="num">8.2&times;10<sup>19</sup></td><td class="num" data-best>9 to 30&times;</td><td class="num">1&times;</td></tr>
+  </tbody>
+</table>
+<p>The three multipliers are three accountings of one table. The post's definitions<a class="cite" href="#ref-1">1</a>:</p>
+<ul>
+  <li><strong>9&times;</strong>: "when the SFT dataset is given, as in our example with OpenThoughts-3, or is amortized across many training runs". The teacher FLOPs of off-policy training are not counted, but the teacher's log-probability pass is counted for OPD, "since we must run the teacher model to compute log-probs". Derived: \(1.5\times10^{21}/(8.4\times10^{19}+8.2\times10^{19})=9.04\).</li>
+  <li><strong>18&times;</strong>: the same comparison in GPU-hours, "since this computation can be cheaply parallelized across GPUs", so the teacher pass is effectively free. Derived: \(1.5\times10^{21}/8.2\times10^{19}=18.3\).</li>
+  <li><strong>30&times;</strong>: the task is new and no distillation dataset exists, so the SFT side also pays for teacher sampling. Derived: \((3.4\times10^{21}+1.5\times10^{21})/(8.4\times10^{19}+8.2\times10^{19})=29.5\).</li>
+</ul>
+<p>All three use only the incremental OPD cost, leaving out the shared 400K SFT initialization (the post does not say so; the numbers only work out that way). One more observation from the table, mine: the SFT-2M row is 3.95 times (student) and 4.0 times (teacher) the SFT-400K row, which is what 1.6M additional prompts at the same per-prompt cost would give, not 2M. The row therefore appears to be the increment over the 400K checkpoint, the right quantity for a like-for-like comparison, but the label says 2M.</p>
+
+<details class="more"><summary>Can the FLOPs columns be reconstructed? A token-count check (derived)</summary>
+<p>The post gives no FLOPs-per-token formula. Use the usual dense convention: \(2N\) FLOPs per token for a forward pass, \(6N\) for forward plus backward (Module 1, section 5.3). For OPD the 8B student decodes and trains on each sampled token, \(8N_S=6.4\times10^{10}\) FLOPs; the 32B teacher does one forward pass, \(2N_T=6.4\times10^{10}\) FLOPs. The two printed columns then imply \(8.2\times10^{19}/6.4\times10^{10}=1.28\times10^{9}\) and \(8.4\times10^{19}/6.4\times10^{10}=1.31\times10^{9}\) tokens, within 2.5% of each other, so the columns are consistent with one token count of about \(1.3\times10^{9}\). Over 77K prompts &times; 4 samples (308,000 samples) that is about 4,200 tokens per sample; over 9,600 &times; 4 (38,400 samples) it would be about 34,000, a very long average for training rollouts that the post says run at shorter context than evaluation<a class="cite" href="#ref-1">1</a>. The FLOPs favor the 77K figure (my reading).</p>
+<p>The SFT rows reconcile less well: at \(6N_S\) per token the student column implies about 19,800 tokens per prompt over 400K prompts, and at \(2N_T\) the teacher column implies about 33,000. The post gives no formula that explains the factor of 1.7.</p>
+</details>
+
+<p>The FLOP-to-time conversion is where an inference engineer should push. A FLOP ratio is a GPU-hour ratio only if every FLOP runs at the same utilization, and these do not. Take the split above, 2 of the 8 student FLOPs per token in sampling and 6 in training, price training and SFT at 30% MFU, and price decode at Olmo 3's measured 1.01% MFU (43.21% MBU) for its final inference configuration<a class="cite" href="#ref-13">13</a> (Table 23). At equal utilization the arithmetic reproduces the post's numbers, 18.3&times; without the teacher pass and 9.0&times; with it. With decode at 1.01% it falls to 2.2&times; and 2.0&times;; at 5% decode MFU it is 8.1&times; and 5.6&times;; at 10%, 12.2&times; and 7.2&times; (all derived, illustrative, and sensitive to the 30% assumption). The post's 18&times; therefore rests on both the teacher pass being cheap and student sampling running about as efficiently as training, and OPD's own cost is dominated by sampling, as Module 1 shows for Olmo 3's RL run. The one measured GPU-hour comparison is Qwen3's RL versus OPD, where both arms pay for sampling.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 220" role="img" aria-labelledby="f4t"><title id="f4t">Left: Qwen3-8B GPU-hours for reinforcement learning (17,920) and on-policy distillation (1,800), ratio 9.96. Right: the three cost-reduction multipliers in the Thinking Machines post, 9, 18 and 30 times, each with a different accounting</title>
+    <text x="20" y="26" class="d-title">Qwen3-8B, same starting checkpoint (GPU-hours)</text>
+    <line x1="120.0" y1="48" x2="120.0" y2="124" class="d-grid"/><text x="120.0" y="140" text-anchor="middle" class="d-small d-mono">0</text>
+    <line x1="189.8" y1="48" x2="189.8" y2="124" class="d-grid"/><text x="189.8" y="140" text-anchor="middle" class="d-small d-mono">5,000</text>
+    <line x1="259.5" y1="48" x2="259.5" y2="124" class="d-grid"/><text x="259.5" y="140" text-anchor="middle" class="d-small d-mono">10,000</text>
+    <line x1="329.3" y1="48" x2="329.3" y2="124" class="d-grid"/><text x="329.3" y="140" text-anchor="middle" class="d-small d-mono">15,000</text>
+    <line x1="120" y1="48" x2="120" y2="124" class="d-axis"/>
+    <text x="110" y="74" text-anchor="end" class="d-bold">RL</text>
+    <rect x="120" y="58" width="250.0" height="26" rx="4" class="d-fill-blue"/><text x="378.0" y="76" class="d-mono d-bold">17,920</text>
+    <text x="110" y="110" text-anchor="end" class="d-bold">OPD</text>
+    <rect x="120" y="94" width="25.1" height="26" rx="4" class="d-fill-orange"/><text x="153.1" y="112" class="d-mono d-bold">1,800</text>
+    <text x="260" y="112" class="d-small d-text-light">17,920 / 1,800 = 9.96&times; (derived)</text>
+    <text x="440" y="26" class="d-title">Thinking Machines cost reduction (CE)</text>
+    <text x="574" y="68" text-anchor="end" class="d-small">FLOPs, SFT data given</text><rect x="582" y="52" width="48.0" height="24" rx="4" class="d-fill-cyan"/><text x="638.0" y="69" class="d-mono d-bold">9&times;</text>
+    <text x="574" y="108" text-anchor="end" class="d-small">GPU-hours</text><rect x="582" y="92" width="96.0" height="24" rx="4" class="d-fill-cyan"/><text x="686.0" y="109" class="d-mono d-bold">18&times;</text>
+    <text x="574" y="148" text-anchor="end" class="d-small">incl. teacher sampling</text><rect x="582" y="132" width="160.0" height="24" rx="4" class="d-fill-cyan"/><text x="750.0" y="149" class="d-mono d-bold">30&times;</text>
+    <text x="582" y="188" class="d-small d-text-light">FLOP-based unless stated</text>
+    <text x="20" y="188" class="d-small d-text-light">Qwen3 report: hardware and teacher cost not stated</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Left: the Qwen3-8B comparison from the Qwen3 report, RL 17,920 versus on-policy distillation 1,800 GPU-hours<a class="cite" href="#ref-7">7</a> (Table 21); the ratio is derived. Right: the three cost-effectiveness multipliers of the Thinking Machines post for reaching about 70% on AIME'24 from a 400K-prompt SFT checkpoint<a class="cite" href="#ref-1">1</a>. The two panels are different experiments with different starting points and different accounting; they are drawn together to show how much the multiplier moves with what is counted.</figcaption>
+</figure>
+<h3 id="numbers-qwen3">4.3 Qwen3's own comparison</h3>
+<p>The Qwen3 report is the origin of both the 17,920 and the 1,800. Its small models (0.6B, 1.7B, 4B, 8B, 14B and the 30B-A3B MoE) skip the four-stage pipeline. They get an off-policy phase on teacher outputs generated in both <code>/think</code> and <code>/no think</code> modes, then an on-policy phase in which the student generates in either mode and "is then fine-tuned by aligning its logits with those of a teacher model (Qwen3-32B or Qwen3-235B-A22B) to minimize the KL divergence"<a class="cite" href="#ref-7">7</a> (§4.5). The report states the saving twice, as "only 1/10 of the GPU hours compared to the four-stage training method" for the whole strong-to-weak route (§4 introduction) and as the Table 21 experiment (§4.7)<a class="cite" href="#ref-7">7</a>.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> Qwen3 report Table 21: RL versus on-policy distillation on Qwen3-8B, both starting from the same off-policy-distilled 8B checkpoint, math and code queries only. Parentheses are pass@64. GPU-hours as printed; hardware not stated<a class="cite" href="#ref-7">7</a> (p. 21). The last column is derived.</caption>
+  <thead><tr><th>Method</th><th class="num">AIME'24</th><th class="num">AIME'25</th><th class="num">MATH500</th><th class="num">LiveCodeBench v5</th><th class="num">MMLU-Redux</th><th class="num">GPQA-Diamond</th><th class="num">GPU-hours</th><th class="num">GPU-hours per AIME'24 point</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Off-policy distillation</td><td class="num">55.0 (90.0)</td><td class="num">42.8 (83.3)</td><td class="num">92.4</td><td class="num">42.0</td><td class="num">86.4</td><td class="num">55.6</td><td class="num">&ndash;</td><td class="num">&ndash;</td></tr>
+    <tr><td class="row">+ RL</td><td class="num">67.6 (90.0)</td><td class="num">55.5 (83.3)</td><td class="num">94.8</td><td class="num">52.9</td><td class="num">86.9</td><td class="num">61.3</td><td class="num" data-worst>17,920</td><td class="num" data-worst>1,422</td></tr>
+    <tr><td class="row">+ on-policy distillation</td><td class="num" data-best>74.4 (93.3)</td><td class="num" data-best>65.5 (86.7)</td><td class="num" data-best>97.0</td><td class="num" data-best>60.3</td><td class="num" data-best>88.3</td><td class="num" data-best>63.3</td><td class="num" data-best>1,800</td><td class="num" data-best>93</td></tr>
+  </tbody>
+</table>
+<p>Derived from the table: \(17{,}920/1{,}800=9.96\). Per point gained on AIME'24 over the shared starting checkpoint, RL spent \(17{,}920/12.6=1{,}422\) GPU-hours and OPD \(1{,}800/19.4=93\), a ratio of 15.3; on AIME'25 the figures are 1,411 and 79, a ratio of 17.8. Both are larger than 9.96 because OPD also ended higher. OPD led on all six benchmarks, by 6.8 and 10.0 points on AIME'24 and AIME'25 and by 1.4 to 7.4 points on the other four.</p>
+<p>Three things the table does not tell you. First, whether the 1,800 GPU-hours include the teacher. The passage I read does not say, and it gives no hardware, so 9.96&times; is the ratio of the two numbers as printed, not a total-cost ratio. Treat it like the 18&times; of the Thinking Machines accounting, where the teacher pass is assumed cheap, and not like the 30&times;. Second, which teacher: §4.5 names Qwen3-32B or Qwen3-235B-A22B for the pipeline, and the Table 21 text does not say which one served the 8B experiment. Third, what the RL arm was. The report says "direct reinforcement learning" from the same checkpoint on math and code queries and gives no recipe for that arm in this comparison, so you cannot tell whether 17,920 GPU-hours is a tuned run or the flagship's stage-2 recipe applied to the 8B. The Thinking Machines post calls the RL result "similar" in cost to 2M SFT prompts and warns it is "hard to compare"<a class="cite" href="#ref-1">1</a>.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 290" role="img" aria-labelledby="f5t"><title id="f5t">Qwen3-8B Table 21 as grouped bars: pass@1 and pass@64 on AIME 2024 and AIME 2025 for the off-policy distilled checkpoint, after RL, and after on-policy distillation</title>
+    <text x="60" y="24" class="d-title">AIME 2024</text>
+    <line x1="60" y1="220.0" x2="390" y2="220.0" class="d-grid"/><text x="54" y="224.0" text-anchor="end" class="d-small d-mono">0</text>
+    <line x1="60" y1="130.0" x2="390" y2="130.0" class="d-grid"/><text x="54" y="134.0" text-anchor="end" class="d-small d-mono">50</text>
+    <line x1="60" y1="40.0" x2="390" y2="40.0" class="d-grid"/><text x="54" y="44.0" text-anchor="end" class="d-small d-mono">100</text>
+    <line x1="60" y1="40" x2="60" y2="220" class="d-axis"/><line x1="60" y1="220" x2="390" y2="220" class="d-axis"/>
+    <rect x="74" y="121.0" width="28" height="99.0" class="d-fill-blue"/><text x="88" y="117.0" text-anchor="middle" class="d-small d-mono">55.0</text>
+    <rect x="106" y="58.0" width="28" height="162.0" class="d-fill-cyan"/><text x="120" y="54.0" text-anchor="middle" class="d-small d-mono">90.0</text>
+    <text x="104" y="238" text-anchor="middle" class="d-small d-bold">off-policy</text>
+    <rect x="180" y="98.3" width="28" height="121.7" class="d-fill-blue"/><text x="194" y="94.3" text-anchor="middle" class="d-small d-mono">67.6</text>
+    <rect x="212" y="58.0" width="28" height="162.0" class="d-fill-cyan"/><text x="226" y="54.0" text-anchor="middle" class="d-small d-mono">90.0</text>
+    <text x="210" y="238" text-anchor="middle" class="d-small d-bold">+ RL</text>
+    <text x="210" y="254" text-anchor="middle" class="d-small d-text-light">17,920 GPU-h</text>
+    <rect x="286" y="86.1" width="28" height="133.9" class="d-fill-blue"/><text x="300" y="82.1" text-anchor="middle" class="d-small d-mono">74.4</text>
+    <rect x="318" y="52.1" width="28" height="167.9" class="d-fill-cyan"/><text x="332" y="48.1" text-anchor="middle" class="d-small d-mono">93.3</text>
+    <text x="316" y="238" text-anchor="middle" class="d-small d-bold">+ OPD</text>
+    <text x="316" y="254" text-anchor="middle" class="d-small d-text-light">1,800 GPU-h</text>
+    <text x="450" y="24" class="d-title">AIME 2025</text>
+    <line x1="450" y1="220.0" x2="780" y2="220.0" class="d-grid"/><text x="444" y="224.0" text-anchor="end" class="d-small d-mono">0</text>
+    <line x1="450" y1="130.0" x2="780" y2="130.0" class="d-grid"/><text x="444" y="134.0" text-anchor="end" class="d-small d-mono">50</text>
+    <line x1="450" y1="40.0" x2="780" y2="40.0" class="d-grid"/><text x="444" y="44.0" text-anchor="end" class="d-small d-mono">100</text>
+    <line x1="450" y1="40" x2="450" y2="220" class="d-axis"/><line x1="450" y1="220" x2="780" y2="220" class="d-axis"/>
+    <rect x="464" y="143.0" width="28" height="77.0" class="d-fill-blue"/><text x="478" y="139.0" text-anchor="middle" class="d-small d-mono">42.8</text>
+    <rect x="496" y="70.1" width="28" height="149.9" class="d-fill-cyan"/><text x="510" y="66.1" text-anchor="middle" class="d-small d-mono">83.3</text>
+    <text x="494" y="238" text-anchor="middle" class="d-small d-bold">off-policy</text>
+    <rect x="570" y="120.1" width="28" height="99.9" class="d-fill-blue"/><text x="584" y="116.1" text-anchor="middle" class="d-small d-mono">55.5</text>
+    <rect x="602" y="70.1" width="28" height="149.9" class="d-fill-cyan"/><text x="616" y="66.1" text-anchor="middle" class="d-small d-mono">83.3</text>
+    <text x="600" y="238" text-anchor="middle" class="d-small d-bold">+ RL</text>
+    <text x="600" y="254" text-anchor="middle" class="d-small d-text-light">17,920 GPU-h</text>
+    <rect x="676" y="102.1" width="28" height="117.9" class="d-fill-blue"/><text x="690" y="98.1" text-anchor="middle" class="d-small d-mono">65.5</text>
+    <rect x="708" y="63.9" width="28" height="156.1" class="d-fill-cyan"/><text x="722" y="59.9" text-anchor="middle" class="d-small d-mono">86.7</text>
+    <text x="706" y="238" text-anchor="middle" class="d-small d-bold">+ OPD</text>
+    <text x="706" y="254" text-anchor="middle" class="d-small d-text-light">1,800 GPU-h</text>
+    <rect x="590" y="6" width="200" height="30" rx="6" class="d-label-bg"/>
+    <rect x="600" y="16" width="14" height="10" class="d-fill-blue"/><text x="620" y="25" class="d-small">pass@1</text>
+    <rect x="676" y="16" width="14" height="10" class="d-fill-cyan"/><text x="696" y="25" class="d-small">pass@64</text>
+    <text x="60" y="278" class="d-small d-text-light">30 questions per year, 64 samples each: pass@64 moves in steps of 3.3 points, one question</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Table 21 of the Qwen3 report: starting from the same off-policy-distilled 8B checkpoint, RL raised pass@1 on AIME'24 from 55.0 to 67.6 and on AIME'25 from 42.8 to 55.5 with pass@64 unchanged (90.0 and 83.3); on-policy distillation raised pass@1 to 74.4 and 65.5 and pass@64 to 93.3 and 86.7<a class="cite" href="#ref-7">7</a>; GPU-hours as printed, hardware and teacher cost not stated. The step size of pass@64 follows from the evaluation protocol of 30 questions and 64 samples per question<a class="cite" href="#ref-7">7</a> (§4.6): 90.0, 83.3, 93.3 and 86.7 are 27, 25, 28 and 26 questions of 30 (derived).</figcaption>
+</figure>
+<p>The pass@64 column is the report's capability argument. RL left it unchanged at 90.0 and 83.3; OPD raised it to 93.3 and 86.7. The report reads this as distillation from teacher logits letting the student "expand its exploration space and enhance its reasoning potential", while RL "does not lead to any improvement in pass@64 scores"<a class="cite" href="#ref-7">7</a> (§4.7). Figure 5 shows how thin the margin is. With 30 questions per benchmark, the OPD gain in pass@64 is exactly one question on each (27 to 28 of 30 on AIME'24, 25 to 26 of 30 on AIME'25), and the report gives no seeds or intervals (derived). The pass@1 gaps of 6.8 and 10.0 points between OPD and RL are much larger than that, but they too come from one run each. Whether RL expands or sharpens, and how to design a measurement that separates the two, is Module 20's question; this module only records that the one place where on-policy distillation and RL were compared at fixed checkpoint and reported pass@k found the two different, on a one-question margin.</p>
+
+<h3 id="numbers-self">4.4 Self-distillation: when the teacher is an earlier copy</h3>
+<p>The post's two remaining experiments change what the teacher is, and they show the cost advantage in a different light<a class="cite" href="#ref-1">1</a>.</p>
+<p><strong>Recovering behavior after mid-training.</strong> Qwen3-8B, already post-trained, is fine-tuned on internal company documents. Knowledge goes up, instruction following goes down, and no mix of document and chat data keeps the original IF-eval. OPD with the earlier Qwen3-8B as teacher, run on Tulu 3 prompts unrelated to the documents, restores most of it.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> Personalization experiment: internal-document QA (knowledge) and IF-eval (instruction following), Qwen3-8B<a class="cite" href="#ref-1">1</a>. Internal QA is the authors' own eval and is not reproducible from outside.</caption>
+  <thead><tr><th>Model</th><th class="num">Internal QA (%)</th><th class="num">IF-eval (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Qwen3-8B</td><td class="num">18</td><td class="num" data-best>85</td></tr>
+    <tr><td class="row">+ mid-train, 100% documents</td><td class="num" data-best>43</td><td class="num" data-worst>45</td></tr>
+    <tr><td class="row">+ mid-train, 70% documents / 30% chat</td><td class="num">36</td><td class="num">79</td></tr>
+    <tr><td class="row">+ mid-train 70/30, then OPD from earlier Qwen3-8B</td><td class="num">41</td><td class="num">83</td></tr>
+  </tbody>
+</table>
+<p><strong>Replaying an RL result.</strong> The post trains Qwen3-8B-Base with RL on DeepMath at LoRA rank 128, and uses the result as the teacher for OPD back into the base model. It reports that the distilled student reaches the teacher's level "in approximately 7-10x fewer gradient steps", that the reverse KL falls to near zero and the AIME score is recovered "in under 10 gradient steps, while RL took 70 steps". It then adds two savings (RL must train near the evaluation context length, while distillation "learns reasonably at shorter context lengths", and OPD tolerates smaller batches) and states a compute efficiency "on the order of 50-100x"<a class="cite" href="#ref-1">1</a>. The factors are not broken out; only the step ratio (70/10, at least 7) is checkable.</p>
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Reading the 50-100&times; figure as "distillation is 50-100 times cheaper than RL". In that experiment the teacher is the RL run. The comparison is between two ways of producing a second copy of a policy that RL has already found; it excludes the cost of finding it. The post says so in its own framing: once a good strategy exists, "distillation serves as a shortcut for learning it"<a class="cite" href="#ref-1">1</a>. The figure matters for repair, merging and continual learning, where a teacher already exists, and says nothing about whether you can skip RL when no teacher exists.</p></aside>
+<p>Two smaller results. Training on one math prompt for 20 steps at 256 rollouts each (5,120 graded sequences) "approximately" matches the teacher's AIME'24 score, less efficiently than the multi-prompt default<a class="cite" href="#ref-1">1</a>. And SFT on the model's own temperature-1 samples degrades IF-eval at every practical learning rate, which the post attributes to finite-batch noise turning self-training into off-policy drift, while OPD against a fixed teacher "always stays on-policy"<a class="cite" href="#ref-1">1</a>. These are single runs, partly on an internal setup, and I treat them as hypotheses with a plausible mechanism.</p>
+
+<h2 id="requirements">5. What the recipe needs: teacher, estimator, horizon</h2>
+<p>The cost results hold when three conditions hold. Later work, mostly 2026 preprints, tested each. All of it is recent and little of it is peer reviewed, which I flag where it matters.</p>
+
+<h3 id="requirements-teacher">5.1 The teacher must be reachable from the student</h3>
+<p>Reverse KL is mode-seeking within the student's support: the post notes that SFT "adds support for new tokens" and "reverse-KL methods can then perform mode seeking within the initialization's support", which is why its experiments start from a mid-trained or SFT'd student<a class="cite" href="#ref-1">1</a>. The MOPD paper tested what happens when that fails. Its student is Qwen3-30B-A3B, and its math teachers are RL-trained descendants of the same SFT checkpoint ("same-origin"). Swapping in Qwen3-235B-A22B, "a significantly larger model with stronger math capability", degraded the student<a class="cite" href="#ref-8">8</a> (§4.4.2). Figure 6 shows the numbers: the initial per-token KL was about 5&times; higher (~0.19 versus ~0.04), entropy under the policy-gradient loss contracted from 0.30 to 0.21 as the student "narrows toward a single mode as it receives predominantly punitive gradient signal", and the top-k variant collapsed near step 18.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 270" role="img" aria-labelledby="f6t"><title id="f6t">Left: AIME 2025 accuracy of a Qwen3-30B-A3B student after multi-teacher on-policy distillation of its math domain, with the same-origin RL teacher (51.46 and 51.77) versus Qwen3-235B-A22B as the math teacher (45.63 and 0.94). Right: initial per-token student-teacher KL, about 0.04 versus about 0.19</title>
+    <text x="70" y="30" class="d-title">Math accuracy, AIME'25 (%)</text>
+    <line x1="70" y1="210.0" x2="430" y2="210.0" class="d-grid"/><text x="62" y="214.0" text-anchor="end" class="d-small d-mono">0</text>
+    <line x1="70" y1="160.0" x2="430" y2="160.0" class="d-grid"/><text x="62" y="164.0" text-anchor="end" class="d-small d-mono">20</text>
+    <line x1="70" y1="110.0" x2="430" y2="110.0" class="d-grid"/><text x="62" y="114.0" text-anchor="end" class="d-small d-mono">40</text>
+    <line x1="70" y1="60.0" x2="430" y2="60.0" class="d-grid"/><text x="62" y="64.0" text-anchor="end" class="d-small d-mono">60</text>
+    <line x1="70" y1="50" x2="70" y2="210" class="d-axis"/><line x1="70" y1="210" x2="430" y2="210" class="d-axis"/>
+    <rect x="84" y="81.3" width="64" height="128.7" class="d-fill-blue"/><text x="116" y="76.3" text-anchor="middle" class="d-small d-mono d-bold">51.46</text>
+    <text x="116" y="226" text-anchor="middle" class="d-small">same-origin</text><text x="116" y="240" text-anchor="middle" class="d-small d-text-light">policy gradient</text>
+    <rect x="170" y="80.6" width="64" height="129.4" class="d-fill-blue"/><text x="202" y="75.6" text-anchor="middle" class="d-small d-mono d-bold">51.77</text>
+    <text x="202" y="226" text-anchor="middle" class="d-small">same-origin</text><text x="202" y="240" text-anchor="middle" class="d-small d-text-light">top-k (k=64)</text>
+    <rect x="256" y="95.9" width="64" height="114.1" class="d-fill-orange"/><text x="288" y="90.9" text-anchor="middle" class="d-small d-mono d-bold">45.63</text>
+    <text x="288" y="226" text-anchor="middle" class="d-small">235B teacher</text><text x="288" y="240" text-anchor="middle" class="d-small d-text-light">policy gradient</text>
+    <rect x="342" y="207.7" width="64" height="2.3" class="d-fill-orange"/><text x="374" y="202.7" text-anchor="middle" class="d-small d-mono d-bold">0.94</text>
+    <text x="374" y="226" text-anchor="middle" class="d-small">235B teacher</text><text x="374" y="240" text-anchor="middle" class="d-small d-text-light">top-k (k=64)</text>
+    <text x="500" y="30" class="d-title">Initial per-token KL</text>
+    <line x1="500" y1="210.0" x2="780" y2="210.0" class="d-grid"/><text x="492" y="214.0" text-anchor="end" class="d-small d-mono">0.0</text>
+    <line x1="500" y1="130.0" x2="780" y2="130.0" class="d-grid"/><text x="492" y="134.0" text-anchor="end" class="d-small d-mono">0.1</text>
+    <line x1="500" y1="50.0" x2="780" y2="50.0" class="d-grid"/><text x="492" y="54.0" text-anchor="end" class="d-small d-mono">0.2</text>
+    <line x1="500" y1="50" x2="500" y2="210" class="d-axis"/><line x1="500" y1="210" x2="780" y2="210" class="d-axis"/>
+    <rect x="530" y="178.0" width="70" height="32.0" class="d-fill-blue"/><text x="565" y="173.0" text-anchor="middle" class="d-small d-mono d-bold">~0.04</text>
+    <text x="565" y="226" text-anchor="middle" class="d-small">same-origin</text>
+    <rect x="640" y="58.0" width="70" height="152.0" class="d-fill-orange"/><text x="675" y="53.0" text-anchor="middle" class="d-small d-mono d-bold">~0.19</text>
+    <text x="675" y="226" text-anchor="middle" class="d-small">235B teacher</text>
+    <text x="70" y="262" class="d-small d-text-light">Same-origin = math teacher obtained by RL from the student's own SFT checkpoint. Top-k diverged near step 18 with the 235B teacher.</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> The same-origin experiment of the MOPD paper on Qwen3-30B-A3B: replacing the math teacher (an RL-trained copy descended from the student's SFT checkpoint) with the larger, stronger Qwen3-235B-A22B lowers AIME'25 from 51.46 to 45.63 under the policy-gradient loss and to 0.94 under the top-k loss, which collapsed around step 18. The initial per-token student-teacher KL was about 0.19 versus about 0.04, roughly 5&times;<a class="cite" href="#ref-8">8</a> (Table 4, Figure 3, §4.4.2). Units of the KL are not stated in the passage I read.</figcaption>
+</figure>
+<p>The tension with Qwen3's own recipe is real and has a reading. Qwen3 distills 235B-A22B and 32B into its 30B-A3B, but only after an off-policy phase that fine-tunes the student on the teacher's outputs<a class="cite" href="#ref-7">7</a> (§4.5). That phase moves the student into the teacher's support before the on-policy phase starts. The MOPD swap did not do that. Li et al. test the same idea from the other side and report that an "off-policy cold start" and "teacher-aligned prompt selection" recover failing OPD runs<a class="cite" href="#ref-14">14</a>. I read these as one finding: OPD needs low initial divergence, and an SFT stage on the teacher's samples is how you buy it. That is my synthesis, not a claim any of the three papers makes in those words.</p>
+<p>Li et al. add that benchmark rank is not what matters. Same-pipeline teachers helped little and RL-post-trained ones much more, measured as the fraction of the student-teacher gap recovered: 5.3% versus 16.9% in the DeepSeek-distill family (student R1-Distill-1.5B) and 15.6% versus 58.6% in the Qwen3 family (student Qwen3-1.7B non-thinking), even though the RL teachers had slightly lower initial token overlap with the student (71.5% versus 74.7%; 70.3% versus 75.7%)<a class="cite" href="#ref-14">14</a> (Figure 4). In a reverse experiment, JustRL-1.5B (an RL-improved model) as student was distilled from its own pre-RL checkpoint and "regress[ed] almost exactly to its pre-RL performance"; with R1-Distill-7B as teacher, a larger model that scored slightly higher than the student on benchmarks, it regressed to the same level<a class="cite" href="#ref-14">14</a> (§3.3). That follows from the objective: the minimizer is the teacher's local distribution, so a teacher that sits in the wrong place pulls the student there whatever its score. In the authors' words OPD "fundamentally learns thinking patterns"; they also report that 97% to 99% of the probability mass sits in a small token set shared by student and teacher in successful runs<a class="cite" href="#ref-14">14</a>.</p>
+
+<h3 id="requirements-estimator">5.2 The sampled-token estimator is cheap and noisy</h3>
+<p>The estimator question is how much of the teacher's distribution each position returns. Sampled-token needs one number per token. Exact reverse KL needs \(|V|\) numbers, and Qwen3's vocabulary is 151,669<a class="cite" href="#ref-7">7</a> (§2). In fp32 that is \(151{,}669\times4=606{,}676\) B, about 592 KiB per token per teacher; a batch of 1M tokens would hold about 607 GB of logits if materialized, against 4 MB for sampled-token log-probabilities (derived; real implementations chunk). Three groups made three choices:</p>
+<ul>
+  <li><strong>DeepSeek-V4</strong> says the sampled-token form is "resource-efficient" but "leads to high variance in gradient estimation and often causes training instability", so it uses full-vocabulary logit distillation, made feasible by caching only the teacher's last-layer hidden states, rebuilding logits through the prediction head on the fly, ordering samples by teacher index so at most one teacher head is resident, and computing the exact KL in a TileLang kernel<a class="cite" href="#ref-2">2</a> (§5.1.2, §5.2.2). The passage I read gives no ablation behind the instability claim.</li>
+  <li><strong>The MOPD paper</strong> compares its policy-gradient (sampled-token) form against top-\(k\) with \(k=64\) on same-origin teachers and finds them "comparable", normalized scores 0.937 versus 0.909, and says top-\(k\) "does not yield additional stability or variance reduction"<a class="cite" href="#ref-8">8</a> (§4.4.1).</li>
+  <li><strong>Fu et al.</strong> replace the sampled token with teacher top-\(K\) local support matching (a truncated reverse KL over the teacher's \(K\) most likely tokens, renormalized on both sides), plus top-\(p\) rollouts and special-token masking, and report "+19.8%". That is the relative gain in average math score, 34.8 to 41.7, in an alternating math and ALFWorld run. In single-task math the average is 36.4 for sampled-token OPD, 40.7 with special-token masking alone and 41.7 with local support matching, so masking accounts for about 81% of the gain (derived: 4.3 of 5.3 points)<a class="cite" href="#ref-9">9</a> (Tables 1 and 2). The student is Qwen2.5-7B-Instruct and the teacher OpenThinker3-7B, not a same-origin pair; the paper is marked "Under review".</li>
+</ul>
+<p>These are compatible if variance matters most when teacher and student are far apart or rollouts are long, which is where Fu et al. and V4 operate, and matters little when the teacher is a close descendant, which is the MOPD setting. That is my reading; no paper runs all three on one setup. Table 7 collects the failure modes the sources report and the fix each proposes.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 7.</b> Reported failure modes of OPD, with the measurement and the proposed fix. All sources except the Thinking Machines post are 2026 preprints; the Li et al. and Shao et al. results are the authors' own.</caption>
+  <thead><tr><th>Failure</th><th>What was measured</th><th>Proposed fix</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Teacher far from student</td><td>initial per-token KL ~0.19 vs ~0.04; entropy 0.30 to 0.21; top-k collapse near step 18</td><td>same-origin teacher; off-policy cold start; teacher-aligned prompts</td><td>MOPD<a class="cite" href="#ref-8">8</a>; Li et al.<a class="cite" href="#ref-14">14</a></td></tr>
+    <tr><td class="row">Imbalanced sampled-token signal</td><td>most sampled tokens receive negative reward (Figure 2 of the source)</td><td>teacher top-\(K\) local support matching</td><td>Fu et al.<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">Repetition not penalized</td><td>teacher "locally aligned" with the student's repeated tokens</td><td>top-\(p\) rollouts; teacher-mixed sampling (\(\alpha\) mix-in)</td><td>Fu et al.<a class="cite" href="#ref-9">9</a>; MiniLLM<a class="cite" href="#ref-6">6</a></td></tr>
+    <tr><td class="row">Tokenizer mismatch</td><td>student's <code>&lt;think&gt;</code> split into three tokens: teacher log-probability &minus;19.16 against student &minus;0.07; end-of-sequence &minus;58.71 against &minus;0.00</td><td>special-token masking; shared tokenizer (Lambert notes KD "often" requires one)</td><td>Fu et al.<a class="cite" href="#ref-9">9</a>; Lambert<a class="cite" href="#ref-3">3</a></td></tr>
+    <tr><td class="row">Long responses</td><td>best results at 3K to 7K maximum length; 10K and 15K collapse late; teacher's accuracy advantage over the student's continuation falls from +0.37 at a 1K prefix to +0.02 at 16K</td><td>cap length; open problem for agentic horizons</td><td>Li et al.<a class="cite" href="#ref-14">14</a> (§6.1)</td></tr>
+    <tr><td class="row">Gradient concentrated on surprising tokens</td><td>gradient L1 norm factors into \(2|\Delta_t|\) and \((1-p_S)\) for the \(k_2\) loss; low-student-probability tokens carry a disproportionate share</td><td>surprise-aware reweighting (SuRe), up to +6.7 points on AIME'24 pass@8 for a 1.7B student</td><td>Shao et al.<a class="cite" href="#ref-11">11</a></td></tr>
+  </tbody>
+</table>
+
+<h3 id="requirements-horizon">5.3 Horizon, and what stays outside this module</h3>
+<p>Li et al.'s long-response result limits the recipe where RL is most valuable. The teacher's grade depends on a prefix the student wrote, and the further it drifts from what the teacher would produce, the less informative the grade; instability starts at the end of long responses and propagates backward, and the authors conclude that OPD "may not extend cleanly" to extended chain-of-thought or agentic multi-turn interaction<a class="cite" href="#ref-14">14</a> (§6.1). That is a statement about their setup, a 1.5B student on math. Mismatch between the engine that produces \(\log\pi_\theta\) and the one that trains is Module 14's subject; multiple teachers, prompt routing and V4's teacher scheduling are Module 22.</p>
+
+<h2 id="versus-rl">6. When distillation, not RL, is the cheaper route</h2>
+<h3 id="versus-evidence">6.1 The comparisons that exist</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 8.</b> The head-to-head evidence between RL and distillation. "Distillation" in the R1 and Yue et al. rows means off-policy SFT on teacher samples, not OPD; only the Qwen3 and Thinking Machines rows are OPD. Accounting differs by row.</caption>
+  <thead><tr><th>Source</th><th>Setting</th><th>Result</th><th>Cost as reported</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DeepSeek-R1, Supp. F.1, Table 16<a class="cite" href="#ref-15">15</a></td><td>Qwen2.5-32B; RL (Qwen2.5-32B-Zero, over 10K steps) versus SFT on 800K R1 samples</td><td>AIME'24 pass@1: QwQ-32B-Preview 50.0, RL 47.0, distilled 72.6; GPQA-Diamond 54.5, 55.0, 62.1; LiveCodeBench 41.9, 40.2, 57.2</td><td>RL "require[s] enormous computational power"; no GPU-hours given in the table</td></tr>
+    <tr><td class="row">Qwen3, Table 21<a class="cite" href="#ref-7">7</a></td><td>8B, same checkpoint; RL versus OPD</td><td>AIME'24 67.6 versus 74.4; pass@64 90.0 versus 93.3</td><td>17,920 versus 1,800 GPU-hours (teacher cost not stated)</td></tr>
+    <tr><td class="row">Thinking Machines<a class="cite" href="#ref-1">1</a></td><td>Qwen3-8B-Base, from SFT-400K (60%)</td><td>OPD 70% at about 150 steps; RL 68% (from the Qwen3 report); SFT-2M extrapolated 70%</td><td>9&times; to 30&times; in FLOPs; 18&times; in GPU-hours</td></tr>
+    <tr><td class="row">Yue et al., §4.2<a class="cite" href="#ref-16">16</a></td><td>Qwen2.5-Math-7B; base, RLVR, R1-distilled</td><td>distilled model's pass@k curve "consistently and significantly above" the base; RLVR bounded by the base</td><td>not compared</td></tr>
+    <tr><td class="row">ProRL<a class="cite" href="#ref-17">17</a></td><td>1.5B from R1-Distill-Qwen-1.5B; RL for over 2,000 steps</td><td>gains over the start of +15.7% (math), +14.4% (code), +25.9% (GPQA-Diamond), +22.0% (IFEval) and +54.8% (Reasoning Gym reward), from the body and Tables 1-3; the introduction prints 14.7%, 13.9%, 25.1% and 18.1% for the first four domains</td><td>about 16K GPU-hours on 4&times;8 H100</td></tr>
+  </tbody>
+</table>
+<p>Read as a set, the rows agree on one thing and leave one thing open. They agree that for a small student with a stronger teacher available, a teacher-supplied signal beats RL from the same start on both quality and cost. They leave open whether RL, run long enough from a distilled start, passes what distillation reaches: ProRL's 16K GPU-hours is the same order as Qwen3's 17,920 for RL on the 8B, and ProRL claims gains "inaccessible to base models, even under extensive sampling"<a class="cite" href="#ref-17">17</a>, while R1's authors close the comparison by saying "advancing beyond the boundaries of human intelligence may still require more powerful base models and larger-scale reinforcement learning"<a class="cite" href="#ref-15">15</a>. Module 20 weighs the capability evidence.</p>
+
+<h3 id="versus-accounting">6.2 Break-even: when a teacher pays for itself</h3>
+<p>The quoted ratios hide that a teacher is a sunk cost somebody paid. If one teacher serves \(n\) students, per-student cost is what you compare; if you must build it, the break-even is \(n^*=C_T/(C_{\mathrm{RL}}-C_{\mathrm{OPD}}(1+o))\), with \(C_T\) the teacher's build cost, \(C_{\mathrm{OPD}}\) the per-student OPD cost, \(C_{\mathrm{RL}}\) the per-student RL cost, and \(o\) the teacher-pass overhead as a fraction of the OPD cost. Qwen3 amortizes teachers over six small models (five dense and one MoE)<a class="cite" href="#ref-7">7</a>; the calculator below defaults to the 8B figures and an unknown, hence zero, teacher cost.</p>
+<div class="calc">
+  <p class="calc-title">Distillation versus RL, with the teacher counted</p>
+  <div class="calc-row"><label for="c21a">RL per student (GPU-h)</label><input type="range" id="c21a" name="Crl" min="1000" max="100000" step="500" value="17920" data-format="si"></div>
+  <div class="calc-row"><label for="c21b">OPD per student (GPU-h)</label><input type="range" id="c21b" name="Copd" min="100" max="50000" step="100" value="1800" data-format="si"></div>
+  <div class="calc-row"><label for="c21c">Teacher-pass overhead o</label><input type="range" id="c21c" name="o" min="0" max="2" step="0.05" value="0" data-format="fixed:2"></div>
+  <div class="calc-row"><label for="c21d">Teacher build cost (GPU-h)</label><input type="range" id="c21d" name="CT" min="0" max="1000000" step="5000" value="0" data-format="si"></div>
+  <div class="calc-row"><label for="c21e">Students sharing the teacher</label><input type="range" id="c21e" name="n" min="1" max="50" step="1" value="6" data-format="int"></div>
+  <div class="calc-out">
+    <div>RL, all students (GPU-h)<output data-expr="n * Crl" data-format="si"></output></div>
+    <div>OPD, all students plus teacher (GPU-h)<output data-expr="CT + n * Copd * (1 + o)" data-format="si"></output></div>
+    <div>Per-student ratio RL / OPD<output data-expr="Crl / (Copd * (1 + o))" data-format="fixed:2"></output></div>
+    <div>Break-even number of students<output data-expr="CT / max(1, Crl - Copd * (1 + o))" data-format="fixed:1"></output></div>
+  </div>
+  <p class="calc-note">Formulas: \(n C_{\mathrm{RL}}\); \(C_T+nC_{\mathrm{OPD}}(1+o)\); \(C_{\mathrm{RL}}/(C_{\mathrm{OPD}}(1+o))\); \(C_T/(C_{\mathrm{RL}}-C_{\mathrm{OPD}}(1+o))\). Defaults are the Qwen3-8B figures of Table 5<a class="cite" href="#ref-7">7</a>; the report states neither the teacher cost nor whether the 1,800 includes it. Setting \(C_T\) to the cost of an RL run for the teacher shows why Thinking Machines' 50-100&times; applies to copies, not to discovery.</p>
+</div>
+
+<h3 id="versus-decision">6.3 Decision inputs</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 9.</b> Which route the evidence favors, by situation. These are my readings of the cited results, not rules any source states; the decision framework for the whole course is Module 33.</caption>
+  <thead><tr><th>Situation</th><th>Cheaper or better route</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Stronger teacher exists, student already SFT'd on its outputs, same tokenizer</td><td>OPD</td><td>Qwen3 Table 21<a class="cite" href="#ref-7">7</a>; Thinking Machines<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">Teacher is a different, larger model and the student is cold</td><td>off-policy SFT first, then OPD; OPD alone can degrade</td><td>MOPD §4.4.2<a class="cite" href="#ref-8">8</a>; Li et al.<a class="cite" href="#ref-14">14</a></td></tr>
+    <tr><td class="row">You must restore a behavior lost in fine-tuning, and an earlier checkpoint has it</td><td>OPD with that checkpoint as teacher</td><td>Table 6<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">No model stronger than your target exists</td><td>RL; OPD cannot exceed its teacher</td><td>R1 Supp. F.1<a class="cite" href="#ref-15">15</a></td></tr>
+    <tr><td class="row">Student and teacher use different tokenizers</td><td>avoid sampled-token OPD, or mask special tokens</td><td>Fu et al.<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">Responses of 10K tokens or more, or multi-turn agent episodes</td><td>no OPD evidence at this length in the sources read</td><td>Li et al.<a class="cite" href="#ref-14">14</a></td></tr>
+  </tbody>
+</table>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The question the sources contest is where a fixed budget goes when you want a strong small reasoning model: RL on the model, or a teacher's signal. A second question, which estimator to use, is covered in section 5.2.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Distill first; RL costs more for less</h4>
+    <p class="who">DeepSeek-R1 authors, Supp. F.1<a class="cite" href="#ref-15">15</a>; Qwen3 team<a class="cite" href="#ref-7">7</a>; Thinking Machines<a class="cite" href="#ref-1">1</a></p>
+    <p>R1 trained Qwen2.5-32B with RL for over 10K steps and matched only QwQ-32B-Preview, while SFT on R1's samples scored far higher. Qwen3 and the post report OPD beating RL at about a tenth of the GPU-hours, with higher pass@64 in Qwen3's case.</p>
+    <ul class="pros"><li>Every direct comparison favors the teacher signal on cost and on pass@1.</li><li>Dense signal works at smaller batches and shorter context than RL needs<a class="cite" href="#ref-1">1</a>.</li></ul>
+    <ul class="cons"><li>The ratios omit or do not state the teacher's cost, and the 30&times; version is the only one that counts teacher sampling.</li><li>Single runs without seeds; R1's "distillation" is off-policy SFT.</li></ul>
+  </article>
+  <article class="position">
+    <h4>RL is still needed to pass the teacher, and it works from a distilled start</h4>
+    <p class="who">DeepSeek-R1 authors, same passage<a class="cite" href="#ref-15">15</a>; ProRL (NVIDIA)<a class="cite" href="#ref-17">17</a></p>
+    <p>R1's own second conclusion is that "advancing beyond the boundaries of human intelligence may still require more powerful base models and larger-scale reinforcement learning". ProRL runs over 2,000 RL steps from a distilled 1.5B checkpoint, with KL control, reference resets and diverse tasks, and reports gains across five domains.</p>
+    <ul class="pros"><li>OPD's optimum is the teacher, so OPD alone cannot exceed it.</li><li>ProRL shows large RL gains on top of distillation at about 16K GPU-hours<a class="cite" href="#ref-17">17</a>.</li></ul>
+    <ul class="cons"><li>ProRL's baseline is its own start, not OPD from a stronger teacher.</li><li>The claim that these gains are new capability is contested (Module 20).</li></ul>
+  </article>
+  <article class="position">
+    <h4>OPD is conditional: it moves a student toward a close teacher, nothing more</h4>
+    <p class="who">Li et al.<a class="cite" href="#ref-14">14</a>; the MOPD paper (Xiaomi)<a class="cite" href="#ref-8">8</a>; Fu et al.<a class="cite" href="#ref-9">9</a></p>
+    <p>A larger, stronger teacher failed when it was distributionally far from the student; same-pipeline teachers gave small gains; a pre-RL checkpoint erased an RL student's gains; long rollouts destabilized training.</p>
+    <ul class="pros"><li>Explains the failures that the headline ratios hide, and offers fixes (cold start, same-origin teachers).</li></ul>
+    <ul class="cons"><li>Small models, mostly math, 2026 preprints, one marked "under review"; none measures cost against RL.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The positions answer different questions, so they mostly do not collide. Below the frontier, with a teacher that exists, shares the tokenizer, and sits close to the student after an SFT stage, OPD is the cheaper route in every comparison here, by 9.96&times; on the one that reports GPU-hours, a ratio that may overstate the saving because the report does not say whether the teacher is in the 1,800. At or past the frontier, or with no teacher stronger than the target, RL is the only route, and the third position says the conditions for the first are narrower than the headlines suggest. The evidence that would settle it is a study the sources do not contain: one starting checkpoint, teacher build and serving cost counted, RL and OPD each given matched total GPU-hours, several seeds, and pass@k at large k over more than 30 problems.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The reproducibility footing is thin. The post's June 2026 update says Qwen3-32B and Qwen3-8B-Base "have since been retired from the Tinker model lineup" and that the cookbook recipes now use Qwen3.5-9B-Base as the student and Qwen3.5-9B as the teacher; the printed numbers come from the original models<a class="cite" href="#ref-1">1</a>. The analysis literature is moving faster than the recipe: Fu et al. (March 2026, revised April), Li et al. (April 2026) and Shao et al. (August 2026, third version October) all post-date the post and all are preprints<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-14">14</a><a class="cite" href="#ref-11">11</a>. In production the recipe has moved from a single teacher to OPD as a final stage with many teachers (DeepSeek-V4's more than ten<a class="cite" href="#ref-2">2</a>), which is Module 22. A separate branch drops the external teacher: Lambert describes on-policy self-distillation, where one model with privileged information in its context, such as a hint or a judge's feedback, acts as its own teacher, and attributes a use of it to Cursor's Composer 2.5<a class="cite" href="#ref-3">3</a> (§12.3.3). I have not checked Cursor's own account.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">blog</span>Lu, K. and Thinking Machines Lab. <em>On-Policy Distillation</em>. Thinking Machines Lab: Connectionism, 27 Oct 2025; June 2026 update note on retired models. <a href="https://thinkingmachines.ai/blog/on-policy-distillation/">https://thinkingmachines.ai/blog/on-policy-distillation/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: taxonomy table, per-token reverse KL objective, discount factor zero, pseudocode, Qwen3-8B-Base experiments, FLOPs table and the 9x/18x/30x accounting, personalization table, 7-10x step and 50-100x compute claims, single-prompt run, June 2026 update.</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv:2606.19348v1. <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: mixed RL replaced by OPD (§5.1), full-vocabulary OPD and the stated reason (§5.1.2, Eq. 29), hidden-state caching and teacher-head scheduling (§5.2.2), more than ten teachers.</span></li>
+  <li id="ref-3"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv:2504.12501v12 (11 Sep 2026). <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-27. <span class="ref-use">Used for: forward-KL identity for SFT-style distillation (§12.3.1, p. 150), exposure bias and the DAgger analogy (§12.3.2, pp. 150-152), advantage as negative per-token reverse KL, combination with GRPO advantages and the shared-tokenizer remark (§12.3.3, p. 153), on-policy self-distillation and the Cursor attribution.</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Ross, S., Gordon, G. J., Bagnell, J. A. <em>A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning</em>. arXiv:1011.0686v3, 16 Mar 2011 (AISTATS 2011). <a href="https://arxiv.org/abs/1011.0686">https://arxiv.org/abs/1011.0686</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the \(T^2\epsilon\) bound for supervised imitation (Theorem 2.1) and DAgger's \(uT\epsilon_N\) bound (Theorem 3.2).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Agarwal, R., Vieillard, N. et al. <em>On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes</em> (GKD). ICLR 2024; arXiv:2306.13649v3, 17 Jan 2024. <a href="https://arxiv.org/abs/2306.13649">https://arxiv.org/abs/2306.13649</a>. Accessed 2026-10-27. <span class="ref-use">Used for: on-policy KD without backpropagating through sampling (§3.1, Eq. 4), the student-data fraction \(\lambda\), divergence choices, relative gains of 2.1x, 1.7x and 1.9x (§1, Figure 1).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Gu, Y., Dong, L., Wei, F., Huang, M. <em>MiniLLM: On-Policy Distillation of Large Language Models</em>. arXiv:2306.08543v6, 31 Jan 2026. <a href="https://arxiv.org/abs/2306.08543">https://arxiv.org/abs/2306.08543</a>. Accessed 2026-10-27. <span class="ref-use">Used for: reverse-KL policy gradient with reward-to-go (§2.2, Eq. 2), single-step decomposition, teacher-mixed sampling and length normalization, reward hacking by degenerate text, the mode-seeking argument (§2.1).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Yang, A., Li, A., Yang, B., Zhang, B. et al. (Qwen Team). <em>Qwen3 Technical Report</em>. arXiv:2505.09388v1, 14 May 2025. <a href="https://arxiv.org/pdf/2505.09388v1">https://arxiv.org/pdf/2505.09388v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: vocabulary size 151,669 (§2), strong-to-weak distillation, off-policy then on-policy phases, teacher choices, 1/10 GPU-hours (§4 introduction, §4.5), evaluation protocol of 30 AIME questions with 64 samples (§4.6), RL versus on-policy distillation (§4.7, Table 21, p. 21).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Ma, W. et al. (Peking University and Xiaomi LLM Core). <em>MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training</em>. arXiv:2606.30406v1, 29 Jun 2026. <a href="https://arxiv.org/pdf/2606.30406v1">https://arxiv.org/pdf/2606.30406v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: per-token reverse KL loss, policy-gradient and top-k forms with clipped advantage (§3.2, Eqs. 1-5), teacher prefill (§3.3), same-origin teacher experiment (§4.4.2, Table 4, Figure 3), policy-gradient versus top-k comparison (§4.4.1).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Fu, Y. et al. <em>Revisiting On-Policy Distillation: Empirical Failure Modes and Simple Fixes</em>. arXiv:2603.25562v2, 27 Apr 2026 (preprint, "under review"). <a href="https://arxiv.org/abs/2603.25562">https://arxiv.org/abs/2603.25562</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the \(\gamma\)-interpolated estimator and the \(O(T^2)\) versus \(O(T^4)\) variance bounds (§2.1, Eqs. 1-3, Appendix D), three failure modes and the tokenizer example (§2.2, Figures 2-5), local support matching (§3), the +19.8% claim (abstract).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Tang, Y., Munos, R. <em>On a few pitfalls in KL divergence gradient estimation for RL</em>. arXiv:2506.09477v1, 11 Jun 2025. <a href="https://arxiv.org/abs/2506.09477">https://arxiv.org/abs/2506.09477</a>. Accessed 2026-10-27. <span class="ref-use">Used for: sequence-level versus token-level KL gradient in the 70B-to-8B on-policy distillation experiment (§5.2-§5.3, Figure 8, Appendix E).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Shao, B. et al. (Fudan University). <em>A Token-Level Analysis of Sampled-Token Reverse-KL On-Policy Distillation</em>. arXiv:2608.25643v3, 13 Oct 2026 (preprint). <a href="https://arxiv.org/abs/2608.25643">https://arxiv.org/abs/2608.25643</a>. Accessed 2026-10-27. <span class="ref-use">Used for: gradient of the per-token \(K_2\) estimator, its direction matching the detached sampled-token reward of Kimi K3 (which clips it), the \(2|\Delta_t|(1-p_S)\) factorization, SuRe result (abstract, Figure 1).</span></li>
+  <li id="ref-12"><span class="ref-type">blog</span>Schulman, J. and Thinking Machines Lab. <em>LoRA Without Regret</em>. Thinking Machines Lab: Connectionism, 29 Sep 2025. <a href="https://thinkingmachines.ai/blog/lora/">https://thinkingmachines.ai/blog/lora/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the O(1) bits per episode argument for policy gradient, 320,000 bits for the MATH run, 5.3M episodes for R1-Zero, the stated limits of the argument (§"How much capacity is needed by supervised and reinforcement learning?").</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Olmo Team. <em>Olmo 3</em>. arXiv:2512.13961v2, 14 Apr 2026. <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: inference-side MFU 1.01% and MBU 43.21% in the RL infrastructure benchmark (Table 23).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Li, Y. et al. (Tsinghua University). <em>Rethinking On-Policy Distillation of Large Language Models: Phenomenology, Mechanism, and Recipe</em>. arXiv:2604.13016v2, 15 Apr 2026 (preprint). <a href="https://arxiv.org/abs/2604.13016">https://arxiv.org/abs/2604.13016</a>. Accessed 2026-10-27. <span class="ref-use">Used for: thinking-pattern consistency and "new knowledge" conditions (§3), gap-recovery rates and initial overlap (Figure 4), reverse distillation (§3.3, Figure 5), overlap-token mechanism (§4), cold start and teacher-aligned prompts (§5), reward quality versus trajectory depth (§6.1).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv:2501.12948v2 (expanded Nature version), 4 Jan 2026. <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: distillation versus RL on Qwen2.5-32B, over 10K RL steps, Table 16 (Supp. F.1), the two conclusions drawn there.</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Yue, Y. et al. (Tsinghua University). <em>Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?</em> arXiv:2504.13837v5, 24 Nov 2025. <a href="https://arxiv.org/pdf/2504.13837v5">https://arxiv.org/pdf/2504.13837v5</a>. Accessed 2026-10-27. <span class="ref-use">Used for: distilled R1-Distill-Qwen-7B pass@k above the base model and above RLVR (§4.2, Figure 7).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Liu, M. et al. (NVIDIA). <em>ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models</em>. arXiv:2505.24864v1, 30 May 2025. <a href="https://arxiv.org/pdf/2505.24864v1">https://arxiv.org/pdf/2505.24864v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: RL from DeepSeek-R1-Distill-Qwen-1.5B, over 2,000 steps, about 16K GPU-hours on 4 nodes of 8 H100 (§3.2), per-domain gains from the body text and Tables 1-3 (§3.3), with the differing figures of the introduction (§1), the claim of strategies inaccessible to base models (abstract).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

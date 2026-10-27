@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calibration-Aware RL: Proper Scoring Rules, the RLCR Reward, and Why Binary Rewards Teach Guessing · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Why binary-reward RLVR pays for guessing at any success probability above zero, how a bounded strictly proper scoring rule (the Brier term in RLCR) repairs the incentive, a derivation of Theorem 1 and of the log-score failure, Behaviorally Calibrated RL as threshold averaging, and Kalai et al.'s counter-view that the fix is in how benchmarks are graded.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 24</p>
+  <h1>Calibration-Aware RL: Proper Scoring Rules, the RLCR Reward, and Why Binary Rewards Teach Guessing</h1>
+  <p class="lede">A binary verifier pays the same for a derived answer and a lucky guess, and it pays for guessing at any success probability above zero. This module derives why a bounded strictly proper scoring rule, the Brier term in RLCR, repairs that incentive; reads RLCR, Behaviorally Calibrated RL and Kalai et al. against their own tables; and ends with what a Brier term in your own RLVR run does and does not buy.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>50 min</b> read</span>
+    <span class="chip"><b>12</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 10</b>, <b>Module 20</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f1t"><title id="f1t">Three payoff schemes for an answer with success probability p: binary correctness, threshold grading with penalty t/(1-t), and the Brier-augmented RLCR reward, linked by t = 0 and by averaging over t</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="10" y="14" width="200" height="40" rx="8" class="d-block-muted"/><text x="110" y="39" text-anchor="middle" class="d-text-inv d-bold">Binary RLVR</text>
+    <rect x="10" y="66" width="200" height="176" rx="8" class="d-panel"/>
+    <text x="110" y="98" text-anchor="middle" class="d-mono">correct: +1</text>
+    <text x="110" y="136" text-anchor="middle" class="d-mono">wrong: 0</text>
+    <text x="110" y="174" text-anchor="middle" class="d-mono">"I don't know": 0</text>
+    <text x="110" y="212" text-anchor="middle" class="d-small d-text-light">no confidence term</text>
+    <rect x="10" y="256" width="200" height="40" rx="8" class="d-hl"/><text x="110" y="281" text-anchor="middle" class="d-bold">answers if p &gt; 0</text>
+    <rect x="300" y="14" width="200" height="40" rx="8" class="d-block"/><text x="400" y="39" text-anchor="middle" class="d-text-inv d-bold">Threshold grading</text>
+    <rect x="300" y="66" width="200" height="176" rx="8" class="d-panel"/>
+    <text x="400" y="98" text-anchor="middle" class="d-mono">correct: +1</text>
+    <text x="400" y="136" text-anchor="middle" class="d-mono">wrong: −t/(1−t)</text>
+    <text x="400" y="174" text-anchor="middle" class="d-mono">"I don't know": 0</text>
+    <text x="400" y="212" text-anchor="middle" class="d-small d-text-light">threshold t is stated</text>
+    <rect x="300" y="256" width="200" height="40" rx="8" class="d-hl"/><text x="400" y="281" text-anchor="middle" class="d-bold">answers if p &gt; t</text>
+    <rect x="590" y="14" width="200" height="40" rx="8" class="d-block-accent"/><text x="690" y="39" text-anchor="middle" class="d-text-inv d-bold">Brier reward (RLCR)</text>
+    <rect x="590" y="66" width="200" height="176" rx="8" class="d-panel"/>
+    <text x="690" y="98" text-anchor="middle" class="d-mono">correct: 1 − (1−q)²</text>
+    <text x="690" y="136" text-anchor="middle" class="d-mono">wrong: −q²</text>
+    <text x="690" y="174" text-anchor="middle" class="d-mono">no abstain action</text>
+    <text x="690" y="212" text-anchor="middle" class="d-small d-text-light">q is stated by the model</text>
+    <rect x="590" y="256" width="200" height="40" rx="8" class="d-hl"/><text x="690" y="281" text-anchor="middle" class="d-bold">best q = p, value p²</text>
+    <path d="M300,150 L220,150" class="d-arrow" marker-end="url(#f1-arr)"/><text x="260" y="140" text-anchor="middle" class="d-mono d-small">t = 0</text>
+    <path d="M510,150 L590,150" class="d-arrow-active" marker-end="url(#f1-arr)"/><text x="550" y="128" text-anchor="middle" class="d-mono d-small">average</text><text x="550" y="142" text-anchor="middle" class="d-mono d-small">over t</text>
+    <text x="400" y="320" text-anchor="middle" class="d-small d-text-light">p = probability the answer is correct; q = confidence the model states</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> Three payoff schemes for one answer with success probability \(p\). The Brier-augmented reward of RLCR<a class="cite" href="#ref-1">1</a> (Eq. 1) equals Kalai et al.’s threshold grading<a class="cite" href="#ref-2">2</a> (§4.2), rescaled and averaged over thresholds drawn uniformly from \((0,1)\), as derived by Wu et al.<a class="cite" href="#ref-3">3</a> (§3.2.2); binary correctness is the \(t=0\) case of that grading. Section 6 reproduces the averaging step.</figcaption>
+</figure>
+
+<h2 id="binary-guessing">1. Why a binary verdict teaches guessing</h2>
+
+<h3 id="binary-guessing-incentive">1.1 The incentive, in one line</h3>
+<p>Take one prompt and one candidate answer \(y\) whose probability of being judged correct is \(p_y\). Under the reward \(R=\mathbf 1[y=y^*]\) the expected reward of answering is \(p_y\), and the expected reward of saying "I don't know" is 0, because a verifier has no category for abstention and scores it as wrong. Answering wins whenever \(p_y&gt;0\). Kalai et al. state the general form as Observation 1: for any belief over binary graders, an abstention is never among the optimal responses<a class="cite" href="#ref-2">2</a> (§4.1). Wu et al. draw the consequence for RLVR: binary rewards make models "good test-takers" and encourage "guessing whenever the probability of correctness exceeds zero"<a class="cite" href="#ref-3">3</a> (abstract). Damani et al. add the second half of the diagnosis: such a reward pays "equally whether they are confidently correct or merely guessing" and penalizes "identically whether they abstain or produce incorrect answers"<a class="cite" href="#ref-1">1</a> (§1).</p>
+<p>R1-Zero is the clean instance: its reward "is solely based on the correctness of final predictions against ground-truth answers"<a class="cite" href="#ref-4">4</a> (§1), plus a format term (Module 10, Section 2). Neither term reads the model's stated certainty, which has two consequences.</p>
+<ul>
+<li><b>Guessing is free.</b> A rollout that guesses and lands on the right answer earns the same as one that derived it. Module 10 (Section 5.4) shows how guessable multiple-choice prompts feed this, and Module 20 (Section 8.3) shows how large-\(k\) pass@k counts lucky guesses as capability.</li>
+<li><b>Confidence is unconstrained.</b> If the policy writes "confidence: 95%" or hedges, \(\partial R/\partial q = 0\): the reward does not change. A token the reward does not read is shaped only by what happens to correlate with reward in the sampled data and by what the base model brought with it.</li>
+</ul>
+
+<h3 id="binary-guessing-evidence">1.2 What post-training did to calibration, as measured</h3>
+<p>The GPT-4 technical report is the earliest widely cited measurement: the pre-trained model "is highly calibrated (its predicted confidence in an answer generally matches the probability of being correct)", and "after the post-training process, the calibration is reduced"<a class="cite" href="#ref-5">5</a> (§5, Fig. 8, an MMLU subset scored on the probabilities of the A/B/C/D tokens). That is token-probability calibration after PPO-based RLHF. For the verbalized kind, Leng et al. report that RLHF "tends to lead models to express verbalized overconfidence" and trace it to PPO reward models with "inherent biases towards high-confidence scores regardless of the actual quality of responses"<a class="cite" href="#ref-6">6</a> (abstract). For reasoning RL, AbstentionBench finds that "reasoning fine-tuning degrades abstention (by 24% on average), even for math and science domains on which reasoning models are explicitly trained", across 20 datasets<a class="cite" href="#ref-7">7</a> (abstract-level reading).</p>
+<p>The most direct evidence sits in the RLCR appendix. Its RLVR baseline is trained on binary correctness and then prompted at evaluation time to state a confidence. A reporter that always states a confidence of 1 has Brier score equal to the error rate and ECE equal to \(1-\text{accuracy}\), and an AUROC of exactly 0.5, because every confidence ties. Table 1 compares those predictions with what the paper prints.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> The RLVR rows printed by Damani et al.<a class="cite" href="#ref-1">1</a> (App. K, Tables 8 to 11; Qwen2.5-7B trained on HotpotQA-Modified) against the values a constant confidence of 1 would give (derived). Accuracy is one shared cell per dataset for all rows built on the RLVR model's outputs.</caption>
+  <thead><tr><th>Dataset</th><th class="num">RLVR accuracy (%)</th><th class="num">1 − accuracy</th><th class="num">Printed Brier</th><th class="num">Printed ECE</th><th class="num">Printed AUROC</th></tr></thead>
+  <tbody>
+    <tr><td class="row">HotpotQA (in-domain)</td><td class="num">63.0</td><td class="num">0.370</td><td class="num">0.37</td><td class="num">0.37</td><td class="num">0.50 ± 0.00</td></tr>
+    <tr><td class="row">TriviaQA</td><td class="num">62.2</td><td class="num">0.378</td><td class="num">0.38</td><td class="num">0.38</td><td class="num">0.50 ± 0.00</td></tr>
+    <tr><td class="row">SimpleQA</td><td class="num">12.4</td><td class="num">0.876</td><td class="num">0.88</td><td class="num">0.88</td><td class="num">0.50 ± 0.00</td></tr>
+    <tr><td class="row">CommonsenseQA</td><td class="num">90.8</td><td class="num">0.092</td><td class="num">0.09</td><td class="num">0.09</td><td class="num">0.50 ± 0.00</td></tr>
+    <tr><td class="row">GPQA</td><td class="num">39.5</td><td class="num">0.605</td><td class="num">0.60</td><td class="num">0.60</td><td class="num">0.50 ± 0.00</td></tr>
+    <tr><td class="row">GSM8K</td><td class="num">80.1</td><td class="num">0.199</td><td class="num">0.20</td><td class="num">0.20</td><td class="num">0.50 ± 0.00</td></tr>
+    <tr><td class="row">MATH-500</td><td class="num">38.6</td><td class="num">0.614</td><td class="num">0.61</td><td class="num">0.61</td><td class="num">0.50 ± 0.01</td></tr>
+  </tbody>
+</table>
+
+<p>All seven match to two decimals. The reading, which is mine and not the paper's: the RLVR model's stated confidence carries no information and sits at or very near 1. That is the failure the Brier term is meant to repair, and it also means the headline "ECE 0.37 to 0.03" compares a model trained to emit a confidence against one that was only asked to. The informative baselines are the classifiers and probes of Section 5.</p>
+
+<h3 id="binary-guessing-kinds">1.3 Three things called calibration</h3>
+<p>The literature uses one word for three quantities, and they fail and are repaired separately. Table 2 separates them; the rest of the module is about the second and third.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Three notions of calibration, what each reads, and the evidence in this module.</caption>
+  <thead><tr><th>Notion</th><th>What is read</th><th>Set by</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Token-probability</td><td>Probability of the answer tokens</td><td>Pretraining cross-entropy; degraded by post-training</td><td>Base GPT-4 calibrated, post-trained not<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-2">2</a>. RLCR's "Answer Probability" baseline has ECE 0.36 on HotpotQA because "the model typically commits to an answer during CoT, inflating output confidence"<a class="cite" href="#ref-1">1</a> (§4.2)</td></tr>
+    <tr><td class="row">Verbalized</td><td>A number the model writes</td><td>RL reward on that number (RLCR, Wu et al.)</td><td>Sections 3 to 6</td></tr>
+    <tr><td class="row">Behavioral</td><td>Whether it answers or abstains as a function of a stated threshold</td><td>Grading with explicit targets; thresholding a verbalized \(q\)</td><td>Sections 6 and 7</td></tr>
+  </tbody>
+</table>
+<p>For an inference engineer the first row has a practical edge: log-probabilities of the final answer tokens are free at serving time. Table 7 shows what they are worth after RL. As a ranking they are mixed, with AUROC 0.72 on HotpotQA, the highest in that table, but 0.52 on math<a class="cite" href="#ref-1">1</a> (Table 1). As probabilities they are inflated (ECE 0.36 on HotpotQA), because the answer is nearly deterministic once the chain of thought has committed to it. A raw log-probability threshold needs recalibration on held-out data before it means anything, and entropy collapse during RL (Module 13) plausibly makes that worse (my inference).</p>
+
+<h2 id="scoring-rules">2. Proper scoring rules, and what the Brier term pays for</h2>
+
+<h3 id="scoring-rules-brier">2.1 Definition and the Brier derivation</h3>
+<p>A scoring rule for a binary event assigns a loss \(\ell(q,c)\) to a stated probability \(q\in[0,1]\) and a realized outcome \(c\in\{0,1\}\). It is <em>proper</em> when the expected loss under \(c\sim\mathrm{Bernoulli}(p)\) is minimized at \(q=p\), and <em>strictly proper</em> when that minimizer is unique<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-1">1</a> (Gneiting and Raftery, abstract and §2; Damani et al., §2). Gneiting and Raftery write scores as rewards to be maximized; the RLCR proof writes losses. This module writes losses, so a reward is \(\lambda c-\ell(q,c)\).</p>
+<p>The Brier loss is \(\ell=(q-c)^2\). Its expectation is</p>
+$$p(1-q)^2+(1-p)\,q^2=p(1-p)+(q-p)^2,$$
+<p>an irreducible term plus the squared miscalibration, so it is uniquely minimized at \(q=p\). The RLCR reward is \(R=c-(q-c)^2\)<a class="cite" href="#ref-1">1</a> (Eq. 1). Because \(c^2=c\) for a 0/1 outcome, \(R=2qc-q^2\): it is \(2q-q^2\) when the answer is correct and \(-q^2\) when it is wrong. Taking the expectation over \(c\) gives</p>
+$$\mathbb E[R\mid p,q]=2pq-q^2=p^2-(q-p)^2 .$$
+<p>The expected reward is a downward parabola in the stated confidence. It peaks at \(q=p\), where it equals \(p^2\), and it falls by exactly the squared miscalibration. Two reference points are worth memorizing. Stating \(q=0\) pays 0 whatever happens (correct: \(1-1\); wrong: \(0-0\)). Stating \(q=1\) pays \(+1\) or \(-1\), which is \(2p-1\) in expectation.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f2t"><title id="f2t">Expected RLCR reward as a function of stated confidence q for true success probabilities 0.3, 0.6 and 0.9; each parabola peaks at q equal to p with height p squared</title>
+    <line x1="70" y1="270.0" x2="740" y2="270.0" class="d-grid"/><text x="62" y="274.0" text-anchor="end" class="d-small d-mono">-0.5</text>
+    <line x1="70" y1="193.3" x2="740" y2="193.3" class="d-axis"/><text x="62" y="197.3" text-anchor="end" class="d-small d-mono">0.0</text>
+    <line x1="70" y1="116.7" x2="740" y2="116.7" class="d-grid"/><text x="62" y="120.7" text-anchor="end" class="d-small d-mono">0.5</text>
+    <line x1="70" y1="40.0" x2="740" y2="40.0" class="d-grid"/><text x="62" y="44.0" text-anchor="end" class="d-small d-mono">1.0</text>
+    <line x1="70" y1="40.0" x2="70" y2="270.0" class="d-axis"/>
+    <text x="70.0" y="286.0" text-anchor="middle" class="d-small d-mono">0</text>
+    <text x="237.5" y="286.0" text-anchor="middle" class="d-small d-mono">0.25</text>
+    <text x="405.0" y="286.0" text-anchor="middle" class="d-small d-mono">0.5</text>
+    <text x="572.5" y="286.0" text-anchor="middle" class="d-small d-mono">0.75</text>
+    <text x="740.0" y="286.0" text-anchor="middle" class="d-small d-mono">1</text>
+    <text x="405" y="304" text-anchor="middle" class="d-small d-text-light">stated confidence q</text>
+    <text x="70" y="22" class="d-small d-text-light">expected reward  E[R] = 2pq − q²</text>
+    <polyline points="70.0,193.3 83.4,191.6 96.8,189.9 110.2,188.4 123.6,187.0 137.0,185.7 150.4,184.5 163.8,183.5 177.2,182.5 190.6,181.7 204.0,181.1 217.4,180.5 230.8,180.1 244.2,179.8 257.6,179.6 271.0,179.5 284.4,179.6 297.8,179.8 311.2,180.1 324.6,180.5 338.0,181.1 351.4,181.7 364.8,182.5 378.2,183.5 391.6,184.5 405.0,185.7 418.4,187.0 431.8,188.4 445.2,189.9 458.6,191.6 472.0,193.3 485.4,195.2 498.8,197.3 512.2,199.4 525.6,201.7 539.0,204.1 552.4,206.6 565.8,209.2 579.2,212.0 592.6,214.9 606.0,217.9 619.4,221.0 632.8,224.2 646.2,227.6 659.6,231.1 673.0,234.7 686.4,238.5 699.8,242.3 713.2,246.3 726.6,250.4 740.0,254.7" class="d-line d-stroke-cyan" style="stroke-width:2.5"/>
+    <line x1="271.0" y1="179.5" x2="271.0" y2="270.0" class="d-line d-stroke-cyan d-dashed" style="stroke-width:1"/>
+    <circle cx="271.0" cy="179.5" r="5" class="d-fill-cyan"/>
+    <text x="271.0" y="169.5" text-anchor="middle" class="d-small d-mono">p² = 0.09</text>
+    <polyline points="70.0,193.3 83.4,189.7 96.8,186.2 110.2,182.8 123.6,179.6 137.0,176.5 150.4,173.5 163.8,170.6 177.2,167.8 190.6,165.2 204.0,162.7 217.4,160.3 230.8,158.0 244.2,155.9 257.6,153.8 271.0,151.9 284.4,150.2 297.8,148.5 311.2,147.0 324.6,145.6 338.0,144.3 351.4,143.1 364.8,142.1 378.2,141.1 391.6,140.3 405.0,139.7 418.4,139.1 431.8,138.7 445.2,138.4 458.6,138.2 472.0,138.1 485.4,138.2 498.8,138.4 512.2,138.7 525.6,139.1 539.0,139.7 552.4,140.3 565.8,141.1 579.2,142.1 592.6,143.1 606.0,144.3 619.4,145.6 632.8,147.0 646.2,148.5 659.6,150.2 673.0,151.9 686.4,153.8 699.8,155.9 713.2,158.0 726.6,160.3 740.0,162.7" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+    <line x1="472.0" y1="138.1" x2="472.0" y2="270.0" class="d-line d-stroke-blue d-dashed" style="stroke-width:1"/>
+    <circle cx="472.0" cy="138.1" r="5" class="d-fill-blue"/>
+    <text x="472.0" y="128.1" text-anchor="middle" class="d-small d-mono">p² = 0.36</text>
+    <polyline points="70.0,193.3 83.4,187.9 96.8,182.5 110.2,177.3 123.6,172.2 137.0,167.3 150.4,162.4 163.8,157.7 177.2,153.1 190.6,148.6 204.0,144.3 217.4,140.0 230.8,135.9 244.2,131.9 257.6,128.1 271.0,124.3 284.4,120.7 297.8,117.2 311.2,113.8 324.6,110.6 338.0,107.5 351.4,104.5 364.8,101.6 378.2,98.8 391.6,96.2 405.0,93.7 418.4,91.3 431.8,89.0 445.2,86.9 458.6,84.8 472.0,82.9 485.4,81.2 498.8,79.5 512.2,78.0 525.6,76.6 539.0,75.3 552.4,74.1 565.8,73.1 579.2,72.1 592.6,71.3 606.0,70.7 619.4,70.1 632.8,69.7 646.2,69.4 659.6,69.2 673.0,69.1 686.4,69.2 699.8,69.4 713.2,69.7 726.6,70.1 740.0,70.7" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+    <line x1="673.0" y1="69.1" x2="673.0" y2="270.0" class="d-line d-stroke-orange d-dashed" style="stroke-width:1"/>
+    <circle cx="673.0" cy="69.1" r="5" class="d-fill-orange"/>
+    <text x="673.0" y="59.1" text-anchor="middle" class="d-small d-mono">p² = 0.81</text>
+    <rect x="90" y="34" width="150" height="74" rx="6" class="d-label-bg"/>
+    <line x1="102" y1="52" x2="126" y2="52" class="d-line d-stroke-cyan" style="stroke-width:2.5"/><text x="134" y="56" class="d-small">true p = 0.3</text>
+    <line x1="102" y1="74" x2="126" y2="74" class="d-line d-stroke-blue" style="stroke-width:2.5"/><text x="134" y="78" class="d-small">true p = 0.6</text>
+    <line x1="102" y1="96" x2="126" y2="96" class="d-line d-stroke-orange" style="stroke-width:2.5"/><text x="134" y="100" class="d-small">true p = 0.9</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Expected RLCR reward for an answer whose true success probability is \(p\), as a function of the confidence \(q\) the model states. Each curve is the parabola \(2pq-q^2\) (derived in Section 2.1 from Eq. 1 of Damani et al.<a class="cite" href="#ref-1">1</a>); the dot marks the maximum at \(q=p\), where the value is \(p^2\). Stating \(q=1\) at \(p=0.3\) pays \(-0.40\); stating \(q=0\) pays \(0\) at every \(p\).</figcaption>
+</figure>
+
+<h3 id="scoring-rules-mixture">2.2 Which rules qualify: a mixture of thresholds</h3>
+<p>Gneiting and Raftery's Theorem 3 (due to Schervish) says every regular, left-continuous proper rule for a binary event is a mixture, with a nonnegative measure \(\nu\) over cost-loss ratios (thresholds) \(t\in(0,1)\), of asymmetric zero-one scores<a class="cite" href="#ref-8">8</a> (§3.2, Eqs. 14 and 15). Each component grades a single decision, "act if the forecast exceeds \(t\)", not the number itself. The rule is strictly proper if and only if \(\nu\) puts positive mass on every open interval. Table 3 lists the three rules RLCR names.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 3.</b> Proper scoring rules in loss form, the gap \(\ell(p,1)-\ell(p,0)\) that Theorem 1's correctness incentive depends on (derived), and the mixing density over thresholds from Gneiting and Raftery's Table 1<a class="cite" href="#ref-8">8</a>. Losses from Damani et al., Eqs. 5 to 7<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Rule</th><th>Loss \(\ell(q,c)\)</th><th>Gap \(\ell(p,1)-\ell(p,0)\)</th><th>Density over thresholds \(t\)</th><th>Bounded gap?</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Brier</td><td>\((q-c)^2\)</td><td>\(1-2p\), at most 1</td><td>uniform</td><td data-best>yes</td></tr>
+    <tr><td class="row">Spherical</td><td>\(-\dfrac{qc+(1-q)(1-c)}{\sqrt{q^2+(1-q)^2}}\)</td><td>\((1-2p)/\sqrt{1-2p+2p^2}\), at most 1</td><td>\((1-2t+2t^2)^{-3/2}\)</td><td data-best>yes</td></tr>
+    <tr><td class="row">Logarithmic</td><td>\(-c\ln q-(1-c)\ln(1-q)\)</td><td>\(\ln\frac{1-p}{p}\), unbounded as \(p\to0\)</td><td>\((t(1-t))^{-1}\), an infinite measure</td><td data-worst>no</td></tr>
+  </tbody>
+</table>
+<p>Brier weights every threshold equally. The log score piles up weight near 0 and 1 without limit, which is the same fact as its unboundedness; Gneiting and Raftery note that it "has been criticized for its unboundedness"<a class="cite" href="#ref-8">8</a> (Example 3). Section 3.2 shows why the bound matters for training, and Section 6 shows that Wu et al. rebuild both the Brier and a clipped log-style reward by choosing the measure \(\nu\).</p>
+
+<h3 id="scoring-rules-pays">2.3 What the term pays for</h3>
+<p>Calibration alone is cheap. Suppose a policy's prompts have success probabilities \(p_i\) with mean \(\bar p\). It can state \(q=\bar p\) on every prompt, be calibrated on average, and earn \(\mathbb E[2p\bar p-\bar p^2]=\bar p^2\). A reporter that knows each \(p_i\) earns \(\mathbb E[p^2]=\bar p^2+\mathrm{Var}(p)\). The reward therefore pays exactly \(\mathrm{Var}(p)\) for knowing which prompts the policy will get right, at most \(\bar p(1-\bar p)\) when every \(p_i\) is 0 or 1 (derived here). ECE can be driven to zero by a constant; the Brier reward is the term that pays for telling easy prompts from hard ones, and Section 5 uses that yardstick.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> Expected reward of answering when the answer is correct with probability \(p\) (derived). Abstaining pays 0 under binary and threshold grading; RLCR has no abstain action. Threshold grading at \(t=0.9\) charges a penalty of \(t/(1-t)=9\) per error<a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th class="num">\(p\)</th><th class="num">Binary reward, answer</th><th class="num">RLCR, honest \(q=p\)</th><th class="num">RLCR, \(q=1\)</th><th class="num">RLCR, \(q=0\)</th><th class="num">Threshold \(t=0.9\), answer</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0.05</td><td class="num">0.05</td><td class="num">0.0025</td><td class="num">−0.90</td><td class="num">0</td><td class="num">−8.50</td></tr>
+    <tr><td class="num">0.20</td><td class="num">0.20</td><td class="num">0.04</td><td class="num">−0.60</td><td class="num">0</td><td class="num">−7.00</td></tr>
+    <tr><td class="num">0.50</td><td class="num">0.50</td><td class="num">0.25</td><td class="num">0.00</td><td class="num">0</td><td class="num">−4.00</td></tr>
+    <tr><td class="num">0.80</td><td class="num">0.80</td><td class="num">0.64</td><td class="num">0.60</td><td class="num">0</td><td class="num">−1.00</td></tr>
+  </tbody>
+</table>
+<p>The binary column says "answer" at every \(p\); the \(t=0.9\) column says "abstain" at every \(p\) shown. RLCR gives the policy no abstain action, so the honest-answer column never goes negative: the only way to lose is to state a confidence that is too high. Note that answering at \(q=1\) pays \(2p-1\), which is exactly the threshold grading at \(t=0.5\) (\(p-(1-p)\)): a model that always states 1 is a test-taker graded at one error per hit.</p>
+
+<h2 id="rlcr-reward">3. The RLCR reward and Theorem 1</h2>
+
+<h3 id="rlcr-reward-format">3.1 Format, reward, and token order</h3>
+<p>RLCR trains one model to write four spans in a fixed order: <code>&lt;think&gt;</code> reasoning, <code>&lt;answer&gt;</code>, <code>&lt;analysis&gt;</code> (a written account of what could be wrong) and <code>&lt;confidence&gt;</code> (a number between 0 and 1 inclusive)<a class="cite" href="#ref-1">1</a> (Fig. 1, App. C). A response with all four tags in order earns the format credit, and "Both format and calibration rewards are weighted equally"<a class="cite" href="#ref-1">1</a> (App. B.2). Two properties of the layout matter. The confidence is written after the answer is committed, so it is a prediction about text that already exists. And the reward is one scalar per rollout, so the group-relative advantage multiplies every token's gradient, reasoning tokens included (Figure 3; mechanism in Modules 2 and 11). The Brier term reaches the reasoning only through that shared advantage.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f3t"><title id="f3t">One RLCR rollout split into think, answer, analysis and confidence spans; correctness is read from the answer, confidence from the last span, the reward combines them, and one group-relative advantage is applied to every token</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="200" y="8" width="400" height="32" rx="6" class="d-hl"/><text x="400" y="29" text-anchor="middle" class="d-bold">A = r − mean(r over the group), one value per rollout</text>
+    <path d="M400,40 L400,52" class="d-arrow-active"/><path d="M20,52 L780,52" class="d-arrow-active"/>
+    <path d="M155,52 L155,66" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+    <path d="M355,52 L355,66" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+    <path d="M510,52 L510,66" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+    <path d="M695,52 L695,66" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+    <rect x="20" y="68" width="270" height="46" rx="8" class="d-block-muted"/><text x="155.0" y="96" text-anchor="middle" class="d-text-inv d-bold">&lt;think&gt; reasoning</text>
+    <rect x="300" y="68" width="110" height="46" rx="8" class="d-block"/><text x="355.0" y="96" text-anchor="middle" class="d-text-inv d-bold">&lt;answer&gt;</text>
+    <rect x="420" y="68" width="180" height="46" rx="8" class="d-block-2"/><text x="510.0" y="96" text-anchor="middle" class="d-text-inv d-bold">&lt;analysis&gt;</text>
+    <rect x="610" y="68" width="170" height="46" rx="8" class="d-block-accent"/><text x="695.0" y="96" text-anchor="middle" class="d-text-inv d-bold">&lt;confidence&gt; q</text>
+    <text x="20" y="136" class="d-small d-text-light">generation order: left to right</text>
+    <path d="M355,114 L355,160" class="d-arrow" marker-end="url(#f3-arr)"/><path d="M695,114 L695,160" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <rect x="270" y="162" width="170" height="40" rx="8" class="d-panel"/><text x="355" y="187" text-anchor="middle" class="d-mono">c = 1[y = y*]</text>
+    <rect x="610" y="162" width="170" height="40" rx="8" class="d-panel"/><text x="695" y="187" text-anchor="middle" class="d-mono">q in [0, 1]</text>
+    <path d="M355,202 L440,236" class="d-arrow" marker-end="url(#f3-arr)"/><path d="M695,202 L610,236" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <rect x="330" y="238" width="360" height="46" rx="8" class="d-surface"/><text x="510" y="267" text-anchor="middle" class="d-mono">r = c − (q − c)²  (plus format reward)</text>
+    <path d="M330,261 L8,261 L8,52 L20,52" class="d-arrow-active d-dashed" marker-end="url(#f3-arr)"/>
+    <text x="20" y="214" class="d-small d-text-light">r from all G = 32 rollouts</text><text x="20" y="228" class="d-small d-text-light">of the same prompt</text>
+    <text x="400" y="316" text-anchor="middle" class="d-small d-text-light">Calibration RL baselines (Section 3.4) apply the loss to the analysis and confidence spans only</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> One RLCR rollout. The model writes reasoning, an answer, an uncertainty analysis and a number in \([0,1]\); correctness is read from the answer span and the Brier term from the confidence span, and the resulting scalar reward becomes a group-relative advantage that multiplies the log-probability gradient of every token<a class="cite" href="#ref-1">1</a> (Fig. 1, §4.1, App. B.2, App. C). The advantage is computed without dividing by the group standard deviation (App. B.2).</figcaption>
+</figure>
+<p>The reward itself is short enough to write down. This is a sketch for this module, not code from the paper: the format weight and the handling of an invalid response are my choices, since the sections read give only the equal-weighting sentence above.</p>
+<pre class="code" data-lang="python" data-title="rlcr_reward.py"><code>import re
+
+PATTERN = re.compile(
+    r"\s*&lt;think&gt;.*?&lt;/think&gt;\s*&lt;answer&gt;(.*?)&lt;/answer&gt;\s*"
+    r"&lt;analysis&gt;.*?&lt;/analysis&gt;\s*&lt;confidence&gt;\s*([01](?:\.\d+)?)\s*&lt;/confidence&gt;\s*",
+    re.S,
+)
+
+def rlcr_reward(completion, gold, is_correct, fmt_weight=1.0):
+    """Eq. 1 of Damani et al. plus a format term. is_correct(answer, gold) is the task verifier."""
+    m = PATTERN.fullmatch(completion)
+    if m is None:
+        return 0.0                       # invalid format: no credit, no calibration term (my choice)
+    q = float(m.group(2))
+    if not 0.0 &lt;= q &lt;= 1.0:
+        return 0.0
+    c = 1.0 if is_correct(m.group(1).strip(), gold) else 0.0
+    return fmt_weight + c - (q - c) ** 2  # c - (q - c)^2 == 2*q*c - q^2 for c in {0, 1}</code></pre>
+
+<h3 id="rlcr-reward-theorem">3.2 Theorem 1, checked against the paper</h3>
+<p>The statement, with the paper's expressions elided<a class="cite" href="#ref-1">1</a> (§3): suppose the success indicator of each prediction \(y\) is Bernoulli\((p_y)\). Then</p>
+<blockquote>Calibration incentive. For any y, the expected reward … is maximized when q = p<sub>y</sub>. Correctness incentive. Among all calibrated predictions (y, p<sub>y</sub>), expected reward is maximized by the prediction whose success probability p<sub>y</sub> is greatest.</blockquote>
+<p>The first property is propriety: \(\lambda p_y\) does not depend on \(q\), so maximizing the reward over \(q\) is minimizing the expected loss. For the second, let \(W(p)=\lambda p-p\,\ell(p,1)-(1-p)\,\ell(p,0)\) be the best reward attainable at success probability \(p\). Propriety means \(p\,\partial_q\ell(p,1)+(1-p)\,\partial_q\ell(p,0)=0\) at \(q=p\), so by the envelope argument</p>
+$$W'(p)=\lambda-\big[\ell(p,1)-\ell(p,0)\big].$$
+<p>Higher \(p\) never pays less exactly when the gap \(\ell(p,1)-\ell(p,0)\) stays at most \(\lambda\). For the Brier loss the gap is \(1-2p\le1\), \(\lambda=1\) suffices, and \(W(p)=p^2\), which is increasing. For the log loss the gap is \(\ln\frac{1-p}{p}\to\infty\) as \(p\to0\), and no finite \(\lambda\) works. Corollary 1 of the paper says the same: a bounded strictly proper rule has a finite \(\lambda\) that works; for an unbounded one no finite \(\lambda\) is guaranteed to<a class="cite" href="#ref-1">1</a> (App. A).</p>
+<p>Two printing slips are worth knowing before you read Appendix A. Its last displayed line prints \(W'(p)=S(p,1)-S(p,0)\), dropping the leading "\(\lambda-\)"; the line above it and the conclusion after it both carry the \(\lambda\), and the check \(W=p^2\Rightarrow W'=2p=1-(1-2p)\) agrees with the corrected form. And the main text states the bound as \(S(p,1)-S(p,0)&lt;\lambda\) where the appendix has \(\le\lambda\).</p>
+<aside class="callout callout-warning"><span class="callout-title">What the theorem does not say</span><p>It is a statement about the maximizer of expected reward given the true conditional success probability. It does not say GRPO reaches that maximizer. The "probability" is the predictor's: the paper's footnote 2 grants that once \(y\) is fixed the outcome is determined, so \(p_y\) is the subjective uncertainty of an information- or computation-constrained predictor<a class="cite" href="#ref-1">1</a> (§3). It is also defined against the training distribution of prompts and the verifier's labels, so it promises nothing about a shifted distribution (Section 5.2) or a noisy verifier (Section 4.2).</p></aside>
+
+<h3 id="rlcr-reward-log">3.3 Why not the log score</h3>
+<p>The log score is the textbook proper rule, and it fails the correctness incentive. With \(\lambda=1\) and an honest report, the expected reward is \(p(1+\ln p)+(1-p)\ln(1-p)\)<a class="cite" href="#ref-1">1</a> (Eq. 13), which the paper shows as non-monotone in Fig. 5. Setting its derivative \(1+\ln\frac{p}{1-p}\) to zero puts the minimum at \(p=1/(1+e)\approx0.269\), where the value is \(-0.313\); the curve returns to zero at \(p\approx0.648\) (derived here, natural log assumed). Below that point a response that is certainly wrong and states \(q=0\) earns exactly 0 and beats any honest attempt (Figure 4).</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f4t"><title id="f4t">Expected reward of a calibrated answer as a function of its success probability p: p squared for the Brier variant, and a non-monotone curve for the log-score variant that dips below zero until p = 0.648</title>
+    <line x1="70" y1="250.0" x2="740" y2="250.0" class="d-grid"/><text x="62" y="254.0" text-anchor="end" class="d-small d-mono">-0.5</text>
+    <line x1="70" y1="176.7" x2="740" y2="176.7" class="d-axis"/><text x="62" y="180.7" text-anchor="end" class="d-small d-mono">0.0</text>
+    <line x1="70" y1="103.3" x2="740" y2="103.3" class="d-grid"/><text x="62" y="107.3" text-anchor="end" class="d-small d-mono">0.5</text>
+    <line x1="70" y1="30.0" x2="740" y2="30.0" class="d-grid"/><text x="62" y="34.0" text-anchor="end" class="d-small d-mono">1.0</text>
+    <line x1="70" y1="30.0" x2="70" y2="250.0" class="d-axis"/>
+    <text x="70.0" y="266.0" text-anchor="middle" class="d-small d-mono">0</text>
+    <text x="237.5" y="266.0" text-anchor="middle" class="d-small d-mono">0.25</text>
+    <text x="405.0" y="266.0" text-anchor="middle" class="d-small d-mono">0.5</text>
+    <text x="572.5" y="266.0" text-anchor="middle" class="d-small d-mono">0.75</text>
+    <text x="740.0" y="266.0" text-anchor="middle" class="d-small d-mono">1</text>
+    <text x="405" y="284" text-anchor="middle" class="d-small d-text-light">true success probability p of the answer (stated q = p)</text>
+    <text x="70" y="18" class="d-small d-text-light">expected reward at calibration</text>
+    <polyline points="70.0,176.7 83.4,176.6 96.8,176.4 110.2,176.1 123.6,175.7 137.0,175.2 150.4,174.6 163.8,173.8 177.2,172.9 190.6,171.9 204.0,170.8 217.4,169.6 230.8,168.2 244.2,166.8 257.6,165.2 271.0,163.5 284.4,161.6 297.8,159.7 311.2,157.7 324.6,155.5 338.0,153.2 351.4,150.8 364.8,148.3 378.2,145.6 391.6,142.9 405.0,140.0 418.4,137.0 431.8,133.9 445.2,130.7 458.6,127.3 472.0,123.9 485.4,120.3 498.8,116.6 512.2,112.8 525.6,108.8 539.0,104.8 552.4,100.6 565.8,96.4 579.2,92.0 592.6,87.4 606.0,82.8 619.4,78.0 632.8,73.2 646.2,68.2 659.6,63.1 673.0,57.9 686.4,52.5 699.8,47.1 713.2,41.5 726.6,35.8 740.0,30.0" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+    <polyline points="70.0,176.7 76.7,183.4 83.4,188.1 90.1,192.0 96.8,195.4 103.5,198.4 110.2,201.2 116.9,203.6 123.6,205.8 130.3,207.8 137.0,209.7 143.7,211.4 150.4,212.9 157.1,214.3 163.8,215.5 170.5,216.7 177.2,217.7 183.9,218.6 190.6,219.4 197.3,220.1 204.0,220.7 210.7,221.2 217.4,221.7 224.1,222.0 230.8,222.3 237.5,222.5 244.2,222.6 250.9,222.6 257.6,222.6 264.3,222.4 271.0,222.3 277.7,222.0 284.4,221.7 291.1,221.3 297.8,220.8 304.5,220.3 311.2,219.7 317.9,219.0 324.6,218.3 331.3,217.5 338.0,216.7 344.7,215.8 351.4,214.8 358.1,213.8 364.8,212.7 371.5,211.6 378.2,210.4 384.9,209.1 391.6,207.8 398.3,206.4 405.0,205.0 411.7,203.5 418.4,201.9 425.1,200.3 431.8,198.7 438.5,196.9 445.2,195.1 451.9,193.3 458.6,191.4 465.3,189.4 472.0,187.4 478.7,185.3 485.4,183.1 492.1,180.9 498.8,178.6 505.5,176.3 512.2,173.9 518.9,171.4 525.6,168.9 532.3,166.3 539.0,163.6 545.7,160.8 552.4,158.0 559.1,155.1 565.8,152.2 572.5,149.1 579.2,146.0 585.9,142.8 592.6,139.5 599.3,136.2 606.0,132.7 612.7,129.2 619.4,125.5 626.1,121.8 632.8,118.0 639.5,114.0 646.2,109.9 652.9,105.7 659.6,101.4 666.3,97.0 673.0,92.3 679.7,87.6 686.4,82.6 693.1,77.5 699.8,72.1 706.5,66.4 713.2,60.5 719.9,54.2 726.6,47.3 733.3,39.7 740.0,30.0" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+    <circle cx="250.2" cy="222.6" r="5" class="d-fill-red"/><text x="258.2" y="242.6" class="d-small d-mono">minimum at p = 0.269: −0.313</text>
+    <circle cx="504.4" cy="176.7" r="5" class="d-fill-red"/><text x="496.4" y="166.7" text-anchor="end" class="d-small d-mono">crosses 0 at p = 0.648</text>
+    <text x="740" y="192.7" text-anchor="end" class="d-small d-text-light">a certainly wrong answer at q = 0 pays 0</text>
+    <rect x="196" y="36" width="270" height="52" rx="6" class="d-label-bg"/><line x1="206" y1="54" x2="230" y2="54" class="d-line d-stroke-blue" style="stroke-width:2.5"/><text x="238" y="58" class="d-small">Brier: p²</text><line x1="206" y1="74" x2="230" y2="74" class="d-line d-stroke-orange" style="stroke-width:2.5"/><text x="238" y="78" class="d-small">log: p(1 + ln p) + (1−p) ln(1−p)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Expected reward \(\lambda p-\ell(p,\cdot)\) of an honestly calibrated answer, for the Brier and the natural-log scoring rule with \(\lambda=1\). The Brier curve rises with \(p\). The log curve falls until \(p=1/(1+e)\approx0.269\) and stays negative until \(p\approx0.648\), so below that point a certainly wrong answer stated at \(q=0\) (reward exactly 0) beats a real attempt. Curves derived from Eq. 12–13 of Damani et al.<a class="cite" href="#ref-1">1</a> (App. E.1); the minimum and the crossing are computed here, and the natural logarithm is assumed because the paper does not state the base.</figcaption>
+</figure>
+<p>The authors show it happens. In a toy task with five arms, up to five observed draws, and permission to answer "invalid" with \(q=0\), a Qwen2.5-7B trained on the log variant "rapidly converges to a degenerate policy" that outputs the invalid arm for nearly every task<a class="cite" href="#ref-1">1</a> (App. E.2): accuracy 0, with Brier and ECE of 0.00 because a policy that always says "no answer, zero confidence" is perfectly calibrated. The Brier variant reaches 34.4% accuracy at ECE 0.02 on the same task. On HotpotQA the log variant does not collapse, at 59.5% accuracy against 62.1% and ECE 0.07 against 0.03, and the authors believe hacking is "dependent on both the data distribution as well as the model size"<a class="cite" href="#ref-1">1</a> (App. E.3). The toy is the regime to worry about: many prompts with low \(p\).</p>
+
+<h3 id="rlcr-reward-baselines">3.4 Variants that fail or fall short</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> What breaks when the RLCR reward is changed, from Damani et al.<a class="cite" href="#ref-1">1</a> (App. E.2 and the paper's Tables 3 and 6). HotpotQA-trained Qwen2.5-7B unless the row says otherwise; accuracy and ECE are in-domain.</caption>
+  <thead><tr><th>Setting</th><th class="num">Accuracy (%)</th><th class="num">ECE</th><th>What happened</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Toy arm task, Brier</td><td class="num">34.4</td><td class="num">0.02</td><td>Makes real predictions</td></tr>
+    <tr><td class="row">Toy arm task, log</td><td class="num" data-worst>0</td><td class="num">0.00</td><td>Outputs the invalid arm at \(q=0\)</td></tr>
+    <tr><td class="row">Log variant</td><td class="num">59.5</td><td class="num">0.07</td><td>No collapse; OOD ECE 0.21</td></tr>
+    <tr><td class="row">Brier (RLCR)</td><td class="num">62.1</td><td class="num" data-best>0.03</td><td>OOD ECE 0.21</td></tr>
+    <tr><td class="row">Brier only, loss on whole sequence</td><td class="num" data-worst>0</td><td class="num">0.00</td><td>Empty or trivial answer at \(q=0\)</td></tr>
+    <tr><td class="row">Brier only, loss on analysis and confidence</td><td class="num">62.0</td><td class="num">0.08</td><td>Started from the RLVR model; OOD ECE 0.25</td></tr>
+    <tr><td class="row">Ternary abstention reward, \(\lambda=0.5\)</td><td class="num">62.1</td><td class="num">0.31</td><td>Started from base; OOD ECE 0.35</td></tr>
+    <tr><td class="row">RLVR</td><td class="num">63.0</td><td class="num">0.37</td><td>Constant confidence (Table 1 here); OOD ECE 0.46</td></tr>
+  </tbody>
+</table>
+<p>A Brier-only reward is optimized by a response with no content: the authors call the degenerate output "essentially the optimal policy with a calibration-only reward" and avoid it by masking the loss to the analysis and confidence spans<a class="cite" href="#ref-1">1</a> (App. I; mask mechanics in Module 18). Earlier calibration-only RL used the Brier score (Xu et al.) or a clipped log loss (Stangel et al., "Rewarding Doubt"), both on non-reasoning tasks<a class="cite" href="#ref-1">1</a> (§5); the latter states a reward "based on the logarithmic scoring rule"<a class="cite" href="#ref-9">9</a> (abstract-level reading).</p>
+<p>The ternary reward (+1 correct, 0 wrong, \(\lambda\) for abstaining; Wei et al., Mohamadi et al. and Song et al. as cited by Damani et al.) has a clean relation to Kalai et al.'s grading. Answering beats abstaining when \(p&gt;\lambda\). Subtracting \(\lambda\) and dividing by \(1-\lambda\) maps the payoffs to \((1,\,-\lambda/(1-\lambda),\,0)\), which is threshold grading at \(t=\lambda\) (derived). The authors' complaint is that it "only teaches whether the model's internal confidence exceeds the threshold \(\lambda\)" and "can also suppress exploration"<a class="cite" href="#ref-1">1</a> (App. I).</p>
+
+<h2 id="group-credit">4. How the reward reaches the policy</h2>
+
+<h3 id="group-credit-toy">4.1 A toy group</h3>
+<p>Take one prompt and eight rollouts, each with a correctness bit and a stated confidence. The numbers are constructed for this module, not taken from a paper. Table 6 gives the binary and RLCR rewards and the group-relative advantage \(A=r-\bar r\), without the division by the group standard deviation that RLCR removes<a class="cite" href="#ref-1">1</a> (App. B.2; Module 11 covers what that division does).</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> One constructed group of eight rollouts for a prompt whose success rate is 4 of 8. Binary rewards average 0.5; RLCR rewards average 0.22875. Computed from \(r=c-(q-c)^2\).</caption>
+  <thead><tr><th class="num">Rollout</th><th class="num">Correct \(c\)</th><th class="num">Stated \(q\)</th><th class="num">Binary reward</th><th class="num">Binary \(A\)</th><th class="num">RLCR reward</th><th class="num">RLCR \(A\)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td class="num">1</td><td class="num">0.9</td><td class="num">1</td><td class="num">+0.500</td><td class="num">0.99</td><td class="num">+0.761</td></tr>
+    <tr><td class="num">2</td><td class="num">1</td><td class="num">0.6</td><td class="num">1</td><td class="num">+0.500</td><td class="num">0.84</td><td class="num">+0.611</td></tr>
+    <tr><td class="num">3</td><td class="num">1</td><td class="num">0.3</td><td class="num">1</td><td class="num">+0.500</td><td class="num">0.51</td><td class="num">+0.281</td></tr>
+    <tr><td class="num">4</td><td class="num">1</td><td class="num">0.6</td><td class="num">1</td><td class="num">+0.500</td><td class="num">0.84</td><td class="num">+0.611</td></tr>
+    <tr><td class="num">5</td><td class="num">0</td><td class="num">0.9</td><td class="num">0</td><td class="num">−0.500</td><td class="num">−0.81</td><td class="num" data-worst>−1.039</td></tr>
+    <tr><td class="num">6</td><td class="num">0</td><td class="num">0.6</td><td class="num">0</td><td class="num">−0.500</td><td class="num">−0.36</td><td class="num">−0.589</td></tr>
+    <tr><td class="num">7</td><td class="num">0</td><td class="num">0.3</td><td class="num">0</td><td class="num">−0.500</td><td class="num">−0.09</td><td class="num">−0.319</td></tr>
+    <tr><td class="num">8</td><td class="num">0</td><td class="num">0.3</td><td class="num">0</td><td class="num">−0.500</td><td class="num">−0.09</td><td class="num">−0.319</td></tr>
+  </tbody>
+</table>
+<p>The binary column gives every correct rollout +0.5 and every wrong one −0.5, whatever it said about its confidence. Under RLCR a confident wrong answer (rollout 5) is pushed down 3.3 times as hard as a hedged wrong one (rollouts 7 and 8), and a hedged correct answer (rollout 3, +0.281) is pulled up less than a confident correct one (rollout 1, +0.761). Summing the advantages over the rollouts that wrote each confidence gives \(-0.278\) for 0.9, \(+0.634\) for 0.6 and \(-0.356\) for 0.3, so probability mass moves toward the value nearest the group's success rate; the binary sums are 0, +0.5 and −0.5, which only reflect which confidences happened to co-occur with correct answers. Eight rollouts are a noisy sample, so read this as the mechanism, not a prediction.</p>
+<p>The general statement is cleaner. If the stated \(q\) is independent of correctness, as for the constant reporter of Table 1, a binary reward gives it zero expected advantage whatever its value, because \(\mathbb E[c-\bar p\mid q]=0\). The Brier term gives it the gradient \(\partial_q\mathbb E[R]=2(p-q)\), which points at \(p\). Nothing in RLVR moves a policy off a constant; RLCR does.</p>
+
+<h3 id="group-credit-recipe">4.2 The recipe and the data</h3>
+<p>RLCR uses GRPO with modifications on a Qwen2.5-7B base with no KL term. It removes the standard-deviation division, following Turtel et al., which "might help with learning on examples where there are extreme miscalibrations"; aggregates token losses with the BNPO normalizer; and samples 32 responses per prompt at temperature 0.7 with an effective batch of 2,048, for one epoch, capping completions at 1,536 tokens (HotpotQA) and 4,096 (math)<a class="cite" href="#ref-1">1</a> (App. B.2). The HotpotQA set is 20,000 examples in equal thirds that keep 0, 1 or 2 of the gold paragraphs among 8 shown, so a third of the training prompts cannot be answered from the context by construction. The math set is 15,000 Big-Math problems with a LLaMA-8B solve rate between 0 and 70% and numeric answers, graded by math-verify<a class="cite" href="#ref-1">1</a> (App. B.1). The SFT variant first fine-tunes on 500 base-model solutions extended with DeepSeek-R1-written uncertainty analyses<a class="cite" href="#ref-1">1</a> (App. B.2).</p>
+<p>Two design points follow from the reward (my reading). A calibration reward needs prompts that span the probability range; the HotpotQA construction supplies low-\(p\) prompts on purpose, whereas the mid-range pass-rate filters of Module 10 (Section 5) would remove the prompts whose right answer is \(q\) near 0 or 1. And the reward turns verifier errors into calibration targets. The authors found that "verifier noise can be significant in Math datasets and can cause training instability" and restricted the set to numeric answers<a class="cite" href="#ref-1">1</a> (App. B.1). If the verifier rejects a correct answer with probability \(\delta\), the optimal stated confidence is the pass probability, roughly \(p(1-\delta)\) plus false accepts, so a noisy verifier makes the policy under-confident by construction (derived).</p>
+
+<h3 id="group-credit-groups">4.3 Zero-variance groups</h3>
+<p>Under a binary reward a group that is all correct or all wrong has zero advantage, and DAPO-style dynamic sampling drops it (Module 13, Section 3.2). Under the Brier term a group in which every rollout is correct still has reward variance if the stated confidences differ: for \(q=0.9\) and \(q=0.5\) the rewards are 0.99 and 0.75, and the advantages push \(q\) up, the right direction as \(p\to1\). A filter keyed on accuracy variance would discard exactly the groups where confidence is the only thing that varies; key it on reward variance instead. RLCR does not discuss dynamic sampling, so this is derived from the reward definition, not measured.</p>
+
+<h3 id="group-credit-critic">4.4 The critic already holds a calibrated number</h3>
+<p>Wu et al. observe that a PPO critic trained with squared error against a 0/1 return estimates the success probability, so it minimizes a Brier-type loss and is calibrated by construction<a class="cite" href="#ref-3">3</a> (§3.2.3). They read the critic's value at the final token as a confidence ("Critic Value"). On BeyondAIME it gives the lowest smECE in their table, 0.061, with an SNR gain of 1.202 and a confidence AUC of 0.881; transferred from math to SimpleQA, its smECE is 0.665 against 0.459 for the verbalized-Brier variant<a class="cite" href="#ref-3">3</a> (the paper's Tables 1 and 4). A critic-free recipe (Module 9) gives that readout up, and a Brier term on a verbalized \(q\) puts a comparable number in the policy's own output at the price of tokens (Module 5 covers the critic). For claim-level confidence the critic fails: its value estimates whether the final solution succeeds given the prefix, so it dips at the contradiction, not at the earlier error that caused it<a class="cite" href="#ref-3">3</a> (§3.3.2).</p>
+
+<h2 id="rlcr-results">5. RLCR's results, read against their own tables</h2>
+
+<h3 id="rlcr-results-main">5.1 The main table</h3>
+<p>Table 7 reproduces the rows of Damani et al.'s Table 1 that carry the argument. Every row except Base, RLCR and SFT+RLCR scores the same RLVR model's outputs; the classifier rows add a second model, initialized from Qwen2.5-7B Base and trained on those outputs with binary cross-entropy<a class="cite" href="#ref-1">1</a> (§4.1). ECE uses 10 bins; AUROC asks whether confidence separates correct from wrong answers.</p>
+<table class="tbl tbl-dense tbl-compare">
+  <caption><b>Table 7.</b> Accuracy and calibration for Qwen2.5-7B models<a class="cite" href="#ref-1">1</a> (Table 1). Out-of-domain (OOD) columns average six datasets after HotpotQA training and five after Big-Math training. Lower is better for Brier and ECE.</caption>
+  <thead><tr><th>Method</th><th class="num">Acc. (%)</th><th class="num">AUROC</th><th class="num">Brier</th><th class="num">ECE</th><th class="num">OOD acc. (%)</th><th class="num">OOD AUROC</th><th class="num">OOD Brier</th><th class="num">OOD ECE</th></tr></thead>
+  <tbody>
+    <tr><td class="row" colspan="9">Trained on HotpotQA-Modified; in-domain = HotpotQA</td></tr>
+    <tr><td>Base</td><td class="num">39.7</td><td class="num">0.54</td><td class="num">0.53</td><td class="num">0.53</td><td class="num">53.3</td><td class="num">0.54</td><td class="num">0.41</td><td class="num">0.40</td></tr>
+    <tr><td>RLVR</td><td class="num">63.0</td><td class="num">0.50</td><td class="num">0.37</td><td class="num">0.37</td><td class="num">53.9</td><td class="num">0.50</td><td class="num">0.46</td><td class="num">0.46</td></tr>
+    <tr><td>RLVR + BCE classifier</td><td class="num">63.0</td><td class="num">0.66</td><td class="num">0.22</td><td class="num">0.07</td><td class="num">53.9</td><td class="num">0.58</td><td class="num">0.27</td><td class="num">0.24</td></tr>
+    <tr><td>RLVR + linear probe</td><td class="num">63.0</td><td class="num">0.55</td><td class="num">0.24</td><td class="num">0.10</td><td class="num">53.9</td><td class="num">0.53</td><td class="num">0.38</td><td class="num">0.38</td></tr>
+    <tr><td>Answer probability</td><td class="num">63.0</td><td class="num">0.72</td><td class="num">0.36</td><td class="num">0.36</td><td class="num">53.9</td><td class="num">0.60</td><td class="num">0.42</td><td class="num">0.42</td></tr>
+    <tr><td>RLCR</td><td class="num">62.1</td><td class="num">0.69</td><td class="num" data-best>0.21</td><td class="num" data-best>0.03</td><td class="num" data-best>56.2</td><td class="num" data-best>0.68</td><td class="num" data-best>0.21</td><td class="num" data-best>0.21</td></tr>
+    <tr><td class="row" colspan="9">Trained on Big-Math digits problems; in-domain = Math (3-dataset average)</td></tr>
+    <tr><td>Base</td><td class="num">56.1</td><td class="num">0.56</td><td class="num">0.40</td><td class="num">0.39</td><td class="num">47.8</td><td class="num">0.53</td><td class="num">0.46</td><td class="num">0.45</td></tr>
+    <tr><td>RLVR</td><td class="num">72.9</td><td class="num">0.47</td><td class="num">0.28</td><td class="num">0.26</td><td class="num">52.5</td><td class="num">0.52</td><td class="num">0.49</td><td class="num">0.49</td></tr>
+    <tr><td>RLVR + BCE classifier</td><td class="num">72.9</td><td class="num">0.78</td><td class="num">0.15</td><td class="num">0.10</td><td class="num">52.5</td><td class="num">0.55</td><td class="num">0.34</td><td class="num">0.33</td></tr>
+    <tr><td>RLCR</td><td class="num">72.7</td><td class="num">0.67</td><td class="num">0.17</td><td class="num">0.10</td><td class="num">50.9</td><td class="num">0.60</td><td class="num">0.28</td><td class="num">0.25</td></tr>
+    <tr><td>SFT + RLCR</td><td class="num">72.2</td><td class="num">0.78</td><td class="num" data-best>0.14</td><td class="num" data-best>0.08</td><td class="num" data-worst>43.8</td><td class="num">0.66</td><td class="num">0.24</td><td class="num" data-best>0.18</td></tr>
+  </tbody>
+</table>
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f5t"><title id="f5t">Expected calibration error for RLVR, an RLVR model plus a BCE confidence classifier, and RLCR, in-domain and out-of-domain, for HotpotQA-trained and Big-Math-trained 7B models</title>
+    <line x1="70" y1="250.0" x2="780" y2="250.0" class="d-axis"/><text x="62" y="254.0" text-anchor="end" class="d-small d-mono">0.0</text>
+    <line x1="70" y1="206.0" x2="780" y2="206.0" class="d-grid"/><text x="62" y="210.0" text-anchor="end" class="d-small d-mono">0.1</text>
+    <line x1="70" y1="162.0" x2="780" y2="162.0" class="d-grid"/><text x="62" y="166.0" text-anchor="end" class="d-small d-mono">0.2</text>
+    <line x1="70" y1="118.0" x2="780" y2="118.0" class="d-grid"/><text x="62" y="122.0" text-anchor="end" class="d-small d-mono">0.3</text>
+    <line x1="70" y1="74.0" x2="780" y2="74.0" class="d-grid"/><text x="62" y="78.0" text-anchor="end" class="d-small d-mono">0.4</text>
+    <line x1="70" y1="30.0" x2="780" y2="30.0" class="d-grid"/><text x="62" y="34.0" text-anchor="end" class="d-small d-mono">0.5</text>
+    <line x1="70" y1="30.0" x2="70" y2="250" class="d-axis"/>
+    <text x="70" y="18" class="d-small d-text-light">ECE, 10 bins (lower is better)</text>
+    <rect x="96" y="87.2" width="40" height="162.8" class="d-fill-blue"/><text x="116" y="82.2" text-anchor="middle" class="d-small d-mono">0.37</text>
+    <rect x="142" y="219.2" width="40" height="30.8" class="d-fill-cyan"/><text x="162" y="214.2" text-anchor="middle" class="d-small d-mono">0.07</text>
+    <rect x="188" y="236.8" width="40" height="13.2" class="d-fill-orange"/><text x="208" y="231.8" text-anchor="middle" class="d-small d-mono">0.03</text>
+    <text x="165" y="268" text-anchor="middle" class="d-small">HotpotQA, in-domain</text>
+    <rect x="271" y="47.6" width="40" height="202.4" class="d-fill-blue"/><text x="291" y="42.6" text-anchor="middle" class="d-small d-mono">0.46</text>
+    <rect x="317" y="144.4" width="40" height="105.6" class="d-fill-cyan"/><text x="337" y="139.4" text-anchor="middle" class="d-small d-mono">0.24</text>
+    <rect x="363" y="157.6" width="40" height="92.4" class="d-fill-orange"/><text x="383" y="152.6" text-anchor="middle" class="d-small d-mono">0.21</text>
+    <text x="340" y="268" text-anchor="middle" class="d-small">HotpotQA-trained, OOD avg</text>
+    <rect x="446" y="135.6" width="40" height="114.4" class="d-fill-blue"/><text x="466" y="130.6" text-anchor="middle" class="d-small d-mono">0.26</text>
+    <rect x="492" y="206.0" width="40" height="44.0" class="d-fill-cyan"/><text x="512" y="201.0" text-anchor="middle" class="d-small d-mono">0.10</text>
+    <rect x="538" y="206.0" width="40" height="44.0" class="d-fill-orange"/><text x="558" y="201.0" text-anchor="middle" class="d-small d-mono">0.10</text>
+    <text x="515" y="268" text-anchor="middle" class="d-small">Math, in-domain</text>
+    <rect x="621" y="34.4" width="40" height="215.6" class="d-fill-blue"/><text x="641" y="29.4" text-anchor="middle" class="d-small d-mono">0.49</text>
+    <rect x="667" y="104.8" width="40" height="145.2" class="d-fill-cyan"/><text x="687" y="99.8" text-anchor="middle" class="d-small d-mono">0.33</text>
+    <rect x="713" y="140.0" width="40" height="110.0" class="d-fill-orange"/><text x="733" y="135.0" text-anchor="middle" class="d-small d-mono">0.25</text>
+    <text x="690" y="268" text-anchor="middle" class="d-small">Math-trained, OOD avg</text>
+    <rect x="96" y="296" width="14" height="14" class="d-fill-blue"/><text x="118" y="307" class="d-small">RLVR</text>
+    <rect x="286" y="296" width="14" height="14" class="d-fill-cyan"/><text x="308" y="307" class="d-small">RLVR + BCE classifier</text>
+    <rect x="476" y="296" width="14" height="14" class="d-fill-orange"/><text x="498" y="307" class="d-small">RLCR</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Expected calibration error from Table 1 of Damani et al.<a class="cite" href="#ref-1">1</a>: Qwen2.5-7B trained on HotpotQA-Modified (left pair) and on Big-Math digits problems (right pair). OOD bars average six datasets after HotpotQA training and five after Big-Math training. RLVR was prompted to state a confidence but never trained to; the classifier is a second Qwen2.5-7B-sized model trained on the RLVR model’s outputs.</figcaption>
+</figure>
+
+<h3 id="rlcr-results-reading">5.2 What the table supports</h3>
+<p><b>Accuracy is matched.</b> In-domain HotpotQA accuracy is 63.0% for RLVR and 62.1% for RLCR, with a 95% bootstrap half-width of ±3.05 on 1,000 validation questions<a class="cite" href="#ref-1">1</a> (App. K, the paper's Table 11; App. B.3). Math is 72.9% against 72.7%. The calibration term did not cost accuracy at 7B on these tasks.</p>
+<p><b>The classifier is closer than the headline suggests.</b> The BCE classifier reaches ECE 0.07 in-domain against RLCR's 0.03, and 0.24 against 0.21 out of domain, at the price of a second 7B model that the authors call "expensive, as it requires training and inference with two large models"<a class="cite" href="#ref-1">1</a> (§4.1). On math in-domain they tie at 0.10, and the classifier discriminates better (AUROC 0.78 against 0.67). What RLCR buys over a classifier is one model and one forward pass, not a large calibration gap.</p>
+<p><b>ECE alone is a weak yardstick; use resolution.</b> A constant reporter at the accuracy has ECE near zero. On HotpotQA, RLCR's accuracy of 62.1% gives a constant-reporter Brier score of \(0.621\times0.379=0.235\); RLCR's printed 0.21 is a Brier skill of \(1-0.21/0.235\approx0.11\), between 0.09 and 0.13 given that the Brier score is rounded to two decimals (derived). The stated confidences resolve about a tenth of the variance that a perfect predictor would, and the AUROC of 0.69 tells the same story. By Section 2.3 that is the quantity the reward pays for.</p>
+<p><b>Out of domain the gain is real but the absolute error stays high.</b> Average OOD ECE is 0.21 after HotpotQA training and 0.25 after math training. Per dataset there is no uniform winner: on SimpleQA, where accuracy is 12.1%, RLCR's ECE is 0.34 against 0.06 for the Brier-trained classifier and 0.88 for RLVR; on TriviaQA it is 0.06 against 0.37 for the same classifier<a class="cite" href="#ref-1">1</a> (App. K, the paper's Table 8). The authors say so: "even after RLCR, out-of-domain calibration error is often high in an absolute sense, and models may still assign high confidence to multiple contradictory answers"<a class="cite" href="#ref-1">1</a> (§6).</p>
+<p><b>The SFT warmup trades accuracy for calibration.</b> SFT+RLCR has the best math calibration (ECE 0.08 in-domain, 0.18 OOD) but OOD accuracy falls from 50.9% to 43.8%, which the authors call "possibly due to catastrophic forgetting induced by SFT warmup"<a class="cite" href="#ref-1">1</a> (§4.3).</p>
+<p><b>The effect size depends on the model.</b> On OLMo-2-7B-Instruct, ECE falls from 0.38 to 0.09 in-domain and 0.48 to 0.20 OOD; on Qwen3-8B the drops are smaller, 0.36 to 0.23 and 0.29 to 0.17, at matched accuracy<a class="cite" href="#ref-1">1</a> (App. F, the paper's Tables 4 and 5).</p>
+
+<h3 id="rlcr-results-cost">5.3 What the calibration costs in tokens</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 8.</b> Ablation of the uncertainty analysis, HotpotQA-trained models<a class="cite" href="#ref-1">1</a> (the paper's Table 2). "Tokens" is the paper's column; the overhead ratios are derived here.</caption>
+  <thead><tr><th>Variant</th><th class="num">Acc. (%)</th><th class="num">Tokens</th><th class="num">ECE</th><th class="num">OOD acc. (%)</th><th class="num">OOD tokens</th><th class="num">OOD ECE</th></tr></thead>
+  <tbody>
+    <tr><td>RLVR</td><td class="num">63.0</td><td class="num">92</td><td class="num">0.37</td><td class="num">53.9</td><td class="num">142</td><td class="num">0.46</td></tr>
+    <tr><td>RLVR, analysis prompted</td><td class="num">62.3</td><td class="num">224</td><td class="num">0.34</td><td class="num">52.6</td><td class="num">221</td><td class="num">0.39</td></tr>
+    <tr><td>RLCR, analysis removed at inference</td><td class="num">61.7</td><td class="num">113</td><td class="num">0.09</td><td class="num">56.5</td><td class="num">179</td><td class="num">0.26</td></tr>
+    <tr><td>RLCR</td><td class="num">62.1</td><td class="num">249</td><td class="num" data-best>0.03</td><td class="num">56.2</td><td class="num">300</td><td class="num" data-best>0.21</td></tr>
+  </tbody>
+</table>
+<p>Prompting alone is not the mechanism: asking the RLVR model for an analysis moves ECE only from 0.37 to 0.34, while an RLCR model with the analysis switched off still reaches 0.09. The reward does most of the work, and the written analysis adds the rest. The serving bill is visible in the token column. RLCR generates 249 tokens against 92, a factor of 2.7 or +157 tokens per answer, and 300 against 142 out of domain (2.1 times). Dropping the analysis cuts that to 113 tokens, +21 or +23%, and keeps ECE at 0.09 in-domain but at 0.26 OOD, against 0.46 for RLVR. The relative overhead shrinks when reasoning is long; the paper reports tokens only for these short-answer tasks.</p>
+
+<h3 id="rlcr-results-voting">5.4 Confidence at test time, and its limit</h3>
+<p>Because \(q\) is a probability of success, it can weight votes: confidence-weighted majority voting beats plain majority voting, max-confidence selection, and two likelihood-based baselines. Averaging \(K\) resampled analyses for a fixed answer lowers the Brier score, but the whole axis of the paper's Fig. 3b spans only 0.208 to 0.214<a class="cite" href="#ref-1">1</a> (§4.4). Wu et al. add the limit. Calibration is a statement across prompts, and selecting among samples of one prompt needs discrimination within it. Their example: two guesses to question I, one right, both stated at 1/2; three guesses to question II, one right, all stated at 1/3. That is perfect calibration with no selection power<a class="cite" href="#ref-3">3</a> (§4.5). Pass@k and Maj@k protocols, and what they measure, are in Module 20.</p>
+
+<h2 id="bcrl">6. Behaviorally Calibrated RL: thresholds in, a scoring rule out</h2>
+<p>Wu et al. (ByteDance Seed with CMU and Fudan; arXiv v3, 28 January 2026) start from the behavioral calibration that Kalai et al. define: a user supplies a risk threshold \(t\), and the model should answer if and only if its confidence is at least \(t\), and otherwise emit an <code>&lt;IDK&gt;</code> token<a class="cite" href="#ref-3">3</a> (§1, §3.1).</p>
+
+<h3 id="bcrl-derivation">6.1 From a user's threshold to the Brier reward</h3>
+<p>The per-threshold reward is Kalai's: +1 for a correct answer, 0 for IDK, \(-t/(1-t)\) for a wrong answer (their Eq. 2). The paper's move is to stop conditioning on \(t\). Let the model state a confidence \(q\) and decide afterwards: abstain if and only if \(q&lt;t\). For boundedness they rescale the per-threshold reward to \(+1\) for a correct answer, \(-1\) for a wrong one and \(2t-1\) for abstaining. That is a positive affine map of Kalai's payoffs at each \(t\) (multiply by \(2(1-t)\), add \(2t-1\)), so the best decision at every \(t\) is unchanged. Averaging over a prior \(u\) on thresholds gives</p>
+$$R_u(c,q)=\int_0^{q}(2c-1)\,du(t)+\int_{q}^{1}(2t-1)\,du(t).$$
+<p>For the uniform prior the first integral is \(q(2c-1)\) and the second is \(q-q^2\), so</p>
+$$R_u=2qc-q^2=c-(q-c)^2,$$
+<p>which is the RLCR reward; the paper writes it as \(2p\cdot\text{valid}-p^2\) and notes the decomposition<a class="cite" href="#ref-3">3</a> (Eq. 3). Figure 6 draws both branches. The paper states that the result is strictly proper when the prior "has positive density anywhere"; the standard condition is positive mass on every open interval (Section 2.2), which the uniform prior and the truncated prior below both meet. A truncated Beta\((0,0)\) prior, with density proportional to \(1/(t(1-t))\) on \((\epsilon,1-\epsilon)\), gives a cross-entropy-style reward on the clipped confidence \(\mathrm{clip}(q,\epsilon,1-\epsilon)\)<a class="cite" href="#ref-3">3</a> (Eq. 4). That is the log score's measure from Table 3 cut to a finite range, and the cut is what makes it bounded (my reading). The Kalai threshold, the Brier reward and a clipped log reward are one family indexed by the prior over thresholds. Wu et al. credit Damani et al. and Stangel et al. with the proper-scoring-rule reward itself<a class="cite" href="#ref-3">3</a> (§2); the derivation, the choice of prior, the critic readout and the claim-level variant are theirs.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 346" role="img" aria-labelledby="f6t"><title id="f6t">Reward of a model that answers when its stated confidence q is at least the risk threshold t, plotted against t for a correct and for a wrong answer; the area under each curve equals the Brier-augmented reward</title>
+    <text x="80" y="14" class="d-title">A. Answer is correct</text><text x="470" y="14" class="d-title">B. Answer is wrong</text>
+    <line x1="80" y1="40" x2="380" y2="40" class="d-grid"/><text x="74" y="44" text-anchor="end" class="d-small d-mono">+1</text>
+    <line x1="80" y1="140" x2="380" y2="140" class="d-axis"/><text x="74" y="144" text-anchor="end" class="d-small d-mono">+0</text>
+    <line x1="80" y1="240" x2="380" y2="240" class="d-grid"/><text x="74" y="244" text-anchor="end" class="d-small d-mono">-1</text>
+    <line x1="80" y1="40" x2="80" y2="240" class="d-axis"/>
+    <text x="80" y="256" text-anchor="middle" class="d-small d-mono">0</text>
+    <text x="230.0" y="256" text-anchor="middle" class="d-small d-mono">0.5</text>
+    <text x="380" y="256" text-anchor="middle" class="d-small d-mono">1</text>
+    <text x="230.0" y="274" text-anchor="middle" class="d-small d-text-light">risk threshold t</text>
+    <polygon points="80,140 80,40 260.0,40 260.0,140" class="d-fill-blue-soft"/>
+    <polygon points="260.0,140 260.0,120.0 380,40 380,140" class="d-fill-amber-soft"/>
+    <line x1="80" y1="240" x2="380" y2="40" class="d-line d-stroke-amber d-dashed" style="stroke-width:1.25"/>
+    <polyline points="80,40 260.0,40 260.0,120.0 380,40" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+    <line x1="260.0" y1="34" x2="260.0" y2="240" class="d-line d-stroke-orange d-dashed" style="stroke-width:1.25"/><text x="260.0" y="30" text-anchor="middle" class="d-small d-mono">t = q = 0.6</text>
+    <line x1="470" y1="40" x2="770" y2="40" class="d-grid"/><text x="464" y="44" text-anchor="end" class="d-small d-mono">+1</text>
+    <line x1="470" y1="140" x2="770" y2="140" class="d-axis"/><text x="464" y="144" text-anchor="end" class="d-small d-mono">+0</text>
+    <line x1="470" y1="240" x2="770" y2="240" class="d-grid"/><text x="464" y="244" text-anchor="end" class="d-small d-mono">-1</text>
+    <line x1="470" y1="40" x2="470" y2="240" class="d-axis"/>
+    <text x="470" y="256" text-anchor="middle" class="d-small d-mono">0</text>
+    <text x="620.0" y="256" text-anchor="middle" class="d-small d-mono">0.5</text>
+    <text x="770" y="256" text-anchor="middle" class="d-small d-mono">1</text>
+    <text x="620.0" y="274" text-anchor="middle" class="d-small d-text-light">risk threshold t</text>
+    <polygon points="470,140 470,240 650.0,240 650.0,140" class="d-fill-red-soft"/>
+    <polygon points="650.0,140 650.0,120.0 770,40 770,140" class="d-fill-amber-soft"/>
+    <line x1="470" y1="240" x2="770" y2="40" class="d-line d-stroke-amber d-dashed" style="stroke-width:1.25"/>
+    <polyline points="470,240 650.0,240 650.0,120.0 770,40" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+    <line x1="650.0" y1="34" x2="650.0" y2="240" class="d-line d-stroke-orange d-dashed" style="stroke-width:1.25"/><text x="650.0" y="30" text-anchor="middle" class="d-small d-mono">t = q = 0.6</text>
+    <text x="230" y="292" text-anchor="middle" class="d-small d-mono">area = 0.60 + 0.24 = 0.84 = 1 − (1−q)²</text>
+    <text x="620" y="292" text-anchor="middle" class="d-small d-mono">area = −0.60 + 0.24 = −0.36 = −q²</text>
+    <rect x="80" y="318" width="14" height="14" class="d-fill-blue-soft"/><text x="100" y="329" class="d-small">answered, correct: +1</text>
+    <rect x="290" y="318" width="14" height="14" class="d-fill-red-soft"/><text x="310" y="329" class="d-small">answered, wrong: −1</text>
+    <rect x="490" y="318" width="14" height="14" class="d-fill-amber-soft"/><text x="510" y="329" class="d-small">abstained: 2t − 1</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Wu et al.’s construction<a class="cite" href="#ref-3">3</a> (§3.2.2) at stated confidence \(q=0.6\). For each threshold \(t\) the model answers if \(q\ge t\) and abstains otherwise; the rescaled reward is \(+1\) for a correct answer, \(-1\) for a wrong one and \(2t-1\) for abstaining. Averaging over \(t\sim U(0,1)\) is the signed area under the curve: \(0.84=1-(1-0.6)^2\) when the answer is correct and \(-0.36=-0.6^2\) when it is wrong, which are the two branches of the Brier-augmented reward. Areas computed here and checked numerically.</figcaption>
+</figure>
+
+<h3 id="bcrl-strategies">6.2 Three strategies, and the one that failed</h3>
+<p>The setup is Qwen3-4B-Instruct-2507 trained on DAPO-Math-17k, with PPO by default and GRPO for the Beta-prior variant "because we discover improved training stability specifically for this reward design"<a class="cite" href="#ref-3">3</a> (§4.1).</p>
+<ul>
+<li><b>Explicit risk thresholding</b> samples \(t\sim U(0,1)\) per training instance, states Kalai's instruction in the prompt, and rewards with Eq. 2. It failed in the authors' hands (§3.2.1, Fig. 1, GRPO, evaluated on AIME 2024 over steps 10 to 60): refusal and hallucination rates were insensitive to the \(t\) in the prompt; the policy over-rejected even at \(t=0\), falling below the binary baseline; SNR did not rise with \(t\), giving a near-zero SNR gain; and the model was over-confident at \(t=1\). Their diagnosis is that "explicitly sampling t creates a noisy optimization landscape"<a class="cite" href="#ref-3">3</a>.</li>
+<li><b>Verbalized confidence</b> is the Section 6.1 reward with the threshold applied after the fact. Uniform prior gives "Confidence-Brier", the Beta prior gives "Confidence-CE".</li>
+<li><b>Critic value</b> reads the PPO critic (Section 4.4).</li>
+</ul>
+
+<h3 id="bcrl-results">6.3 Results, and how to read them</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 9.</b> Response-level confidence on BeyondAIME (100 problems), selected rows of Table 1 of Wu et al.<a class="cite" href="#ref-3">3</a> The authors' own evaluation. SNR gain is the log-scale gain of the accuracy-to-hallucination ratio over all thresholds relative to answering everything; Conf AUC ranks correct above wrong answers; Abs Acc is accuracy of the answer-or-abstain decision at confidence 0.5; Pred Acc is accuracy with no abstention.</caption>
+  <thead><tr><th>Model</th><th class="num">SNR gain</th><th class="num">Conf AUC</th><th class="num">Abs Acc</th><th class="num">smECE</th><th class="num">Brier</th><th class="num">NLL</th><th class="num">Pred Acc</th></tr></thead>
+  <tbody>
+    <tr><td>o4-mini</td><td class="num">0.515</td><td class="num">0.738</td><td class="num">0.698</td><td class="num">0.164</td><td class="num">0.241</td><td class="num">0.845</td><td class="num">0.527</td></tr>
+    <tr><td>GPT-5</td><td class="num">0.207</td><td class="num">0.706</td><td class="num">0.718</td><td class="num">0.160</td><td class="num">0.208</td><td class="num">0.719</td><td class="num" data-best>0.680</td></tr>
+    <tr><td>Gemini-2.5-Pro</td><td class="num">0.071</td><td class="num">0.699</td><td class="num">0.553</td><td class="num">0.431</td><td class="num">0.387</td><td class="num">1.443</td><td class="num">0.544</td></tr>
+    <tr><td>Qwen3-4B-Instruct</td><td class="num">0.084</td><td class="num">0.715</td><td class="num">0.338</td><td class="num">0.632</td><td class="num">0.599</td><td class="num">2.316</td><td class="num">0.291</td></tr>
+    <tr><td>Qwen3-4B + PPO</td><td class="num">0.101</td><td class="num">0.786</td><td class="num">0.388</td><td class="num">0.560</td><td class="num">0.518</td><td class="num">1.873</td><td class="num">0.361</td></tr>
+    <tr><td>4B, confidence-min</td><td class="num">0.683</td><td class="num">0.863</td><td class="num">0.703</td><td class="num">0.220</td><td class="num">0.194</td><td class="num">0.606</td><td class="num">0.384</td></tr>
+    <tr><td>4B, confidence-Brier</td><td class="num">0.802</td><td class="num" data-best>0.902</td><td class="num">0.782</td><td class="num">0.177</td><td class="num">0.161</td><td class="num">0.527</td><td class="num">0.395</td></tr>
+    <tr><td>4B, confidence-prod</td><td class="num">0.806</td><td class="num">0.883</td><td class="num">0.766</td><td class="num">0.166</td><td class="num">0.166</td><td class="num">0.516</td><td class="num">0.385</td></tr>
+    <tr><td>4B, confidence-CE</td><td class="num">1.097</td><td class="num">0.854</td><td class="num">0.771</td><td class="num">0.174</td><td class="num">0.179</td><td class="num">0.722</td><td class="num">0.364</td></tr>
+    <tr><td>4B, PPO-value</td><td class="num" data-best>1.202</td><td class="num">0.881</td><td class="num" data-best>0.797</td><td class="num" data-best>0.061</td><td class="num" data-best>0.141</td><td class="num" data-best>0.436</td><td class="num">0.387</td></tr>
+  </tbody>
+</table>
+<p><b>Which number is the headline.</b> The abstract's "0.806 against GPT-5's 0.207" is the confidence-prod row of Table 9. The Brier variant is 0.802, and two variants are higher: CE at 1.097 and the PPO critic at 1.202. The abstract calls the metric the Accuracy-to-Hallucination Ratio gain; the body calls it SNR gain, and the log base is not stated.</p>
+<p><b>What it measures.</b> SNR gain is relative to each model's own answer-everything ratio, and Conf AUC is insensitive to accuracy by design<a class="cite" href="#ref-3">3</a> (§4.2, §5). On level metrics the picture is mixed. GPT-5 answers 0.680 of the problems correctly against 0.364 to 0.395 for the trained variants; its smECE of 0.160 is no worse than their 0.166 to 0.220 (only the critic reaches 0.061); and they win on Brier (0.141 to 0.194 against 0.208). The defensible reading is about discrimination: confidence separates right from wrong far better after training (AUC 0.854 to 0.902 against GPT-5's 0.706, Figure 7), a gain of about 0.14 to 0.19 over the untrained model's 0.715.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f7t"><title id="f7t">Scatter of predictive accuracy against confidence AUC on BeyondAIME for frontier models, the untrained and PPO-trained Qwen3-4B-Instruct, and five calibration-trained variants</title>
+    <line x1="80" y1="229.0" x2="740" y2="229.0" class="d-grid"/><text x="72" y="233.0" text-anchor="end" class="d-small d-mono">0.5</text>
+    <line x1="80" y1="187.0" x2="740" y2="187.0" class="d-grid"/><text x="72" y="191.0" text-anchor="end" class="d-small d-mono">0.6</text>
+    <line x1="80" y1="145.0" x2="740" y2="145.0" class="d-grid"/><text x="72" y="149.0" text-anchor="end" class="d-small d-mono">0.7</text>
+    <line x1="80" y1="103.0" x2="740" y2="103.0" class="d-grid"/><text x="72" y="107.0" text-anchor="end" class="d-small d-mono">0.8</text>
+    <line x1="80" y1="61.0" x2="740" y2="61.0" class="d-grid"/><text x="72" y="65.0" text-anchor="end" class="d-small d-mono">0.9</text>
+    <line x1="146.0" y1="250" x2="146.0" y2="40" class="d-grid"/><text x="146.0" y="266" text-anchor="middle" class="d-small d-mono">0.3</text>
+    <line x1="278.0" y1="250" x2="278.0" y2="40" class="d-grid"/><text x="278.0" y="266" text-anchor="middle" class="d-small d-mono">0.4</text>
+    <line x1="410.0" y1="250" x2="410.0" y2="40" class="d-grid"/><text x="410.0" y="266" text-anchor="middle" class="d-small d-mono">0.5</text>
+    <line x1="542.0" y1="250" x2="542.0" y2="40" class="d-grid"/><text x="542.0" y="266" text-anchor="middle" class="d-small d-mono">0.6</text>
+    <line x1="674.0" y1="250" x2="674.0" y2="40" class="d-grid"/><text x="674.0" y="266" text-anchor="middle" class="d-small d-mono">0.7</text>
+    <line x1="80" y1="250" x2="740" y2="250" class="d-axis"/><line x1="80" y1="250" x2="80" y2="40" class="d-axis"/>
+    <text x="410" y="284" text-anchor="middle" class="d-small d-text-light">predictive accuracy with no abstention (Pred Acc)</text>
+    <text x="80" y="22" class="d-small d-text-light">confidence AUC: does confidence separate correct from wrong answers?</text>
+    <circle cx="647.6" cy="142.5" r="5" class="d-fill-blue"/>
+    <circle cx="445.6" cy="129.0" r="5" class="d-fill-blue"/>
+    <circle cx="468.1" cy="145.4" r="5" class="d-fill-blue"/>
+    <circle cx="458.8" cy="154.2" r="5" class="d-fill-blue"/>
+    <circle cx="325.5" cy="143.7" r="5" class="d-fill-blue"/>
+    <circle cx="452.2" cy="221.0" r="5" class="d-fill-blue"/>
+    <circle cx="485.2" cy="230.7" r="5" class="d-fill-blue"/>
+    <circle cx="218.6" cy="154.2" r="5" class="d-fill-blue"/>
+    <circle cx="134.1" cy="138.7" r="5" class="d-fill-amber"/>
+    <circle cx="226.5" cy="108.9" r="5" class="d-fill-amber"/>
+    <circle cx="256.9" cy="76.5" r="5" class="d-fill-orange"/>
+    <circle cx="271.4" cy="60.2" r="5" class="d-fill-orange"/>
+    <circle cx="258.2" cy="68.1" r="5" class="d-fill-orange"/>
+    <circle cx="230.5" cy="80.3" r="5" class="d-fill-orange"/>
+    <circle cx="260.8" cy="69.0" r="5" class="d-fill-orange"/>
+    <text x="657.6" y="160.5" text-anchor="start" class="d-small">GPT-5</text>
+    <text x="453.6" y="121.0" text-anchor="start" class="d-small">o4-mini</text>
+    <text x="476.1" y="161.4" text-anchor="start" class="d-small">Gemini-2.5-Pro</text>
+    <text x="460.2" y="215.0" text-anchor="start" class="d-small">GLM-4.5</text>
+    <text x="493.2" y="244.7" text-anchor="start" class="d-small">Qwen3-next-80b-thinking</text>
+    <text x="208.6" y="168.2" text-anchor="end" class="d-small">Kimi-K2-0905</text>
+    <text x="142.1" y="130.7" text-anchor="start" class="d-small">Qwen3-4B-Instruct</text>
+    <text x="216.5" y="100.9" text-anchor="end" class="d-small">Qwen3-4B + PPO</text>
+    <text x="285.4" y="65.2" class="d-small d-bold">five calibration-trained 4B variants</text>
+    <rect x="560" y="60" width="180" height="70" rx="6" class="d-label-bg"/>
+    <circle cx="574" cy="78" r="5" class="d-fill-blue"/><text x="586" y="82" class="d-small">frontier models</text>
+    <circle cx="574" cy="98" r="5" class="d-fill-amber"/><text x="586" y="102" class="d-small">Qwen3-4B base / PPO</text>
+    <circle cx="574" cy="118" r="5" class="d-fill-orange"/><text x="586" y="122" class="d-small">calibration-trained 4B</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> Predictive accuracy against confidence AUC on BeyondAIME (100 problems) for the models in Table 1 of Wu et al.<a class="cite" href="#ref-3">3</a>, 15 rows; the five orange points are the paper’s own variants (min, Brier, product, CE, PPO-value). The trained variants separate right from wrong answers better than any frontier model in the table (AUC 0.854–0.902 against at most 0.738) while answering far fewer problems correctly (Pred Acc 0.364–0.395 against 0.680 for GPT-5). Two frontier rows (Qwen3-max, GPT-oss-120b) are plotted without labels; the values are in Table 9.</figcaption>
+</figure>
+<p><b>How much to trust the decimals.</b> BeyondAIME is 100 problems<a class="cite" href="#ref-3">3</a> (§4.2). At an accuracy of 0.39 the standard error of one accuracy estimate is \(\sqrt{0.39\times0.61/100}=0.049\) (derived). The tables print no intervals, and the text read reports no seed counts. Differences in the second decimal between the 4B variants are within noise; the gap between the variants and the untrained model is not. This is the authors' own evaluation and has not, in the sources read, been independently replicated. Module 20 gives the protocol for judging gains of this size.</p>
+<p><b>Transfer.</b> Trained on math only, the Brier variant on SimpleQA has smECE 0.459 against 0.821 for the untrained model, SNR gain 0.411 against GPT-5's 0.498, and a predictive accuracy of only 0.058<a class="cite" href="#ref-3">3</a> (the paper's Table 4). The abstract says its calibration error is "on par with" Grok-4 and Gemini-2.5-Pro; the table supports that for Gemini-2.5-Pro (0.451) but not Grok-4 (0.307). At 5.8% accuracy a constant reporter would be nearly calibrated, so this is a weak test on the calibration axis.</p>
+<p><b>Claims inside a response.</b> The same machinery flags individual claims. Only the final outcome is labelled, so claim confidences are aggregated into a response confidence, by product or by minimum, and trained with the Brier reward. Product assumes independent claims, which the authors found violated; a 10-step wrong response at a uniform 80% per claim gives \(0.8^{10}=0.107\), matching the paper's "11%"<a class="cite" href="#ref-3">3</a> (§3.3.1). Minimum aggregation wins at claim level (SNR gain 0.301 against 0.183, AUC 0.788 against 0.741) and product wins at response level<a class="cite" href="#ref-3">3</a> (the paper's Tables 1 and 3).</p>
+
+<h2 id="kalai-grading">7. Kalai et al.: the incentive sits in the grading</h2>
+
+<h3 id="kalai-grading-argument">7.1 The argument and the audit</h3>
+<p>Kalai et al. (OpenAI and Georgia Tech, 4 September 2025) argue that language models hallucinate "because the training and evaluation procedures reward guessing over acknowledging uncertainty"<a class="cite" href="#ref-2">2</a> (abstract). The pretraining half of the paper, a reduction from generation to a binary "is-it-valid" classification problem, is outside this module. The post-training half is the incentive of Section 1 made formal: under binary grading "abstaining is strictly sub-optimal", because an "I don't know" earns the minimum and an overconfident best guess is optimal<a class="cite" href="#ref-2">2</a> (§4.1). Their illustration is two models that differ only in behavior: Model A signals uncertainty and never hallucinates, Model B always guesses, and B outscores A under 0-1 grading (§1.2).</p>
+<p>The audit is Table 2 of the paper. Of ten widely used evaluations (GPQA, MMLU-Pro, IFEval, Omni-MATH, WildBench, BBH, MATH level 5, MuSR, SWE-bench, HLE) nine are marked binary with no credit for an IDK. The tenth, WildBench, gives partial credit, but its 1-to-10 rubric may place an IDK at 3 to 4, below a "fair" response with factual errors at 5 to 6<a class="cite" href="#ref-2">2</a> (App. F). Their conclusion is that a few added hallucination evaluations "won't suffice" and "the numerous primary evaluations must be adjusted"<a class="cite" href="#ref-2">2</a> (§1.2); Module 20 (Section 8.3) is the evaluation-side twin.</p>
+
+<h3 id="kalai-grading-targets">7.2 Confidence targets, and the penalty that does not follow</h3>
+<p>The proposed change is a sentence in the prompt of every question: "Answer only if you are &gt; t confident, since mistakes are penalized t/(1 − t) points, while correct answers receive 1 point, and an answer of 'I don't know' receives 0 points"<a class="cite" href="#ref-2">2</a> (§4.2). The expected score of answering is \(p-(1-p)\,\tfrac{t}{1-t}\), which is positive exactly when \(p(1-t)&gt;(1-p)\,t\), that is when \(p&gt;t\). A threshold of \(t=0\) is binary grading. Table 10 sets the printed values beside the formula.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 10.</b> Penalty per error under Kalai et al.'s confidence-target instruction<a class="cite" href="#ref-2">2</a> (§4.2, arXiv v1) against \(t/(1-t)\) (derived). The break-even column is the success probability above which answering has positive expected score under the formula.</caption>
+  <thead><tr><th class="num">Target \(t\)</th><th class="num">Penalty as printed</th><th class="num">Penalty \(t/(1-t)\)</th><th class="num">Break-even \(p\)</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0</td><td class="num">not given</td><td class="num">0</td><td class="num">0</td><td>binary grading</td></tr>
+    <tr><td class="num">0.50</td><td class="num">1</td><td class="num">1</td><td class="num">0.50</td><td>consistent</td></tr>
+    <tr><td class="num">0.75</td><td class="num" data-worst>2</td><td class="num" data-best>3</td><td class="num">0.75</td><td>printed value does not follow</td></tr>
+    <tr><td class="num">0.90</td><td class="num">9</td><td class="num">9</td><td class="num">0.90</td><td>consistent</td></tr>
+    <tr><td class="num">0.667</td><td class="num">not given</td><td class="num">2</td><td class="num">0.667</td><td>the \(t\) that a penalty of 2 corresponds to</td></tr>
+  </tbody>
+</table>
+<p>The printed "\(t=0.75\) (penalty 2)" contradicts the paper's own formula, which gives \(0.75/0.25=3\); a penalty of 2 belongs to \(t=2/3\). The slip changes decisions. At \(p=0.70\), answering is worth \(0.70-0.30\times3=-0.20\) under the formula, so abstain, and \(0.70-0.30\times2=+0.10\) under the printed value, so answer. The two disagree for every \(p\) between \(2/3\) and \(3/4\). arXiv lists only version 1 of the paper as of 2026-10-27, so the slip is in the only text. Wu et al. use the formula, not the printed value<a class="cite" href="#ref-3">3</a> (Eq. 2).</p>
+<p>A second sentence in the same section inverts its own rule. It says the one behavior optimal for all targets is "outputting IDK among examples where its correctness probability is greater than the target"<a class="cite" href="#ref-2">2</a> (§4.2), a few lines after stating that answering beats IDK exactly when the probability exceeds \(t\). Read "greater" as "less".</p>
+
+<h3 id="kalai-grading-link">7.3 Behavioral calibration, and how it meets the Brier term</h3>
+<p>Kalai et al. call the policy that is optimal at every target "behavioral calibration" and define it without a stated probability: "rather than requiring the model to output a probabilistic confidence", the model "must formulate the most useful response in which it is at least t confident", and the property "can be audited by comparing accuracy and error rates across thresholds"<a class="cite" href="#ref-2">2</a> (§4.2). The Brier reward reaches the same behavior by a different road. A model that states a calibrated \(q\) lets the deployer pick any \(t\) afterwards (Section 6.1), and an answer at \(q=1\) is the \(t=0.5\) test-taker (Table 4). The two differ in where they act. Kalai et al. change the score of an evaluation and run no training experiment on it; Wu et al. tried to train the prompt-conditioned version and moved the threshold out of the prompt when it failed (Section 6.2).</p>
+<p>OpenAI's announcement page for the paper returned HTTP 403 when fetched for this module, and I did not work around it, so nothing from it is used except one figure that comes from a search-result summary of the page: <mark class="unverified" title="OpenAI blog page returned HTTP 403 and was not read; the figures come from a web-search summary of the page">gpt-5-thinking-mini abstains on 52% of SimpleQA questions and is wrong on 26%, against 1% abstention and 75% errors for o4-mini</mark>. If it holds, it shows the size of the effect the paper describes: a leaderboard that reports only accuracy cannot see that difference.</p>
+
+<h2 id="levers">8. The levers side by side, and what shipped recipes say</h2>
+<table class="tbl tbl-compare">
+  <caption><b>Table 11.</b> Seven ways to change the incentive to guess, with what each leaves open. Evidence column points to the sections of this module.</caption>
+  <thead><tr><th>Lever</th><th>What changes</th><th>Incentive it creates</th><th>Left open</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Binary verifier only</td><td>nothing</td><td>answer at any \(p&gt;0\); \(q\) unconstrained</td><td>guessing; constant confidence</td><td>Table 1</td></tr>
+    <tr><td class="row">Brier term on stated \(q\) (RLCR)</td><td>reward</td><td>\(q=p\); answer with the highest \(p\)</td><td>no abstain action; OOD ECE 0.21 to 0.25; +157 tokens</td><td>Tables 5, 7, 8</td></tr>
+    <tr><td class="row">Prompted threshold, trained in</td><td>prompt and reward</td><td>answer iff \(p&gt;t\)</td><td>policy did not become \(t\)-sensitive in the 4B run</td><td>Section 6.2</td></tr>
+    <tr><td class="row">Ternary abstention reward</td><td>reward</td><td>abstain iff \(p&lt;\lambda\)</td><td>no confidence number; fewer attempts</td><td>Table 5</td></tr>
+    <tr><td class="row">Critic or classifier readout</td><td>a second head or model</td><td>success-probability estimate</td><td>extra model; weaker transfer; no critic in GRPO</td><td>Tables 7, 9</td></tr>
+    <tr><td class="row">Refusal SFT data</td><td>data</td><td>refuse where samples are consistently wrong</td><td>not RL; judge-dependent</td><td>below</td></tr>
+    <tr><td class="row">Confidence targets in grading</td><td>evaluation</td><td>explicit threshold \(t\)</td><td>needs adoption; no training result</td><td>Section 7</td></tr>
+  </tbody>
+</table>
+<p>A keyword search made for this module (calibrat*, abstain, abstention, hallucinat*) of twelve recipe reports in this course, from Llama 3 to DeepSeek-V4, found no calibration or abstention reward. Absence from a report is not absence from practice; the hits are informative.</p>
+<ul>
+<li><b>Kimi K2</b> writes prescriptive rubrics that forbid hedging such as "I might be wrong", so the framework "may favor responses that appear confident and assertive" and the model "may occasionally overstate certainty"; the report adds that future iterations "may incorporate more fine-grained handling of calibrated uncertainty"<a class="cite" href="#ref-10">10</a> (App. F.3). That is the incentive of Section 1 produced by a judge instead of a verifier (Modules 8 and 16).</li>
+<li><b>Qwen3</b> tracks an in-house CounterFactQA, questions with false premises that the model should flag: 50.4 after reasoning RL, 61.3 after thinking-mode fusion and 68.1 after general RL, in thinking mode<a class="cite" href="#ref-11">11</a> (Table 22). Its general RL includes RAG rewards meant to reduce hallucination (§4.4). The report isolates no cause, and flagging a false premise is a cousin of abstention, not calibration.</li>
+<li><b>Llama 3</b> takes the data route. It samples answers to questions generated from pre-training snippets, judges them against the snippet, and writes a refusal when responses are "consistently informative and incorrect", on the principle that post-training should align the model to "know what it knows"<a class="cite" href="#ref-12">12</a> (§4.3.6). There is no RL and no confidence number.</li>
+</ul>
+
+<h2 id="recipe">9. Adding a Brier term to your run: what it does and does not buy</h2>
+<div class="grid-2">
+<div>
+<p><b>It incentivizes</b></p>
+<ul>
+<li>\(q\to p\) on every answer the policy emits; the expected reward is \(p^2-(q-p)^2\) (Section 2.1).</li>
+<li>Among calibrated outputs, the answer with the highest \(p\), provided the rule is bounded (Theorem 1).</li>
+<li>Resolution: reward grows by \(\mathrm{Var}(p)\) as confidence separates easy prompts from hard ones (Section 2.3).</li>
+</ul>
+</div>
+<div>
+<p><b>It does not incentivize</b></p>
+<ul>
+<li>Abstaining. No action pays for silence: \(q=0\) pays 0 and an honest answer pays \(p^2\ge0\), so the abstain decision is the deployer's threshold on \(q\) (derived).</li>
+<li>Calibration off the training distribution: OOD ECE is 0.21 and 0.25 (Table 7).</li>
+<li>Choosing among samples of one prompt (Section 5.4).</li>
+<li>Faithful uncertainty reasoning. At 7B a classifier reads the confidence off the solution itself; the written analysis helped only the 0.5B and 1.5B classifiers<a class="cite" href="#ref-1">1</a> (App. G).</li>
+<li>Robustness to a noisy verifier (Section 4.2) or cheap serving (Section 5.3).</li>
+</ul>
+</div>
+</div>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>Use a bounded rule and keep the correctness term, since calibration-only collapses to empty answers (Table 5). Keep prompts that span low and high \(p\), and filter groups on reward variance, not accuracy variance (Section 4.3). Judge the run by Brier skill against a constant reporter and by AUROC, not ECE alone, with intervals on accuracy (Module 20). Budget the extra tokens (Section 5.3). If you need an abstain action rather than a number, the threshold or ternary reward is the lever, and the one 4B experiment on it did not train.</p></aside>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Everyone in this module agrees on the diagnosis: a binary verdict pays for guessing. They disagree on where to repair it. One camp changes the reward the policy optimizes, one changes the score the field reports, and a third leaves the policy alone and reads confidence from a second component.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Train calibration into the policy with a bounded proper score</h4>
+    <p class="who">Damani et al., MIT, ICLR 2026<a class="cite" href="#ref-1">1</a>; Wu et al., ByteDance Seed<a class="cite" href="#ref-3">3</a></p>
+    <p>Put a Brier-type term on a verbalized confidence next to the correctness reward. Theorem 1 says the optimum is a calibrated, accurate answer, and the experiments say accuracy survives.</p>
+    <ul class="pros">
+      <li>Accuracy matched at 7B (63.0% against 62.1%, within ±3.05); ECE 0.37 to 0.03 and 0.26 to 0.10.</li>
+      <li>One model, one decode; out-of-domain ECE is lower than RLVR's in both runs.</li>
+      <li>The same reward falls out of averaging Kalai's thresholds, so it also serves a deployer who picks \(t\) later.</li>
+    </ul>
+    <ul class="cons">
+      <li>+157 tokens per answer in the short-answer setting; OOD ECE stays at 0.21 to 0.25.</li>
+      <li>Brier skill against a constant reporter is about 0.11; the evidence is 4B to 8B models on short, verifiable tasks, evaluated by the authors.</li>
+      <li>A log-score variant collapsed in the toy task; a noisy verifier becomes a biased target.</li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Fix how benchmarks grade</h4>
+    <p class="who">Kalai et al., OpenAI and Georgia Tech<a class="cite" href="#ref-2">2</a></p>
+    <p>Models guess because leaderboards reward guessing; nine of ten audited evaluations give an IDK nothing. Put the target \(t\) and the penalty \(t/(1-t)\) in every prompt.</p>
+    <ul class="pros">
+      <li>Acts on the cause for every lab at once, at no training cost.</li>
+      <li>The target behavior is auditable without any stated probability.</li>
+    </ul>
+    <ul class="cons">
+      <li>No training experiment in the paper, and its adoption depends on leaderboard owners.</li>
+      <li>Wu et al.'s prompt-conditioned training did not become sensitive to \(t\) at 4B<a class="cite" href="#ref-3">3</a>.</li>
+      <li>Two printed slips in the key section (penalty 2 at \(t=0.75\); "greater" for "less").</li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Keep the reward binary; read confidence from a separate head</h4>
+    <p class="who">The classifier and probe baselines of Damani et al.<a class="cite" href="#ref-1">1</a>; the PPO critic readout of Wu et al.<a class="cite" href="#ref-3">3</a></p>
+    <p>A second model trained on the policy's outputs, or the critic that PPO already has, gives a success-probability estimate without touching the policy's reward.</p>
+    <ul class="pros">
+      <li>No risk to the policy's accuracy; BCE classifier ECE is 0.07 in-domain against RLCR's 0.03.</li>
+      <li>The critic had the lowest smECE in Wu et al.'s table (0.061); retrofits to a finished model.</li>
+    </ul>
+    <ul class="cons">
+      <li>A second 7B model, or a critic that GRPO does not have.</li>
+      <li>The policy itself still never abstains; transfer is uneven (critic smECE 0.665 on SimpleQA; Brier-trained classifier ECE 0.37 on TriviaQA).</li>
+    </ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The first two are complements: they act on different layers of one incentive, and each predicts that a binary verdict pushes toward guessing. If you train, the evidence supports a bounded Brier term next to a verifiable reward at modest scale: it costs little accuracy and removes the constant-confidence failure. It does not give you an abstain action, calibration that survives a distribution shift, or a selector within a prompt. If you publish numbers, the grading argument applies whatever you train, and reporting accuracy and error at several targets costs nothing. The third position fits only when you cannot change the RL recipe. Three results would settle the open parts: a matched comparison at frontier scale on agentic or noisy-verifier tasks; independent replication of Wu et al.'s numbers on more than 100 problems, with intervals; and a test of whether thresholding RLCR's \(q\) at \(t=0.5,0.75,0.9\) reproduces the accuracy-and-error trade that Kalai et al. want graders to measure.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>As of 2026-10-27 three papers are the public evidence for training calibration into reasoning RL: RLCR (v2 15 May 2026, ICLR 2026), Wu et al. (v3 28 January 2026) and Kalai et al. (v1 only). No recipe report in the Section 8 search describes a calibration reward, and Kimi K2 names the gap. Open: full distributions over answers, which RLCR calls impractical for chain-of-thought models<a class="cite" href="#ref-1">1</a> (§3, footnote 1); long-form and agentic outputs, where the correctness label is a judge's; and whether leaderboards adopt confidence targets. The acronym collision with RLCD, and the claims made under that name, are Module 8 (Section 8) and Module 25; nothing here describes any company's method.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Damani, M., Puri, I., Slocum, S., Shenfeld, I., Choshen, L., Kim, Y., Andreas, J. <em>Beyond Binary Rewards: Training LMs to Reason About Their Uncertainty</em> (RLCR, Reinforcement Learning with Calibration Rewards). ICLR 2026; arXiv:2507.16806 v2, 15 May 2026 (v1 22 Jul 2025). <a href="https://arxiv.org/pdf/2507.16806v2">https://arxiv.org/pdf/2507.16806v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Eq. 1 and Theorem 1 (§3), proof and Corollary 1 (App. A), training details and data (App. B), prompts (App. C), log-versus-Brier analysis and toy task (App. E), other models (App. F), classifier-size ablation (App. G), RL-calibration baselines (App. I), per-dataset tables with bootstrap intervals (App. K), Tables 1 to 3.</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Kalai, A. T., Nachum, O., Vempala, S. S., Zhang, E. <em>Why Language Models Hallucinate</em>. OpenAI and Georgia Tech; arXiv:2509.04664 v1, 4 Sep 2025 (the only version listed on 2026-10-27). <a href="https://arxiv.org/pdf/2509.04664v1">https://arxiv.org/pdf/2509.04664v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Observation 1 and the post-training argument (§1.2, §4.1), confidence targets and behavioral calibration (§4.2), benchmark audit (Table 2, App. F); the t = 0.75 penalty and the "greater than" slips are in §4.2.</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Wu, J., Liu, J., Zeng, Z., Zhan, T., Cai, T., Huang, W. <em>Mitigating LLM Hallucination via Behaviorally Calibrated Reinforcement Learning</em>. ByteDance Seed, Carnegie Mellon, Fudan; arXiv:2512.19920 v3, 28 Jan 2026. <a href="https://arxiv.org/abs/2512.19920">https://arxiv.org/abs/2512.19920</a>. Accessed 2026-10-27. <span class="ref-use">Used for: full text read for this module (the source map had the abstract only): threshold-averaging derivation and the three strategies (§3), explicit-thresholding failure (§3.2.1, Fig. 1), training setup (§4.1), Tables 1 to 4, test-time scaling limit (§4.5).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>DeepSeek-AI (Guo, D., et al.). <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv:2501.12948 v2, 4 Jan 2026 (expanded Nature version). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: R1-Zero reward "solely based on the correctness of final predictions" (§1).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>OpenAI. <em>GPT-4 Technical Report</em>. arXiv:2303.08774 v6, 4 Mar 2024. <a href="https://arxiv.org/pdf/2303.08774">https://arxiv.org/pdf/2303.08774</a>. Accessed 2026-10-27. <span class="ref-use">Used for: pre-trained model calibrated, post-training reduces calibration (§5 Limitations, Fig. 8).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Leng, J., Huang, C., Zhu, B., Huang, J. <em>Taming Overconfidence in LLMs: Reward Calibration in RLHF</em>. arXiv:2410.09724 v2, 28 Feb 2025. <a href="https://arxiv.org/abs/2410.09724">https://arxiv.org/abs/2410.09724</a>. Accessed 2026-10-27. <span class="ref-use">Used for: RLHF verbalized overconfidence and reward-model bias toward high-confidence scores (abstract only; the full text was not read).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Kirichenko, P., Ibrahim, M., Chaudhuri, K., Bell, S. J. <em>AbstentionBench: Reasoning LLMs Fail on Unanswerable Questions</em>. arXiv:2506.09038, 10 Jun 2025. <a href="https://arxiv.org/abs/2506.09038">https://arxiv.org/abs/2506.09038</a>. Accessed 2026-10-27. <span class="ref-use">Used for: reasoning fine-tuning degrades abstention by 24% on average, 20 datasets and 20 models (abstract only).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Gneiting, T., Raftery, A. E. <em>Strictly Proper Scoring Rules, Prediction, and Estimation</em>. Journal of the American Statistical Association 102(477), March 2007, pp. 359-378. <a href="https://sites.stat.washington.edu/raftery/Research/PDF/Gneiting2007jasa.pdf">https://sites.stat.washington.edu/raftery/Research/PDF/Gneiting2007jasa.pdf</a>. Accessed 2026-10-27. <span class="ref-use">Used for: definitions of proper and strictly proper rules, Savage and Schervish representations (§3.1-3.2, Theorem 3), Table 1 mixing measures, remark on the log score's unboundedness (Example 3).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Bani-Harouni, D., Pellegrini, C., Stangel, P., Özsoy, E., Zaripova, K., Navab, N., Keicher, M. <em>Rewarding Doubt: A Reinforcement Learning Approach to Calibrated Confidence Expression of Large Language Models</em>. arXiv:2503.02623 v6, 28 Feb 2026 (v1 4 Mar 2025; cited by Damani et al. and Wu et al. as Stangel et al.). <a href="https://arxiv.org/abs/2503.02623">https://arxiv.org/abs/2503.02623</a>. Accessed 2026-10-27. <span class="ref-use">Used for: reward based on the logarithmic scoring rule, penalizing over- and under-confidence (abstract only).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Kimi Team (Moonshot AI). <em>Kimi K2: Open Agentic Intelligence</em>. arXiv:2507.20534 v2, 3 Feb 2026. <a href="https://arxiv.org/pdf/2507.20534v2">https://arxiv.org/pdf/2507.20534v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: rubric limitations on hedging and overstated certainty (App. F.3).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Qwen Team. <em>Qwen3 Technical Report</em>. arXiv:2505.09388 v1, 14 May 2025. <a href="https://arxiv.org/pdf/2505.09388v1">https://arxiv.org/pdf/2505.09388v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: CounterFactQA by stage (Table 22, §4.7) and RAG rewards in general RL (§4.4).</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Llama Team, AI @ Meta. <em>The Llama 3 Herd of Models</em>. arXiv:2407.21783 v3, 23 Nov 2024. <a href="https://arxiv.org/pdf/2407.21783v3">https://arxiv.org/pdf/2407.21783v3</a>. Accessed 2026-10-27. <span class="ref-use">Used for: factuality post-training by knowledge probing and refusal data (§4.3.6).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

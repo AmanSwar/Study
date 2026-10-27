@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capability Integration: Mixed RL, Cascade RL, Parameter Merging, and Multi-Teacher On-Policy Distillation (MOPD) · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="How 2026 recipes combine many RL-trained skills into one model: mixed RL, cascade RL, off-policy finetuning and parameter merging versus multi-teacher on-policy distillation (MOPD). Covers the MOPD objective, the Qwen3-30B-A3B and MiMo-V2-Flash evidence, the same-origin teacher requirement, sampled-token versus full-vocabulary distillation (DeepSeek-V4), and the Kimi K3, Nemotron 3 Ultra and GLM-5 recipes.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 22</p>
+  <h1>Capability Integration: Mixed RL, Cascade RL, Parameter Merging, and Multi-Teacher On-Policy Distillation (MOPD)</h1>
+  <p class="lede">Frontier models are now trained as a set of RL specialists (math, instruction following, software engineering, search) that must end up in one set of weights. This module compares the five ways to do that, derives the multi-teacher on-policy distillation objective, reads the one controlled comparison and the frontier reports that use the method, and lays the Kimi K3, DeepSeek-V4, Nemotron 3 Ultra, GLM-5 and DeepSeek-V3.2 recipes side by side. Afterwards you can choose between mixed RL, a cascade and MOPD for a multi-skill target, and say what each costs and where each fails.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>17</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 16</b>, <b>Module 18</b>, <b>Module 21</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 410" role="img" aria-labelledby="f1t"><title id="f1t">Five routes from several domain specialists to one model, each shown with the place where the skills are combined and the signal that carries the gradient</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="105" y="24" text-anchor="middle" class="d-small d-bold d-text-light">Route</text>
+    <text x="355" y="24" text-anchor="middle" class="d-small d-bold d-text-light">Skills are combined in</text>
+    <text x="650" y="24" text-anchor="middle" class="d-small d-bold d-text-light">Signal that carries the gradient</text>
+
+    <rect x="20" y="40" width="170" height="56" rx="8" class="d-block"/><text x="105" y="73" text-anchor="middle" class="d-text-inv d-bold">Mix-RL</text>
+    <path d="M190,68 L230,68" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="230" y="40" width="250" height="56" rx="8" class="d-panel"/><text x="355" y="73" text-anchor="middle">one pooled batch of prompts</text>
+    <path d="M480,68 L520,68" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="520" y="40" width="260" height="56" rx="8" class="d-panel"/><text x="650" y="73" text-anchor="middle">sparse reward per trajectory</text>
+
+    <rect x="20" y="110" width="170" height="56" rx="8" class="d-block"/><text x="105" y="143" text-anchor="middle" class="d-text-inv d-bold">Cascade RL</text>
+    <path d="M190,138 L230,138" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="230" y="110" width="250" height="56" rx="8" class="d-panel"/><text x="355" y="143" text-anchor="middle">time: domains in sequence</text>
+    <path d="M480,138 L520,138" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="520" y="110" width="260" height="56" rx="8" class="d-panel"/><text x="650" y="143" text-anchor="middle">sparse reward per trajectory</text>
+
+    <rect x="20" y="180" width="170" height="56" rx="8" class="d-block"/><text x="105" y="213" text-anchor="middle" class="d-text-inv d-bold">Off-policy finetune</text>
+    <path d="M190,208 L230,208" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="230" y="180" width="250" height="56" rx="8" class="d-panel"/><text x="355" y="213" text-anchor="middle">a fixed set of teacher text</text>
+    <path d="M480,208 L520,208" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="520" y="180" width="260" height="56" rx="8" class="d-panel"/><text x="650" y="213" text-anchor="middle">dense labels, teacher's states</text>
+
+    <rect x="20" y="250" width="170" height="56" rx="8" class="d-block"/><text x="105" y="283" text-anchor="middle" class="d-text-inv d-bold">Parameter merge</text>
+    <path d="M190,278 L230,278" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="230" y="250" width="250" height="56" rx="8" class="d-panel"/><text x="355" y="283" text-anchor="middle">weight space</text>
+    <path d="M480,278 L520,278" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="520" y="250" width="260" height="56" rx="8" class="d-panel"/><text x="650" y="283" text-anchor="middle">none: no gradient step</text>
+
+    <rect x="20" y="320" width="170" height="56" rx="8" class="d-block-accent"/><text x="105" y="353" text-anchor="middle" class="d-text-inv d-bold">MOPD</text>
+    <path d="M190,348 L230,348" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <rect x="230" y="320" width="250" height="56" rx="8" class="d-hl"/><text x="355" y="353" text-anchor="middle" class="d-bold">the student's own rollout</text>
+    <path d="M480,348 L520,348" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <rect x="520" y="320" width="260" height="56" rx="8" class="d-hl"/><text x="650" y="353" text-anchor="middle" class="d-bold">dense teacher log-prob per token</text>
+
+    <text x="20" y="400" class="d-small d-text-light">MOPD is the only route that is dense, on-policy and parallelisable at once (Table 1)</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> Five routes from per-domain specialists to one model, by where the skills are combined and what carries the gradient. The paper that names MOPD frames the contrast as integration in policy space versus weight space or a static dataset space, and scores the routes on three axes: dense optimization, on-policy training, and a parallelisable pipeline<a class="cite" href="#ref-1">1</a> (Table 1 and §1).</figcaption>
+</figure>
+
+<h2 id="integration-problem">1. The integration problem</h2>
+
+<h3 id="integration-problem-why">1.1 Why skills are trained separately</h3>
+<p>Each target skill has its own RL pipeline. The MOPD paper lists them: verifiable-answer RL for mathematics, agent-style RL in executable sandboxes for software engineering, rubric-based RL for instruction following and writing, and web-environment RL for search agents<a class="cite" href="#ref-1">1</a> (§1). The pipelines differ in what a rollout is (one response versus fifty tool turns), how long it takes to verify, and which hyperparameters survive. NVIDIA's Cascade RL paper puts the cost bluntly: cross-domain heterogeneity, including large variation in response length and verification latency, "complicates the RL infrastructure, slows training, and makes training curriculum … and hyperparameter selection challenging"<a class="cite" href="#ref-2">2</a> (abstract). Modules 17 and 18 cover why the rollout shapes differ; this module takes the consequence. If every domain has its own recipe, there are N trained policies and one deliverable, and some operation has to turn N into one.</p>
+
+<h3 id="integration-problem-routes">1.2 Five routes and the failure each one is blamed for</h3>
+<p>The MOPD paper sorts prior work into four families and adds its own<a class="cite" href="#ref-1">1</a>. Table 1 reproduces its three axes (read from the paper's Table 1; the PDF text extraction scrambles the column order, so the symbols were checked against the rendered page) and adds the failure the authors name and where the route appears in the reports used in this module.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> Capability-integration routes. Axes and failure modes are the MOPD authors' framing<a class="cite" href="#ref-1">1</a> (Table 1, §1), not a neutral benchmark; the last column is from the cited reports.</caption>
+  <thead><tr><th>Route</th><th>Dense signal</th><th>On-policy</th><th>Parallel specialists</th><th>Failure named by the MOPD paper</th><th>Appears in</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Mix-RL</td><td>no</td><td>yes</td><td>no</td><td>cross-domain signals interfere ("see-saw"); joint model stays below per-domain teachers</td><td>one RL stage over mixed prompts: DeepSeek-V3.2<a class="cite" href="#ref-3">3</a>; Qwen3's last RL stage<a class="cite" href="#ref-4">4</a></td></tr>
+    <tr><td class="row">Cascade RL</td><td>no</td><td>yes</td><td>no</td><td>earlier skills decay as later stages run; a long run amplifies stability risk</td><td>Nemotron-Cascade<a class="cite" href="#ref-2">2</a>; Qwen3's four stages<a class="cite" href="#ref-4">4</a></td></tr>
+    <tr><td class="row">Off-policy finetune</td><td>yes</td><td>no</td><td>yes</td><td>exposure bias: the student trains on text it would not itself generate</td><td>DeepSeek-V3.2 specialist distillation<a class="cite" href="#ref-3">3</a></td></tr>
+    <tr><td class="row">Parameter merge</td><td>no</td><td>n/a</td><td>yes</td><td>fused model "typically unstable", fails to match every teacher</td><td>task arithmetic<a class="cite" href="#ref-5">5</a>; Llama 3 averages runs of one task<a class="cite" href="#ref-6">6</a></td></tr>
+    <tr><td class="row">MOPD</td><td data-best>yes</td><td data-best>yes</td><td data-best>yes</td><td>same-origin teachers needed (Section 4)</td><td>MiMo-V2-Flash, Kimi K3, Nemotron 3 Ultra, DeepSeek-V4 (Section 6)</td></tr>
+  </tbody>
+</table>
+
+<p>Three of the attributions in that last column are the MOPD paper's own: it cites the Qwen3 report for Mix-RL, Nemotron-Cascade for Cascade RL, and DeepSeek-V3.2 for off-policy finetuning<a class="cite" href="#ref-1">1</a>. They are fair labels for the shape of each pipeline but not for everything those reports do. Qwen3's flagship recipe is four sequential stages whose last RL stage covers more than 20 task types<a class="cite" href="#ref-4">4</a> (§4.4), so it is a cascade ending in a mixed stage. DeepSeek-V3.2 trains specialists for six domains (plus writing and general question answering), distils their outputs into data, then runs one mixed GRPO stage that merges reasoning, agent and human-alignment training<a class="cite" href="#ref-3">3</a> (§3). Section 6 returns to that report, because DeepSeek-V4 reversed it.</p>
+
+<p>Parameter merging deserves one line of algebra, since it is the route that needs no training. A task vector is the fine-tuned weights minus the pre-trained weights, and task vectors can be combined by addition<a class="cite" href="#ref-5">5</a> (abstract). For specialists \(\theta_1,\dots,\theta_N\) fine-tuned from a shared checkpoint \(\theta_0\):</p>
+$$\theta_{\text{merged}}=\theta_0+\sum_{i=1}^{N}\lambda_i(\theta_i-\theta_0),\qquad \lambda_i=\tfrac1N\;\Rightarrow\;\theta_{\text{merged}}=\tfrac1N\sum_i\theta_i .$$
+<p>Plain weight averaging is task arithmetic with equal coefficients, so the merge baselines in the MOPD comparison (Section 3) are two settings of one family, and the coefficients are the knob. Merging has a long production record when the inputs are runs of the same task: Llama 3 averages "models obtained from experiments using various versions of data or hyperparameters" at the reward-model, SFT and DPO stages<a class="cite" href="#ref-6">6</a> (§4.1.5). Merging specialists that moved in different directions under RL is a different regime, and the evidence in this module is that it is the least reliable one.</p>
+
+<h3 id="integration-problem-qwen3">1.3 The see-saw in a published table</h3>
+<p>The decay that Table 1 attributes to sequential training is visible in a primary source. Qwen3-32B passes through reasoning RL (stage 2), thinking-mode fusion (stage 3) and general RL (stage 4); the report tabulates the thinking-mode scores after each<a class="cite" href="#ref-4">4</a> (Table 22). General benchmarks rise and the two hardest reasoning benchmarks fall.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Qwen3-32B, thinking mode, scores (%) after each post-training stage<a class="cite" href="#ref-4">4</a> (Table 22). The "net" column is derived: stage 4 minus stage 2. The authors conjecture the drops come from training on a broader range of general tasks and "choose to accept this performance trade-off".</caption>
+  <thead><tr><th>Benchmark</th><th class="num">Stage 2: reasoning RL</th><th class="num">Stage 3: fusion</th><th class="num">Stage 4: general RL</th><th class="num">Net (points)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">AIME'24</td><td class="num">83.8</td><td class="num">81.9</td><td class="num" data-worst>81.4</td><td class="num" data-worst>-2.4</td></tr>
+    <tr><td class="row">LiveCodeBench v5</td><td class="num">68.4</td><td class="num">67.2</td><td class="num" data-worst>65.7</td><td class="num" data-worst>-2.7</td></tr>
+    <tr><td class="row">LiveBench 2024-11-25</td><td class="num">68.6</td><td class="num">70.9</td><td class="num" data-best>74.9</td><td class="num" data-best>+6.3</td></tr>
+    <tr><td class="row">Arena-Hard</td><td class="num">86.8</td><td class="num">89.4</td><td class="num" data-best>93.8</td><td class="num" data-best>+7.0</td></tr>
+  </tbody>
+</table>
+<p>The drops are small, and stage 3 is supervised fusion rather than RL, so this is a weaker test of "cascade RL" than the MOPD paper's own (Section 3). What it shows is that Qwen3's authors accepted a measured regression on AIME'24 to buy breadth, which is the trade the integration literature is trying to remove.</p>
+
+<h2 id="mopd-mechanism">2. MOPD: the mechanism</h2>
+
+<h3 id="mopd-mechanism-stages">2.1 Three stages, one initialisation, routing by label</h3>
+<p>The MOPD paper structures post-training as three stages<a class="cite" href="#ref-1">1</a> (§3.1). Stage 1 is general SFT on a corpus covering every target capability. Stage 2 trains one expert \(\pi_{\phi_d}\) per domain \(d\), each started from the Stage-1 checkpoint and each using "the RL recipe most natural for its domain"; the runs are independent and fully parallel. Stage 3 starts the student from the same Stage-1 checkpoint, freezes the experts as the teacher group, and trains on a multi-domain prompt set. Routing is a lookup: each trajectory is "dispatched to its corresponding domain teacher according to the task's domain". The paper describes no learned router and no mixture over teachers inside a prompt. Figure 2 steps through one iteration.</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 330" role="img" aria-label="One MOPD iteration: prompts sampled from a domain mixture, student rollout, routing to the frozen domain teacher for prefill, per-token log-ratio advantages, and a policy-gradient update of the student">
+      <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+      <rect x="10" y="10" width="780" height="310" rx="10" class="d-panel"/>
+      <rect x="30" y="50" width="150" height="116" rx="8" class="d-surface"/>
+      <text x="105" y="70" text-anchor="middle" class="d-bold">Prompt pool</text>
+      <rect x="44" y="82" width="122" height="22" rx="4" class="d-fill-blue-soft"/><text x="105" y="98" text-anchor="middle" class="d-small d-mono">math 35%</text>
+      <rect x="44" y="108" width="122" height="22" rx="4" class="d-fill-blue-soft"/><text x="105" y="124" text-anchor="middle" class="d-small d-mono">IF 35%</text>
+      <rect x="44" y="134" width="122" height="22" rx="4" class="d-fill-blue-soft"/><text x="105" y="150" text-anchor="middle" class="d-small d-mono">SWE 30%</text>
+      <rect x="300" y="50" width="170" height="50" rx="8" class="d-block"/><text x="385" y="80" text-anchor="middle" class="d-text-inv d-bold">Student (SFT init)</text>
+      <rect x="590" y="50" width="190" height="150" rx="8" class="d-surface"/>
+      <text x="685" y="70" text-anchor="middle" class="d-bold">Frozen teachers</text>
+      <rect x="604" y="82" width="162" height="30" rx="6" class="d-block-2"/><text x="685" y="102" text-anchor="middle" class="d-text-inv d-bold">math teacher</text>
+      <rect x="604" y="120" width="162" height="30" rx="6" class="d-block-2"/><text x="685" y="140" text-anchor="middle" class="d-text-inv d-bold">IF teacher</text>
+      <rect x="604" y="158" width="162" height="30" rx="6" class="d-block-2"/><text x="685" y="178" text-anchor="middle" class="d-text-inv d-bold">SWE teacher</text>
+      <rect x="300" y="262" width="170" height="44" rx="8" class="d-block-muted"/><text x="385" y="289" text-anchor="middle" class="d-text-inv d-bold">RL trainer</text>
+
+      <g data-step="1">
+        <path d="M180,75 L298,75" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <text x="240" y="66" text-anchor="middle" class="d-small d-mono">x, domain d</text>
+      </g>
+      <g data-step="2">
+        <path d="M385,100 L385,118" class="d-arrow" marker-end="url(#f2-arr)"/>
+        <rect x="300" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/><rect x="317" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/><rect x="334" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/><rect x="351" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/><rect x="368" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/><rect x="385" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/><rect x="402" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/><rect x="419" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/><rect x="436" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/><rect x="453" y="120" width="17" height="22" class="d-fill-blue-soft d-outline"/>
+        <text x="385" y="158" text-anchor="middle" class="d-small d-mono">y1 … yn sampled from the student</text>
+      </g>
+      <g data-step="3">
+        <rect x="604" y="158" width="162" height="30" rx="6" class="d-block-accent"/><text x="685" y="178" text-anchor="middle" class="d-text-inv d-bold">SWE teacher</text>
+        <path d="M470,131 L602,170" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <text x="540" y="136" class="d-small d-mono">prefill, route by d</text>
+        <text x="685" y="222" text-anchor="middle" class="d-small d-mono">log pT(y_t) at every t</text>
+      </g>
+      <g data-step="4">
+        <path d="M300,205 L470,205" class="d-axis"/>
+        <rect x="304" y="194" width="9" height="11" class="d-fill-green"/><rect x="321" y="205" width="9" height="14" class="d-fill-red"/><rect x="338" y="197" width="9" height="8" class="d-fill-green"/><rect x="355" y="189" width="9" height="16" class="d-fill-green"/><rect x="372" y="205" width="9" height="6" class="d-fill-red"/><rect x="389" y="201" width="9" height="4" class="d-fill-green"/><rect x="406" y="205" width="9" height="18" class="d-fill-red"/><rect x="423" y="193" width="9" height="12" class="d-fill-green"/><rect x="440" y="198" width="9" height="7" class="d-fill-green"/><rect x="457" y="205" width="9" height="9" class="d-fill-red"/>
+        <text x="385" y="242" text-anchor="middle" class="d-small d-mono">a_t = clip(log pT − log pθ), illustrative</text>
+      </g>
+      <g data-step="5">
+        <path d="M385,248 L385,260" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <path d="M300,284 L250,284 L250,90 L298,90" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <text x="484" y="288" class="d-small d-mono">θ ← θ + η Σ_t a_t ∇ log πθ(y_t)</text>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Sample prompts.</b> A batch comes from the multi-domain prompt set at a fixed domain ratio: math 0.35, instruction following 0.35, software engineering 0.30 in the Qwen3-30B-A3B runs<a class="cite" href="#ref-1">1</a> (Appendix A).</li>
+    <li><b>Student rolls out.</b> The student generates one trajectory per prompt (\(N=1\)) from its own distribution and records its per-token probabilities.</li>
+    <li><b>Route and prefill.</b> The trajectory goes to the frozen teacher for the prompt's domain, which prefills it and returns its log-probability at every position. The teacher never decodes.</li>
+    <li><b>Per-token advantage.</b> The advantage at position \(t\) is the teacher-minus-student log-probability of the sampled token, stop-gradient, clipped to \(\pm A_{\max}\). The bar heights drawn here are illustrative, not measured.</li>
+    <li><b>Update.</b> An ordinary policy-gradient step with those advantages; the trainer is the existing PPO or GRPO stack with the advantage computation replaced<a class="cite" href="#ref-1">1</a> (§3.2.1).</li>
+  </ol>
+</div>
+
+<h3 id="mopd-mechanism-objective">2.2 The objective, and why the advantage is a log-ratio</h3>
+<p>Write the prefix as \(s_t=(x,y_{\lt t})\). The per-token reverse KL to the routed teacher, averaged over the student's own trajectory, is</p>
+$$\mathcal L_{\text{rev-KL}}=\mathbb E_{x,\;y\sim\pi_\theta}\Big[\tfrac1{|y|}\sum_{t}\sum_{v}\pi_\theta(v\mid s_t)\log\frac{\pi_\theta(v\mid s_t)}{\pi_{\phi_d}(v\mid s_t)}\Big]$$
+<p>(the paper's Eq. 1<a class="cite" href="#ref-1">1</a>). Differentiate one token's term at a fixed prefix. Because \(\sum_v\nabla\pi_\theta(v)=0\), the second term of the product rule vanishes and</p>
+$$\nabla_\theta\sum_v\pi_\theta(v)\log\frac{\pi_\theta(v)}{\pi_T(v)}=-\,\mathbb E_{v\sim\pi_\theta}\Big[\log\frac{\pi_T(v)}{\pi_\theta(v)}\;\nabla_\theta\log\pi_\theta(v)\Big].$$
+<p>That is a policy-gradient step whose per-token advantage is \(\hat A_t=\mathrm{sg}[\log\pi_T(y_t)-\log\pi_\theta(y_t)]\), which is the paper's Eq. 2 and 3<a class="cite" href="#ref-1">1</a>. The final loss clips the advantage to \([-A_{\max},+A_{\max}]\) "for training stability" (Eq. 4), with a default \(A_{\max}=5\) in the Qwen3-30B-A3B experiments (Appendix A). A clip at 5 in log space is a probability ratio of \(e^5\approx148\), so it only touches tokens where teacher and student disagree by about two orders of magnitude. Two properties follow from the form. First, the sampled-token advantage is the negative of the \(k_1\) estimator of Module 6, so the cheap estimator is unbiased for the KL value and, as the display shows, for its gradient at a fixed prefix. Second, the estimator keeps only the token-level term and has no return-to-go sum over later tokens, the "discount zero" choice that Module 21 examines. The template (student samples, teacher grades each token) is the one Thinking Machines' on-policy distillation post describes<a class="cite" href="#ref-7">7</a>; what MOPD adds is the routing in Stage 3 and, more importantly, the way the teachers are produced in Stage 2.</p>
+
+<h3 id="mopd-mechanism-variants">2.3 What the reports changed</h3>
+<p>Every deployment keeps the sampled log-ratio but wraps it differently. Table 3 lists the variants; Module 12 covers the clip and ratio machinery and Module 14 the importance-sampling corrections.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 3.</b> The distillation signal as each report defines it. "Student" and "teacher" log-probabilities are at the sampled token unless stated.</caption>
+  <thead><tr><th>Report</th><th>Signal</th><th>Stabilisers</th><th>Batch and rollout</th></tr></thead>
+  <tbody>
+    <tr><td class="row">MOPD paper, Qwen3-30B-A3B<a class="cite" href="#ref-1">1</a></td><td>\(\mathrm{sg}[\log\pi_T-\log\pi_\theta]\) (Eq. 3); alternative top-\(k\) form with a bias-correcting term (Eq. 5)</td><td>two-sided clip \(\pm A_{\max}\), default 5; top-\(k\) with \(k=64\)</td><td>batch 2,048, \(N=1\), no dynamic sampling (App. A)</td></tr>
+    <tr><td class="row">MiMo-V2-Flash<a class="cite" href="#ref-8">8</a></td><td>same log-ratio plus \(\alpha\hat A_{\text{ORM}}\), a GRPO outcome-reward advantage (Eq. 9)</td><td>training-inference importance weight, zeroed outside \([\epsilon_{\text{low}},\epsilon_{\text{high}}]\) (Eq. 7, 8)</td><td>not stated in the section read (§4.4)</td></tr>
+    <tr><td class="row">Kimi K3<a class="cite" href="#ref-9">9</a></td><td>\(\mathrm{clip}(\mathrm{sg}[\log\pi^{(d,e)}_{\text{teacher}}-\log\pi_\theta(\cdot\mid e,\dots)],\pm R_{\max})\) (Eq. 15); student sees effort \(e\)</td><td>clip \(R_{\max}\) (value not given)</td><td>not stated (§4.1.3)</td></tr>
+    <tr><td class="row">Nemotron 3 Ultra<a class="cite" href="#ref-10">10</a></td><td>\(\mathrm{sg}[\ell^{T}-\ell^{\text{prox}}]\), then PPO clip on \(\pi_\theta/\pi_{\text{prox}}\) (Eq. 2, 3)</td><td>behaviour-to-proximal correction \(c_t\), IcePop mask, domain weights \(\lambda_i\)</td><td>1,024 prompts, 1 rollout each; up to 192K tokens (§3.3.1)</td></tr>
+    <tr><td class="row">GLM-5<a class="cite" href="#ref-11">11</a></td><td>\(\mathrm{sg}[\log\pi^{\text{infer}}_{\text{teacher}}-\log\pi^{\text{train}}_\theta]\) replaces the GRPO advantage (Eq. 2)</td><td>GRPO loss with IcePop mask carried over from Eq. 1</td><td>group size 1, batch 1,024 (§3.5)</td></tr>
+    <tr><td class="row">DeepSeek-V4<a class="cite" href="#ref-12">12</a></td><td>\(\sum_i w_i D_{\mathrm{KL}}(\pi_\theta\Vert\pi_{E_i})\), full-vocabulary (Eq. 29)</td><td>none stated; exact KL kernel</td><td>not stated (§5.1.2)</td></tr>
+  </tbody>
+</table>
+
+<p>Two entries change the problem rather than the details. MiMo-V2-Flash adds the outcome-reward advantage to the teacher term by default<a class="cite" href="#ref-8">8</a> (§4.4), so the student is pulled toward the teacher and toward verified correctness at once; its Figure 6 compares ORM-only RL, MOPD without outcome rewards, and MOPD on AIME 2025 and LiveCodeBench, and the report says MOPD "matches or exceeds the strongest teacher in most domains" without tabulating the three curves. GLM-5 and Nemotron set the group size or the rollouts per prompt to one, because "it is no longer necessary to maintain a large group of samples per prompt to estimate advantages; the advantage is computed directly from the gap with the teacher models instead"<a class="cite" href="#ref-11">11</a> (§3.5). That is a structural saving against GRPO (Module 9): one rollout per prompt instead of \(G\).</p>
+
+<h3 id="mopd-mechanism-infra">2.4 Where the teacher runs</h3>
+<p>The only new operation in Stage 3 is the teacher prefill. The MOPD authors note that it "has the same nature as reward computation in RL", so they deploy each domain teacher as a stand-alone prefill service outside the trainer<a class="cite" href="#ref-1">1</a> (§3.3). As soon as one student sequence finishes, the trainer fires an asynchronous request; the service returns per-token log-probabilities, and because prefill overlaps with other sequences still being sampled, "the teacher cost is essentially hidden behind student sampling" and contributed "nearly no measurable wall-clock overhead" in their deployments. Nemotron 3 Ultra pipelines rollout workers, teacher-scoring workers and learner workers the same way<a class="cite" href="#ref-10">10</a> (§3.3.1), and GLM-5 fetches the teachers' logits through its inference engine<a class="cite" href="#ref-11">11</a> (§3.5). The hiding claim depends on the teacher service keeping pace with sampling; Section 5 shows the cost when there are more than ten teachers, each potentially with trillions of parameters. How the trainer, rollout engines and teacher services are wired is System Design Modules 36 to 38.</p>
+
+<h2 id="mopd-evidence">3. The evidence: Qwen3-30B-A3B and MiMo-V2-Flash</h2>
+
+<h3 id="mopd-evidence-setup">3.1 The controlled comparison and its metric</h3>
+<p>The MOPD paper compares all five routes from one Stage-1 SFT checkpoint of Qwen3-30B-A3B-Base on three domains: math (AIME25 and AIME26, 32 samples per question), instruction following (IFBench and IFEval, one sample each) and software engineering (SWE-bench Verified, one run per task), at temperature 1.0 with no top-\(p\) or top-\(k\)<a class="cite" href="#ref-1">1</a> (§4.1, Appendix B). The specialists use GRPO with dynamic sampling at learning rate \(3\times10^{-6}\): batch size 144 with \(N=8\) rollouts per prompt for math and IF (about 175K sequences), batch size 80 with \(N=8\) for SWE (about 150K sequences). Cascade RL runs them in the order IF, math, SWE. Mix-RL uses batch 256, \(N=8\) and a 0.35:0.35:0.3 mix (Appendix A).</p>
+<p>Raw accuracy over-weights the domains with more headroom, so the paper normalises: \(\tilde s_d=(s_d-s^{\text{student}}_d)/(s^{\text{teacher}}_d-s^{\text{student}}_d)\), which is 0 at the Stage-1 student and 1 at the per-domain specialist, and reports the uniform mean over domains<a class="cite" href="#ref-1">1</a> (§4.1).</p>
+<details class="more"><summary>Reproducing the headline 0.9373 from the paper's Table 2 (derived)</summary>
+<p>The paper does not say how a domain's accuracy is formed from its two benchmarks. Averaging them reproduces every printed score in that table, so that is what this module uses. Student domain accuracies: math \((45.42+54.48)/2=49.95\), IF \((42.69+84.17)/2=63.43\), SWE \(35.80\). Teachers: \(59.22\), \(86.95\), \(51.20\). MOPD: \((51.46+65.31)/2=58.385\), \((77.89+93.84)/2=85.865\), \(50.40\). Then</p>
+$$\tilde s_{\text{math}}=\tfrac{58.385-49.95}{59.22-49.95}=0.910,\quad \tilde s_{\text{IF}}=\tfrac{85.865-63.43}{86.95-63.43}=0.954,\quad \tilde s_{\text{SWE}}=\tfrac{50.40-35.80}{51.20-35.80}=0.948,$$
+<p>mean \(0.937\), as printed. The same arithmetic gives 0.8818 (Mix-RL), 0.7752 (Cascade), 0.8241 (off-policy finetune), 0.3280 (averaged merge) and 0.8574 (task-arithmetic merge). Note that the SWE term rests on one run of one benchmark: a 0.8-point gap there is \(0.8/15.4\approx5\%\) of the SWE headroom.</p>
+</details>
+
+<figure class="fig">
+<svg viewBox="0 0 800 392" role="img" aria-labelledby="f3t"><title id="f3t">Grouped bars of the per-domain normalised score on Qwen3-30B-A3B for six integration methods across math, instruction following and software engineering</title>
+<text x="70" y="22" class="d-small d-text-light">Normalised score per domain: 0 = Stage-1 SFT student, 1 = per-domain RL teacher</text>
+<line x1="70" y1="300.0" x2="780" y2="300.0" class="d-grid"/><text x="62" y="304.0" text-anchor="end" class="d-small d-mono">0.00</text>
+<line x1="70" y1="245.5" x2="780" y2="245.5" class="d-grid"/><text x="62" y="249.5" text-anchor="end" class="d-small d-mono">0.25</text>
+<line x1="70" y1="190.9" x2="780" y2="190.9" class="d-grid"/><text x="62" y="194.9" text-anchor="end" class="d-small d-mono">0.50</text>
+<line x1="70" y1="136.4" x2="780" y2="136.4" class="d-grid"/><text x="62" y="140.4" text-anchor="end" class="d-small d-mono">0.75</text>
+<line x1="70" y1="81.8" x2="780" y2="81.8" class="d-axis d-dashed"/><text x="62" y="85.8" text-anchor="end" class="d-small d-mono">1.00</text>
+<line x1="70" y1="50" x2="70" y2="300" class="d-axis"/><line x1="70" y1="300" x2="780" y2="300" class="d-axis"/>
+<rect x="92" y="105.1" width="26" height="194.9" class="d-fill-blue"/>
+<text x="105.0" y="101.1" text-anchor="middle" class="d-small d-mono">0.89</text>
+<rect x="121" y="176.2" width="26" height="123.8" class="d-fill-cyan"/>
+<text x="134.0" y="172.2" text-anchor="middle" class="d-small d-mono">0.57</text>
+<rect x="150" y="122.3" width="26" height="177.7" class="d-fill-green"/>
+<text x="163.0" y="118.3" text-anchor="middle" class="d-small d-mono">0.81</text>
+<rect x="179" y="211.9" width="26" height="88.1" class="d-fill-red"/>
+<text x="192.0" y="207.9" text-anchor="middle" class="d-small d-mono">0.40</text>
+<rect x="208" y="141.8" width="26" height="158.2" class="d-fill-amber"/>
+<text x="221.0" y="137.8" text-anchor="middle" class="d-small d-mono">0.72</text>
+<rect x="237" y="101.5" width="26" height="198.5" class="d-fill-orange"/>
+<text x="250.0" y="97.5" text-anchor="middle" class="d-small d-mono">0.91</text>
+<text x="177.5" y="318" text-anchor="middle" class="d-bold">Math</text>
+<rect x="328" y="101.9" width="26" height="198.1" class="d-fill-blue"/>
+<text x="341.0" y="97.9" text-anchor="middle" class="d-small d-mono">0.91</text>
+<rect x="357" y="86.4" width="26" height="213.6" class="d-fill-cyan"/>
+<text x="370.0" y="82.4" text-anchor="middle" class="d-small d-mono">0.98</text>
+<rect x="386" y="80.0" width="26" height="220.0" class="d-fill-green"/>
+<text x="399.0" y="76.0" text-anchor="middle" class="d-small d-mono">1.01</text>
+<rect x="415" y="227.3" width="26" height="72.7" class="d-fill-red"/>
+<text x="428.0" y="223.3" text-anchor="middle" class="d-small d-mono">0.33</text>
+<rect x="444" y="81.2" width="26" height="218.8" class="d-fill-amber"/>
+<text x="457.0" y="77.2" text-anchor="middle" class="d-small d-mono">1.00</text>
+<rect x="473" y="91.9" width="26" height="208.1" class="d-fill-orange"/>
+<text x="486.0" y="87.9" text-anchor="middle" class="d-small d-mono">0.95</text>
+<text x="413.5" y="318" text-anchor="middle" class="d-bold">Instruction following</text>
+<rect x="564" y="115.8" width="26" height="184.2" class="d-fill-blue"/>
+<text x="577.0" y="111.8" text-anchor="middle" class="d-small d-mono">0.84</text>
+<rect x="593" y="130.0" width="26" height="170.0" class="d-fill-cyan"/>
+<text x="606.0" y="126.0" text-anchor="middle" class="d-small d-mono">0.78</text>
+<rect x="622" y="158.3" width="26" height="141.7" class="d-fill-green"/>
+<text x="635.0" y="154.3" text-anchor="middle" class="d-small d-mono">0.65</text>
+<rect x="651" y="246.2" width="26" height="53.8" class="d-fill-red"/>
+<text x="664.0" y="242.2" text-anchor="middle" class="d-small d-mono">0.25</text>
+<rect x="680" y="115.8" width="26" height="184.2" class="d-fill-amber"/>
+<text x="693.0" y="111.8" text-anchor="middle" class="d-small d-mono">0.84</text>
+<rect x="709" y="93.2" width="26" height="206.8" class="d-fill-orange"/>
+<text x="722.0" y="89.2" text-anchor="middle" class="d-small d-mono">0.95</text>
+<text x="649.5" y="318" text-anchor="middle" class="d-bold">Software engineering</text>
+<rect x="90" y="335" width="14" height="14" class="d-fill-blue"/><text x="112" y="346" class="d-small">Mix-RL: mean 0.882</text>
+<rect x="340" y="335" width="14" height="14" class="d-fill-cyan"/><text x="362" y="346" class="d-small">Cascade RL: mean 0.775</text>
+<rect x="590" y="335" width="14" height="14" class="d-fill-green"/><text x="612" y="346" class="d-small">Off-policy FT: mean 0.824</text>
+<rect x="90" y="357" width="14" height="14" class="d-fill-red"/><text x="112" y="368" class="d-small">Merge (avg): mean 0.328</text>
+<rect x="340" y="357" width="14" height="14" class="d-fill-amber"/><text x="362" y="368" class="d-small">Merge (task arith.): mean 0.857</text>
+<rect x="590" y="357" width="14" height="14" class="d-fill-orange"/><text x="612" y="368" class="d-small">MOPD: mean 0.937</text>
+</svg>
+  <figcaption><b>Figure 3.</b> Per-domain normalised score on Qwen3-30B-A3B for the five routes (two merge variants). Derived from the per-benchmark accuracies in Table 2 of the MOPD paper<a class="cite" href="#ref-1">1</a> by averaging each domain's benchmarks; the dashed line is the specialist teacher. Legend means match the printed Norm. score column. MOPD is the flattest profile (0.91 to 0.95); cascade RL swings from 0.57 (math) to 0.98 (IF).</figcaption>
+</figure>
+
+<h3 id="mopd-evidence-reading">3.2 What the comparison shows, and what it does not</h3>
+<p>The authors read four things off the paper's Table 2 and Figure 2<a class="cite" href="#ref-1">1</a> (§4.2). Mix-RL is the most balanced baseline (per-domain range 0.064) but still trails MOPD by 5.5 points overall, 0.882 against 0.937. Cascade RL in the order IF, math, SWE closes 98% of the IF headroom first, then only 57% of the math headroom, and the training curves show math accuracy falling during the SWE stage; the paper reads this as cross-domain interference and decay. Off-policy finetuning beats the IF teacher (1.01) yet closes only 65% of SWE. Parameter merging is "highly sensitive to the merging recipe": averaging gives 0.328, task arithmetic recovers to 0.857 but closes only 73% of math. MOPD's three per-domain scores sit in 0.91 to 0.95 and the authors report closing "91–95% of the student–teacher headroom on every domain".</p>
+<p>Two limits matter before anyone treats this as settled. First, the sample-efficiency claim is about the integration stage alone: MOPD reaches the teacher-level plateau within about 25K IF samples and about 30K SWE samples, where Mix-RL "requires the full 150–180K sample budget in each domain"<a class="cite" href="#ref-1">1</a> (§4.2). The three specialists were trained first, on roughly 175K, 175K and 150K sequences (Appendix A), about 500K in total (derived). If the paper's "samples" and "sequences" are comparable units, the specialists alone cost about what the whole Mix-RL run did, and MOPD's student stage sits on top. The paper reports no total compute, so the defensible claims are that the integration stage is cheap and that the specialists can be built in parallel, not that MOPD uses fewer rollouts end to end. Second, every number is the authors' own, from single runs with no intervals; the gaps of one or two points on IF and SWE in the paper's Table 2 are inside what a single run can move (Section 3.3 gives a scale).</p>
+
+<h3 id="mopd-evidence-mimo">3.3 MiMo-V2-Flash: the frontier deployment</h3>
+<p>The same recipe was applied to MiMo-V2-Flash, a 309B-parameter, 15B-active mixture-of-experts model<a class="cite" href="#ref-8">8</a> (abstract), with teachers for math, code, instruction following, software engineering and tool use<a class="cite" href="#ref-1">1</a> (§4.3). The MiMo report's own table is more complete than the MOPD paper's seven-column subset, and it tags what kind of model the "best teacher" is.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> MiMo-V2-Flash before and after MOPD<a class="cite" href="#ref-8">8</a> (Table 7). "Best teacher" is the strongest single teacher per benchmark; "Self" means the pre-MOPD student itself. The last column, student after minus best teacher, is as printed.</caption>
+  <thead><tr><th>Benchmark</th><th class="num">Student before (%)</th><th>Best teacher</th><th class="num">Teacher (%)</th><th class="num">Student after (%)</th><th class="num">After minus teacher (points)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">AIME 2025</td><td class="num">89.3</td><td>RL</td><td class="num">93.9</td><td class="num">94.1</td><td class="num">+0.2</td></tr>
+    <tr><td class="row">HMMT Feb. 2025</td><td class="num">76.9</td><td>RL</td><td class="num">82.6</td><td class="num">84.4</td><td class="num" data-best>+1.8</td></tr>
+    <tr><td class="row">LiveCodeBench</td><td class="num">77.5</td><td>RL</td><td class="num">82.6</td><td class="num">83.2</td><td class="num">+0.6</td></tr>
+    <tr><td class="row">MMLU-Pro</td><td class="num">84.7</td><td>Self</td><td class="num">84.7</td><td class="num">84.9</td><td class="num">+0.2</td></tr>
+    <tr><td class="row">GPQA-Diamond</td><td class="num">84.9</td><td>Self</td><td class="num">84.9</td><td class="num">84.3</td><td class="num">-0.6</td></tr>
+    <tr><td class="row">HLE (no tools)</td><td class="num">21.2</td><td>Self</td><td class="num">21.2</td><td class="num">22.1</td><td class="num">+0.9</td></tr>
+    <tr><td class="row">Arena-Hard (hard prompt)</td><td class="num">50.0</td><td>Self</td><td class="num">50.0</td><td class="num">54.1</td><td class="num" data-best>+4.1</td></tr>
+    <tr><td class="row">Arena-Hard (creative writing)</td><td class="num">90.1</td><td>Self</td><td class="num">90.1</td><td class="num">86.2</td><td class="num" data-worst>-3.9</td></tr>
+    <tr><td class="row">SWE-Bench Verified</td><td class="num">67.8</td><td>RL</td><td class="num">74.2</td><td class="num">73.4</td><td class="num">-0.8</td></tr>
+    <tr><td class="row">Tau2-Bench</td><td class="num">75.9</td><td>RL</td><td class="num">79.6</td><td class="num">80.3</td><td class="num">+0.7</td></tr>
+    <tr><td class="row">Tau2-Bench (Telecom)</td><td class="num">92.7</td><td>RL</td><td class="num">95.0</td><td class="num">95.3</td><td class="num">+0.3</td></tr>
+    <tr><td class="row">BrowseComp</td><td class="num">42.5</td><td>SFT</td><td class="num">51.7</td><td class="num">45.4</td><td class="num" data-worst>-6.3</td></tr>
+  </tbody>
+</table>
+
+<p>Read the table for what it says about the mechanism. On the six benchmarks with RL teachers, the student ends at most 0.8 points below the teacher and above it on five of the six: the integration stage works when the teacher is an RL specialist trained from the student's own checkpoint. On the five rows where the "teacher" is the student's own pre-MOPD checkpoint, the target is the student's old behaviour, yet the scores moved by between -3.9 and +4.1 points. That is a drift scale (derived from the table, not stated by the authors): one-point gaps in this table should not be read as signal, given single runs and the outcome-reward term MiMo adds to the loss (Table 3). The one large miss, BrowseComp, is a case where the best teacher was an SFT model and the student gained 2.9 points over its pre-MOPD self but stayed 6.3 below the teacher. The MOPD paper's own summary of the same run names two regressions, IFBench (-2.2) and SWE-Bench Verified (-0.8), "modest relative to the gains on the remaining benchmarks"<a class="cite" href="#ref-1">1</a> (§4.3); its table is a seven-column subset that adds an IFBench column (student 55.4, teacher 68.9, MOPD 66.7) absent from the MiMo report's Table 7 and omits the MMLU-Pro, GPQA, HLE, Arena-Hard and BrowseComp rows.</p>
+
+<h2 id="teacher-support">4. Same-origin teachers, and what MOPD cannot import</h2>
+
+<h3 id="teacher-support-external">4.1 A stronger teacher that breaks the run</h3>
+<p>The obvious variant is to use the best available teacher rather than a specialist derived from the student. The MOPD authors test it directly: in the math domain they replace the Qwen3-30B-A3B math teacher with Qwen3-235B-A22B, "a significantly larger model with stronger math capability", and keep everything else fixed<a class="cite" href="#ref-1">1</a> (§4.4.2). Math gets worse under both loss forms.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> Same-origin versus external math teacher, Qwen3-30B-A3B student, accuracy (%) and normalised score<a class="cite" href="#ref-1">1</a> (the paper's Table 4; the student row is from its Table 2). "PG" is the sampled-token policy-gradient loss; "top-k" uses \(k=64\). The IF and SWE teachers are unchanged in every row.</caption>
+  <thead><tr><th>Math teacher</th><th>Loss</th><th class="num">AIME25</th><th class="num">AIME26</th><th class="num">IFBench</th><th class="num">IFEval</th><th class="num">SWE-bench Verified</th><th class="num">Norm. score</th></tr></thead>
+  <tbody>
+    <tr><td class="row">none (Stage-1 student)</td><td>n/a</td><td class="num">45.42</td><td class="num">54.48</td><td class="num">42.69</td><td class="num">84.17</td><td class="num">35.80</td><td class="num">0.0000</td></tr>
+    <tr><td class="row">same-origin RL teacher</td><td>PG</td><td class="num" data-best>51.46</td><td class="num" data-best>65.31</td><td class="num">77.89</td><td class="num">93.84</td><td class="num">50.40</td><td class="num" data-best>0.9373</td></tr>
+    <tr><td class="row">same-origin RL teacher</td><td>top-k</td><td class="num">51.77</td><td class="num">64.79</td><td class="num">75.85</td><td class="num">93.07</td><td class="num">50.20</td><td class="num">0.9093</td></tr>
+    <tr><td class="row">Qwen3-235B-A22B</td><td>PG</td><td class="num" data-worst>45.63</td><td class="num" data-worst>51.56</td><td class="num">79.25</td><td class="num">93.99</td><td class="num">50.60</td><td class="num" data-worst>0.6003</td></tr>
+    <tr><td class="row">Qwen3-235B-A22B</td><td>top-k</td><td class="num" data-worst>0.94</td><td class="num" data-worst>0.42</td><td class="num">72.96</td><td class="num">88.97</td><td class="num">51.20</td><td class="num" data-worst>-1.1898</td></tr>
+  </tbody>
+</table>
+
+<p>The 235B teacher with the policy-gradient loss leaves AIME25 at 45.63, which is 0.21 above the SFT student's 45.42, and drops AIME26 to 51.56, below the student's 54.48. The paper's Figure 3 gives the mechanism<a class="cite" href="#ref-1">1</a> (§4.4.2). The initial per-token student-teacher KL is about 0.19 with the external teacher against about 0.04 for the same-origin one, roughly five times as large. Under the policy-gradient loss, math accuracy "degrades progressively while entropy contracts from 0.30 to 0.21": the student "receives predominantly punitive gradient signal from the teacher's low-probability region" and narrows toward one mode. Under top-\(k\) the run diverges "around step 18" with wild oscillation in KL and entropy. With the same-origin teacher, KL falls monotonically from its low start and entropy holds near 0.30. The authors' conclusion is that same-origin teachers (each produced by domain RL from the very checkpoint that initialises the student) give "low initial KL divergence and smooth, stable optimization" (§3.1).</p>
+<p>Two independent abstracts point the same way. Li et al. state that on-policy distillation works when "the student and teacher should share compatible thinking patterns" and "the teacher must offer genuinely new capabilities beyond what the student has seen during training"<a class="cite" href="#ref-13">13</a> (abstract; the full paper was not read). Ko et al. say the method "remains prone to instability and negative transfer", frame the teacher-student log-likelihood ratio as a token reward, and stabilise it with mixture-based reward clipping<a class="cite" href="#ref-14">14</a> (abstract). The advantage clip of Section 2 (\(A_{\max}=5\) in the MOPD paper) is related in spirit: both bound how hard a single token's teacher score can push the student.</p>
+
+<h3 id="teacher-support-warmup">4.2 When teachers are not same-origin: Nemotron 3 Ultra's warmup</h3>
+<p>Nemotron 3 Ultra did not hold the same-origin condition for many of its teachers, and reports what that cost. Its teachers were developed in parallel with the student, many through their own specialised SFT pipelines, and the authors found that "teacher models trained with substantially different training pipelines cannot be effectively combined through a straightforward MOPD merge"<a class="cite" href="#ref-10">10</a> (§3.3.3). Their hypothesis: different SFT data produce different reasoning behaviours, so student rollouts are out-of-distribution for the teacher and its token-level scores become unreliable. The fix is a brief SFT of the student on data from the teacher's training distribution before MOPD, kept "intentionally limited in scale" so that regressions elsewhere are recovered during MOPD.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> Nemotron 3 Ultra warmup ablation, benchmark scores<a class="cite" href="#ref-10">10</a> (Table 4). The last two columns are derived: the fraction of the student-to-teacher gap that MOPD closed, \((\text{score}-\text{student})/(\text{teacher}-\text{student})\).</caption>
+  <thead><tr><th>Benchmark</th><th class="num">RLVR student</th><th class="num">With warmup</th><th class="num">Without warmup</th><th class="num">Teacher</th><th class="num">Gap closed, with (%)</th><th class="num">Gap closed, without (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">GDPVal</td><td class="num">28.9</td><td class="num">46.7</td><td class="num">35.3</td><td class="num">49.5</td><td class="num" data-best>86.4</td><td class="num" data-worst>31.1</td></tr>
+    <tr><td class="row">BrowseComp</td><td class="num">31.0</td><td class="num">44.4</td><td class="num">33.0</td><td class="num">51.0</td><td class="num" data-best>67.0</td><td class="num" data-worst>10.0</td></tr>
+    <tr><td class="row">HLE (no tools)</td><td class="num">25.6</td><td class="num">26.7</td><td class="num">26.3</td><td class="num">32.1</td><td class="num">16.9</td><td class="num">10.8</td></tr>
+  </tbody>
+</table>
+<p>Warmup nearly triples the gap closed on GDPVal and multiplies it by 6.7 on BrowseComp, and does almost nothing on HLE. The report's own "Foundations for MOPD" paragraph lists the cleaner alternatives it did not run: a shared SFT stage before specialisation, or generating the student's SFT data from the specialists<a class="cite" href="#ref-10">10</a> (§3.3.5). Both are ways of restoring same-origin.</p>
+
+<h3 id="teacher-support-support">4.3 The support argument</h3>
+<p>Figure 4 shows the recovery column of the report's main MOPD table, which the authors define as \((\text{MOPD2}-\text{RLVR})/(\text{Teacher}-\text{RLVR})\)<a class="cite" href="#ref-10">10</a> (Table 5). All eleven printed values reproduce from the table's scores.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 392" role="img" aria-labelledby="f4t"><title id="f4t">Horizontal bars of the recovery rate of Nemotron 3 Ultra after two MOPD iterations on eleven benchmarks, from 172.7 percent on Terminal Bench 2.0 down to 16.9 percent on HLE</title>
+<text x="10" y="22" class="d-small d-text-light">Recovery = (MOPD2 minus RLVR student) / (teacher minus RLVR student), as printed, %</text>
+<line x1="215.0" y1="36" x2="215.0" y2="335" class="d-grid"/><text x="215.0" y="349" text-anchor="middle" class="d-small d-mono">0</text>
+<line x1="369.2" y1="36" x2="369.2" y2="335" class="d-grid"/><text x="369.2" y="349" text-anchor="middle" class="d-small d-mono">50</text>
+<line x1="523.3" y1="36" x2="523.3" y2="335" class="d-axis d-dashed"/><text x="523.3" y="349" text-anchor="middle" class="d-small d-mono">100</text>
+<line x1="677.5" y1="36" x2="677.5" y2="335" class="d-grid"/><text x="677.5" y="349" text-anchor="middle" class="d-small d-mono">150</text>
+<text x="10" y="58" class="d-small">Terminal Bench 2.0</text>
+<rect x="215" y="44" width="532.5" height="19" class="d-fill-blue"/>
+<text x="753.5" y="58" class="d-small d-mono">172.7</text>
+<text x="10" y="85" class="d-small">Multi-Challenge</text>
+<rect x="215" y="71" width="359.8" height="19" class="d-fill-cyan"/>
+<text x="580.8" y="85" class="d-small d-mono">116.7</text>
+<text x="10" y="112" class="d-small">TauBench Telecom</text>
+<rect x="215" y="98" width="278.4" height="19" class="d-fill-blue"/>
+<text x="499.4" y="112" class="d-small d-mono">90.3</text>
+<text x="10" y="139" class="d-small">SWE-Bench Verified</text>
+<rect x="215" y="125" width="271.6" height="19" class="d-fill-blue"/>
+<text x="492.6" y="139" class="d-small d-mono">88.1</text>
+<text x="10" y="166" class="d-small">GDPVal</text>
+<rect x="215" y="152" width="266.4" height="19" class="d-fill-blue"/>
+<text x="487.4" y="166" class="d-small d-mono">86.4</text>
+<text x="10" y="193" class="d-small">OmniScience Non-Halluc.</text>
+<rect x="215" y="179" width="245.4" height="19" class="d-fill-cyan"/>
+<text x="466.4" y="193" class="d-small d-mono">79.6</text>
+<text x="10" y="220" class="d-small">IFBench (prompt loose)</text>
+<rect x="215" y="206" width="221.1" height="19" class="d-fill-cyan"/>
+<text x="442.1" y="220" class="d-small d-mono">71.7</text>
+<text x="10" y="247" class="d-small">BrowseComp</text>
+<rect x="215" y="233" width="206.6" height="19" class="d-fill-blue"/>
+<text x="427.6" y="247" class="d-small d-mono">67.0</text>
+<text x="10" y="274" class="d-small">IMOAnswerBench</text>
+<rect x="215" y="260" width="158.2" height="19" class="d-fill-orange"/>
+<text x="379.2" y="274" class="d-small d-mono">51.3</text>
+<text x="10" y="301" class="d-small">LiveCodeBench v6</text>
+<rect x="215" y="287" width="98.7" height="19" class="d-fill-orange"/>
+<text x="319.7" y="301" class="d-small d-mono">32.0</text>
+<text x="10" y="328" class="d-small">HLE (no tools)</text>
+<rect x="215" y="314" width="52.1" height="19" class="d-fill-orange"/>
+<text x="273.1" y="328" class="d-small d-mono">16.9</text>
+<rect x="20" y="360" width="14" height="14" class="d-fill-blue"/><text x="42" y="371" class="d-small">agentic</text>
+<rect x="130" y="360" width="14" height="14" class="d-fill-cyan"/><text x="152" y="371" class="d-small">instruction following / factuality</text>
+<rect x="420" y="360" width="14" height="14" class="d-fill-orange"/><text x="442" y="371" class="d-small">reasoning (grouping by this module)</text>
+</svg>
+  <figcaption><b>Figure 4.</b> Share of the teacher-student gap closed by two MOPD iterations on Nemotron 3 Ultra, per benchmark (the printed recovery column<a class="cite" href="#ref-10">10</a>, Table 5; each value was recomputed from the table's scores and matches). Values above 100 occur where the gap is small (Terminal Bench: 5.5 points; Multi-Challenge: 3.0 points). The dashed line is full recovery. Colours for agentic and instruction-following groups follow the report's text; the third group is this module's.</figcaption>
+</figure>
+
+<p>The report's reading is explicit. MOPD "is particularly effective when the teacher's advantage can be expressed as token-level preferences over trajectories that the student is already able to sample, such as tool-use decisions, environment interactions, abstention behavior, and multi-step execution patterns". It is weakest on HLE (16.9%) because the general-reasoning teacher gained through "additional large-scale SFT and RL on a separate reasoning mixture generated by DeepSeek-V4-Pro" that the student never saw, so the teacher's advantage "also comes from capabilities acquired through additional off-policy data exposure" and the student's rollouts are "effectively out-of-distribution for the teacher"<a class="cite" href="#ref-10">10</a> (§3.3.4). In other words, a per-token log-ratio only grades tokens the student can emit. A skill that lives in reasoning paths the student almost never samples cannot be pulled in by scoring its own samples. That is the same boundary as the exposure-bias argument, seen from the teacher's side, and it is why the warmup helps agentic domains and not HLE. This module's inference, not the report's claim: it predicts that off-policy SFT on teacher rollouts (Table 1's third route) is the better tool for exactly those skills, with MOPD used afterwards to repair what that SFT disturbed.</p>
+
+<h3 id="teacher-support-camopd">4.4 Failure modes beyond teacher quality</h3>
+<p>A May 2026 follow-up names two more failure modes of vanilla MOPD, in a setting where a general-purpose teacher must restore broad ability while domain behaviour is preserved. The first is "recovery-preservation counteraction from mixing conflicting recovery and preservation gradients"; the second is "weak-signal flattening from uniformly averaging samples with unequal correction demand". Its remedy, CaMOPD, gives recovery dedicated updates, interleaves periodic preservation updates, and prioritises samples with larger average token-level teacher-student log-probability gaps<a class="cite" href="#ref-15">15</a> (abstract only; role-play and medical QA, not the reasoning-and-agent setting of the frontier reports). The relevance here is the second failure: a batch mixing domains with very different correction demand averages the signal where it matters least, a relative of the dilution Nemotron raises against mixed RL (Section 6).</p>
+
+<h2 id="sampled-vs-full">5. Sampled-token versus distribution-level distillation</h2>
+
+<h3 id="sampled-vs-full-toy">5.1 What one sampled token costs in noise</h3>
+<p>The cheap estimator of Section 2 reads one number per position: the log-ratio at the token the student happened to sample. The alternative reads the teacher's whole next-token distribution and computes the exact per-position KL. The difference is easiest to see on a four-token vocabulary (constructed numbers, not from a report). At one prefix let the student be \(\pi_\theta=(0.70,0.20,0.05,0.05)\) and the teacher \(\pi_T=(0.50,0.40,0.09,0.01)\). The per-position reverse KL is \(0.148\) nats, and the advantage a sampled token would receive is \(\log\pi_T-\log\pi_\theta=(-0.34,+0.69,+0.59,-1.61)\), Figure 5.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 330" role="img" aria-labelledby="f5t"><title id="f5t">Left: student and teacher next-token probabilities over four tokens at one prefix. Right: the sampled-token advantage log teacher over student for each token, positive for tokens the teacher prefers and negative for tokens the student over-weights</title>
+<text x="20" y="24" class="d-bold">Next-token distributions at one prefix</text>
+<text x="430" y="24" class="d-bold">Advantage if that token is the one sampled</text>
+<line x1="40" y1="250" x2="390" y2="250" class="d-axis"/>
+<line x1="40" y1="197.5" x2="390" y2="197.5" class="d-grid"/><text x="34" y="201.5" text-anchor="end" class="d-small d-mono">0.25</text>
+<line x1="40" y1="145.0" x2="390" y2="145.0" class="d-grid"/><text x="34" y="149.0" text-anchor="end" class="d-small d-mono">0.50</text>
+<line x1="40" y1="92.5" x2="390" y2="92.5" class="d-grid"/><text x="34" y="96.5" text-anchor="end" class="d-small d-mono">0.75</text>
+<rect x="58" y="103.0" width="30" height="147.0" class="d-fill-blue"/><text x="73" y="99.0" text-anchor="middle" class="d-small d-mono">0.70</text>
+<rect x="90" y="145.0" width="30" height="105.0" class="d-fill-cyan"/><text x="105" y="141.0" text-anchor="middle" class="d-small d-mono">0.50</text>
+<text x="89" y="268" text-anchor="middle" class="d-mono">v1</text>
+<rect x="142" y="208.0" width="30" height="42.0" class="d-fill-blue"/><text x="157" y="204.0" text-anchor="middle" class="d-small d-mono">0.20</text>
+<rect x="174" y="166.0" width="30" height="84.0" class="d-fill-cyan"/><text x="189" y="162.0" text-anchor="middle" class="d-small d-mono">0.40</text>
+<text x="173" y="268" text-anchor="middle" class="d-mono">v2</text>
+<rect x="226" y="239.5" width="30" height="10.5" class="d-fill-blue"/><text x="241" y="235.5" text-anchor="middle" class="d-small d-mono">0.05</text>
+<rect x="258" y="231.1" width="30" height="18.9" class="d-fill-cyan"/><text x="273" y="227.1" text-anchor="middle" class="d-small d-mono">0.09</text>
+<text x="257" y="268" text-anchor="middle" class="d-mono">v3</text>
+<rect x="310" y="239.5" width="30" height="10.5" class="d-fill-blue"/><text x="325" y="235.5" text-anchor="middle" class="d-small d-mono">0.05</text>
+<rect x="342" y="247.9" width="30" height="2.1" class="d-fill-cyan"/><text x="357" y="243.9" text-anchor="middle" class="d-small d-mono">0.01</text>
+<text x="341" y="268" text-anchor="middle" class="d-mono">v4</text>
+<rect x="60" y="292" width="12" height="12" class="d-fill-blue"/><text x="78" y="302" class="d-small">student pθ</text><rect x="190" y="292" width="12" height="12" class="d-fill-cyan"/><text x="208" y="302" class="d-small">teacher pT</text>
+<line x1="430" y1="150" x2="780" y2="150" class="d-axis"/>
+<rect x="452" y="150.0" width="44" height="16.8" class="d-fill-red"/><text x="474" y="180.8" text-anchor="middle" class="d-small d-mono">-0.34</text>
+<text x="474" y="98" text-anchor="middle" class="d-mono">v1</text>
+<text x="474" y="268" text-anchor="middle" class="d-small d-mono">p=0.70</text>
+<rect x="536" y="115.3" width="44" height="34.7" class="d-fill-green"/><text x="558" y="110.3" text-anchor="middle" class="d-small d-mono">+0.69</text>
+<text x="558" y="168" text-anchor="middle" class="d-mono">v2</text>
+<text x="558" y="268" text-anchor="middle" class="d-small d-mono">p=0.20</text>
+<rect x="620" y="120.6" width="44" height="29.4" class="d-fill-green"/><text x="642" y="115.6" text-anchor="middle" class="d-small d-mono">+0.59</text>
+<text x="642" y="168" text-anchor="middle" class="d-mono">v3</text>
+<text x="642" y="268" text-anchor="middle" class="d-small d-mono">p=0.05</text>
+<rect x="704" y="150.0" width="44" height="80.5" class="d-fill-red"/><text x="726" y="244.5" text-anchor="middle" class="d-small d-mono">-1.61</text>
+<text x="726" y="98" text-anchor="middle" class="d-mono">v4</text>
+<text x="726" y="268" text-anchor="middle" class="d-small d-mono">p=0.05</text>
+<text x="430" y="288" class="d-small d-text-light">p = probability the student samples that token</text>
+<text x="430" y="316" class="d-small">sampled-token estimate: one of these four numbers per position</text>
+</svg>
+  <figcaption><b>Figure 5.</b> A constructed four-token example. Left: student and teacher distributions at one prefix. Right: the sampled-token advantage for each possible draw; the student draws \(v_1\) 70% of the time and gets a weak negative signal, draws \(v_4\) 5% of the time and gets a strong one. The gradient estimator built from these draws is unbiased (Section 2.2) but not quiet.</figcaption>
+</figure>
+
+<p>Take the gradient of the loss with respect to the four logits. The exact value, \(\pi_\theta\odot(\log\pi_\theta-\log\pi_T-\mathrm{KL})\), is \((0.132,-0.168,-0.037,0.073)\), and averaging the single-sample estimator over the student's own draws reproduces it exactly. A single draw does not: the four possible estimates have norms 0.12, 0.74, 0.70 and 1.93, the total variance is 0.278, and the standard deviation (0.53) is 2.3 times the norm of the true gradient (0.23). A full-vocabulary computation removes the variance from the token draw at this prefix. Real batches average thousands of positions, and if the draws were independent the extra variance would shrink as \(1/\sqrt n\); whether the remainder matters is an empirical question the reports answer differently (Section 5.3).</p>
+
+<h3 id="sampled-vs-full-v4">5.2 DeepSeek-V4: full-vocabulary OPD</h3>
+<p>DeepSeek-V4 takes the exact route. Its report writes the objective as \(\sum_i w_i D_{\mathrm{KL}}(\pi_\theta\Vert\pi_{E_i})\) over \(N\) experts, with \(w_i\) "typically determined by the relative importance of the expert", and says the unified policy "selectively learns from the specialized expert relevant to the current task context"<a class="cite" href="#ref-12">12</a> (§5.1.2, Eq. 29). It does not say how \(w_i\) is set beyond that, so whether a prompt carries one nonzero weight or several is not specified. More than ten teachers are used. The stated reason for the full vocabulary: prior work reduces the KL to "a token-level KL estimate" reused as a per-token advantage; that is "resource-efficient" but "leads to high variance in gradient estimation and often causes training instability". The report gives no ablation numbers for this choice in the sections read, so it is a design claim, not a measured result.</p>
+<p>The claim comes with an engineering bill. Materialising logits over a vocabulary above 100K for every teacher is "prohibitive, even when spooled to disk", so the system caches only each teacher's last-layer hidden states and rebuilds the logits at training time<a class="cite" href="#ref-12">12</a> (§5.2.2). Figure 6 shows the path.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f6t"><title id="f6t">DeepSeek-V4 full-vocabulary on-policy distillation data path: teacher weights are loaded on demand for the forward pass, only last-layer hidden states are cached, samples are sorted by teacher index so one teacher head is resident at a time, logits are rebuilt on the fly, and an exact KL kernel compares them with the student logits</title>
+    <defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="20" y="24" class="d-bold">Teacher forward over the student's rollouts</text>
+    <rect x="10" y="32" width="780" height="96" rx="10" class="d-panel"/>
+    <rect x="24" y="44" width="200" height="72" rx="8" class="d-block-2"/><text x="124" y="76" text-anchor="middle" class="d-text-inv d-bold">Teacher weights</text><text x="124" y="96" text-anchor="middle" class="d-text-inv d-small">central store, ZeRO-like shards</text>
+    <path d="M224,80 L270,80" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <rect x="270" y="44" width="200" height="72" rx="8" class="d-block-2"/><text x="370" y="76" text-anchor="middle" class="d-text-inv d-bold">Teacher forward</text><text x="370" y="96" text-anchor="middle" class="d-text-inv d-small">loaded on demand</text>
+    <path d="M470,80 L516,80" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <rect x="516" y="44" width="260" height="72" rx="8" class="d-block-2"/><text x="646" y="76" text-anchor="middle" class="d-text-inv d-bold">Hidden-state cache</text><text x="646" y="96" text-anchor="middle" class="d-text-inv d-small">last layer only: d values per token</text>
+
+    <text x="20" y="160" class="d-bold">Training time</text>
+    <rect x="10" y="168" width="780" height="130" rx="10" class="d-panel"/>
+    <rect x="24" y="190" width="170" height="72" rx="8" class="d-block-muted"/><text x="109" y="222" text-anchor="middle" class="d-text-inv d-bold">Samples sorted</text><text x="109" y="242" text-anchor="middle" class="d-text-inv d-small">by teacher index</text>
+    <path d="M194,226 L232,226" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <rect x="232" y="190" width="170" height="72" rx="8" class="d-block-2"/><text x="317" y="222" text-anchor="middle" class="d-text-inv d-bold">Teacher head i</text><text x="317" y="242" text-anchor="middle" class="d-text-inv d-small">one resident at a time</text>
+    <path d="M402,226 L440,226" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <rect x="440" y="190" width="150" height="72" rx="8" class="d-block-2"/><text x="515" y="222" text-anchor="middle" class="d-text-inv d-bold">Logits</text><text x="515" y="242" text-anchor="middle" class="d-text-inv d-small">V above 100K, rebuilt</text>
+    <path d="M590,226 L628,226" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <rect x="628" y="190" width="148" height="72" rx="8" class="d-hl"/><text x="702" y="222" text-anchor="middle" class="d-bold">Exact KL</text><text x="702" y="242" text-anchor="middle" class="d-small">TileLang kernel</text>
+    <path d="M646,116 L646,150 L317,150 L317,188" class="d-arrow-active" marker-end="url(#f6-arr)"/>
+    <text x="480" y="144" text-anchor="middle" class="d-small d-mono">cached hidden states read back</text>
+    <rect x="440" y="318" width="336" height="50" rx="8" class="d-block"/><text x="608" y="348" text-anchor="middle" class="d-text-inv d-bold">Student forward: logits</text>
+    <path d="M702,318 L702,264" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <text x="20" y="334" class="d-small">The cache holds d numbers per token; the head rebuilds V.</text>
+    <text x="20" y="354" class="d-small d-mono">V / d = 17.9 (Pro), 31.3 (Flash)</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> The DeepSeek-V4 full-vocabulary OPD path as the report describes it<a class="cite" href="#ref-12">12</a> (§5.2.2): weights offloaded to central storage and loaded on demand, last-layer hidden states cached, samples ordered by teacher index so each head loads once per mini-batch, logits rebuilt on the fly, exact KL in a TileLang kernel. The ratio V/d uses a 128K vocabulary (§4.1) and hidden sizes 7,168 (Pro) and 4,096 (Flash) (§4.2.1).</figcaption>
+</figure>
+
+<p>The arithmetic behind the cache is a ratio. V4 keeps a 128K vocabulary<a class="cite" href="#ref-12">12</a> (§4.1) and has hidden size \(d=7{,}168\) in Pro and \(4{,}096\) in Flash (§4.2.1). Per token, a cached hidden state is \(d\) numbers and the logits are \(V\) numbers, so at equal precision caching saves a factor \(V/d=17.9\) for Pro and \(31.3\) for Flash, taking 128K as 128,000. The price is recomputing the head: \(2dV\) FLOPs per token, 1.84 GFLOP for Pro. Against a forward pass of about \(2N_{\text{active}}\) FLOPs per token (a standard approximation that ignores attention; 49B active parameters for Pro and 13B for Flash<a class="cite" href="#ref-12">12</a>, §4.2.1), that is 98 GFLOP, so the head is about 1.9% of a Pro-sized teacher forward and 4.0% of a Flash-sized one (derived). That supports the report's "negligible recomputation overhead". The calculator exposes the knobs; the cache precision is not stated in the report, so it is an input.</p>
+
+<div class="calc">
+  <p class="calc-title">Per-sequence bytes for one teacher: full logits versus cached hidden states</p>
+  <div class="calc-row"><label for="c1n">Sequence length (tokens)</label><input type="range" id="c1n" name="n" min="1024" max="1048576" step="1024" value="32768" data-format="si"></div>
+  <div class="calc-row"><label for="c1d">Hidden size d</label><select id="c1d" name="d"><option value="7168">7,168 (V4-Pro)</option><option value="4096">4,096 (V4-Flash)</option></select><span></span></div>
+  <div class="calc-row"><label for="c1v">Vocabulary V</label><select id="c1v" name="V"><option value="128000">128,000 (V4's "128K")</option><option value="131072">131,072 (128 x 1,024)</option></select><span></span></div>
+  <div class="calc-row"><label for="c1l">Bytes per logit</label><select id="c1l" name="bl"><option value="2">BF16 (2 B)</option><option value="4">FP32 (4 B)</option></select><span></span></div>
+  <div class="calc-row"><label for="c1h">Bytes per cached value</label><select id="c1h" name="bh"><option value="2">BF16 (2 B)</option><option value="4">FP32 (4 B)</option><option value="1">FP8 (1 B)</option></select><span></span></div>
+  <div class="calc-out">
+    <div>Full logits, one sequence<output data-expr="n * V * bl" data-format="bytes10"></output></div>
+    <div>Cached hidden states, one sequence<output data-expr="n * d * bh" data-format="bytes10"></output></div>
+    <div>Ratio (logits / cache)<output data-expr="(V * bl) / (d * bh)" data-format="fixed:1"></output></div>
+  </div>
+  <p class="calc-note">Formulas: \(n\,V\,b_\ell\) against \(n\,d\,b_h\). \(V\) and \(d\) are the DeepSeek-V4 values<a class="cite" href="#ref-12">12</a> (§4.1, §4.2.1); the report does not state the cache dtype or whether logits would be BF16 or FP32, so both are inputs.</p>
+</div>
+
+<p>At the 32,768-token maximum sequence length of the MOPD paper's math and IF data<a class="cite" href="#ref-1">1</a> (Appendix A), with BF16 logits, one teacher's logits for one sequence are 8.39 GB against 0.47 GB of Pro-sized hidden states. At a million tokens the same BF16 logits are 268 GB per teacher per sequence (derived), and V4 serves more than ten teachers; that is why sorting samples by teacher index and holding one head at a time matters.</p>
+
+<h3 id="sampled-vs-full-evidence">5.3 Who tested the alternatives</h3>
+<p>The data movement is also the MOPD authors' argument for their top-\(k\) variant: it "keeps the teacher-prefill payload small enough to be transmitted like a lightweight reward signal, in contrast to full-vocabulary distillation which requires shipping the entire vocabulary distribution per token"<a class="cite" href="#ref-1">1</a> (§3.2.2). Table 7 puts numbers on the three payloads and collects what each report found when it tried more than one.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 7.</b> Teacher payload per token under the three objectives (derived: log-probabilities FP32, indices int32, full logits BF16, \(V=128{,}000\); the 32,768-token column is the maximum sequence length of the MOPD paper's math and IF data) and what the reports found.</caption>
+  <thead><tr><th>Objective</th><th class="num">Payload per token</th><th class="num">Per 32,768-token sequence</th><th>Reported comparison</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Sampled token</td><td class="num">4 B</td><td class="num">0.13 MB</td><td>MOPD paper default (norm. 0.937)<a class="cite" href="#ref-1">1</a>; used by MiMo, K3, Nemotron and GLM-5 (Table 3)</td></tr>
+    <tr><td class="row">Top-64</td><td class="num">512 B</td><td class="num">16.8 MB</td><td>MOPD paper: 0.909, "comparable on Math and slightly worse on IF and SWE", and no added stability with same-origin teachers<a class="cite" href="#ref-1">1</a> (§4.4.1). K3: "no clear advantage in either convergence speed or final performance"<a class="cite" href="#ref-9">9</a> (§4.1.3)</td></tr>
+    <tr><td class="row">Top-k or full vocabulary ("logit matching")</td><td class="num">512 B to 256 kB</td><td class="num">16.8 MB to 8.39 GB</td><td>Nemotron 3 Ultra: logit matching "did not improve MOPD performance and consistently underperformed the sampled-token objective on some agentic benchmarks such as Terminal Bench"<a class="cite" href="#ref-10">10</a> (§3.3.5)</td></tr>
+    <tr><td class="row">Full vocabulary</td><td class="num">256 kB</td><td class="num">8.39 GB</td><td>DeepSeek-V4 adopts it for stability<a class="cite" href="#ref-12">12</a>; no ablation numbers in the sections read</td></tr>
+  </tbody>
+</table>
+
+<p>Nemotron offers a mechanism for why more information could hurt: "full-distribution matching may impose an overly strong local constraint on prefixes sampled from the student policy, particularly when those prefixes have limited support under the teacher distribution", where teacher logits "can become poorly calibrated or less informative"<a class="cite" href="#ref-10">10</a> (§3.3.5). That is the same off-support problem as Section 4. This module's reading: exactness removes sampling noise, not teacher error, so if the teacher's distribution is unreliable off its own support, matching all of it fits that error more faithfully. The report calls its explanation a hypothesis and the question open. The MOPD paper's top-\(k\) numbers support the narrower statement that with same-origin teachers, the extra information bought nothing measurable in their setting. DeepSeek-V4 is the only report on the other side, with more than ten teachers and no published ablation.</p>
+
+<h2 id="recipes">6. The recipes side by side</h2>
+
+<h3 id="recipes-timeline">6.1 Seven pipelines on one axis</h3>
+<p>Figure 7 places each report's integration design in report-date order. Read it for one thing: where the RL happens relative to the distillation, and whether the teachers are produced in parallel (Xiaomi, DeepSeek-V4, Nemotron 3 Ultra, Kimi K3) or in sequence (GLM-5, Nemotron-Cascade 2). Lambert's survey identifies MiMo-V2-Flash as the first technical report to document this process<a class="cite" href="#ref-17">17</a> (§3.2.4). Per-report recipe detail is Modules 28 (Kimi), 30 (DeepSeek) and 32 (GLM-5, Nemotron).</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 450" role="img" aria-labelledby="f7t"><title id="f7t">Seven post-training recipes in date order showing where each places supervised fine-tuning, specialist or sequential reinforcement learning, mixed reinforcement learning and on-policy distillation</title>
+<text x="10" y="20" class="d-small d-text-light">Stages left to right in training order; block widths are not durations</text>
+<text x="10" y="48" class="d-bold">DeepSeek-V3.2</text><text x="10" y="64" class="d-small d-text-light">2 Dec 2025</text>
+<rect x="180" y="34" width="54" height="32" rx="6" class="d-block-muted"/><text x="207" y="54.0" text-anchor="middle" class="d-text-inv d-bold d-small">SFT</text>
+<rect x="238" y="34" width="170" height="32" rx="6" class="d-block"/><text x="323" y="54.0" text-anchor="middle" class="d-text-inv d-bold d-small">Domain specialists</text>
+<rect x="412" y="34" width="140" height="32" rx="6" class="d-hl"/><text x="482" y="54.0" text-anchor="middle" class="d-bold d-small">Specialists to data</text>
+<rect x="556" y="34" width="200" height="32" rx="6" class="d-block-2"/><text x="656" y="54.0" text-anchor="middle" class="d-text-inv d-bold d-small">One mixed RL stage</text>
+<text x="180" y="82" class="d-small d-text-light">specialists distilled off-policy, then one GRPO stage over reasoning, agent, alignment</text>
+<text x="10" y="104" class="d-bold">MiMo-V2-Flash</text><text x="10" y="120" class="d-small d-text-light">8 Jan 2026</text>
+<rect x="180" y="90" width="54" height="32" rx="6" class="d-block-muted"/><text x="207" y="110.0" text-anchor="middle" class="d-text-inv d-bold d-small">SFT</text>
+<rect x="238" y="90" width="250" height="32" rx="6" class="d-block"/><text x="363" y="110.0" text-anchor="middle" class="d-text-inv d-bold d-small">Domain teachers: RL or SFT</text>
+<rect x="492" y="90" width="250" height="32" rx="6" class="d-block-accent"/><text x="617" y="110.0" text-anchor="middle" class="d-text-inv d-bold d-small">MOPD + outcome reward</text>
+<text x="180" y="138" class="d-small d-text-light">first documented MOPD; expert count not reported</text>
+<text x="10" y="160" class="d-bold">GLM-5</text><text x="10" y="176" class="d-small d-text-light">24 Feb 2026</text>
+<rect x="180" y="146" width="54" height="32" rx="6" class="d-block-muted"/><text x="207" y="166.0" text-anchor="middle" class="d-text-inv d-bold d-small">SFT</text>
+<rect x="238" y="146" width="120" height="32" rx="6" class="d-block"/><text x="298" y="166.0" text-anchor="middle" class="d-text-inv d-bold d-small">Reasoning RL</text>
+<rect x="362" y="146" width="120" height="32" rx="6" class="d-block"/><text x="422" y="166.0" text-anchor="middle" class="d-text-inv d-bold d-small">Agentic RL</text>
+<rect x="486" y="146" width="120" height="32" rx="6" class="d-block"/><text x="546" y="166.0" text-anchor="middle" class="d-text-inv d-bold d-small">General RL</text>
+<rect x="610" y="146" width="160" height="32" rx="6" class="d-block-accent"/><text x="690" y="166.0" text-anchor="middle" class="d-text-inv d-bold d-small">Cross-stage OPD</text>
+<text x="180" y="194" class="d-small d-text-light">teachers are the earlier stages' own checkpoints</text>
+<text x="10" y="216" class="d-bold">Nemotron-Cascade 2</text><text x="10" y="232" class="d-small d-text-light">19 Mar 2026</text>
+<rect x="180" y="202" width="54" height="32" rx="6" class="d-block-muted"/><text x="207" y="222.0" text-anchor="middle" class="d-text-inv d-bold d-small">SFT</text>
+<rect x="238" y="202" width="330" height="32" rx="6" class="d-block"/><text x="403" y="222.0" text-anchor="middle" class="d-text-inv d-bold d-small">Cascade RL, domain by domain</text>
+<rect x="238" y="236" width="330" height="6" class="d-fill-orange"/>
+<text x="180" y="250" class="d-small d-text-light">multi-domain OPD from best intermediates runs during the cascade (abstract only)</text>
+<text x="10" y="272" class="d-bold">DeepSeek-V4</text><text x="10" y="288" class="d-small d-text-light">report stamp 26 Apr 2026</text>
+<rect x="180" y="258" width="280" height="32" rx="6" class="d-block"/><text x="320" y="278.0" text-anchor="middle" class="d-text-inv d-bold d-small">Specialists: SFT, then GRPO</text>
+<rect x="464" y="258" width="290" height="32" rx="6" class="d-block-accent"/><text x="609" y="278.0" text-anchor="middle" class="d-text-inv d-bold d-small">OPD, more than 10 teachers</text>
+<text x="180" y="306" class="d-small d-text-light">mixed RL stage replaced; full-vocabulary KL</text>
+<text x="10" y="328" class="d-bold">Nemotron 3 Ultra</text><text x="10" y="344" class="d-small d-text-light">12 Jun 2026</text>
+<rect x="180" y="314" width="54" height="32" rx="6" class="d-block-muted"/><text x="207" y="334.0" text-anchor="middle" class="d-text-inv d-bold d-small">SFT</text>
+<rect x="238" y="314" width="100" height="32" rx="6" class="d-block-2"/><text x="288" y="334.0" text-anchor="middle" class="d-text-inv d-bold d-small">Unified RLVR</text>
+<rect x="342" y="314" width="96" height="32" rx="6" class="d-block-muted"/><text x="390" y="334.0" text-anchor="middle" class="d-text-inv d-bold d-small">Warmup SFT</text>
+<rect x="442" y="314" width="86" height="32" rx="6" class="d-block-accent"/><text x="485" y="334.0" text-anchor="middle" class="d-text-inv d-bold d-small">MOPD 1</text>
+<rect x="532" y="314" width="100" height="32" rx="6" class="d-block"/><text x="582" y="334.0" text-anchor="middle" class="d-text-inv d-bold d-small">New teachers</text>
+<rect x="636" y="314" width="86" height="32" rx="6" class="d-block-accent"/><text x="679" y="334.0" text-anchor="middle" class="d-text-inv d-bold d-small">MOPD 2</text>
+<text x="180" y="362" class="d-small d-text-light">more than 10 teachers trained in parallel; RLVR student is the self-teacher elsewhere</text>
+<text x="10" y="384" class="d-bold">Kimi K3</text><text x="10" y="400" class="d-small d-text-light">v2, 7 Aug 2026</text>
+<rect x="180" y="370" width="54" height="32" rx="6" class="d-block-muted"/><text x="207" y="390.0" text-anchor="middle" class="d-text-inv d-bold d-small">SFT</text>
+<rect x="238" y="370" width="320" height="32" rx="6" class="d-block"/><text x="398" y="390.0" text-anchor="middle" class="d-text-inv d-bold d-small">9 experts: 3 domains x 3 efforts</text>
+<rect x="562" y="370" width="180" height="32" rx="6" class="d-block-accent"/><text x="652" y="390.0" text-anchor="middle" class="d-text-inv d-bold d-small">MOPD</text>
+<text x="180" y="418" class="d-small d-text-light">teacher chosen by (domain, effort); student conditioned on effort</text>
+<rect x="10" y="422" width="14" height="14" rx="3" class="d-block-muted"/><text x="30" y="433" class="d-small">SFT</text>
+<rect x="80" y="422" width="14" height="14" rx="3" class="d-block"/><text x="100" y="433" class="d-small">Specialist or stage RL</text>
+<rect x="235" y="422" width="14" height="14" rx="3" class="d-block-2"/><text x="255" y="433" class="d-small">Mixed RL</text>
+<rect x="325" y="422" width="14" height="14" rx="3" class="d-block-accent"/><text x="345" y="433" class="d-small">On-policy distillation</text>
+<rect x="495" y="422" width="14" height="14" rx="3" class="d-hl"/><text x="515" y="433" class="d-small">Teacher output as data</text>
+</svg>
+  <figcaption><b>Figure 7.</b> Integration designs, from the reports: DeepSeek-V3.2<a class="cite" href="#ref-3">3</a> (§3), MiMo-V2-Flash<a class="cite" href="#ref-8">8</a> (§4.1), GLM-5<a class="cite" href="#ref-11">11</a> (§3, §3.5), Nemotron-Cascade 2<a class="cite" href="#ref-16">16</a> (abstract), DeepSeek-V4<a class="cite" href="#ref-12">12</a> (§5.1), Nemotron 3 Ultra<a class="cite" href="#ref-10">10</a> (§3, Figure 10), Kimi K3<a class="cite" href="#ref-9">9</a> (§4.1). Dates are the arXiv version stamps; the V4 PDF carries a 26 Apr 2026 stamp while its identifier (2606) suggests June, unresolved here. Nemotron 3 Ultra took reasoning data from DeepSeek-V4-Pro<a class="cite" href="#ref-10">10</a> (§3.3.4), so V4 existed before 12 Jun 2026 either way.</figcaption>
+</figure>
+
+<h3 id="recipes-deepseek">6.2 DeepSeek reverses itself</h3>
+<p>The cleanest before-and-after in the literature is inside one lab. DeepSeek-V3.2 distils specialists into data and then merges "reasoning, agent, and human alignment training into one RL stage", a design said to balance performance "while circumventing the catastrophic forgetting issues commonly associated with multi-stage training paradigms"; the same report says models trained on the distilled specialist data landed "only marginally below" the specialists, with "the performance gap … effectively eliminated through subsequent RL training"<a class="cite" href="#ref-3">3</a> (§3). Its mixed stage rewards reasoning and agent tasks with rule-based outcomes plus a length penalty and a language-consistency reward, and general tasks with a rubric-based generative reward model. DeepSeek-V4 says the pipeline "largely mirrored" V3.2 but that "the mixed Reinforcement Learning (RL) stage was entirely replaced by On-Policy Distillation"<a class="cite" href="#ref-12">12</a> (§5.1). Each specialist still gets SFT then GRPO, keeping "hyper-parameters closely aligned with our prior research" (§5.1.1). The claimed benefit is that logits-level alignment is "practically circumventing the performance degradation often encountered in traditional weight-merging or mixed RL techniques" (§5.1.2).</p>
+<p>Two cautions. V4 reports no V3.2-style mixed-RL control, so the replacement is a decision the report states, not an ablation it shows (in the sections read). And V3.2's own claim, that one mixed stage avoids the forgetting of multi-stage training, is the opposite diagnosis from the one MOPD makes of mixed RL, so the two reports differ on what mixed RL does as well as on what to replace it with. Neither contains a matched-compute comparison between the two.</p>
+
+<h3 id="recipes-sequential">6.3 Distilling from your own earlier checkpoints</h3>
+<p>GLM-5 does not train its teachers in parallel. It runs SFT, then Reasoning RL, Agentic RL and General RL in sequence, and finishes with "on-policy cross-stage distillation" in which "the final checkpoints from the preceding training stages serve as teacher models", with prompts "sampled from the corresponding teachers' RL training sets and mixed in appropriate proportions"<a class="cite" href="#ref-11">11</a> (§3.5). The stated motive is the cascade failure of Table 1: "sequentially optimizing for distinct objectives can lead to the cumulative degradation of previously acquired capabilities". The loss replaces the GRPO advantage with the teacher-student log-ratio (Eq. 2), uses a group size of 1 and a batch of 1,024, and fetches teacher logits through the inference engine. Because each teacher is an earlier checkpoint of the same run, the same-origin condition of Section 4 is satisfied by construction, but no parallelism is gained: the stages are still serial. Nemotron-Cascade 2 does something similar, running "multi-domain on-policy distillation from the strongest intermediate teacher models for each domain" throughout its Cascade RL to "recover benchmark regressions"<a class="cite" href="#ref-16">16</a> (abstract only; schedule and numbers not read).</p>
+<p>The evidence on whether cascades decay is split. The MOPD paper's cascade lost math accuracy during its SWE stage (Section 3.2). The original Nemotron-Cascade paper says that "subsequent domain-wise RLVR stages rarely degrade the benchmark performance attained in earlier domains and may even improve it", after an RLHF pre-step<a class="cite" href="#ref-2">2</a> (abstract). The orders differ (IF, math, SWE against an RLHF-first order), the domains differ, and the abstract does not give numbers, so these are not contradictory measurements. They do show that cascade decay depends on the order and the pair of domains, which is what makes it hard to plan around.</p>
+
+<h3 id="recipes-experts">6.4 How experts are defined and routed</h3>
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 8.</b> Expert count, expert definition and routing per report. "Not stated" means the sections read do not give it; Lambert's survey records the same counts for Nemotron, K3 and V4 and notes that Xiaomi did not report one<a class="cite" href="#ref-17">17</a> (§3.2.4).</caption>
+  <thead><tr><th>Report</th><th class="num">Experts</th><th>What defines an expert</th><th>Routing and weighting</th></tr></thead>
+  <tbody>
+    <tr><td class="row">MOPD paper (Qwen3-30B-A3B)<a class="cite" href="#ref-1">1</a></td><td class="num">3</td><td>domain: math, instruction following, SWE</td><td>by the task's domain label; batch mix 0.35:0.35:0.3 (§3.1, App. A)</td></tr>
+    <tr><td class="row">MiMo-V2-Flash<a class="cite" href="#ref-8">8</a></td><td class="num">not stated</td><td>agentic (search, coding, tool use) and non-agentic (math, general reasoning, safety); teacher may be RL, SFT or the student itself</td><td>domain-specific teachers; outcome-reward advantage added (§4.1, §4.4)</td></tr>
+    <tr><td class="row">GLM-5<a class="cite" href="#ref-11">11</a></td><td class="num">not stated</td><td>an earlier stage's final checkpoint</td><td>prompts from each teacher's RL set, mixed in proportions (§3.5)</td></tr>
+    <tr><td class="row">DeepSeek-V4<a class="cite" href="#ref-12">12</a></td><td class="num">more than 10</td><td>domain, "such as mathematics, coding, agent, and instruction following"</td><td>weights \(w_i\) "by the relative importance of the expert" (Eq. 29)</td></tr>
+    <tr><td class="row">Nemotron 3 Ultra<a class="cite" href="#ref-10">10</a></td><td class="num">more than 10</td><td>domain (SWE, office work, search, terminal use, conversational tool use, usability, ...); the RLVR student is the self-teacher for uncovered areas</td><td>per-domain prompt set \(\mathcal D_i\), weights \(\lambda_i\); second round adds teachers branched from MOPD 1 (§3.3, Fig. 10)</td></tr>
+    <tr><td class="row">Kimi K3<a class="cite" href="#ref-9">9</a></td><td class="num">9</td><td>domain (general, general agents, coding agents) crossed with effort (low, high, max)</td><td>teacher chosen by \((d,e)\); the student is conditioned on \(e\) (Eq. 15)</td></tr>
+  </tbody>
+</table>
+<p>Kimi K3's grid makes effort an explicit axis of the expert definition, and its nine experts come from running the budget-controlled RL of Module 23 per domain. DeepSeek-V4 also trains specialists "under divergent RL configurations" for its three reasoning-effort modes<a class="cite" href="#ref-12">12</a> (§5.1.1) but does not say how those map onto its distillation teachers. The general expert's reward for non-verifiable tasks is the agentic judge that the report describes only as retaining "the tournament-style group reward with binary comparisons as in Kimi K2.5"<a class="cite" href="#ref-9">9</a> (§4.1.2); how that aggregation works is not given there, and Module 16 records that the K2.5 text does not use the word. The report also says expert trajectories at all effort levels are "jointly collected for supervised fine-tuning and multi-teacher on-policy distillation" without placing the SFT in the order.</p>
+<p>Nemotron states the argument for experts at all: with unified RLVR, "as the number of environments continues to grow, each domain contributes only a relatively small number of samples to any given training batch, diluting the per-domain learning signal and making it increasingly difficult to balance training across domains"<a class="cite" href="#ref-10">10</a> (§3.3). The arithmetic is a share. Its unified run lists fifteen items (terminal use through model usability) and reports a global batch of 8,192 with 16 rollouts per sample, which the report does not specify as prompts or rollouts, so no per-domain count is derived here. An even split would give each listed item 1/15 of whatever the batch counts (an illustration only: the report mixes data with a Gaussian-based curriculum). A specialist run trains one domain on its whole batch. The MOPD student batch is also mixed, but each token carries a teacher signal rather than one outcome per rollout, so a domain's gradient does not wait for a rare success.</p>
+
+<h3 id="recipes-rounds">6.5 Second rounds, and agentic rollouts</h3>
+<p>Both Nemotron 3 Ultra (two MOPD iterations, Figure 10) and the MOPD paper run a second round: retrain each teacher from the first-round student, then distill again. In the MOPD paper the second-round teachers score 1.030 on the paper's metric (above the original specialists) against the first-round student's 0.937, and the second-round student reaches 0.986 (+0.049). Only math and IF were retrained; SWE moved from 50.40 to 50.20 with no SWE training<a class="cite" href="#ref-1">1</a> (§4.4.3, Table 5; both normalised scores reproduce from the table's accuracies). The iteration is what makes the cost of Section 7 recurrent rather than one-off.</p>
+<p>For agentic domains, Nemotron states a practical limit: mixing end-to-end agentic environments with reasoning environments in MOPD, "we observed substantial training inefficiency because rollout times can differ dramatically", so "we use single-turn rollouts, similar to PivotRL … for most of the agentic tasks"; whether end-to-end rollouts give more is "an open area for exploration"<a class="cite" href="#ref-10">10</a> (§3.3.5). The turn-local training that this relies on is Module 18's Section 5; the Kimi K3 report instead keeps partial rollouts with distillation in the same RL framework, noting that the dense reward "naturally enabl[es] infrastructure-level optimizations such as partial rollout training for long-horizon tasks"<a class="cite" href="#ref-9">9</a> (§4.1.3).</p>
+
+<h2 id="costs">7. What each route costs</h2>
+<p>None of the reports gives total GPU-hours for an integration route, so cost here is a set of derived counts and structural facts, each labelled. The sequence counts come from the MOPD paper's setup (Appendix A): the three specialists consumed about 175K, 175K and 150K sequences, 500K in all. Figure 2's axes run to roughly 175K math, 175K IF and 150K SWE samples, which at Mix-RL's 0.35:0.35:0.3 mix is the same total (\(175/0.35=150/0.30=500\) thousand; derived from the axes), and the Figure 3 runs last 60 steps at batch 2,048 with one rollout per prompt, about 123K student sequences if a step is one batch (derived). So the student stage adds up to roughly a quarter to the sequence count of a specialist build. It is also an upper bound on student sequences only: sequence length differs by domain (SWE runs to 65,536 tokens over up to 50 turns), and the teacher prefill adds a forward pass the RL baselines do not have. Under the usual \(2N\) (forward) and \(6N\) (forward and backward) FLOPs-per-token approximation of Module 1, a teacher of the student's own size adds one third of the student's update FLOPs per token (derived, attention ignored), which the authors hide behind sampling by running prefill as an asynchronous service<a class="cite" href="#ref-1">1</a> (§3.3).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 9.</b> What each route requires and what it exposes. Scores are the MOPD paper's normalised scores<a class="cite" href="#ref-1">1</a> (Table 2); its §5 argues the parallel-development and restart properties for MOPD, and the "restart" and "wall-clock" columns extend that reading to the other routes, so they are this module's structural reading, as is the evidence tag.</caption>
+  <thead><tr><th>Route</th><th>Training runs</th><th>Wall-clock shape</th><th>Extra infrastructure</th><th>A restart costs</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Mix-RL</td><td>1 pooled run</td><td>serial</td><td>one verifier per domain in one trainer</td><td>the whole run</td><td>controlled, authors' own: 0.882</td></tr>
+    <tr><td class="row">Cascade RL</td><td>N runs in sequence</td><td>sum of stages</td><td>none</td><td>every later stage</td><td>controlled, authors' own: 0.775; split elsewhere (Section 6.3)</td></tr>
+    <tr><td class="row">Off-policy finetune</td><td>N specialists, then SFT</td><td>max of specialists, then SFT</td><td>teacher sampling</td><td>one specialist</td><td>controlled: 0.824; V3.2 pairs it with RL<a class="cite" href="#ref-3">3</a></td></tr>
+    <tr><td class="row">Parameter merge</td><td>N specialists, no training after</td><td>max of specialists</td><td>none</td><td>one specialist</td><td>controlled: 0.328 to 0.857 by recipe</td></tr>
+    <tr><td class="row">MOPD</td><td>N specialists, then one student pass</td><td>max of specialists, then student pass</td><td>teacher prefill service per teacher</td><td data-best>one specialist</td><td data-best>controlled: 0.937; four frontier reports, no matched ablation</td></tr>
+  </tbody>
+</table>
+
+<p>Three decision inputs follow from the evidence. (1) The number and heterogeneity of domains. At three domains with similar rollout shape, mixed RL was 5.5 points behind on a metric the MOPD authors defined; at the dozen-plus environments of Nemotron 3 Ultra, the report's reason for specialists is per-domain dilution<a class="cite" href="#ref-10">10</a>. The sources do not locate the crossover. (2) Whether the teachers share the student's origin. The paper's diagnostic is the initial per-token reverse KL, about 0.04 against 0.19<a class="cite" href="#ref-1">1</a> (§4.4.2); measuring it on a few hundred student rollouts before committing to a teacher is this module's suggestion, not a procedure any report states. (3) Whether the missing skill is something the student can already sample. If not, the HLE row of Figure 4 says the dense signal has little to grade, and the report's alternatives (a shared SFT stage, or SFT on specialist outputs first) apply.</p>
+<p>For an inference engineer the new workload is the teacher service: a prefill-only job that scores completed sequences and returns a log-probability at every position, at up to 192K tokens per sequence in Nemotron's runs<a class="cite" href="#ref-10">10</a> (§3.3.1). That shape (long prefill, per-position outputs, no decode) differs from both a serving engine and an RL rollout engine. This is an inference from the reports' descriptions, not a statement from them; infrastructure choices are System Design Modules 36 to 38.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The 2026 reports do not agree on how to combine skills, and Lambert's survey says so directly: MOPD "is a popular new tool, but labs are far from unanimous in its usage"<a class="cite" href="#ref-17">17</a> (§3.2.4). The disagreement has four live positions. Only one controlled comparison exists (the MOPD authors', on three domains), and none of the frontier reports published here includes a matched-compute ablation against the alternative it replaced.</p>
+<div class="positions">
+  <article class="position">
+    <h4>A. Keep one mixed RL stage</h4>
+    <p class="who">DeepSeek-V3.2<a class="cite" href="#ref-3">3</a> (§3); Qwen3's final general-RL stage<a class="cite" href="#ref-4">4</a>; Nemotron 3 Ultra's own first stage is a unified RLVR run<a class="cite" href="#ref-10">10</a></p>
+    <p>One on-policy run over all domains, which V3.2 says "balances performance across diverse domains while circumventing the catastrophic forgetting issues" of multi-stage pipelines.</p>
+    <ul class="pros"><li>Simplest to operate: one trainer, one recipe, no teacher fleet.</li><li>Most balanced of the non-distillation baselines in the controlled test (range 0.064, score 0.882)<a class="cite" href="#ref-1">1</a>.</li></ul>
+    <ul class="cons"><li>5.5 points behind MOPD on the authors' metric and subject to the "see-saw"<a class="cite" href="#ref-1">1</a>.</li><li>Per-domain signal dilutes as environments multiply<a class="cite" href="#ref-10">10</a>; a restart restarts everything.</li><li>DeepSeek replaced it between V3.2 and V4<a class="cite" href="#ref-12">12</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B. Sequential stages, repaired by distilling from earlier checkpoints</h4>
+    <p class="who">GLM-5<a class="cite" href="#ref-11">11</a> (§3.5); Nemotron-Cascade and Cascade 2<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-16">16</a> (abstracts)</p>
+    <p>Accept that stages interfere and fix it at the end, with the model's own earlier checkpoints as teachers.</p>
+    <ul class="pros"><li>Same-origin by construction; no parallel teacher fleet to build.</li><li>The original Cascade RL paper reports later stages "rarely degrade" earlier domains<a class="cite" href="#ref-2">2</a>.</li></ul>
+    <ul class="cons"><li>Stages stay serial; total time is a sum.</li><li>GLM-5's own motive is cumulative degradation<a class="cite" href="#ref-11">11</a>, and the MOPD paper's cascade scored 0.775 with math at 0.57<a class="cite" href="#ref-1">1</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>C. Parallel specialists, sampled-token MOPD</h4>
+    <p class="who">MOPD paper<a class="cite" href="#ref-1">1</a>; MiMo-V2-Flash<a class="cite" href="#ref-8">8</a>; Kimi K3<a class="cite" href="#ref-9">9</a>; Nemotron 3 Ultra<a class="cite" href="#ref-10">10</a></p>
+    <p>Train each skill to its peak independently, then distill with one log-ratio per token on the student's own rollouts.</p>
+    <ul class="pros"><li>Best score and flattest profile in the controlled comparison (0.937; 0.91 to 0.95)<a class="cite" href="#ref-1">1</a>.</li><li>Parallel teams and restarts confined to one specialist<a class="cite" href="#ref-1">1</a> (§5).</li><li>Three independent reports found richer signals gave no gain<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-10">10</a>.</li></ul>
+    <ul class="cons"><li>Needs same-origin teachers or a warmup; a stronger external teacher broke the run<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-10">10</a>.</li><li>Cannot import skills the student never samples (HLE, 16.9% recovery)<a class="cite" href="#ref-10">10</a>.</li><li>N specialist runs, and every comparative number is the authors' own.</li></ul>
+  </article>
+  <article class="position">
+    <h4>D. Parallel specialists, full-vocabulary distillation</h4>
+    <p class="who">DeepSeek-V4<a class="cite" href="#ref-12">12</a> (§5.1.2, §5.2.2)</p>
+    <p>The sampled-token estimate is resource-efficient but "leads to high variance in gradient estimation and often causes training instability", so use the exact KL over the whole vocabulary.</p>
+    <ul class="pros"><li>Removes sampling variance (the toy example's 2.3x noise-to-signal at one prefix).</li><li>Engineering shown to work with more than ten teachers.</li></ul>
+    <ul class="cons"><li>No ablation published; Nemotron's logit matching underperformed on Terminal Bench<a class="cite" href="#ref-10">10</a>.</li><li>Needs hidden-state caching, per-teacher head loading and a custom KL kernel.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The choice turns on three inputs: how many domains there are and how different their rollouts are, whether the teachers can be made same-origin, and whether the missing skill lies inside the student's own sampling distribution. With few, similar domains, mixed RL is within reach of MOPD (5.5 points on the authors' metric) at far lower engineering cost, so position A is defensible there. With many environments including long agentic ones, four independent reports (Xiaomi, Moonshot, NVIDIA, DeepSeek) chose specialists, and the dilution argument is mechanistically sound. Position B is a reasonable compromise when parallel teams are not available. Between C and D the evidence favours C as the default and treats D as unproven: three reports tested richer signals and found no gain, and the one report that adopted them published no comparison. What would settle it: a matched-GPU-hour comparison, with several seeds, of continued mixed RL, cascade-plus-repair, sampled-token MOPD and full-vocabulary OPD from one SFT checkpoint at ten or more domains, including at least two agentic ones. That experiment does not exist in the sources read.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Four items are open. First, the same-origin requirement is being worked around: Nemotron's warmup SFT and its proposed shared SFT stage, Ko et al.'s relaxed imitation through reward clipping<a class="cite" href="#ref-14">14</a>, and Li et al.'s off-policy cold start with teacher-aligned prompt selection<a class="cite" href="#ref-13">13</a> (abstracts) all try to make distillation tolerate a teacher that differs from the student. Second, whether end-to-end agentic rollouts beat single-turn ones under distillation is untested (Section 6.5). Third, the naming is unsettled: DeepSeek-V4 calls its stage "multi-teacher On-Policy Distillation (OPD)" and GLM-5 "on-policy cross-stage distillation"<a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-12">12</a>, while Lambert groups both under MOPD<a class="cite" href="#ref-17">17</a>; the term is a family, not a spec. Fourth, the iterative loop (retrain specialists from the last student, then distill again) is measured for one extra round in the MOPD paper<a class="cite" href="#ref-1">1</a> and for two MOPD iterations in Nemotron 3 Ultra<a class="cite" href="#ref-10">10</a> (Table 5), so how many rounds keep paying is unknown. The MOPD paper is a June 2026 preprint, v1; its numbers come from the authors' own runs.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Ma, W., Wei, J., Zhao, L., Zhang, H., et al. (Xiaomi LLM Core; Peking University). <em>MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training</em>. arXiv:2606.30406v1, 29 Jun 2026. <a href="https://arxiv.org/pdf/2606.30406v1">https://arxiv.org/pdf/2606.30406v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Table 1 axes (checked on the rendered page), §3 objective and infrastructure, Tables 2 to 5, Appendix A hyperparameters, §4.4 analyses, §5 workflow argument.</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Wang, B., Lee, C., Lee, N., Lin, S.-C., Dai, W., Chen, Y., Chen, Y., Yang, Z., Liu, Z., Shoeybi, M., Catanzaro, B., Ping, W. <em>Nemotron-Cascade: Scaling Cascaded Reinforcement Learning for General-Purpose Reasoning Models</em>. arXiv:2512.13607, v1 15 Dec 2025, v2 27 Mar 2026. <a href="https://arxiv.org/abs/2512.13607">https://arxiv.org/abs/2512.13607</a>. Accessed 2026-10-27. <span class="ref-use">Used for: abstract only (cross-domain heterogeneity, Cascade RL, "rarely degrade"); full text not read.</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv:2512.02556v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §3 specialist distillation and mixed RL training, reward composition.</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Yang, A., et al. (Qwen Team). <em>Qwen3 Technical Report</em>. arXiv:2505.09388v1, 14 May 2025. <a href="https://arxiv.org/pdf/2505.09388v1">https://arxiv.org/pdf/2505.09388v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §4 four-stage pipeline, §4.4 General RL task list, Table 22 stage-by-stage scores.</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Ilharco, G., Ribeiro, M. T., Wortsman, M., Gururangan, S., Schmidt, L., Hajishirzi, H., Farhadi, A. <em>Editing Models with Task Arithmetic</em>. ICLR 2023; arXiv:2212.04089. <a href="https://arxiv.org/abs/2212.04089">https://arxiv.org/abs/2212.04089</a>. Accessed 2026-10-27. <span class="ref-use">Used for: task-vector definition and addition (abstract only).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Llama Team, AI @ Meta. <em>The Llama 3 Herd of Models</em>. arXiv:2407.21783v3. <a href="https://arxiv.org/pdf/2407.21783v3">https://arxiv.org/pdf/2407.21783v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §4.1.5 model averaging across data and hyperparameter variants.</span></li>
+  <li id="ref-7"><span class="ref-type">blog</span>Lu, K. and Thinking Machines Lab. <em>On-Policy Distillation</em>. Thinking Machines Lab: Connectionism, 27 Oct 2025 (page notes a June 2026 update). <a href="https://thinkingmachines.ai/blog/on-policy-distillation/">https://thinkingmachines.ai/blog/on-policy-distillation/</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the student-samples, teacher-grades-each-token template (single-teacher treatment is Module 21).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Xiaomi LLM-Core. <em>MiMo-V2-Flash Technical Report</em>. arXiv:2601.02780v2, 8 Jan 2026. <a href="https://arxiv.org/pdf/2601.02780v2">https://arxiv.org/pdf/2601.02780v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §4.1 three-stage MOPD, Table 7 (12 benchmarks), §4.4 Eq. 5 to 9, Figure 6.</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Kimi Team. <em>Kimi K3: Open Frontier Intelligence</em>. arXiv:2607.24653v2, 7 Aug 2026. <a href="https://arxiv.org/pdf/2607.24653v2">https://arxiv.org/pdf/2607.24653v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §4.1.2 nine experts and agentic GRM sentence, §4.1.3 MOPD reward (Eq. 15) and top-k remark.</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>NVIDIA. <em>Nemotron 3 Ultra: Open, Efficient Mixture-of-Experts Hybrid Mamba-Transformer Model for Agentic Reasoning</em>. arXiv:2606.15007v1, 12 Jun 2026. <a href="https://arxiv.org/pdf/2606.15007v1">https://arxiv.org/pdf/2606.15007v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §3.2 to §3.3 (unified RLVR, MOPD, warmup, Tables 4 and 5, limitations), Figure 10.</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>GLM-5 Team. <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. arXiv:2602.15763v2, 24 Feb 2026. <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §3 pipeline, §3.5 on-policy cross-stage distillation (Eq. 2).</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv:2606.19348v1 (PDF stamp 26 Apr 2026). <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §5.1 specialists and OPD (Eq. 29), §5.2.2 teacher scheduling, §4.1 and §4.2.1 vocabulary and hidden sizes.</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Li, Y., Zuo, Y., He, B., Zhang, J., Xiao, C., Qian, C., Yu, T., Gao, H., Yang, W., Liu, Z., Ding, N. <em>Rethinking On-Policy Distillation of Large Language Models: Phenomenology, Mechanism, and Recipe</em>. arXiv:2604.13016, 14 Apr 2026. <a href="https://arxiv.org/abs/2604.13016">https://arxiv.org/abs/2604.13016</a>. Accessed 2026-10-27. <span class="ref-use">Used for: abstract only (conditions for success, cold start).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Ko, J., Abdali, S., Kim, Y. J., Chen, T., Cameron, P. <em>Scaling Reasoning Efficiently via Relaxed On-Policy Distillation</em>. arXiv:2603.11137, 11 Mar 2026. <a href="https://arxiv.org/abs/2603.11137">https://arxiv.org/abs/2603.11137</a>. Accessed 2026-10-27. <span class="ref-use">Used for: abstract only (instability, log-ratio as token reward, reward clipping).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Chen, T., Ou, J., Liu, Z., Tang, R., Liang, J., Li, H. <em>Counteraction-Aware Multi-Teacher On-Policy Distillation for General Capability Recovery with Domain Preservation</em>. arXiv:2605.27115, v1 26 May 2026, v2 14 Sep 2026. <a href="https://arxiv.org/abs/2605.27115">https://arxiv.org/abs/2605.27115</a>. Accessed 2026-10-27. <span class="ref-use">Used for: abstract only (two failure modes of vanilla MOPD, CaMOPD).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Yang, Z., et al. (NVIDIA). <em>Nemotron-Cascade 2: Post-Training LLMs with Cascade RL and Multi-Domain On-Policy Distillation</em>. arXiv:2603.19220, v1 19 Mar 2026, v2 22 Mar 2026. <a href="https://arxiv.org/abs/2603.19220">https://arxiv.org/abs/2603.19220</a>. Accessed 2026-10-27. <span class="ref-use">Used for: abstract only (distillation from the strongest intermediate teachers inside a cascade).</span></li>
+  <li id="ref-17"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv:2504.12501v12, 11 Sep 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §3.2.4 MOPD recipe shift, expert counts, "far from unanimous".</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

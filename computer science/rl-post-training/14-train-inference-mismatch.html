@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training-Inference Mismatch: Why the Rollout Engine and the Trainer Disagree on Probabilities, and the Four Families of Fixes · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Why vLLM-style rollout probabilities differ from trainer probabilities for the same weights, what that does to the on-policy assumption, and the statistical, numerical, deterministic and masking fixes reported by Qwen, MiniMax, DeepSeek, GLM, Olmo, Ling, ByteDance, SGLang and vLLM.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 14</p>
+  <h1>Training-Inference Mismatch: Why the Rollout Engine and the Trainer Disagree on Probabilities, and the Four Families of Fixes</h1>
+  <p class="lede">Two engines run the same weights and report different probabilities for the same token, so the "on-policy" batch is quietly off-policy. This module traces where the disagreement enters (reduction order, precision, the sampler, MoE routing, indexer top-k, tokenization), what it does to a run, and the four fix families the 2025-2026 reports use: correct statistically, fix the numerics, remove the source, or mask the damage. You can use it to instrument a rollout and trainer pair, find the dominant source for a new architecture, and pick the cheapest fix that covers it.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>22</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 1</b>, <b>Module 12</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 472" role="img" aria-labelledby="f1t"><title id="f1t">The same weights go through a rollout engine and a trainer; six places where the two computations of the same token probability can diverge, ending in the mismatch ratio rho</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="290" y="12" width="220" height="38" rx="8" class="d-surface"/><text x="400" y="36" text-anchor="middle" class="d-bold">same weights θ_old</text>
+    <path d="M340,50 L200,84" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M460,50 L600,84" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="20" y="84" width="340" height="264" rx="10" class="d-panel"/>
+    <text x="190" y="106" text-anchor="middle" class="d-title">Rollout engine (vLLM, SGLang)</text>
+    <rect x="40" y="120" width="270" height="38" rx="6" class="d-block-2"/><text x="175" y="144" text-anchor="middle" class="d-text-inv d-bold">decode: 1 token per step</text>
+    <rect x="40" y="172" width="270" height="38" rx="6" class="d-block-2"/><text x="175" y="196" text-anchor="middle" class="d-text-inv d-bold">layers: attention, router, matmul</text>
+    <rect x="40" y="224" width="270" height="38" rx="6" class="d-block-2"/><text x="175" y="248" text-anchor="middle" class="d-text-inv d-bold">LM head to logits</text>
+    <rect x="40" y="276" width="270" height="38" rx="6" class="d-block-accent"/><text x="175" y="300" text-anchor="middle" class="d-text-inv d-bold">sampler: T, top-p, top-k</text>
+    <path d="M175,158 L175,172" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M175,210 L175,224" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M175,262 L175,276" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="190" y="336" text-anchor="middle" class="d-mono d-small">emits y_t and log π_infer(y_t)</text>
+
+    <rect x="440" y="84" width="340" height="264" rx="10" class="d-panel"/>
+    <text x="610" y="106" text-anchor="middle" class="d-title">Trainer (FSDP, Megatron)</text>
+    <rect x="470" y="120" width="270" height="38" rx="6" class="d-block"/><text x="605" y="144" text-anchor="middle" class="d-text-inv d-bold">whole sequence, one pass</text>
+    <rect x="470" y="172" width="270" height="38" rx="6" class="d-block"/><text x="605" y="196" text-anchor="middle" class="d-text-inv d-bold">layers: other kernels, sharding</text>
+    <rect x="470" y="224" width="270" height="38" rx="6" class="d-block"/><text x="605" y="248" text-anchor="middle" class="d-text-inv d-bold">LM head to logits</text>
+    <rect x="470" y="276" width="270" height="38" rx="6" class="d-block"/><text x="605" y="300" text-anchor="middle" class="d-text-inv d-bold">log-softmax, no mask</text>
+    <path d="M605,158 L605,172" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M605,210 L605,224" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M605,262 L605,276" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="610" y="336" text-anchor="middle" class="d-mono d-small">scores y_t: log π_train(y_t)</text>
+
+    <path d="M360,139 L440,139" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <text x="400" y="128" text-anchor="middle" class="d-small">token ids</text>
+
+    <circle cx="336" cy="139" r="10" class="d-fill-orange"/><text x="336" y="143" text-anchor="middle" class="d-text-inv d-bold d-small">3</text>
+    <circle cx="326" cy="191" r="10" class="d-fill-orange"/><text x="326" y="195" text-anchor="middle" class="d-text-inv d-bold d-small">1</text>
+    <circle cx="347" cy="191" r="10" class="d-fill-orange"/><text x="347" y="195" text-anchor="middle" class="d-text-inv d-bold d-small">5</text>
+    <circle cx="336" cy="243" r="10" class="d-fill-orange"/><text x="336" y="247" text-anchor="middle" class="d-text-inv d-bold d-small">2</text>
+    <circle cx="336" cy="295" r="10" class="d-fill-orange"/><text x="336" y="299" text-anchor="middle" class="d-text-inv d-bold d-small">4</text>
+    <circle cx="400" cy="162" r="10" class="d-fill-orange"/><text x="400" y="166" text-anchor="middle" class="d-text-inv d-bold d-small">6</text>
+
+    <path d="M190,348 L300,372" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M610,348 L500,372" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="260" y="372" width="280" height="40" rx="8" class="d-hl"/><text x="400" y="397" text-anchor="middle" class="d-mono">ρ_t = π_train(y_t) / π_infer(y_t) ≠ 1</text>
+
+    <circle cx="40" cy="436" r="9" class="d-fill-orange"/><text x="40" y="440" text-anchor="middle" class="d-text-inv d-bold d-small">1</text><text x="56" y="440">reduction order</text>
+    <circle cx="300" cy="436" r="9" class="d-fill-orange"/><text x="300" y="440" text-anchor="middle" class="d-text-inv d-bold d-small">2</text><text x="316" y="440">precision, dtype</text>
+    <circle cx="560" cy="436" r="9" class="d-fill-orange"/><text x="560" y="440" text-anchor="middle" class="d-text-inv d-bold d-small">3</text><text x="576" y="440">different program</text>
+    <circle cx="40" cy="456" r="9" class="d-fill-orange"/><text x="40" y="460" text-anchor="middle" class="d-text-inv d-bold d-small">4</text><text x="56" y="460">sampling mask</text>
+    <circle cx="300" cy="456" r="9" class="d-fill-orange"/><text x="300" y="460" text-anchor="middle" class="d-text-inv d-bold d-small">5</text><text x="316" y="460">discrete choices</text>
+    <circle cx="560" cy="456" r="9" class="d-fill-orange"/><text x="560" y="460" text-anchor="middle" class="d-text-inv d-bold d-small">6</text><text x="576" y="460">token round trip</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> One checkpoint, two programs. The rollout engine decodes one token per step at a varying batch size, applies a sampler, and returns the probability it used; the trainer evaluates the whole sequence in one pass with different kernels and sharding. Each numbered point is a place a reported divergence enters: reduction order<a class="cite" href="#ref-1">1</a>, precision<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>, the decode-versus-sequence program<a class="cite" href="#ref-2">2</a>, the sampling mask<a class="cite" href="#ref-4">4</a>, discrete router and indexer choices<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>, and re-tokenization<a class="cite" href="#ref-5">5</a>. Sections 2.1 to 2.5 take them in turn; Module 12 (Section 1.2, Figure 2) factors the full ratio into this mismatch and the optimizer drift.</figcaption>
+</figure>
+
+<h2 id="mismatch-defined">1. The mismatch, defined and measured</h2>
+
+<h3 id="mismatch-defined-what">1.1 What "same weights" does not give you</h3>
+<p>A rollout engine and a trainer load one checkpoint. For a sampled token \(a_t\) in state \(s_t\), the engine reports \(\log\pi^{infer}(a_t\mid s_t)\) while sampling; run the trainer on the same token ids and it returns \(\log\pi^{train}(a_t\mid s_t)\). The mismatch ratio and its log are
+$$\rho_t=\frac{\pi^{train}_{\theta_{old}}(a_t\mid s_t)}{\pi^{infer}_{\theta_{old}}(a_t\mid s_t)},\qquad \delta_t=\log\rho_t .$$
+This is the \(\rho_t\) of Module 12 (Section 1.2), where the ratio a loss sees is factored exactly into optimizer drift \(r_t\) and this term. Zhong et al. call the same definition "objective-agnostic": it exists before you choose REINFORCE, PPO or GRPO<a class="cite" href="#ref-6">6</a> (Eq. 1).</p>
+<p>Two consequences need separate fixes. The first is a biased gradient. The batch is drawn from \(\mu=\pi^{infer}\) but the optimizer differentiates \(\pi=\pi^{train}\), so the update is \(\mathbb E_{y\sim\mu}[\nabla\log\pi(y)\,R]\) and not the policy gradient \(\mathbb E_{y\sim\pi}[\nabla\log\pi(y)\,R]\)<a class="cite" href="#ref-2">2</a> (Eq. 3). One update per rollout does not remove it: \(r_t\) is exactly 1 in that regime and the bias still lives in \(\rho_t\). The second is the deployment gap. The weights that maximize reward under \(\pi\) need not maximize it under \(\mu\), the engine that serves the model; a correction inside the loss addresses the first problem and, by construction, not the second<a class="cite" href="#ref-2">2</a> (Eq. 4).</p>
+<p>Qwen's formulation says when a token-level loss is a valid stand-in at all. The exact sequence-level importance weight is a product over tokens, too noisy to use; the token-level surrogate replaces it with a sum of per-token ratios, the first-order expansion \(\prod_t(1+\epsilon_t)\approx 1+\sum_t\epsilon_t\). That holds only while every \(\epsilon_t\) is small, and each token's ratio splits into the training-inference discrepancy and policy staleness, so the surrogate is valid "only when both" are minimized<a class="cite" href="#ref-7">7</a> (Abstract, §2.3-2.4). The discrepancy is one of the two terms that decide whether the algorithm approximates the right objective, not a rounding error beneath it.</p>
+
+<h3 id="mismatch-defined-metrics">1.2 How large it is, and how each report measures it</h3>
+<p>Six reports quote a number, each with a different statistic, so the rows of Table 1 cannot be compared with each other. They agree on one pattern: the average gap is small and the tail is not.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 1.</b> Reported size of the rollout-trainer gap for the same weights. The statistic differs by row; values marked "read off" are read from a plot by the writer and are approximate.</caption>
+  <thead><tr><th>Report</th><th>Model and setting</th><th>Statistic</th><th>Reported value</th></tr></thead>
+  <tbody>
+    <tr><td class="row">MiniMax-M1<a class="cite" href="#ref-3">3</a></td><td>hybrid-attention model, before and after an FP32 LM head</td><td>Pearson correlation of token probabilities</td><td class="num">0.987319 before; 0.997135 after</td></tr>
+    <tr><td class="row">Ring-1T<a class="cite" href="#ref-8">8</a></td><td>1T-parameter MoE, GRPO baseline, steps 0 to about 405</td><td>per-token absolute log gap; batch maximum</td><td class="num">about 0.027; max about 12 to 15, up to about 24 (read off Fig. 6)</td></tr>
+    <tr><td class="row">Zhong et al.<a class="cite" href="#ref-6">6</a></td><td>Qwen3-1.7B dense, GRPO, vLLM and FSDP</td><td>\(|\delta_t|\) per batch, mean and max</td><td class="num">mean small (plot axis 0 to 0.07); max near 1.0 (Fig. 1; the text calls it a probability difference)</td></tr>
+    <tr><td class="row">Qi et al.<a class="cite" href="#ref-2">2</a></td><td>R1-Distill-Qwen-1.5B, temperature 1.0, no top-p, 32 samples per question</td><td>sequence KL[µ‖π]; slope of log ratio per 1K tokens</td><td class="num">BF16 7.64, slope −1.01; FP16 0.32, slope −0.07 (Fig. 2)</td></tr>
+    <tr><td class="row">Miles post<a class="cite" href="#ref-9">9</a></td><td>Qwen3 dense and MoE, SGLang and Megatron or FSDP</td><td>K3 KL, rollout against trainer</td><td class="num">dense 10<sup>-5</sup> to 10<sup>-3</sup>; MoE 10<sup>-3</sup> to 10<sup>-1</sup> (stated typical ranges)</td></tr>
+    <tr><td class="row">Thinking Machines<a class="cite" href="#ref-1">1</a></td><td>Qwen 2.5-VL instruct 8B, RLVR on Bigmath, 4,096-token rollouts</td><td>KL of log-probs, sampler against trainer</td><td class="num">about 0.001 with importance weighting; flat 0 when bitwise identical</td></tr>
+  </tbody>
+</table>
+
+<p>The means look harmless (about 0.027 nats per token in Ring-1T); the maxima do not (about 12 to 15 nats at the start of Ring-1T's baseline and about 24 at the end, a per-batch maximum near 1.0 in the dense Qwen3-1.7B run). Zhong et al.'s Table 1 traces one sentence token by token. On Qwen3-8B BF16 weights, along one greedy AIME 2024 response, the engine gave the token "that" log-probability −0.694 and the trainer −0.827 (\(\delta_t=-0.133\)), and at that position the trainer's top-1 token was a different string (":\n\n", −0.577): the argmax flipped. The other positions shown agreed to within 0.01<a class="cite" href="#ref-6">6</a>.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f2t"><title id="f2t">Schematic of token probabilities in training mode against inference mode, before and after the FP32 LM head fix, with the reported Pearson correlations 0.987319 and 0.997135</title>
+    <rect x="80" y="40" width="270" height="250" class="d-outline"/>
+    <path d="M80,290 L350,40" class="d-line d-stroke-red d-dashed" style="stroke-width:1.5"/>
+    <circle cx="118.9" cy="260.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="338.7" cy="72.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="157.4" cy="219.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="241.2" cy="114.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="168.5" cy="214.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="293.3" cy="107.1" r="2.2" class="d-fill-blue"/>
+    <circle cx="115.1" cy="251.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="160.7" cy="181.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="150.1" cy="217.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="137.5" cy="257.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="230.7" cy="155.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="257.9" cy="133.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="121.2" cy="255.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="136.9" cy="231.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="350.0" cy="72.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="184.5" cy="165.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="233.2" cy="131.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="125.8" cy="265.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="241.2" cy="147.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="116.2" cy="264.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="315.7" cy="82.1" r="2.2" class="d-fill-blue"/>
+    <circle cx="203.5" cy="176.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="140.5" cy="228.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="123.8" cy="267.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="289.8" cy="84.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="91.5" cy="272.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="268.1" cy="101.2" r="2.2" class="d-fill-blue"/>
+    <circle cx="104.8" cy="254.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="214.2" cy="173.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="213.4" cy="184.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="221.8" cy="178.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="107.7" cy="256.1" r="2.2" class="d-fill-blue"/>
+    <circle cx="207.0" cy="169.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="309.3" cy="46.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="96.6" cy="259.2" r="2.2" class="d-fill-blue"/>
+    <circle cx="222.6" cy="138.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="98.7" cy="283.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="215.3" cy="201.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="194.7" cy="217.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="163.6" cy="228.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="160.3" cy="207.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="196.0" cy="161.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="154.8" cy="223.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="165.9" cy="207.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="343.6" cy="57.1" r="2.2" class="d-fill-blue"/>
+    <circle cx="329.3" cy="65.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="179.1" cy="198.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="122.9" cy="246.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="136.4" cy="233.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="137.9" cy="204.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="166.4" cy="238.2" r="2.2" class="d-fill-blue"/>
+    <circle cx="173.7" cy="224.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="186.4" cy="223.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="170.3" cy="221.1" r="2.2" class="d-fill-blue"/>
+    <circle cx="204.0" cy="222.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="194.2" cy="224.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="148.0" cy="225.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="165.5" cy="220.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="187.6" cy="223.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="247.0" cy="161.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="195.7" cy="163.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="208.7" cy="165.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="197.9" cy="164.2" r="2.2" class="d-fill-blue"/>
+    <circle cx="258.2" cy="164.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="180.7" cy="165.1" r="2.2" class="d-fill-blue"/>
+    <circle cx="237.5" cy="163.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="262.3" cy="107.2" r="2.2" class="d-fill-blue"/>
+    <circle cx="260.8" cy="108.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="267.8" cy="106.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="233.2" cy="106.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="305.1" cy="106.2" r="2.2" class="d-fill-blue"/>
+    <circle cx="242.6" cy="105.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="295.4" cy="108.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="201.5" cy="70.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="242.0" cy="240.0" r="2.2" class="d-fill-blue"/>
+    <text x="80" y="304" text-anchor="middle" class="d-small d-text-light">0</text>
+    <text x="74" y="294" text-anchor="end" class="d-small d-text-light">0</text>
+    <text x="215" y="304" text-anchor="middle" class="d-small d-text-light">0.5</text>
+    <text x="74" y="169" text-anchor="end" class="d-small d-text-light">0.5</text>
+    <text x="350" y="304" text-anchor="middle" class="d-small d-text-light">1.0</text>
+    <text x="74" y="44" text-anchor="end" class="d-small d-text-light">1.0</text>
+    <text x="215.0" y="322" text-anchor="middle" class="d-small d-text-light">inference-mode probability</text>
+    <text x="40" y="165.0" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 40 165.0)">training-mode probability</text>
+    <text x="215.0" y="30" text-anchor="middle" class="d-bold">before fix: correlation 0.987319</text>
+    <rect x="470" y="40" width="270" height="250" class="d-outline"/>
+    <path d="M470,290 L740,40" class="d-line d-stroke-red d-dashed" style="stroke-width:1.5"/>
+    <circle cx="719.6" cy="63.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="646.5" cy="128.2" r="2.2" class="d-fill-blue"/>
+    <circle cx="581.1" cy="187.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="551.3" cy="227.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="698.0" cy="76.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="494.5" cy="272.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="622.5" cy="160.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="498.3" cy="259.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="732.0" cy="51.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="698.7" cy="72.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="499.3" cy="274.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="681.7" cy="95.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="572.1" cy="192.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="624.7" cy="140.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="678.6" cy="96.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="606.3" cy="168.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="727.6" cy="52.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="541.6" cy="227.1" r="2.2" class="d-fill-blue"/>
+    <circle cx="479.5" cy="288.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="732.9" cy="45.1" r="2.2" class="d-fill-blue"/>
+    <circle cx="706.9" cy="53.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="707.0" cy="67.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="593.3" cy="180.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="564.3" cy="201.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="511.2" cy="252.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="721.6" cy="53.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="730.8" cy="56.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="609.4" cy="157.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="711.7" cy="71.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="497.2" cy="271.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="679.8" cy="93.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="588.3" cy="186.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="591.2" cy="191.2" r="2.2" class="d-fill-blue"/>
+    <circle cx="521.2" cy="231.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="597.6" cy="169.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="577.5" cy="193.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="533.1" cy="231.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="536.7" cy="228.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="533.3" cy="220.2" r="2.2" class="d-fill-blue"/>
+    <circle cx="496.2" cy="260.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="485.6" cy="281.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="652.1" cy="124.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="680.2" cy="102.9" r="2.2" class="d-fill-blue"/>
+    <circle cx="584.5" cy="182.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="632.4" cy="130.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="656.6" cy="115.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="651.8" cy="116.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="577.8" cy="195.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="673.1" cy="105.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="571.4" cy="206.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="555.8" cy="210.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="522.0" cy="243.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="698.8" cy="80.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="543.6" cy="216.1" r="2.2" class="d-fill-blue"/>
+    <circle cx="517.5" cy="250.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="611.9" cy="161.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="643.2" cy="135.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="569.2" cy="194.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="682.7" cy="94.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="482.7" cy="280.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="509.6" cy="253.4" r="2.2" class="d-fill-blue"/>
+    <circle cx="625.8" cy="141.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="581.3" cy="189.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="601.0" cy="172.8" r="2.2" class="d-fill-blue"/>
+    <circle cx="568.2" cy="202.3" r="2.2" class="d-fill-blue"/>
+    <circle cx="699.3" cy="82.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="688.4" cy="89.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="734.8" cy="45.7" r="2.2" class="d-fill-blue"/>
+    <circle cx="554.3" cy="211.5" r="2.2" class="d-fill-blue"/>
+    <circle cx="707.2" cy="68.6" r="2.2" class="d-fill-blue"/>
+    <circle cx="510.5" cy="65.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="686.0" cy="215.0" r="2.2" class="d-fill-blue"/>
+    <circle cx="605.0" cy="240.0" r="2.2" class="d-fill-blue"/>
+    <text x="470" y="304" text-anchor="middle" class="d-small d-text-light">0</text>
+    <text x="464" y="294" text-anchor="end" class="d-small d-text-light">0</text>
+    <text x="605" y="304" text-anchor="middle" class="d-small d-text-light">0.5</text>
+    <text x="464" y="169" text-anchor="end" class="d-small d-text-light">0.5</text>
+    <text x="740" y="304" text-anchor="middle" class="d-small d-text-light">1.0</text>
+    <text x="464" y="44" text-anchor="end" class="d-small d-text-light">1.0</text>
+    <text x="605.0" y="322" text-anchor="middle" class="d-small d-text-light">inference-mode probability</text>
+    <text x="430" y="165.0" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 430 165.0)">training-mode probability</text>
+    <text x="605.0" y="30" text-anchor="middle" class="d-bold">FP32 LM head: correlation 0.997135</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Token probabilities from the training-mode code against the inference-mode code, same weights, one point per token. Schematic after MiniMax-M1's Figure 3; point positions are illustrative, the two correlations are the figure's own labels<a class="cite" href="#ref-3">3</a>. The original left panel shows horizontal bands; the text says the mismatch "prevented reward growth"<a class="cite" href="#ref-3">3</a> (§3.2).</figcaption>
+</figure>
+
+<p>The number to keep from MiniMax-M1's scatter is 0.987319: a correlation that high still stalled reward growth. A Pearson coefficient on token probabilities is dominated by the many tokens near 0 or 1 and says little about the tail (the writer's reading), so the sections below use tail statistics (max, outside-band fraction, sequence-level slope).</p>
+
+<h3 id="mismatch-defined-length">1.3 Length turns a small per-token gap into a large sequence-level one</h3>
+<p>The sequence-level ratio is the product of token ratios, so its log is the sum \(\sum_t\delta_t\). Averaged over sequences drawn from \(\mu\), \(\mathbb E_\mu[\log\rho(y)]=-\mathrm{KL}(\mu\Vert\pi)\), which is \(-kT\) for a per-token KL of \(k\) nats over \(T\) tokens (derived). Qi et al. plot the sequence log-ratio against length for R1-Distill-Qwen-1.5B, sampled at temperature 1.0 with no top-p so that \(\mu\) is comparable to \(\pi\), and fit a slope of −1.01 per thousand tokens in BF16 against −0.07 in FP16, with sequence-level KL[µ‖π] of 7.64 against 0.32<a class="cite" href="#ref-2">2</a> (§3.5, Fig. 2). Reading the slope as \(1000k\) gives a per-token KL of about \(1.0\times10^{-3}\) in BF16 and \(7\times10^{-5}\) in FP16 (derived), which sits inside the dense range in Table 1. Figure 3 draws the two fits.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 352" role="img" aria-labelledby="f3t"><title id="f3t">Expected sequence-level log importance ratio against response length for BF16 and FP16, from the fitted slopes in Qi et al. Figure 2</title>
+    <path d="M90,40 L90,300" class="d-grid"/>
+    <text x="90" y="316" text-anchor="middle" class="d-small d-text-light">0</text>
+    <path d="M218,40 L218,300" class="d-grid"/>
+    <text x="218" y="316" text-anchor="middle" class="d-small d-text-light">5</text>
+    <path d="M346,40 L346,300" class="d-grid"/>
+    <text x="346" y="316" text-anchor="middle" class="d-small d-text-light">10</text>
+    <path d="M474,40 L474,300" class="d-grid"/>
+    <text x="474" y="316" text-anchor="middle" class="d-small d-text-light">15</text>
+    <path d="M602,40 L602,300" class="d-grid"/>
+    <text x="602" y="316" text-anchor="middle" class="d-small d-text-light">20</text>
+    <path d="M730,40 L730,300" class="d-grid"/>
+    <text x="730" y="316" text-anchor="middle" class="d-small d-text-light">25</text>
+    <path d="M90,40 L730,40" class="d-grid"/>
+    <text x="82" y="44" text-anchor="end" class="d-small d-text-light">0</text>
+    <path d="M90,90 L730,90" class="d-grid"/>
+    <text x="82" y="94" text-anchor="end" class="d-small d-text-light">−5</text>
+    <path d="M90,140 L730,140" class="d-grid"/>
+    <text x="82" y="144" text-anchor="end" class="d-small d-text-light">−10</text>
+    <path d="M90,190 L730,190" class="d-grid"/>
+    <text x="82" y="194" text-anchor="end" class="d-small d-text-light">−15</text>
+    <path d="M90,240 L730,240" class="d-grid"/>
+    <text x="82" y="244" text-anchor="end" class="d-small d-text-light">−20</text>
+    <path d="M90,290 L730,290" class="d-grid"/>
+    <text x="82" y="294" text-anchor="end" class="d-small d-text-light">−25</text>
+    <path d="M90,40 L90,300 L730,300" class="d-axis d-line"/>
+    <path d="M90,40 L730,40" class="d-axis d-dashed"/>
+    <polyline points="90,40 730,292.5" class="d-line d-stroke-orange"/>
+    <polyline points="90,40 730,57.5" class="d-line d-stroke-blue"/>
+    <circle cx="602" cy="242" r="5" class="d-fill-orange"/>
+    <circle cx="602" cy="54" r="5" class="d-fill-blue"/>
+    <text x="592" y="246" text-anchor="end" class="d-mono d-small">−20.2 nats at 20K</text>
+    <text x="602" y="44" text-anchor="middle" class="d-mono d-small">−1.4 at 20K</text>
+    <rect x="480" y="100" width="240" height="64" rx="6" class="d-label-bg"/>
+    <path d="M492,120 L516,120" class="d-line d-stroke-orange"/><text x="524" y="124" class="d-small">BF16: slope −1.01 per 1K, KL 7.64</text>
+    <path d="M492,144 L516,144" class="d-line d-stroke-blue"/><text x="524" y="148" class="d-small">FP16: slope −0.07 per 1K, KL 0.32</text>
+    <text x="410.0" y="336" text-anchor="middle" class="d-small d-text-light">sequence length (thousand tokens)</text>
+    <text x="38" y="170.0" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 38 170.0)">E[log ρ(y)] = −k·T  (nats)</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Expected sequence-level log importance ratio against response length: straight lines from the slopes fitted in Qi et al.'s Figure 2 (−1.01 and −0.07 nats per thousand tokens)<a class="cite" href="#ref-2">2</a>. The paper's BF16 scatter is wide around its fitted line, with individual long sequences far below it (the plot's axis runs to −50)<a class="cite" href="#ref-2">2</a> (p. 7). At 20K tokens the BF16 line is at −20.2 nats and the FP16 line at −1.4 (derived).</figcaption>
+</figure>
+
+<p>Why that matters follows from the variance of the weight. If the sequence log-ratio is Gaussian with mean \(-\sigma^2/2\) and variance \(\sigma^2\), the lognormal that keeps \(\mathbb E_\mu[\rho]=1\), then \(\mathrm{KL}=\sigma^2/2\) and \(\mathbb E_\mu[\rho^2]=e^{\sigma^2}\). The fraction of a batch that is effectively usable under sequence-level weights, \(1/\mathbb E[\rho^2]\), is \(e^{-\sigma^2}=e^{-2\mathrm{KL}}\). With Qi et al.'s average KL values that is \(e^{-15.3}\approx2.3\times10^{-7}\) in BF16 and \(e^{-0.64}\approx0.53\) in FP16 (derived). It is a model, not a measurement: it assumes independent tokens and one lognormal, and real weights are heavier-tailed. It does predict the direction of Qi et al.'s result: sequence-level masked IS "suffers from slow convergence due to the high variance" in BF16, and in FP16 the sequence ratio "becomes much more concentrated and stable"<a class="cite" href="#ref-2">2</a> (§4.2).</p>
+
+<div class="calc">
+  <p class="calc-title">Sequence-level importance weight under a per-token KL</p>
+  <div class="calc-row"><label for="c1k">Per-token KL (units of 1e-5 nats)</label><input type="range" id="c1k" name="kpt" min="1" max="200" step="1" value="100"></div>
+  <div class="calc-row"><label for="c1t">Response length (thousand tokens)</label><input type="range" id="c1t" name="len" min="1" max="32" step="1" value="16"></div>
+  <div class="calc-out">
+    <div>Expected log ratio, nats<output data-expr="-kpt * 1e-5 * len * 1000" data-format="fixed:2"></output></div>
+    <div>Std of log ratio, nats<output data-expr="sqrt(2 * kpt * 1e-5 * len * 1000)" data-format="fixed:2"></output></div>
+    <div>Usable fraction of a batch<output data-expr="exp(-2 * kpt * 1e-5 * len * 1000)"></output></div>
+  </div>
+  <p class="calc-note">Formulas: \(\mathbb E[\log\rho]=-kT\), \(\sigma=\sqrt{2kT}\), usable fraction \(e^{-2kT}\), under the lognormal assumption stated above. The default (100 units, 16K tokens) is BF16-like; 7 units at 16K tokens is FP16-like. A model, not a measurement.</p>
+</div>
+
+<p>Li et al. give the trust-region version: classical error bounds scale as \(O(T^2)\), and for \(T=4{,}096\) and a maximum per-token KL of \(10^{-4}\) the bound is 1,677 against a maximum reward of 1, "vacuous"<a class="cite" href="#ref-10">10</a> (§1). Ling Team add that the gap feeds on itself: under smoothness and bias-alignment assumptions their Theorem 1 has the KL between the two engines growing by a constant factor per update, and their baseline curve shows the engine gap and the gradient norm rising together<a class="cite" href="#ref-8">8</a> (§2.3.2, App. B, Fig. 6).</p>
+
+<h2 id="sources">2. Where two engines on identical weights diverge</h2>
+<p>Six mechanisms, numbered as in Figure 1: three numerical, one about what is being sampled, and two discrete decisions that turn small noise into a different computation. Comparisons to the serving kernels you know are the writer's; the facts are cited.</p>
+
+<h3 id="sources-reduction-order">2.1 Reduction order: batch size changes the answer</h3>
+<p>Floating-point addition is not associative, so any change in the order of a reduction can change a result. Figure 4 shows the smallest case worth remembering: with round-to-nearest-even, \((1+2^{-8})+2^{-8}\) is 1.0 in BF16, because each addend is exactly half a unit in the last place of 1.0 and ties go to even, while \(1+(2^{-8}+2^{-8})\) is 1.0078125 (derived). In FP16 both orders agree. The next representable number above 1 is \(1+2^{-10}\approx1.000977\) in FP16 and \(1+2^{-7}\approx1.007812\) in BF16, the eight-fold resolution gap the FP16 argument rests on<a class="cite" href="#ref-2">2</a> (Table 1).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f4t"><title id="f4t">Two reduction orders for the same three numbers, 1, 2 to the minus 8 and 2 to the minus 8: in BF16 the two orders give 1.0 and 1.0078125, in FP16 both give 1.0078125</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="20" y="14" width="370" height="230" rx="10" class="d-panel"/>
+    <rect x="410" y="14" width="370" height="230" rx="10" class="d-panel"/>
+    <text x="205" y="38" text-anchor="middle" class="d-title">order A: (a + b) + c</text>
+    <text x="595" y="38" text-anchor="middle" class="d-title">order B: a + (b + c)</text>
+
+    <rect x="50" y="190" width="70" height="34" rx="6" class="d-block"/><text x="85" y="212" text-anchor="middle" class="d-text-inv d-mono">a = 1</text>
+    <rect x="155" y="190" width="70" height="34" rx="6" class="d-block-2"/><text x="190" y="212" text-anchor="middle" class="d-text-inv d-mono">b = 2⁻⁸</text>
+    <rect x="260" y="190" width="70" height="34" rx="6" class="d-block-2"/><text x="295" y="212" text-anchor="middle" class="d-text-inv d-mono">c = 2⁻⁸</text>
+    <path d="M85,190 L125,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M190,190 L150,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="95" y="116" width="110" height="34" rx="6" class="d-surface"/><text x="150" y="138" text-anchor="middle" class="d-mono d-small">BF16: 2⁻⁸ lost</text>
+    <path d="M150,116 L180,84" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M295,190 L250,84" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="150" y="62" width="130" height="22" rx="5" class="d-hl"/><text x="215" y="78" text-anchor="middle" class="d-mono d-small">BF16 1.0</text>
+
+    <rect x="440" y="190" width="70" height="34" rx="6" class="d-block"/><text x="475" y="212" text-anchor="middle" class="d-text-inv d-mono">a = 1</text>
+    <rect x="545" y="190" width="70" height="34" rx="6" class="d-block-2"/><text x="580" y="212" text-anchor="middle" class="d-text-inv d-mono">b = 2⁻⁸</text>
+    <rect x="650" y="190" width="70" height="34" rx="6" class="d-block-2"/><text x="685" y="212" text-anchor="middle" class="d-text-inv d-mono">c = 2⁻⁸</text>
+    <path d="M580,190 L620,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M685,190 L645,150" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="575" y="116" width="120" height="34" rx="6" class="d-surface"/><text x="635" y="138" text-anchor="middle" class="d-mono d-small">2⁻⁷ exact</text>
+    <path d="M635,116 L600,84" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <path d="M475,190 L560,84" class="d-arrow" marker-end="url(#f4-arr)"/>
+    <rect x="505" y="62" width="170" height="22" rx="5" class="d-hl"/><text x="590" y="78" text-anchor="middle" class="d-mono d-small">BF16 1.0078125</text>
+
+    <rect x="20" y="258" width="760" height="58" rx="8" class="d-surface"/>
+    <text x="40" y="280" class="d-bold">BF16 (7 mantissa bits): A and B differ by 2⁻⁷ = 0.0078125</text>
+    <text x="40" y="302" class="d-bold">FP16 (10 mantissa bits): A and B agree, 1.0078125</text>
+    <text x="560" y="280" class="d-small d-text-light">ties round to even; each add rounds once</text>
+    <text x="560" y="302" class="d-small d-text-light">a kernel picks A or B by batch size</text>
+  </svg>
+
+  <figcaption><b>Figure 4.</b> The same three numbers summed in two orders. BF16 has 7 mantissa bits and FP16 has 10<a class="cite" href="#ref-2">2</a> (Table 1); results computed by the writer with round-to-nearest-even. A kernel that splits a reduction differently at different batch sizes is choosing between orders like A and B.</figcaption>
+</figure>
+
+<p>The engineering question is who chooses the order. Horace He's analysis for Thinking Machines argues that the common explanation, concurrency and atomic adds, is wrong for inference: the forward pass contains no atomic adds and is "run-to-run deterministic", so identical requests to an identical server give identical results. What varies is the batch size, because load changes it, and the kernels are not batch-invariant<a class="cite" href="#ref-1">1</a> (§ "Batch invariance"). Three operations carry reductions and each breaks invariance its own way. RMSNorm may split one row across cores when the batch is small. A matmul may use Split-K, or different tensor-core instructions, to fill the GPU. Attention's decode-time Split-KV changes how many chunks the KV is cut into: a KV length of 1,000 cut four ways gives four chunks of 250, a fixed chunk size of 256 gives three of 256 and one of 232, so the trees differ unless the split size, not the split count, is fixed<a class="cite" href="#ref-1">1</a>. Their invariant kernels use one matmul configuration for all shapes and lost about 20% against cuBLAS, with a Triton kernel that is "not an optimized" one (no TMA)<a class="cite" href="#ref-1">1</a>.</p>
+<p>The same page measures the effect in the setting where you would least expect it. Qwen3-235B-A22B-Instruct-2507 at temperature 0, prompted "Tell me about Richard Feynman" 1,000 times with 1,000 tokens each, produced 80 unique completions; the most common appeared 78 times, all 1,000 agreed for the first 102 tokens, and at token 103 992 continued with "Queens, New York" and 8 with "New York City". With batch-invariant kernels all 1,000 were identical<a class="cite" href="#ref-1">1</a> (Experiments). That is nondeterminism within one engine; a trainer, with its own tile shapes and batch, should disagree with the engine at least as much (the writer's inference).</p>
+<p>Two orders are specific to RL. The rollout is a decode loop with tiny matrices and the trainer processes whole sequences in large batches, so different kernels get selected<a class="cite" href="#ref-9">9</a>. And the rollout often runs tensor-parallel while the trainer shards with FSDP, so the all-reduce order differs; Zhang et al.'s Tree-Based Invariant Kernels fix one hierarchical order across TP sizes and report bitwise identical results between vLLM and FSDP (abstract only read)<a class="cite" href="#ref-11">11</a>.</p>
+
+<h3 id="sources-precision">2.2 Precision: where the rounding lands</h3>
+<p>Order matters only because every partial sum is rounded. The format decides how coarse the rounding is. Qi et al.'s thesis is that BF16 (8 exponent bits, 7 mantissa bits) lets "different rounding errors" in two implementations accumulate over a sequence, while FP16's 10 mantissa bits give "8 times more precision" and absorb implementation differences. FP16's range is roughly \(6.1\times10^{-5}\) to \(6.6\times10^{4}\) against BF16's \(1.2\times10^{-38}\) to \(3.4\times10^{38}\); they argue RL no longer needs BF16's range because weight and activation ranges were set in pre-training<a class="cite" href="#ref-2">2</a> (§3.1, §3.4).</p>
+<p>One result matters for an inference engineer: inference precision alone barely moves task scores. On R1-Distill-Qwen-1.5B with a 32K budget, AMC23 was 62.35 (BF16), 63.10 (FP16) and 62.42 (FP32)<a class="cite" href="#ref-2">2</a> (Table 2). An eval that looks identical across dtypes does not show the dtype is safe for rollouts: accuracy is a coarse average, while an importance ratio reads the probability of one sampled token.</p>
+<p>MiniMax-M1 localized the gap by layer-by-layer comparison and found it in the LM head: "high-magnitude activations in the LM head at the output layer" were "the primary source of error", and raising the head to FP32 realigned the probabilities, with the correlation in Figure 2 rising from 0.987319 to 0.997135<a class="cite" href="#ref-3">3</a> (§3.2). The report adds that the problem "did not appear in smaller, dense models with softmax attention", so the hybrid-attention architecture, or its kernels, was a precondition. The report does not say why the head is sensitive; here is an arithmetic reason that fits (derived, not MiniMax's). \(\log\pi(a)=z_a-\log\sum_v e^{z_v}\), so an error in the sampled token's own logit passes into \(\log\pi\) nearly one-to-one when that token dominates. A BF16 number in \([16,32)\) has spacing \(2^4\cdot2^{-7}=0.125\), so rounding the logit alone moves it by up to 0.0625 nats, a 6% probability change; FP16 spacing there is \(2^4\cdot2^{-10}=0.0156\), an error of at most 0.0078. Large logits put the format's step function directly on the quantity the importance ratio reads.</p>
+
+<h3 id="sources-program">2.3 A different program for the same function</h3>
+<p>Inference computes one token per step from a KV cache; training computes all positions in parallel. Qi et al. note that "tokens are generated auto-regressively during inference but are processed in parallel during training", and add different parallelization strategies and precision-sensitive operations such as MoE top-k<a class="cite" href="#ref-2">2</a> (§2.2). Backends compound it: the Miles post picks FlashAttention-3 for both engines because it achieves bitwise equality between prefill and decode, which suggests (the writer's reading) that other backends' prefill and decode kernels need not agree<a class="cite" href="#ref-9">9</a>. Quantized rollouts are the lever you may care about: a follow-up by Yao et al. is said to find the mismatch particularly severe with INT8 and FP8 rollouts, with TIS still stabilizing training <mark class="unverified" title="Search-engine summary of an OpenReview paper that could not be opened; not read first-hand">(second-hand, unverified)</mark>. DeepSeek-V4's post-training uses FP4 quantization-aware training for MoE expert weights and the indexer's QK path; its report does not discuss the rollout-trainer gap there<a class="cite" href="#ref-12">12</a> (§1).</p>
+
+<h3 id="sources-sampler">2.4 The sampler is part of the policy</h3>
+<p>The first three sources are noise on the same function; this one is a different function. A rollout engine samples from \(\mathrm{softmax}(z/\tau)\) after top-\(p\) or top-\(k\) truncation and renormalization, while the trainer's \(\log\pi\) is the plain log-softmax of \(z\) (Module 2 states the unbiasedness condition). Two consequences follow.</p>
+<p>The first is what the engine reports. vLLM's <code>--logprobs-mode</code> has four values (<code>raw_logprobs</code>, <code>processed_logprobs</code>, <code>raw_logits</code>, <code>processed_logits</code>); "raw" is the value before logit processors and "processed" is after all of them, "including temperature and top_k/top_p", and the default is <code>raw_logprobs</code><a class="cite" href="#ref-13">13</a>. TRL's documented vLLM server command passes <code>--logprobs-mode processed_logprobs</code> and <code>--max-logprobs -1</code><a class="cite" href="#ref-14">14</a>. A ratio built from the default raw value while sampling at \(\tau\neq1\) or with truncation compares the trainer with the wrong behavior policy (derived; check which mode your framework requests).</p>
+<p>The second is support. With top-\(p\) truncation the kept set has mass \(Z_t\ge p\) and a kept token's behavior probability is \(\pi(a)/Z_t\), so the truncation alone contributes a per-token factor \(\rho_t=Z_t\in[p,1]\) and tokens outside the kept set have behavior probability 0 and never appear in a batch. At \(p=0.95\) the worst case is \(\ln0.95=-0.051\) per token, \(-51\) nats over 1,000 tokens (derived; far above typical). DeepSeek-V3.2's remedy is to preserve the top-p and top-k masks from \(\pi_{old}\)'s sampling and apply them to \(\pi_\theta\) in training, "ensuring both policies share identical action subspaces", and it reports that combining top-p sampling with this Keep Sampling Mask "effectively preserves language consistency"<a class="cite" href="#ref-4">4</a> (§3.1). Qi et al. sidestep it for measurement by sampling at temperature 1.0 with no top-p "so that µ is directly comparable to π"<a class="cite" href="#ref-2">2</a> (§3.5).</p>
+
+<h3 id="sources-discrete">2.5 Discrete decisions amplify noise</h3>
+<p>A continuous function turns a \(10^{-3}\) perturbation into a \(10^{-3}\) change; a top-\(k\) selection can turn it into a different branch. DeepSeek-V3.2 states that discrepancies between inference and training frameworks, "compounded by policy updates, can result in inconsistent expert routing during inference and training even for identical inputs", inducing "abrupt shifts in the active parameter subspace"<a class="cite" href="#ref-4">4</a> (§3.1). Qwen's MoE decomposition writes each engine's routed experts explicitly, so the discrepancy term includes the two engines picking different experts for the same input<a class="cite" href="#ref-7">7</a> (Eq. 6). Routing drift under optimizer updates is Module 12's Section 4.4; the concern here is that routing flips with no update at all.</p>
+<p>The sparse-attention indexer is the same mechanism one layer over. GLM-5 uses DeepSeek Sparse Attention (DSA)<a class="cite" href="#ref-5">5</a>, where an indexer retrieves the top-\(k\) most relevant KV entries with \(k=2048\), and reports that the retrieved top-\(k\) results "are critical for RL stability"<a class="cite" href="#ref-5">5</a> (§3.2). Section 6.2 gives the failure.</p>
+<p>The last discrete source is not numerical at all. If the rollout service returns text and the trainer re-tokenizes it, token boundaries, whitespace and normalization, truncation and special-token placement can differ from what was sampled, corrupting the alignment between actions and advantages. GLM-5 reports that a token-in-token-out (TITO) gateway that records the engine's token ids and feeds them to the learner is "critical for asynchronous RL training"<a class="cite" href="#ref-5">5</a> (§4.1.2). Module 18 covers multi-turn trajectories; the point here is that the token id sequence must match before the probability can.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Sources of rollout-trainer divergence, what the reports say about each, and which fix family in Sections 4 to 7 addresses it.</caption>
+  <thead><tr><th>Source</th><th>Mechanism</th><th>Evidence in the reports</th><th>Fixes</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Reduction order</td><td>split-K, split-KV, tile shape and TP size change summation order</td><td>80 unique completions in 1,000 at temperature 0<a class="cite" href="#ref-1">1</a>; TP-size invariance<a class="cite" href="#ref-11">11</a></td><td>C (invariant kernels)</td></tr>
+    <tr><td class="row">Precision</td><td>BF16 rounding, large logits at the LM head</td><td>correlation 0.987319 to 0.997135 with an FP32 head<a class="cite" href="#ref-3">3</a>; KL 7.64 to 0.32 with FP16<a class="cite" href="#ref-2">2</a></td><td>B</td></tr>
+    <tr><td class="row">Program shape</td><td>decode loop and KV cache against full-sequence pass; attention backend</td><td>M1 hybrid attention only<a class="cite" href="#ref-3">3</a>; FlashAttention-3 chosen for prefill-decode equality<a class="cite" href="#ref-9">9</a></td><td>B, C</td></tr>
+    <tr><td class="row">Sampler</td><td>temperature, top-p, top-k, logprob mode</td><td>Keep Sampling Mask<a class="cite" href="#ref-4">4</a>; <code>--logprobs-mode</code><a class="cite" href="#ref-13">13</a></td><td>C</td></tr>
+    <tr><td class="row">Router, indexer top-k</td><td>a small perturbation flips a discrete choice</td><td>Keep Routing<a class="cite" href="#ref-4">4</a>; non-deterministic top-k collapse<a class="cite" href="#ref-5">5</a></td><td>C, A, D</td></tr>
+    <tr><td class="row">Tokenization</td><td>text round trip changes token ids</td><td>TITO gateway<a class="cite" href="#ref-5">5</a></td><td>C</td></tr>
+  </tbody>
+</table>
+
+<h2 id="damage">3. What the mismatch does to a run</h2>
+<p>If the mismatch were only noise it would average out. The reports that isolate it find that it does not, and how it hurts depends on where \(\pi_{old}\) comes from.</p>
+
+<h3 id="damage-zhong">3.1 The zero-mismatch reference experiment</h3>
+<p>The cleanest evidence is from Zhong et al., who removed the mismatch rather than correcting it. VeXact is a rollout engine whose token log-probabilities are bitwise identical to FSDP's: the same Hugging Face model code in both, batch-invariant kernels with fixed tiling and reduction order (RMSNorm, batched matmul, fused MoE), attention with KV splitting disabled, and chunked prefill, CUDA graphs and pipeline parallelism to recover throughput<a class="cite" href="#ref-6">6</a> (§3.1). The only difference between a VeXact run and a vLLM run is the mismatch, so any gap between the runs is attributable to it.</p>
+<p>On-policy REINFORCE on Qwen3-30B-A3B (DAPO data) shows the vLLM run improving and then degrading after step 280, with training and validation reward falling from 0.574 and 0.293 to 0.255 and 0.067, while the VeXact run reaches 0.753 and 0.534<a class="cite" href="#ref-6">6</a> (§3.2, Fig. 2). GRPO runs on Qwen3-1.7B separate the two ways of obtaining \(\pi_{old}\). With the trainer's recomputation, reward falls from about 0.87 to roughly 0.40 within 650 steps, partly recovers, then reaches near zero after about step 1,665; with the engine's own log-probabilities (bypass) it degrades once, to roughly 0.4, without collapsing. VeXact holds about 0.93<a class="cite" href="#ref-6">6</a> (§4.1, Fig. 3). Both ways of computing the ratio failed.</p>
+<p>They give three observations. First, aggregate KL probes miss the early phase: in recomputation mode K1 and K3 on the PPO ratio stay "nearly flat during the first 700 steps, even though the reward is already entering the degradation phase", and rise only in bypass mode<a class="cite" href="#ref-6">6</a> (Fig. 4). Second, with the zero-centered contribution \(C(r)=-(r-1)\hat A\) (same gradient as the usual surrogate, zero at \(r=1\)), the trainer-referenced contribution under vLLM separates by advantage sign, with "a larger positive shift for negative-advantage tokens", while the two references coincide under VeXact<a class="cite" href="#ref-6">6</a> (Fig. 5): recomputation adds a sign-dependent skew, not uniform noise. Third, bypass uses the right denominator but evaluates the numerator in the trainer's numerics, so "the optimizer exploits numerical artifacts in the trainer's forward pass"; in the first 10 steps on GSM8K with Qwen3-1.7B, 17.3% of token log-probability changes pointed against the sign of the advantage when measured after the update, and none did under VeXact<a class="cite" href="#ref-6">6</a> (§4.1). That is the deployment gap of Section 1.1 made visible: the update moved the trainer's landscape the right way and the engine that generates the next batch saw something else.</p>
+
+<h3 id="damage-collapse">3.2 Collapse timelines in the reports</h3>
+<p>Table 3 lists what the reports observed, at the step counts they give. The settings differ too much for the step numbers to be compared; the pattern is that the mismatch grows, or a norm moves, before or with the fall in reward.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 3.</b> Reported collapses and degradations attributed to the training-inference mismatch, as stated by each source. "Early signal" is what the source says moved first.</caption>
+  <thead><tr><th>Source</th><th>Model, algorithm</th><th>What happened</th><th>Early signal</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Zhong et al.<a class="cite" href="#ref-6">6</a></td><td>Qwen3-30B-A3B MoE, REINFORCE</td><td>reward falls after step 280</td><td>gradient-norm anomalies accompany the fall (§4.1)</td></tr>
+    <tr><td class="row">Zhong et al.<a class="cite" href="#ref-6">6</a></td><td>Qwen3-1.7B dense, GRPO, recomputation</td><td>degradation by step 650; near-zero reward after about 1,665</td><td>none in K1 or K3 until late</td></tr>
+    <tr><td class="row">Thinking Machines<a class="cite" href="#ref-1">1</a></td><td>Qwen 2.5-VL instruct 8B, Bigmath, no correction</td><td>reward collapses; loss spike around step 318</td><td>KL spike at the same time</td></tr>
+    <tr><td class="row">Miles post<a class="cite" href="#ref-9">9</a></td><td>Qwen3-30B-A3B, GRPO</td><td>reward drops sharply after step 320</td><td>gradient norm falls from about 0.07 to 0.02, then K3 KL rises</td></tr>
+    <tr><td class="row">Ring-1T paper<a class="cite" href="#ref-8">8</a></td><td>Ring-mini-2.0 (16.8B total, 0.75B active), GRPO without KL</td><td>reward collapses after 180 to 200 steps; gradient norm explodes</td><td>probability gap grows (App. C, Fig. 10-11)</td></tr>
+    <tr><td class="row">Qi et al.<a class="cite" href="#ref-2">2</a></td><td>R1-Distill-Qwen-1.5B, BF16, GRPO and token TIS</td><td>peak training accuracy 73% (VeRL) and 84% (Oat), then degrades; token TIS peaks at 82% and 88% before collapsing</td><td>"growing training-inference mismatch" beforehand (§4.2)</td></tr>
+    <tr><td class="row">GLM-5<a class="cite" href="#ref-5">5</a></td><td>DSA model, non-deterministic top-k in the indexer</td><td>"drastic performance degradation ... after only a few steps"</td><td>sharp entropy drop</td></tr>
+  </tbody>
+</table>
+
+<p>Two caveats change how to read the table. The Miles post, from the Miles and SGLang RL teams, reports the opposite experience on its own stack: across more than 300 runs in settings "traditionally notorious for instability" it rarely saw a consistent collapse and never saw one in the post-training of GLM 4.5, 4.6 and 4.7; one MoE trajectory did collapse and became the test case for its mitigations, and on a dense Qwen3-4B-Base run the K3 KL rose after about 600 steps while reward stayed stable<a class="cite" href="#ref-9">9</a>. These are the authors' own unreviewed observations; they bound the claim: the hazard's strength depends on the stack. Most entries are small or mid-size models on math tasks; the one trillion-parameter entry, Ring-1T, shows the baseline's gradient norm and probability gap rising and then the stabilized run, and its own limitations section says IcePop "does not achieve perfect training-inference consistency"<a class="cite" href="#ref-8">8</a> (§5).</p>
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Watching KL between the old and current policy as the health signal for the mismatch. In recomputation mode that KL measures optimizer drift only, and Zhong et al. show it stays flat while the run degrades. The signal that tracks the mismatch is the per-token or sequence-level gap between the engine's returned log-probability and the trainer's, which TRL logs as <code>sampling/sampling_logp_difference/mean</code> and <code>/max</code> only when its vLLM correction is enabled<a class="cite" href="#ref-14">14</a>.</p></aside>
+
+<h2 id="family-a">4. Family A: correct the gradient statistically</h2>
+<p>The first family leaves both engines alone and re-weights each update by the mismatch ratio so the expected gradient is again the trainer policy's. It is the cheapest to adopt, a change to the loss, and the reports disagree about whether it is enough.</p>
+
+<h3 id="family-a-forms">4.1 Four forms of the same weight</h3>
+<p>Write \(\rho_t=\pi^{train}_{old}(a_t)/\pi^{infer}_{old}(a_t)\) as in Section 1.1. The estimator that is exactly unbiased multiplies the whole gradient by the sequence ratio \(\rho(y)=\prod_t\rho_t\)<a class="cite" href="#ref-2">2</a> (Eq. 5). Its variance is the problem of Section 1.3, so every deployed variant trades some bias for variance, along two axes: what happens to a large weight, and which unit carries it.</p>
+<ul>
+<li><strong>Truncate or mask.</strong> Truncated importance sampling (TIS) caps the weight, \(\min(\rho,C)\), so a large ratio is damped but still contributes<a class="cite" href="#ref-2">2</a> (Eq. 6, 9). Masked importance sampling (MIS) zeroes samples whose ratio leaves a range and keeps in-range ratios<a class="cite" href="#ref-2">2</a> (Eq. 7, 10). <mark class="unverified" title="Yao et al. and Liu et al. are Notion posts that rendered empty; definitions and attributions are second-hand via Qi et al. and Olmo 3">TIS is credited to Yao et al. and MIS to Liu et al. (second-hand, posts unread)</mark>. TRL implements both with an optional lower bound, "inspired by" IcePop (Section 7)<a class="cite" href="#ref-14">14</a>.</li>
+<li><strong>Token, sequence or in between.</strong> Per token the weight is cheap and, in the Miles post's words, "mathematically biased"; the sequence product is unbiased but has "extreme variance"; the geometric mean of the token weights sits between them and is less numerically unstable than the product<a class="cite" href="#ref-9">9</a>.</li>
+</ul>
+<p>Shipped settings differ. TRL's GRPO trainer enables sequence-level masked IS by default for vLLM generation, with \(C_{max}=3.0\) and no lower bound<a class="cite" href="#ref-15">15</a>. Olmo 3 multiplies the loss by a token-level truncated weight, taking the denominator from the probabilities vLLM returns, with a cap of 2.0 in its 32B Think and RL-Zero runs and none listed for its 7B Think and 7B Instruct runs<a class="cite" href="#ref-16">16</a> (§4.4.1, Table 49). Qwen's 30B MoE study caps the token weight at 5<a class="cite" href="#ref-7">7</a> (§4.2). Zhong et al. note why token-level TIS works: multiplying the PPO ratio \(r=\pi_\theta/\pi^{train}_{old}\) by \(\rho\) gives \(\pi_\theta/\pi^{infer}_{old}\), the bypass ratio, so TIS turns the recomputation loss into the bypass loss with a cap<a class="cite" href="#ref-6">6</a> (§4.2). Module 12 (Section 1.2) shows where each design places the factor.</p>
+
+<h3 id="family-a-cost">4.2 The price is a forward pass, not a mismatch</h3>
+<p>Qi et al. observe that the GRPO-style corrections need \(\pi^{train}_{old}\) for the sampled tokens, an extra trainer forward pass before the update, "approximately 25%" more training cost if a backward pass costs twice a forward pass<a class="cite" href="#ref-2">2</a> (§1, §2.1.1). The arithmetic is Module 1's: a forward pass is about \(2N\) FLOPs per token and forward plus backward \(6N\), so the extra \(2N\) is 33% on top of an uncorrected trainer and 25% of the corrected \(8N\) (derived; I read the paper's 25% as the second). The estimator of Eq. 5 needs no such pass: it has one ratio \(\pi_\theta/\mu_{\theta'}\) and \(\pi_\theta\) comes from the loss's own forward pass. The extra pass is the price of keeping PPO's drift ratio \(r\) separate from \(\rho\) (the writer's reading of Eq. 5-10).</p>
+<p>What that costs in wall-clock depends on whether the trainer is the bottleneck, Module 1's question. Olmo 3's footnote gives a 1,000 s step with 125 s of training<a class="cite" href="#ref-16">16</a> (§4.4.3, footnote 41; Module 1, Section 5.1, reconciles it with the text's 75% idle figure): serialized, the extra 41.7 s is 4.2% of the step, and in an asynchronous design it hides behind generation until the learner's busy fraction rises from 12.5% to 16.7%. Tulu 3's 405B RLVR iteration took about 550 s of inference, 25 s of weight transfer and 1,500 s of training<a class="cite" href="#ref-17">17</a> (§8.1); there the extra 500 s is 24.1% of the 2,075 s. All of it assumes a forward-only pass runs at the same utilization as the training pass.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 276" role="img" aria-labelledby="f5t"><title id="f5t">Seconds per RL iteration for Olmo 3 and Tulu 3 405B with the extra forward pass for importance-ratio recomputation added as a derived segment</title>
+    <path d="M200.0,34 L200.0,196" class="d-grid"/>
+    <text x="200.0" y="212" text-anchor="middle" class="d-small d-text-light">0</text>
+    <path d="M311.5,34 L311.5,196" class="d-grid"/>
+    <text x="311.5" y="212" text-anchor="middle" class="d-small d-text-light">500</text>
+    <path d="M423.1,34 L423.1,196" class="d-grid"/>
+    <text x="423.1" y="212" text-anchor="middle" class="d-small d-text-light">1,000</text>
+    <path d="M534.6,34 L534.6,196" class="d-grid"/>
+    <text x="534.6" y="212" text-anchor="middle" class="d-small d-text-light">1,500</text>
+    <path d="M646.2,34 L646.2,196" class="d-grid"/>
+    <text x="646.2" y="212" text-anchor="middle" class="d-small d-text-light">2,000</text>
+    <path d="M757.7,34 L757.7,196" class="d-grid"/>
+    <text x="757.7" y="212" text-anchor="middle" class="d-small d-text-light">2,500</text>
+    <text x="490" y="232" text-anchor="middle" class="d-small d-text-light">seconds per iteration</text>
+    <text x="20" y="68" class="d-bold">Olmo 3 (asynchronous)</text>
+    <rect x="200.0" y="48" width="195.2" height="44" class="d-fill-cyan"/>
+    <rect x="395.2" y="48" width="27.9" height="44" class="d-fill-blue"/>
+    <rect x="423.1" y="48" width="9.3" height="44" class="d-fill-red"/>
+    <text x="20" y="86" class="d-small d-text-light">1,000 s step; +41.7 s if serialized</text>
+    <text x="20" y="148" class="d-bold">Tulu 3 405B (synchronous)</text>
+    <rect x="200.0" y="128" width="122.7" height="44" class="d-fill-cyan"/>
+    <rect x="322.7" y="128" width="5.6" height="44" class="d-fill-amber"/>
+    <rect x="328.3" y="128" width="334.6" height="44" class="d-fill-blue"/>
+    <rect x="662.9" y="128" width="111.5" height="44" class="d-fill-red"/>
+    <text x="20" y="166" class="d-small d-text-light">2,075 s iteration; +500 s</text>
+    <text x="297.6" y="75" text-anchor="middle" class="d-small d-text-inv d-bold">875 s</text>
+    <text x="409.1" y="42" text-anchor="middle" class="d-small d-mono">125 s train</text>
+    <text x="440.4" y="75" class="d-small d-mono">+41.7</text>
+    <text x="261.3" y="155" text-anchor="middle" class="d-small d-text-inv d-bold">550 s</text>
+    <text x="495.6" y="155" text-anchor="middle" class="d-small d-text-inv d-bold">1,500 s train</text>
+    <text x="718.7" y="155" text-anchor="middle" class="d-small d-text-inv d-bold">+500 s</text>
+    <text x="325.5" y="122" text-anchor="middle" class="d-small d-mono">25 s sync</text>
+    <rect x="20" y="246" width="14" height="14" rx="3" class="d-fill-cyan"/><text x="40" y="258" class="d-small">generation / inference</text>
+    <rect x="194.6" y="246" width="14" height="14" rx="3" class="d-fill-amber"/><text x="214.6" y="258" class="d-small">weight transfer</text>
+    <rect x="325.1" y="246" width="14" height="14" rx="3" class="d-fill-blue"/><text x="345.1" y="258" class="d-small">training pass</text>
+    <rect x="443.0" y="246" width="14" height="14" rx="3" class="d-fill-red"/><text x="463.0" y="258" class="d-small">extra forward pass (derived)</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Seconds per iteration for two reported runs with the extra forward pass for the mismatch ratio added (red, derived as one third of the training time at equal utilization). Olmo 3: 1,000 s step with 125 s of training, from footnote 41<a class="cite" href="#ref-16">16</a>. Tulu 3 405B: about 550 s, 25 s and 1,500 s<a class="cite" href="#ref-17">17</a>. The runs differ in design (asynchronous against synchronous), so the bars are not a comparison of the two recipes.</figcaption>
+</figure>
+
+<div class="calc">
+  <p class="calc-title">Wall-clock cost of the extra forward pass</p>
+  <div class="calc-row"><label for="c2g">Generation time per step (s)</label><input type="range" id="c2g" name="tg" min="100" max="3000" step="25" value="875"></div>
+  <div class="calc-row"><label for="c2t">Training time per step (s)</label><input type="range" id="c2t" name="tt" min="25" max="2000" step="25" value="125"></div>
+  <div class="calc-row"><label for="c2f">Extra pass, percent of training time</label><input type="range" id="c2f" name="f" min="10" max="50" step="1" value="33"></div>
+  <div class="calc-row"><label for="c2m">Schedule</label><select id="c2m" name="m"><option value="1">asynchronous (overlapped)</option><option value="0">synchronous (serialized)</option></select><span></span></div>
+  <div class="calc-out">
+    <div>Step time before<output data-expr="m * max(tg, tt) + (1 - m) * (tg + tt)" data-format="fixed:0" data-unit="s"></output></div>
+    <div>Step time after<output data-expr="m * max(tg, tt * (1 + f / 100)) + (1 - m) * (tg + tt * (1 + f / 100))" data-format="fixed:0" data-unit="s"></output></div>
+    <div>Slowdown<output data-expr="(m * max(tg, tt * (1 + f / 100)) + (1 - m) * (tg + tt * (1 + f / 100))) / (m * max(tg, tt) + (1 - m) * (tg + tt)) - 1" data-format="pct"></output></div>
+  </div>
+  <p class="calc-note">Defaults are Olmo 3's 1,000 s step (875 s generation-bound, 125 s training) and one third for the extra pass. The asynchronous branch is \(\max(T_{gen},T_{train})\), a simplification that ignores weight sync and staleness (System Design Modules 37 and 38).</p>
+</div>
+
+<h3 id="family-a-limits">4.3 What the correction does not buy</h3>
+<p>Qi et al.'s "sanity test" gives the controlled comparison. They keep MATH problems on which R1-Distill-Qwen-1.5B scores 20% to 80% over 40 samples (1,460 questions), so a reliable algorithm should approach 100% training accuracy; each step has 64 questions with 8 rollouts and 4 gradient steps, at \(C=3\) for the IS variants<a class="cite" href="#ref-2">2</a> (§4, §4.1). In BF16 the plain GRPO baseline peaks at 73% (VeRL) and 84% (Oat) before degrading, and token-level TIS "prolongs training slightly" and collapses after 82% and 88%. GSPO, which does not use the engine's probabilities at all, lasts longer than token TIS but its gradient norm became NaN after 1,200 steps in VeRL. Only sequence-level MIS stays stable in BF16, and it converges slowly and plateaus: 95% training accuracy against 99% in FP16 and 34% against 39% on AIME 2024, which they read as the deployment gap<a class="cite" href="#ref-2">2</a> (§4.2). The bias-variance reading is theirs: low-variance, high-bias estimators (GRPO, token TIS, GSPO) are fast and collapse, and low-bias, high-variance ones (sequence-level IS or MIS) are stable and slow.</p>
+<p>Other groups find the correction necessary and, with care, close to sufficient. Qwen's 30B MoE study reports that on-policy the basic policy gradient with the correction is the most stable, that removing it causes "rapid training collapse and a sharp drop in entropy", and that length normalization, used by GRPO and CISPO, is suboptimal because it breaks the first-order approximation<a class="cite" href="#ref-7">7</a> (§4.3). Zhong et al. find that a token-level cap followed by sequence-level rejection on \(\rho\), not on drift, "can closely track" the zero-mismatch run, but that it "can only suppress already-generated samples and may also discard useful learning signals", and that without a zero-mismatch reference the thresholds are "largely ad hoc"<a class="cite" href="#ref-6">6</a> (§4.2). The family fixes the bias at the price of variance and a forward pass; it does not touch the deployment gap.</p>
+
+<h2 id="family-b">5. Family B: change the numerics</h2>
+<p>The second family shrinks the disagreement at its size rather than correcting for it. Reduction order creates a difference; mantissa width and the places where logits are rounded set how large that difference becomes (the writer's synthesis of Sections 2.1 and 2.2). Three moves appear in the reports.</p>
+<p><strong>An FP32 LM head.</strong> MiniMax-M1 raised the output head to FP32, and the correlation in Figure 2 went from 0.987319 to 0.997135 and "remained stable throughout training, enabling successful reward increase"<a class="cite" href="#ref-3">3</a> (§3.2). ScaleRL adopted FP32 logits in both generator and trainer after finding that it lifted the fitted asymptote \(A\) of a baseline recipe from 0.52 to 0.61, then found the effect nearly invisible inside the full recipe on a dense 8B model, where run-to-run noise on \(A\) is about 0.02, yet useful for GRPO and DAPO-style losses and for a 17B-by-16-expert MoE, where removing it reduced scalability<a class="cite" href="#ref-18">18</a> (§3.2, Fig. 5b; leave-one-out and Scout results, Fig. 7 and 8b). Qi et al. say the FP32 head alone "is shown to be insufficient to prevent training collapse", citing Yao et al. and Liu et al., whose posts I could not read; that is second-hand<a class="cite" href="#ref-2">2</a> (§2.2). The findings are compatible if the head is one of several sources whose weight depends on the architecture, which is how MiniMax states it. The reports give no overhead figure for the head.</p>
+<p><strong>FP16 in place of BF16.</strong> Qi et al. switch both engines to FP16 and report a sequence-level mismatch "approximately 24× smaller" (KL 7.64 to 0.32, Section 1.3), with no change to the algorithm: under FP16 the five algorithms they compare are "almost indistinguishable", and the plain unbiased sequence-level estimator of Section 4.1 becomes usable<a class="cite" href="#ref-2">2</a> (§3.5, §4.3). Their ablation with vLLM and FSDP separates the engines: BF16 training with FP32 inference is fully stable but the FP32 inference is "nearly three times slower", while FP16 in both is the most stable and loses no speed. They extend it to a Qwen3-30B-A3B-Base MoE, LoRA, Qwen3-14B-Base with DAPO and OctoThinker-3B, with BF16 LoRA collapsing near step 600, across two frameworks, VeRL and Oat<a class="cite" href="#ref-2">2</a> (§4.4, §5). Their own limits: FP16 is not claimed "universally optimal", very large models may overflow its range, and FP16 needs loss scaling, which adds a global synchronization to check for overflow in distributed training<a class="cite" href="#ref-2">2</a> (§3.2, §6). Zhong et al. credit a 2026 TRL-team write-up (Dirhoussi et al.) with the same FP16 finding; I did not locate that write-up<a class="cite" href="#ref-6">6</a> (§5). The measured 24-fold reduction is larger than the 8-fold finer resolution of FP16 mantissas that one rounding would explain; the paper does not decompose the difference (derived comparison).</p>
+<p><strong>Higher precision on one side</strong> bought stability at triple the inference cost, a poor trade for the engine that is already the bottleneck in Module 1's cost model.</p>
+
+<h2 id="family-c">6. Family C: remove the source</h2>
+<p>The third family makes the two computations agree exactly. For the continuous sources that means bitwise-identical kernels; for the discrete ones it means reusing the engine's decision in the trainer or making the selection deterministic.</p>
+
+<h3 id="family-c-determinism">6.1 Bitwise identical engines, and what they cost</h3>
+<p>Thinking Machines' invariant kernels plus a modified trainer gave bitwise identical results between sampling and training and "0 KL divergence" in an RLVR run on Bigmath with a Qwen 2.5-VL instruct 8B policy and 4,096-token rollouts, where the same run without a correction lost reward and with importance weighting held KL near 0.001<a class="cite" href="#ref-1">1</a>. The price in their test (Qwen-3-8B, one GPU, 1,000 sequences of 90 to 110 tokens) was 26 s for default vLLM, 55 s for unoptimized deterministic vLLM and 42 s with an improved attention kernel: 2.1 and 1.6 times (derived)<a class="cite" href="#ref-1">1</a>. Table 4 collects the follow-ups and the overheads each reports.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 4.</b> Reported cost and scope of bitwise-identical rollout and training. The settings differ; the overheads are each source's own and are not comparable across rows.</caption>
+  <thead><tr><th>Source</th><th>Setting</th><th>Result</th><th>Reported cost or limit</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Thinking Machines<a class="cite" href="#ref-1">1</a></td><td>vLLM with FlexAttention, batch-invariant ops</td><td>1,000 of 1,000 completions identical; KL 0 in RL</td><td>26 s default; 42 s and 55 s deterministic (1.6x and 2.1x); matmul about 20% below cuBLAS</td></tr>
+    <tr><td class="row">SGLang<a class="cite" href="#ref-19">19</a></td><td>deterministic mode, FlashInfer and FlashAttention 3, CUDA graphs</td><td>reproducible RL runs on Qwen3-8B with slime</td><td>34.35% average slowdown, range 25% to 45%; 61.5% quoted for the earlier kernels</td></tr>
+    <tr><td class="row">vLLM and TorchTitan<a class="cite" href="#ref-20">20</a></td><td>Qwen3 1.7B, GSM8K, synchronous, one host</td><td><code>kl_div</code> exactly 0.0; higher reward in fewer steps</td><td>2.4x slower RL run; two copies of the model code are "fragile"</td></tr>
+    <tr><td class="row">Miles Truly On Policy<a class="cite" href="#ref-9">9</a></td><td>SGLang with FSDP or Megatron; FlashAttention 3, DeepGEMM, torch.compile</td><td>bitwise identical log-probs, dense models</td><td>"some performance loss", unquantified; MoE not covered; no better reward seen on dense</td></tr>
+    <tr><td class="row">Zhong et al. (VeXact)<a class="cite" href="#ref-6">6</a></td><td>rollout engine matched to FSDP on VeRL</td><td>stable where vLLM collapses (Section 3.1)</td><td>throughput recovered by chunked prefill, CUDA graphs; no figure quoted</td></tr>
+    <tr><td class="row">DeepSeek-V4<a class="cite" href="#ref-12">12</a></td><td>end-to-end batch-invariant and deterministic kernels</td><td>bitwise alignment across pre-training, post-training and inference is a design goal</td><td>authors' claim: overhead of batch-invariant decoding "negligible"</td></tr>
+  </tbody>
+</table>
+
+<p>DeepSeek-V4 is the largest public case. Split-KV is not allowed, since it would leave a partially filled last wave of SMs, so decode attention uses two kernels: one computes a whole sequence in one SM for full waves, and a second spreads one sequence over several SMs for the last partial wave, with its accumulation order designed to match the first and distributed shared memory within a thread-block cluster for the exchange. Matmul replaces cuBLAS with DeepGEMM and drops split-k in most cases, with optimizations that "match or even surpass" standard split-k in most major scenarios (the authors' claim). The backward pass gets per-SM accumulation buffers in attention and token-order pre-processing in MoE<a class="cite" href="#ref-12">12</a> (§3.3). The report gives the kernel design, not a rollout-mismatch measurement.</p>
+<p>Tensor-parallel size is the remaining reduction-order gap: TBIK's tree-structured kernels make results independent of it<a class="cite" href="#ref-11">11</a>. The Miles post is explicit about the burden: its mode requires invasive changes to Megatron and FSDP, is hard to reproduce, and every architecture, parallelism choice and hardware target adds complexity<a class="cite" href="#ref-9">9</a>.</p>
+
+<h3 id="family-c-discrete">6.2 Discrete choices: replay or determinize</h3>
+<p>For MoE routing, DeepSeek-V3.2 stores the experts used at sampling and enforces them in training ("Keep Routing", in use since DeepSeek-V3-0324)<a class="cite" href="#ref-4">4</a> (§3.1); Rollout Routing Replay (R3) is the same idea, recording the inference engine's routing and replaying it in training<a class="cite" href="#ref-21">21</a>. Qwen's analysis finds a cost beyond storage. On-policy, R3 reduced the training-inference KL and still gave no gain, and R3 without the importance correction "still fails rapidly", from which they conclude that replay "can alter the original target policy and introduce bias"<a class="cite" href="#ref-7">7</a> (§4.3). Replay lowers the measured gap and changes what is being optimized, a reason to keep the correction alongside it. Module 12 (Section 4.4, Figure 6) covers the other branch, GSPO's sequence average.</p>
+<p>GLM-5's indexer is the case where replay is not available. The report judges storing the indexer's top-\(k\) indices at every token position "clearly impractical", because \(k=2048\) is "much larger than the k typically used in MoE" and the storage and the traffic between engines would be "enormous"; for scale, at an MoE top-\(k\) of 8 a record would hold 256 times as many indices per decision (illustrative arithmetic, the report gives no figure)<a class="cite" href="#ref-5">5</a> (§3.2). What worked instead was determinism: replacing the non-deterministic CUDA and TileLang top-\(k\) operators in the training engine's indexer with <code>torch.topk</code>, "slightly slower but deterministic", which "yields substantial RL gains", where the other operators "caused drastic performance degradation during RL after only a few steps, accompanied by a sharp drop in entropy". The indexer's parameters were also frozen during RL to prevent unstable learning in the indexer<a class="cite" href="#ref-5">5</a>. The report does not say which pair of passes disagreed, rollout against trainer or two trainer passes, so what it demonstrates is that a non-deterministic discrete selection is enough to break a run, and that a deterministic one removes the problem at small cost.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 250" role="img" aria-labelledby="f6t"><title id="f6t">Schematic of GLM-5 reasoning RL with two top-k operators in the sparse-attention indexer: with a non-deterministic operator entropy drops sharply and performance degrades after a few steps, with torch.topk training proceeds</title>
+    <rect x="40" y="40" width="330" height="150" class="d-outline"/>
+    <text x="205.0" y="28" text-anchor="middle" class="d-bold">non-deterministic top-k (CUDA, TileLang)</text>
+    <polyline points="40,97 80,100 106,103 129,145 152,172 238,178 370,181" class="d-line d-stroke-cyan"/>
+    <polyline points="40,145 80,133 113,127 139,139 188,160 271,172 370,178" class="d-line d-stroke-blue"/>
+    <path d="M129,40 L129,190" class="d-axis d-dashed"/>
+    <text x="135" y="56" class="d-small d-text-light">a few steps</text>
+    <text x="205.0" y="208" text-anchor="middle" class="d-small d-text-light">RL steps (no values in the report)</text>
+    <rect x="430" y="40" width="330" height="150" class="d-outline"/>
+    <text x="595.0" y="28" text-anchor="middle" class="d-bold">torch.topk (deterministic)</text>
+    <polyline points="430,97 512,103 595,112 678,120 760,126" class="d-line d-stroke-cyan"/>
+    <polyline points="430,145 512,127 595,108 678,91 760,79" class="d-line d-stroke-blue"/>
+    <text x="595.0" y="208" text-anchor="middle" class="d-small d-text-light">RL steps (no values in the report)</text>
+    <rect x="40" y="228" width="14" height="4" class="d-fill-cyan"/><text x="60" y="234" class="d-small">entropy</text><rect x="140" y="228" width="14" height="4" class="d-fill-blue"/><text x="160" y="234" class="d-small">performance</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Schematic of the GLM-5 indexer finding. Left: with non-deterministic top-k operators entropy drops sharply and performance degrades "after only a few steps". Right: with <code>torch.topk</code> RL proceeds. The report gives the qualitative description only<a class="cite" href="#ref-5">5</a> (§3.2); no step counts or values are drawn from it, and the curve shapes are illustrative.</figcaption>
+</figure>
+
+<h2 id="family-d">7. Family D: mask what the engine's own probabilities flag</h2>
+<p>The fourth family does not try to make the estimator unbiased; it uses the engine's returned probability to decide what the update should not learn from. It borders family A (IcePop is a two-sided token-level mask on \(\rho\) that passes in-range ratios through); the difference is intent, a trust region on the data and not a correction of the expectation. Module 12 (Sections 5.2, 5.3) writes the IcePop and DeepSeek-V3.2 masks in one form; this section adds the evidence on thresholds.</p>
+<p>IcePop comes from Ling Team's Ring-1T report. It masks tokens whose \(\rho\) leaves \([\alpha,\beta]\) and passes the rest through, and for Ring-1T uses \(\alpha=0.5\), \(\beta=5\) with a learning rate of \(2\times10^{-6}\), no KL, temperature 1.0, 480 prompts times 8 rollouts and responses up to 65,536 tokens<a class="cite" href="#ref-8">8</a> (§2.3.2, §2.3.4). On Ring-mini-2.0 (16.8B total, 0.75B active) it beat TIS on AIME25 (Avg@64), lifting the base score of 63% by "over 14%" while vanilla GRPO fell by step 150; at the defaults about 1 to 2 per thousand tokens were masked, skewed toward high entropy<a class="cite" href="#ref-8">8</a> (§2.4.1, App. C, Fig. 5, 12). The sensitivity result is the part to carry over: a narrow \([0.5,2.0]\) "immediately destabilizes training", the default \([0.5,5.0]\) stabilizes it, and a wider \([0.4,5.0]\) also stabilizes but admits higher-probability tokens<a class="cite" href="#ref-8">8</a> (App. C, Fig. 13). GLM-5 ships \(\beta=2\), the range Ring-mini-2.0 found unstable, in a reasoning stage run entirely on-policy with a different model and stack<a class="cite" href="#ref-5">5</a> (§3.2). The two do not conflict: the band is a property of the stack, to be set against a measured distribution of \(\rho\) (Section 9).</p>
+<p>DeepSeek-V3.2 masks whole sequences with negative advantage whose divergence from the engine's returned \(\pi_{old}\) exceeds \(\delta\), reasoning that "highly off-policy negative samples can be detrimental"; \(\delta\) and any ablation are not given<a class="cite" href="#ref-4">4</a> (§3.1). Because the engine's probability is the reference, the mask sees drift and mismatch together. Li et al. give a rationale for sequence-level masks: their bounds depend on the maximum token-level divergence, "a sequence-level quantity that cannot be controlled by token-independent methods like PPO clipping", and the classical \(O(T^2)\) growth falls to \(O(T^{3/2})\) and \(O(T)\). On Qwen3-8B-Base with vLLM and FSDP they report that PPO clipping at (0.8, 1.28) "exacerbates instability" against token-level IS, while masking with \(\delta=0.05\) (max divergence) or 0.001 (average) keeps the log-perplexity gap bounded<a class="cite" href="#ref-10">10</a> (§1, §5, Fig. 1-2); authors' claims, one benchmark. Zhong et al. find that rejecting on the mismatch ratio \(\rho\) beats rejecting on the drift ratio, and that a token-level cap before the sequence-level rejection tracks the zero-mismatch run best<a class="cite" href="#ref-6">6</a> (§4.2). The Miles post lists a veto (discard a sequence if any token's old probability falls below a threshold such as \(10^{-6}\)) and one MoE rescue, where an upper TIS bound of 2.0 collapsed and 1.5 did not, from a single trajectory in more than 300 runs<a class="cite" href="#ref-9">9</a>.</p>
+<p>GSPO's sequence-level ratio averages token noise, and its paper argues that sequence likelihood tolerates training-inference precision differences, "intuitively", with no experiment (Module 12, Section 4.4)<a class="cite" href="#ref-22">22</a> (§5.4). Qi et al. give partial support and a limit: in BF16 GSPO outlasted token-level TIS without using the engine's probabilities, then its gradient norm turned NaN after 1,200 steps in one framework<a class="cite" href="#ref-2">2</a> (§4.2).</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 5.</b> The four families side by side. "Bias left" is what remains after the fix as the sources report it; costs are each source's own figures (Sections 4 to 7).</caption>
+  <thead><tr><th>Family</th><th>Mechanism</th><th>Bias or gap left</th><th>Reported cost</th><th>Used by</th></tr></thead>
+  <tbody>
+    <tr><td class="row">A. Statistical</td><td>weight by \(\rho\): truncate, mask, token or sequence level</td><td>truncation bias or sequence-level variance; deployment gap untouched</td><td>one extra trainer forward pass if \(r\) and \(\rho\) are kept apart, about 25% of the corrected cost<a class="cite" href="#ref-2">2</a>; none for a single-ratio form</td><td>Olmo 3, TRL default, Qwen study</td></tr>
+    <tr><td class="row">B. Numerics</td><td>FP32 head; FP16 in both engines</td><td>order-driven gap remains: KL 0.32, not 0<a class="cite" href="#ref-2">2</a></td><td>head: none reported; FP16: no speed loss reported; FP32 inference about 3x slower</td><td>MiniMax-M1, ScaleRL, Qi et al.</td></tr>
+    <tr><td class="row">C. Remove the source</td><td>bitwise engines; Keep Routing, R3, Keep Sampling Mask; deterministic top-k</td><td>none when exact; replay can alter the target policy<a class="cite" href="#ref-7">7</a></td><td>1.6x to 2.4x or 34.35% for kernels; replay storage; <code>torch.topk</code> slightly slower</td><td>V3.2, GLM-5, V4, Miles, vLLM, SGLang</td></tr>
+    <tr><td class="row">D. Mask</td><td>drop tokens or sequences outside a trust region set from \(\rho\) or the engine's \(\pi_{old}\)</td><td>discards signal; thresholds stack-specific</td><td>1 to 2 per thousand tokens masked at IcePop defaults<a class="cite" href="#ref-8">8</a></td><td>GLM-5, Ring-1T, V3.2, TRM</td></tr>
+  </tbody>
+</table>
+
+<h2 id="architectures">8. Why MoE and hybrid attention are hit harder</h2>
+<p>The Miles post puts typical K3 KL at \(10^{-5}\) to \(10^{-3}\) for dense models and \(10^{-3}\) to \(10^{-1}\) for MoE, two orders of magnitude more at the top of the range, and describes the mechanism as logit differences selecting different experts<a class="cite" href="#ref-9">9</a>. Qi et al. (§2.2) and Ling Team (§2.3.2) name routing as the aggravating factor<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-8">8</a>. It is a discrete amplifier: a perturbation of an ulp can flip a top-\(k\) boundary and change every downstream activation for that token (the writer's reading; Section 2.5), and the same logic covers the sparse-attention indexer (Section 6.2). Hybrid attention is the other precondition in the record: MiniMax-M1's gap appeared with lightning attention and not in smaller dense softmax-attention models<a class="cite" href="#ref-3">3</a> (§3.2). Length multiplies all of them (Section 1.3), and multi-turn rollouts add the token round trip of Section 2.5 (Module 18). The counterweight is the Miles post's observation that its dense models never collapsed, so a dense softmax-attention stack may need only logging and a default mask, as in TRL<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-15">15</a>.</p>
+
+<h2 id="procedure">9. A procedure for a new architecture</h2>
+<p>This is the writer's synthesis of the reports' techniques, not a procedure any one report prescribes: log a gap statistic that reaches the tail, vary one factor at a time until the gap moves, and match the fix class to the factor that moved it.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 490" role="img" aria-labelledby="f7t"><title id="f7t">Flowchart for diagnosing training-inference mismatch in a new architecture: log the gap, then run five single-factor tests, each pointing to a fix family, and keep a statistical safety net</title>
+    <defs><marker id="f7-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="20" y="14" width="400" height="50" rx="8" class="d-block"/>
+    <text x="34" y="36" class="d-text-inv d-bold">1  Log the gap on a real batch</text>
+    <text x="34" y="54" class="d-text-inv d-small">mean and max |δ|, K3 KL, outside-band fraction, sequence slope</text>
+    <text x="470" y="44" class="d-small d-text-light">Figure 1 points 1 to 6 are candidates</text>
+    <path d="M220,64 L220,82" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <rect x="20" y="82" width="400" height="50" rx="8" class="d-block-2"/>
+    <text x="34" y="104" class="d-text-inv d-bold">2  Same engine, two batch sizes: outputs differ?</text>
+    <text x="34" y="122" class="d-text-inv d-small">greedy decode of one prompt at batch 1 and batch 64</text>
+    <path d="M440,107.0 L470,107.0" class="d-arrow-active" marker-end="url(#f7-arr)"/>
+    <text x="446" y="101.0" class="d-small d-text-light">yes</text>
+    <rect x="470" y="82" width="310" height="50" rx="8" class="d-surface"/>
+    <text x="484" y="104" class="d-small">reduction order: invariant kernels (C),</text>
+    <text x="484" y="120" class="d-small">else correct (A)</text>
+    <path d="M420,107.0 L440,107.0" class="d-arrow-active"/>
+    <path d="M220,132 L220,150" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <text x="230" y="145" class="d-small d-text-light">no, or both: continue</text>
+    <rect x="20" y="150" width="400" height="50" rx="8" class="d-block-2"/>
+    <text x="34" y="172" class="d-text-inv d-bold">3  Trainer or engine in FP32 or FP16: gap shrinks?</text>
+    <text x="34" y="190" class="d-text-inv d-small">re-run the same token ids at higher precision</text>
+    <path d="M440,175.0 L470,175.0" class="d-arrow-active" marker-end="url(#f7-arr)"/>
+    <text x="446" y="169.0" class="d-small d-text-light">yes</text>
+    <rect x="470" y="150" width="310" height="50" rx="8" class="d-surface"/>
+    <text x="484" y="172" class="d-small">precision: FP32 head or FP16 (B)</text>
+    <path d="M420,175.0 L440,175.0" class="d-arrow-active"/>
+    <path d="M220,200 L220,218" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <text x="230" y="213" class="d-small d-text-light">no, or both: continue</text>
+    <rect x="20" y="218" width="400" height="50" rx="8" class="d-block-2"/>
+    <text x="34" y="240" class="d-text-inv d-bold">4  Sampler transforms off: gap shrinks?</text>
+    <text x="34" y="258" class="d-text-inv d-small">T = 1, no top-p, processed logprobs requested</text>
+    <path d="M440,243.0 L470,243.0" class="d-arrow-active" marker-end="url(#f7-arr)"/>
+    <text x="446" y="237.0" class="d-small d-text-light">yes</text>
+    <rect x="470" y="218" width="310" height="50" rx="8" class="d-surface"/>
+    <text x="484" y="240" class="d-small">sampler: processed logprobs, Keep</text>
+    <text x="484" y="256" class="d-small">Sampling Mask (C)</text>
+    <path d="M420,243.0 L440,243.0" class="d-arrow-active"/>
+    <path d="M220,268 L220,286" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <text x="230" y="281" class="d-small d-text-light">no, or both: continue</text>
+    <rect x="20" y="286" width="400" height="50" rx="8" class="d-block-2"/>
+    <text x="34" y="308" class="d-text-inv d-bold">5  Router or indexer picks differ?</text>
+    <text x="34" y="326" class="d-text-inv d-small">compare expert ids or top-k index sets per token</text>
+    <path d="M440,311.0 L470,311.0" class="d-arrow-active" marker-end="url(#f7-arr)"/>
+    <text x="446" y="305.0" class="d-small d-text-light">yes</text>
+    <rect x="470" y="286" width="310" height="50" rx="8" class="d-surface"/>
+    <text x="484" y="308" class="d-small">discrete: replay or deterministic top-k</text>
+    <text x="484" y="324" class="d-small">(C)</text>
+    <path d="M420,311.0 L440,311.0" class="d-arrow-active"/>
+    <path d="M220,336 L220,354" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <text x="230" y="349" class="d-small d-text-light">no, or both: continue</text>
+    <rect x="20" y="354" width="400" height="50" rx="8" class="d-block-2"/>
+    <text x="34" y="376" class="d-text-inv d-bold">6  Token ids differ after the round trip?</text>
+    <text x="34" y="394" class="d-text-inv d-small">text out, text in against token ids out</text>
+    <path d="M440,379.0 L470,379.0" class="d-arrow-active" marker-end="url(#f7-arr)"/>
+    <text x="446" y="373.0" class="d-small d-text-light">yes</text>
+    <rect x="470" y="354" width="310" height="50" rx="8" class="d-surface"/>
+    <text x="484" y="376" class="d-small">token-in-token-out gateway (C)</text>
+    <path d="M420,379.0 L440,379.0" class="d-arrow-active"/>
+    <path d="M220,404 L220,422" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <text x="230" y="417" class="d-small d-text-light">no, or both: continue</text>
+    <rect x="20" y="422" width="400" height="50" rx="8" class="d-block-accent"/>
+    <text x="34" y="444" class="d-text-inv d-bold">7  Residual gap remains</text>
+    <text x="34" y="462" class="d-text-inv d-small">every report that fixed a source still lists a residual</text>
+    <path d="M440,447.0 L470,447.0" class="d-arrow-active" marker-end="url(#f7-arr)"/>
+    <text x="446" y="441.0" class="d-small d-text-light">yes</text>
+    <rect x="470" y="422" width="310" height="50" rx="8" class="d-surface"/>
+    <text x="484" y="444" class="d-small">keep a mask or cap on ρ and keep logging</text>
+    <text x="484" y="460" class="d-small">(A, D)</text>
+    <path d="M420,447.0 L440,447.0" class="d-arrow-active"/>
+  </svg>
+  <figcaption><b>Figure 7.</b> Diagnosis flow. Step 1 uses the statistics of Table 1 and Section 3; steps 2 and 3 follow Thinking Machines' batch-size test<a class="cite" href="#ref-1">1</a> and MiniMax-M1's precision and layer-by-layer analysis<a class="cite" href="#ref-3">3</a>; step 4 follows V3.2's Keep Sampling Mask and vLLM's <code>--logprobs-mode</code><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-13">13</a>; steps 5 and 6 follow V3.2, GLM-5 and R3<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-21">21</a>. The order is the writer's.</figcaption>
+</figure>
+<p>Step 1 is a few lines. The function below takes the engine's returned log-probabilities of the sampled tokens (requested under the same temperature and truncation the sampler used, Section 2.4) and the trainer's log-probabilities for the same token ids, and returns the statistics of Table 1: mean and max \(|\delta|\), the K3 estimate of KL(engine‖trainer) on engine samples, the fraction outside a band, and the mean sequence log-ratio per thousand tokens, whose sign and size read like Qi et al.'s slope. TRL logs the first two when its correction is on<a class="cite" href="#ref-14">14</a>. Alert on the maximum and the outside-band fraction rather than the means (Section 1.2), and compare changes in them with the gradient norm, which moved before or with the reward in the Miles, Zhong and Ring-1T entries of Table 3.</p>
+<pre class="code" data-lang="python" data-title="mismatch_report.py"><code>import torch
+
+def mismatch_report(lp_engine, lp_trainer, lengths, lo=0.5, hi=2.0):
+    """lp_*: [B, T] log-probs of the sampled tokens, same token ids, same
+    sampling transform on both sides; lengths: [B] valid token counts."""
+    T = lp_engine.shape[1]
+    valid = torch.arange(T, device=lp_engine.device)[None, :] &lt; lengths[:, None]
+    delta = (lp_trainer - lp_engine)[valid]          # delta_t = log rho_t
+    rho = delta.exp()
+    k3 = rho - 1.0 - delta                           # K3 estimate of KL(engine || trainer)
+    seq = ((lp_trainer - lp_engine) * valid).sum(1)  # log rho(y) per sequence
+    return {
+        "abs_delta_mean": delta.abs().mean().item(),
+        "abs_delta_max": delta.abs().max().item(),
+        "k3_kl": k3.mean().item(),
+        "frac_outside_band": ((rho &lt; lo) | (rho &gt; hi)).float().mean().item(),
+        "mean_seq_logratio_per_1k_tokens": (seq / lengths * 1000).mean().item(),
+    }</code></pre>
+<p>Steps 2 to 6 are single-factor experiments, each run in some form by a report: decoding one prompt at two batch sizes (Thinking Machines' test)<a class="cite" href="#ref-1">1</a>; re-running the trainer in FP32, or moving to FP16 as Qi et al. did, to see whether the gap tracks mantissa width<a class="cite" href="#ref-2">2</a>; turning the sampler's transforms off, as Qi et al. did for measurement; comparing expert ids or indexer index sets between engines; and diffing token ids after a text round trip<a class="cite" href="#ref-5">5</a>. If a first layer where hidden states diverge by more than rounding is visible, as in MiniMax-M1's layer-by-layer trace, the fix may be local, as the FP32 head was there<a class="cite" href="#ref-3">3</a>. Whatever moves the gap, the last box stays: Ling Team's limitations say IcePop leaves "underlying numerical discrepancies" as "a latent source of instability"<a class="cite" href="#ref-8">8</a> (§5), and Zhong et al. find tuned corrections close to, not equal to, the zero-mismatch run<a class="cite" href="#ref-6">6</a>. Fix the source you can, and keep a threshold on \(\rho\) for what is left.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The reports agree that the engines disagree and that "same weights" is not "same policy". They disagree about where to spend the effort. Each position below is backed by runs on its own stack, and no report compares them at matched compute and architecture.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Correct it in the loss (family A and D)</h4>
+    <p class="who">Olmo 3 (token-level TIS, cap 2.0)<a class="cite" href="#ref-16">16</a>; TRL's default sequence-level masked IS<a class="cite" href="#ref-15">15</a>; Qwen's 30B MoE study<a class="cite" href="#ref-7">7</a>; IcePop in Ring-1T and GLM-5<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-5">5</a>.</p>
+    <p>Engines and trainers will always differ, so make the estimator robust to it with a weight or a mask that works on any architecture.</p>
+    <ul class="pros"><li>No kernel work; one loss change, and IcePop stabilized a trillion-parameter run.</li><li>Zhong et al. find tuned corrections track the zero-mismatch run closely<a class="cite" href="#ref-6">6</a>.</li></ul>
+    <ul class="cons"><li>Leaves the deployment gap: sequence-level MIS plateaued at 95% training accuracy against 99% in FP16 and 34% against 39% on AIME 2024<a class="cite" href="#ref-2">2</a>.</li><li>Thresholds are stack-specific: a narrow band destabilized Ring-mini-2.0<a class="cite" href="#ref-8">8</a>; the corrections discard signal and are "ad hoc" without a reference<a class="cite" href="#ref-6">6</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Fix the numerics (family B)</h4>
+    <p class="who">Qi et al. (FP16 in both engines)<a class="cite" href="#ref-2">2</a>; MiniMax-M1 and ScaleRL (FP32 LM head)<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-18">18</a>.</p>
+    <p>The mismatch is rounding that accumulates; give the format more mantissa, or the head more precision, and the algorithmic patches become unnecessary.</p>
+    <ul class="pros"><li>No extra forward pass, no algorithm change; five algorithms become "almost indistinguishable" under FP16<a class="cite" href="#ref-2">2</a>.</li><li>Closes the deployment gap the loss-side fixes cannot.</li></ul>
+    <ul class="cons"><li>FP16 evidence is mostly one group's; range and loss-scaling limits at large scale, which the authors state<a class="cite" href="#ref-2">2</a>.</li><li>The FP32-head result splits: ScaleRL gains at the asymptote, while Qi et al. cite posts reporting it insufficient (second-hand)<a class="cite" href="#ref-2">2</a>. FP16 leaves KL 0.32, not 0.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Remove the source (family C)</h4>
+    <p class="who">Thinking Machines, vLLM and TorchTitan, SGLang, Miles<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-20">20</a><a class="cite" href="#ref-19">19</a><a class="cite" href="#ref-9">9</a>; Zhong et al.'s VeXact<a class="cite" href="#ref-6">6</a>; DeepSeek-V3.2 and GLM-5 for routing, sampling masks and top-k<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>; DeepSeek-V4's kernels<a class="cite" href="#ref-12">12</a>.</p>
+    <p>If the two computations are bitwise identical there is nothing to correct, and the model you train is the model you serve.</p>
+    <ul class="pros"><li>Exactly on-policy: KL flat at 0, and a ground-truth reference for calibrating any correction<a class="cite" href="#ref-6">6</a>.</li></ul>
+    <ul class="cons"><li>Reported overheads of 1.6x to 2.4x or 34.35%<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-20">20</a><a class="cite" href="#ref-19">19</a>; invasive, covers dense models only in Miles, two copies of model code to keep in step<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-20">20</a>.</li><li>Routing replay can alter the target policy<a class="cite" href="#ref-7">7</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Mostly benign on a well-built stack</h4>
+    <p class="who">The Miles and SGLang RL post<a class="cite" href="#ref-9">9</a>.</p>
+    <p>Across more than 300 runs the authors rarely saw a collapse, none in GLM 4.5 to 4.7 post-training, and treat their mitigations as a fail-safe for rare MoE cases.</p>
+    <ul class="pros"><li>Guards against over-engineering a dense, mature stack.</li></ul>
+    <ul class="cons"><li>Own stack, unreviewed; dense collapses are reported with vLLM and FSDP by Qi et al., Zhong et al. and Thinking Machines<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-1">1</a>.</li><li>Its one collapse in 300 runs shows the tail is real.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The mismatch alone, with everything else fixed, can collapse a run: three groups show it and Zhong et al. isolate it with a zero-mismatch control. How often it bites depends on the stack, so Miles's experience and Zhong's can both be true. The positions are layers, not rivals. On a dense softmax-attention stack, log the tail statistics of Section 9 and keep a default mask; if the tail grows, FP16 or an FP32 head is the cheapest lever, with no extra pass and an effect on the deployment gap. For MoE, share the routing and keep a correction, since replay alone changes the objective. For sparse-attention indexers, make the selection deterministic. Reserve bitwise engines for diagnosis and for scales where 1.6x to 2.4x is acceptable. One matched experiment would settle it: a single MoE, a zero-mismatch reference, each family alone and in pairs, and an evaluation on the serving engine. No report has run it.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The vLLM and TorchTitan teams list a unified model definition and compilation support as next steps, to remove the fragility of two model copies<a class="cite" href="#ref-20">20</a>. TRL's main branch enables sequence-level masked IS by default and logs the gap<a class="cite" href="#ref-15">15</a>; read its values as a snapshot. DeepSeek-V4 aims at bitwise alignment between training and inference kernels<a class="cite" href="#ref-12">12</a>. Open: quantized rollouts (the evidence here is second-hand), hybrid and sparse attention beyond the two architectures reported, and whether thresholds can come from a bound such as Li et al.'s<a class="cite" href="#ref-10">10</a> instead of trial. As of 2026-10-27; the Miles post is undated.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">blog</span>He, H. and Thinking Machines Lab. <em>Defeating Nondeterminism in LLM Inference</em>. Thinking Machines Lab: Connectionism, 10 Sep 2025. <a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: batch invariance and the three reduction operations (RMSNorm, matrix multiplication, attention); the 1,000-completion experiment on Qwen3-235B-A22B-Instruct-2507; the performance table (26 / 55 / 42 s); the true on-policy RL experiment (Experiments, "True on-policy RL"). Full page fetched and the quoted numbers checked against it.</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Qi, P., Liu, Z., Zhou, X., Pang, T., Du, C., Lee, W. S., Lin, M. (Sea AI Lab / National University of Singapore). <em>Defeating the Training-Inference Mismatch via FP16</em>. arXiv:2510.26788v1, 30 Oct 2025. <a href="https://arxiv.org/pdf/2510.26788v1">https://arxiv.org/pdf/2510.26788v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the biased-gradient and deployment-gap formulation (§2, Eq. 3-4); TIS and MIS forms (Eq. 6-10); the extra-forward-pass cost estimate (§1, §2.1.1); the FP16 and BF16 format table (Table 1); sequence-level mismatch against length (Fig. 2, p. 7); the sanity test and results (§4, Fig. 3-5); MoE, LoRA and 14B runs (§5).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>MiniMax (Chen, A., Li, A. et al.). <em>MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention</em>. arXiv:2506.13585v1, 16 Jun 2025. <a href="https://arxiv.org/pdf/2506.13585v1">https://arxiv.org/pdf/2506.13585v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the training-versus-inference probability mismatch, the layer-by-layer diagnosis, the FP32 LM head and the correlations in Figure 3 (§3.2, p. 8); the repetition-truncation rule (§3.2).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>DeepSeek-AI (Liu, A., Mei, A., Lin, B. et al.). <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv:2512.02556v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Off-Policy Sequence Masking (Eq. 8-9), Keep Routing and Keep Sampling Mask (§3.1, pp. 7-8).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>GLM-5 Team (Zeng, A., Lv, X. et al.; Zhipu AI / Tsinghua). <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. arXiv:2602.15763v2 (24 Feb 2026; v1 17 Feb 2026). <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: GRPO with IcePop, β = 2, no KL, on-policy, group 32 (§3.2, Eq. 1); the DSA indexer finding, deterministic top-k, k = 2048, frozen indexer (§3.2, "DSA RL insights"); the TITO gateway and direct double-sided importance sampling (§3.3, §4.1.2).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Zhong, T., Ling, N., Pi, Y., Wei, Z., Yu, T., Fox, G., Wu, P., Yu, X. (ByteDance / University of Virginia). <em>Diagnosing Training-Inference Mismatch in LLM Reinforcement Learning via a Zero-Mismatch Reference</em>. arXiv:2605.14220v2, 29 Sep 2026 (v1 14 May 2026). <a href="https://arxiv.org/pdf/2605.14220">https://arxiv.org/pdf/2605.14220</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the token-level discrepancy δ<sub>t</sub> (Eq. 1) and the argmax-flip example (Table 1); the mean-versus-max statistics (Fig. 1); VeXact and the REINFORCE collapse (§3, Fig. 2); recomputation versus bypass, the KL-estimator finding, the zero-centered loss contribution and the 17.3% misaligned-direction figure (§4.1, Fig. 3-5); the TIS and rejection-sampling ablation (§4.2, Fig. 6).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Zheng, C., Dang, K., Yu, B., Li, M., Jiang, H., Lin, J., Liu, Y., Lin, H., Wu, C., Hu, F., Yang, A., Zhou, J., Lin, J. (Qwen Team, Alibaba Inc.). <em>Stabilizing Reinforcement Learning with LLMs: Formulation and Practices</em>. arXiv:2512.01374v3, 3 Dec 2025. <a href="https://arxiv.org/pdf/2512.01374">https://arxiv.org/pdf/2512.01374</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the token-level objective as a first-order approximation (§2.2-2.4, Eq. 1-5); the MoE decomposition (Eq. 6); Vanilla and Rollout Routing Replay, R2 and R3 (§3.2); on-policy and off-policy results (§4.3-4.4). Source added beyond the researcher's map.</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Ling Team (Inclusion AI). <em>Every Step Evolves: Scaling Reinforcement Learning for Trillion-Scale Thinking Model</em> (Ring-1T). arXiv:2510.18855v2, 25 Oct 2025. <a href="https://arxiv.org/pdf/2510.18855">https://arxiv.org/pdf/2510.18855</a>. Accessed 2026-10-27. <span class="ref-use">Used for: IcePop (§2.3.2, Eq. 1-3, Theorem 1), the recipe α = 0.5, β = 5, 480 prompts × 8 rollouts (§2.3.4), Fig. 5-6 (§2.4.1), the sensitivity analysis and clipping statistics (App. C, Fig. 12-13), limitations (§5). Source added beyond the researcher's map.</span></li>
+  <li id="ref-9"><span class="ref-type">blog</span>Miles / SGLang RL team (contributors listed in the post's acknowledgments, ByteDance, SGLang RL Team, RadixArk Miles Team). <em>Let Speed Be With Stability: All-In-One Solution to Training-Inference Mismatch with Miles</em>. Awesome-ML-SYS-Tutorial repository, rlhf/slime/mismatch/blog-en.md; no date shown. <a href="https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/slime/mismatch/blog-en.md">https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/slime/mismatch/blog-en.md</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the list of mismatch sources, K3 KL magnitudes for dense and MoE models, the Truly On Policy mode and its stated limits, the three-policy (decoupled PPO) picture, aggregation levels, and the four-configuration MoE rescue experiment. Raw markdown fetched and the numbers checked; the experiments are the authors' own and unreviewed. Source added beyond the researcher's map.</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Li, Y., Liu, J., Xu, J., Tong, Y., Li, Z., Liu, Q., Wang, B. (Fudan University / CUHK-Shenzhen). <em>Trust Region Masking for Long-Horizon LLM Reinforcement Learning</em>. arXiv:2512.23075v5, 26 Jun 2026 (v1 28 Dec 2025). <a href="https://arxiv.org/pdf/2512.23075">https://arxiv.org/pdf/2512.23075</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the three sources of divergence and the O(T<sup>2</sup>) bound arithmetic (§1); sequence-level masking (§4); the log-absolute-perplexity gap (§5, Eq. 25) and Fig. 1-2. Source added beyond the researcher's map; it is the arXiv version of the group whose Notion post (not readable) Qi et al. call Liu et al.</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Zhang, Z., Ding, X., Yuan, J., Liu, R., Mao, H., Xing, J., Liu, Z. <em>Deterministic Inference across Tensor Parallel Sizes That Eliminates Training-Inference Mismatch</em> (TBIK). arXiv:2511.17826v2, 29 May 2026 (v1 21 Nov 2025). <a href="https://arxiv.org/abs/2511.17826">https://arxiv.org/abs/2511.17826</a>. Accessed 2026-10-27. <span class="ref-use">Used for: abstract only, read through the arXiv API: tensor-parallel size as a source of mismatch, Tree-Based Invariant Kernels, the vLLM-to-FSDP bitwise result. Source added beyond the researcher's map; the full text was not read.</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>DeepSeek-AI (Xu, A., Lin, B., Xue, B. et al.). <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv:2606.19348v1. <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: batch-invariant and deterministic kernel libraries, the dual-kernel attention strategy, DeepGEMM in place of cuBLAS, abandoning split-k (§3.3, pp. 18-19); FP4 quantization-aware training in post-training (§1). The arXiv id and submission date disagree in the source map (note on date ambiguities).</span></li>
+  <li id="ref-13"><span class="ref-type">official</span>vLLM project. <em>Engine Arguments</em> (stable documentation). <a href="https://docs.vllm.ai/en/stable/configuration/engine_args/">https://docs.vllm.ai/en/stable/configuration/engine_args/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: <code>--logprobs-mode</code>, its four values, the default <code>raw_logprobs</code>, and the definition of raw versus processed. Source added beyond the researcher's map.</span></li>
+  <li id="ref-14"><span class="ref-type">official</span>Hugging Face. <em>TRL documentation: GRPO Trainer</em> (docs/source/grpo_trainer.md, main branch; no version stated). <a href="https://huggingface.co/docs/trl/main/en/grpo_trainer">https://huggingface.co/docs/trl/main/en/grpo_trainer</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the logged metrics <code>sampling/sampling_logp_difference</code> and <code>sampling/importance_sampling_ratio</code>; the default <code>sequence_mask</code> mode; truncation and masking variants; the vLLM server flag <code>--logprobs-mode processed_logprobs</code>; the pointer list to the mismatch literature ("Dealing with the Training-Inference Mismatch"). Main-branch documentation, a snapshot.</span></li>
+  <li id="ref-15"><span class="ref-type">repo</span>Hugging Face. <em>TRL source: trl/trainer/grpo_config.py</em> (main branch, raw file; no version stated). <a href="https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_config.py">https://github.com/huggingface/trl/blob/main/trl/trainer/grpo_config.py</a>. Accessed 2026-10-27. <span class="ref-use">Used for: defaults <code>vllm_importance_sampling_correction=True</code>, <code>vllm_importance_sampling_mode="sequence_mask"</code>, <code>vllm_importance_sampling_clip_max=3.0</code>, <code>clip_min=None</code>; the four modes; <code>off_policy_mask_threshold</code> (None by default; the docs' example value 0.5). Main-branch source, a snapshot. Source added beyond the researcher's map.</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Olmo Team (Ettinger, A., Bertsch, A. et al.; Allen Institute for AI). <em>Olmo 3</em>. arXiv:2512.13961v2 (14 Apr 2026; v1 15 Dec 2025). <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the OlmoRL objective with vLLM probabilities and the truncated importance-sampling cap (§4.4.1, Eq. 1); Table 49 (TIS cap 2.0 for 32B Think and RL-Zero, max asynchrony); the 1,000 s step with 125 s of training (§4.4.3, footnote 41).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S. et al. (Allen Institute for AI / University of Washington). <em>Tülu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv:2411.15124v5. <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the 405B RLVR run, 16-way tensor-parallel vLLM inference, about 550 s inference, 25 s weight transfer and 1,500 s training per iteration (§8.1).</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Khatri, D., Madaan, L., Tiwari, R., Bansal, R. et al. (Meta / UT Austin / UCL / UC Berkeley / Harvard / Periodic Labs). <em>The Art of Scaling Reinforcement Learning Compute for LLMs</em>. arXiv:2510.13786v1, 15 Oct 2025. <a href="https://arxiv.org/pdf/2510.13786v1">https://arxiv.org/pdf/2510.13786v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the FP32 LM-head ablation, asymptote 0.52 to 0.61 (§3.2, Fig. 5b); the leave-one-out and Scout MoE results (§4, Fig. 7, Fig. 8b).</span></li>
+  <li id="ref-19"><span class="ref-type">blog</span>The SGLang Team. <em>Towards Deterministic Inference in SGLang and Reproducible RL Training</em>. LMSYS Org blog, 22 Sep 2025 (updated 24 Sep). <a href="https://www.lmsys.org/blog/2025-09-22-sglang-deterministic/">https://www.lmsys.org/blog/2025-09-22-sglang-deterministic/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the 34.35% average slowdown of deterministic mode (25% to 45% range) against the 61.5% quoted for Thinking Machines' kernels; per-request seeds for non-greedy deterministic sampling. Source added beyond the researcher's map.</span></li>
+  <li id="ref-20"><span class="ref-type">blog</span>Wasti, B., Ye, W., Rao, T., Goin, M., Zhang, P., Liu, T., Gimelshein, N., Kwon, W., You, K., Li, Z. (vLLM and TorchTitan teams). <em>No More Train-Inference Mismatch: Bitwise Consistent On-Policy Reinforcement Learning with vLLM and TorchTitan</em>. vLLM blog, 10 Nov 2025. <a href="https://vllm.ai/blog/2025-11-10-bitwise-consistent-train-inference">https://vllm.ai/blog/2025-11-10-bitwise-consistent-train-inference</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the bitwise-consistent Qwen3 1.7B run on GSM8K, the 2.4x slowdown, KL equal to 0.0, the two-copies-of-model-code caveat, the synchronous single-host setup. Source added beyond the researcher's map.</span></li>
+  <li id="ref-21"><span class="ref-type">paper</span>Ma, W., Zhang, H., Zhao, L., Song, Y., Wang, Y., Sui, Z., Luo, F. <em>Stabilizing MoE Reinforcement Learning by Aligning Training and Inference Routers</em> (R3). arXiv:2510.11370v2, 21 Oct 2025 (v1 13 Oct 2025). <a href="https://arxiv.org/abs/2510.11370">https://arxiv.org/abs/2510.11370</a>. Accessed 2026-10-27. <span class="ref-use">Used for: abstract only: Rollout Routing Replay records the inference engine's routing and replays it in training. Source added beyond the researcher's map; the full text was not read.</span></li>
+  <li id="ref-22"><span class="ref-type">paper</span>Zheng, C., Liu, S., Li, M., Chen, X.-H., Yu, B. et al. (Qwen Team, Alibaba Inc.). <em>Group Sequence Policy Optimization</em>. arXiv:2507.18071v2, 28 Jul 2025. <a href="https://arxiv.org/pdf/2507.18071v2">https://arxiv.org/pdf/2507.18071v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the claim that sequence-level likelihood tolerates training-versus-inference precision differences (§5.4); the Routing Replay baseline (§5.3).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

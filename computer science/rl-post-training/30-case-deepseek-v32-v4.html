@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case Study: DeepSeek-V3.2 to V4 · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Reads DeepSeek's three reasoning-era post-training recipes against each other: R1's staged pipeline, V3.2's specialists plus one mixed GRPO stage with its stability toolbox and synthesized agent tasks, and V4's replacement of that stage by multi-teacher on-policy distillation and an actor that judges. States what each report gives, omits and never tests.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 30</p>
+  <h1>Case Study: DeepSeek-V3.2 to V4: Scaling GRPO Past 10% of Pre-Training Compute, Then Replacing Mixed RL with On-Policy Distillation</h1>
+  <p class="lede">DeepSeek's three reasoning-era reports share one optimizer and differ in nearly everything around it. R1 stacked SFT and RL stages; V3.2 merged reasoning, agent and alignment RL into one GRPO stage and spent more than 10% of pre-training cost on it; V4 dropped that stage and distilled more than ten specialists into one student. This module reads the three recipes against each other, including what each report states, leaves out and never tests. Afterwards you can say which R1 choices DeepSeek revised and why, what V4 gave up by dropping mixed RL, and which V3.2 stability fixes an RL loop of your own would still need.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>40 min</b> read</span>
+    <span class="chip"><b>20</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 9</b>, <b>Module 11</b>, <b>Module 22</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 392" role="img" aria-labelledby="f1t"><title id="f1t">Three DeepSeek post-training recipes as lanes of stages; orange marks the step where separately acquired skills are merged</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <text x="20" y="22" class="d-title d-bold">DeepSeek-R1: four stages in sequence</text>
+    <rect x="20" y="32" width="170" height="68" rx="8" class="d-block-muted"/>
+    <text x="105" y="58" text-anchor="middle" class="d-text-inv d-bold">Cold-start SFT</text>
+    <text x="105" y="78" text-anchor="middle" class="d-text-inv d-small">thousands of examples</text>
+    <path d="M190,66 L215,66" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="215" y="32" width="170" height="68" rx="8" class="d-block-2"/>
+    <text x="300" y="58" text-anchor="middle" class="d-text-inv d-bold">Reasoning RL</text>
+    <text x="300" y="78" text-anchor="middle" class="d-text-inv d-small">GRPO, rule rewards</text>
+    <path d="M385,66 L410,66" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="410" y="32" width="170" height="68" rx="8" class="d-block-accent"/>
+    <text x="495" y="55" text-anchor="middle" class="d-text-inv d-bold">Rejection-sampling SFT</text>
+    <text x="495" y="73" text-anchor="middle" class="d-text-inv d-small">~600K reasoning +</text>
+    <text x="495" y="88" text-anchor="middle" class="d-text-inv d-small">~200K other samples</text>
+    <path d="M580,66 L605,66" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="605" y="32" width="170" height="68" rx="8" class="d-block-2"/>
+    <text x="690" y="58" text-anchor="middle" class="d-text-inv d-bold">Second RL stage</text>
+    <text x="690" y="78" text-anchor="middle" class="d-text-inv d-small">1,700 steps</text>
+
+    <text x="20" y="128" class="d-title d-bold">DeepSeek-V3.2: specialists, then one mixed RL stage</text>
+    <rect x="20" y="138" width="170" height="68" rx="8" class="d-block-muted"/>
+    <text x="105" y="164" text-anchor="middle" class="d-text-inv d-bold">V3.1-Terminus + DSA</text>
+    <text x="105" y="184" text-anchor="middle" class="d-text-inv d-small">continued pre-training</text>
+    <path d="M190,172 L215,172" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="215" y="138" width="170" height="68" rx="8" class="d-block-2"/>
+    <text x="300" y="161" text-anchor="middle" class="d-text-inv d-bold">Specialists</text>
+    <text x="300" y="179" text-anchor="middle" class="d-text-inv d-small">6 domains + writing + QA</text>
+    <text x="300" y="194" text-anchor="middle" class="d-text-inv d-small">large-scale RL for each</text>
+    <path d="M385,172 L410,172" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="410" y="138" width="170" height="68" rx="8" class="d-block-muted"/>
+    <text x="495" y="164" text-anchor="middle" class="d-text-inv d-bold">Train on distilled data</text>
+    <text x="495" y="184" text-anchor="middle" class="d-text-inv d-small">specialists' outputs</text>
+    <path d="M580,172 L605,172" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="605" y="138" width="170" height="68" rx="8" class="d-block-accent"/>
+    <text x="690" y="161" text-anchor="middle" class="d-text-inv d-bold">One mixed GRPO stage</text>
+    <text x="690" y="179" text-anchor="middle" class="d-text-inv d-small">reason + agent + align</text>
+    <text x="690" y="194" text-anchor="middle" class="d-text-inv d-small">thousands of steps</text>
+
+    <text x="20" y="234" class="d-title d-bold">DeepSeek-V4: specialists, then on-policy distillation</text>
+    <rect x="20" y="244" width="170" height="68" rx="8" class="d-block-muted"/>
+    <text x="105" y="270" text-anchor="middle" class="d-text-inv d-bold">Pre-training</text>
+    <text x="105" y="290" text-anchor="middle" class="d-text-inv d-small">32T (Flash), 33T (Pro)</text>
+    <path d="M190,278 L215,278" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="215" y="244" width="170" height="68" rx="8" class="d-block-2"/>
+    <text x="300" y="267" text-anchor="middle" class="d-text-inv d-bold">Specialists</text>
+    <text x="300" y="285" text-anchor="middle" class="d-text-inv d-small">SFT, then GRPO per domain</text>
+    <text x="300" y="300" text-anchor="middle" class="d-text-inv d-small">three effort settings</text>
+    <path d="M385,278 L410,278" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="410" y="244" width="170" height="68" rx="8" class="d-block-accent"/>
+    <text x="495" y="267" text-anchor="middle" class="d-text-inv d-bold">Multi-teacher OPD</text>
+    <text x="495" y="285" text-anchor="middle" class="d-text-inv d-small">&gt;10 teachers, reverse KL</text>
+    <text x="495" y="300" text-anchor="middle" class="d-text-inv d-small">full-vocabulary logits</text>
+    <path d="M580,278 L605,278" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="605" y="244" width="170" height="68" rx="8" class="d-block"/>
+    <text x="690" y="267" text-anchor="middle" class="d-text-inv d-bold">V4-Pro / V4-Flash</text>
+    <text x="690" y="285" text-anchor="middle" class="d-text-inv d-small">1.6T/49B and 284B/13B</text>
+    <text x="690" y="300" text-anchor="middle" class="d-text-inv d-small">Non-think, High, Max</text>
+    <rect x="185" y="322" width="230" height="30" rx="8" class="d-outline d-dashed"/>
+    <text x="300" y="342" text-anchor="middle" class="d-small">hard-to-verify: actor is the GRM</text>
+    <path d="M300,312 L300,322" class="d-arrow"/>
+
+    <rect x="20" y="368" width="14" height="14" rx="3" class="d-block-muted"/>
+    <text x="40" y="380" class="d-small">SFT or pre-training</text>
+    <rect x="200" y="368" width="14" height="14" rx="3" class="d-block-2"/>
+    <text x="220" y="380" class="d-small">RL (GRPO)</text>
+    <rect x="330" y="368" width="14" height="14" rx="3" class="d-block-accent"/>
+    <text x="350" y="380" class="d-small">where skills are combined</text>
+    <rect x="560" y="368" width="14" height="14" rx="3" class="d-block"/>
+    <text x="580" y="380" class="d-small">released model</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The three recipes as lanes. Orange marks the step where separately acquired skills are merged: an SFT mixture in R1 (about 600K reasoning and 200K other samples<a class="cite" href="#ref-1">1</a>), one mixed GRPO stage in V3.2<a class="cite" href="#ref-2">2</a>, multi-teacher on-policy distillation in V4<a class="cite" href="#ref-3">3</a>. Stage contents from R1 §3 and Supp. B.3.3, V3.2 §3, and V4 abstract, §1 and §5.1; V4 sizes are total/activated parameters.</figcaption>
+</figure>
+
+<h2 id="r1-left-open">1. What R1 settled, and what it left open</h2>
+<p>R1-Zero ran GRPO<a class="cite" href="#ref-4">4</a> directly on DeepSeek-V3-Base with a reward that checks only the final answer, and AIME 2024 pass@1 rose from 15.6% to 77.9% (arXiv v2)<a class="cite" href="#ref-1">1</a>. Module 27 reads that recipe stage by stage; this module needs five of its facts, because each is something a later report changes.</p>
+<ul>
+<li><strong>Optimizer settings.</strong> Advantage \(A_i=(r_i-\mathrm{mean})/\mathrm{std}\) over a group of 16, KL coefficient 0.001, 32 questions per step, the reference model replaced by the latest policy every 400 steps, and each 8,192-output rollout split into 16 minibatches with one inner epoch<a class="cite" href="#ref-1">1</a> (§2.1, Eq. 3).</li>
+<li><strong>Reasoning rewards.</strong> Rule-based accuracy and format only. The report states that it abstains "from applying neural reward models—whether outcome-based or process-based—to reasoning tasks" because they are "susceptible to reward hacking during large-scale reinforcement learning"<a class="cite" href="#ref-1">1</a> (§2.2).</li>
+<li><strong>Stages.</strong> Cold-start SFT, reasoning RL with a language-consistency reward, rejection sampling plus SFT, then a second RL stage. Helpfulness and harmlessness reward models enter only in the last 400 of that stage's 1,700 steps, because longer exposure to the preference reward "may lead to reward hacking"<a class="cite" href="#ref-1">1</a> (§3.2.2, Supp. B.5).</li>
+<li><strong>Context.</strong> Maximum output length 32,768 tokens, raised to 65,536 after step 8.2K<a class="cite" href="#ref-1">1</a> (§2.1).</li>
+<li><strong>Cost.</strong> 101K H800 GPU-hours for R1-Zero, 5K for SFT data creation and 41K for R1, 147K in total, which the report prices at $294K at $2 per GPU-hour<a class="cite" href="#ref-1">1</a> (Table 7).</li>
+</ul>
+<p>V3.2's introduction names three deficiencies of open models: vanilla attention, "insufficient computational investment during the post-training phase", and weak generalization in agent settings<a class="cite" href="#ref-2">2</a> (§1). The last two are the RL half of the report, and they turn R1's loose ends into four questions that organize the rest of this module. How do you push RL past 10% of pre-training cost, against 3.8% to 5.5% for R1 (derived in Section 5), without the run diverging (Sections 4 and 5)? How do you get reasoning and tool use into one trajectory (Section 3)? Where does the reward for open-ended prompts come from now that a scalar reward model is the thing R1 saw being hacked (Sections 3 and 6)? And how should skills trained separately end up in one set of weights (Sections 2, 7 and 9)? V3.2 answers all four; V4 keeps most of the answers to the first three and reverses the fourth.</p>
+
+<h2 id="v32-pipeline">2. DeepSeek-V3.2: specialists first, then one mixed RL stage</h2>
+<h3 id="v32-pipeline-base">2.1 The checkpoint RL starts from, and the attention it runs through</h3>
+<p>V3.2 starts from DeepSeek-V3.1-Terminus, whose context had been extended to 128K, and adds DeepSeek Sparse Attention (DSA) by continued pre-training in two stages: a dense warm-up that trains only the lightning indexer (1,000 steps of 16 sequences of 128K tokens at learning rate \(10^{-3}\)), then a sparse stage that trains everything with 2,048 key-value entries selected per query (15,000 steps of 480 sequences at \(7.3\times10^{-6}\))<a class="cite" href="#ref-2">2</a> (§2.1.1). The report's token totals, 2.1B and 943.7B, follow from reading 128K as 131,072 tokens: \(1{,}000\times16\times131{,}072=2.10\mathrm{B}\) and \(15{,}000\times480\times131{,}072=943.7\mathrm{B}\) (derived). Post-training "employs sparse attention in the same way as the sparse continued pre-training stage"<a class="cite" href="#ref-2">2</a> (§3), so rollouts are sampled through the same top-\(k\) selection (\(k=2{,}048\) in the continued pre-training stage; the post-training value is not restated) and the trainer must reproduce that selection when it recomputes probabilities. The report does not discuss how the two engines keep the indexer's choice consistent. GLM-5, which also trains on DSA, reports that a non-deterministic top-k kernel in the indexer degraded RL drastically within a few steps and that a deterministic <code>torch.topk</code> fixed it<a class="cite" href="#ref-5">5</a> (§3.2). That is an observation about GLM-5's stack, not a finding about DeepSeek's, but it names the failure that Section 4's fixes do not cover.</p>
+
+<h3 id="v32-pipeline-stages">2.2 Specialists, distilled data, then a single stage</h3>
+<p>For each domain the team first builds a specialist, all fine-tuned from the same pre-trained V3.2 base checkpoint. The domains are writing and general question answering plus six named areas: mathematics, programming, general logical reasoning, general agentic tasks, agentic coding and agentic search, each in thinking and non-thinking mode, with different models generating the long chain-of-thought data and the direct-response data. Each specialist is "trained with large-scale Reinforcement Learning (RL) computing", and the specialists then produce the domain data for the final checkpoint<a class="cite" href="#ref-2">2</a> (§3). The report's evidence for this step is one sentence: models trained on the distilled data reach performance "only marginally below those of domain-specific specialists, with the performance gap being effectively eliminated through subsequent RL training". No table shows the gap.</p>
+<p>The final stage is GRPO<a class="cite" href="#ref-4">4</a>, with "reasoning, agent, and human alignment training" merged "into one RL stage", which the report says "effectively balances performance across diverse domains while circumventing the catastrophic forgetting issues commonly associated with multi-stage training paradigms". The merged data then go through "thousands of steps of continued RL training to reach the final checkpoints"<a class="cite" href="#ref-2">2</a> (§3). The mixed stage is therefore RL on top of a model already trained on distilled specialist data, not RL from a cold start. That matters for Section 9, because V4 removes this RL pass.</p>
+
+<h3 id="v32-pipeline-unstated">2.3 What the recipe does not tell you</h3>
+<p>The report prints an objective, an advantage and four stability operations, and few of the numbers that would let you rerun them. Table 1 lists what a reproducer needs against what the sections give.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> DeepSeek-V3.2's RL recipe: stated against not stated. "Not stated" means the report was searched in full (main text and appendices) and the quantity does not appear<a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th>Item</th><th>What the report gives</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Algorithm and advantage</td><td>GRPO; \(\hat A_{i,t}=R_i-\mathrm{mean}(\boldsymbol R)\), no division by the standard deviation</td><td>§3, §3.1</td></tr>
+    <tr><td class="row">Loss aggregation</td><td>Printed per token with \(1/|o_i|\) (Eqs. 5, 6, 8); whether the code matches is not stated (Module 11)</td><td>§3.1</td></tr>
+    <tr><td class="row">Group size \(G\), prompts per step, batch size</td><td>Not stated; \(G\) appears only as a symbol</td><td>§3.1</td></tr>
+    <tr><td class="row">Learning rate, \(\varepsilon\), \(\beta\)</td><td>Not stated for RL. The only learning rates printed are the DSA ones: \(10^{-3}\) and \(7.3\times10^{-6}\)</td><td>§2.1.1, §3.1</td></tr>
+    <tr><td class="row">Mask threshold \(\delta\)</td><td>Not stated (Module 12)</td><td>§3.1, Eq. 9</td></tr>
+    <tr><td class="row">Run length</td><td>"Thousands of steps"</td><td>§3</td></tr>
+    <tr><td class="row">Length penalty, language consistency</td><td>Named; form and weights not stated</td><td>§3</td></tr>
+    <tr><td class="row">Judge for general tasks</td><td>A generative reward model with per-prompt rubrics; which model it is and who writes the rubrics is not stated</td><td>§3</td></tr>
+    <tr><td class="row">RL compute</td><td>"Exceeding 10% of the pre-training cost"; the denominator is not defined</td><td>§1, §4.1</td></tr>
+  </tbody>
+</table>
+
+<h3 id="v32-pipeline-speciale">2.4 Speciale</h3>
+<p>V3.2-Speciale is the same RL run with the dials turned toward length: "trained exclusively on reasoning data with a reduced length penalty", plus the DeepSeekMath-V2 proof data and reward<a class="cite" href="#ref-2">2</a> (§3). It scores 35/42 on IMO 2025, 102/126 on CMO 2025 and 492/600 on IOI 2025, and solved 10 of 12 ICPC World Finals 2025 problems, at a 128K generation cap and without tools (Table 4, Appendix D); the report concedes its token efficiency "remains significantly inferior" to Gemini-3.0-Pro's<a class="cite" href="#ref-2">2</a> (§4.2). Module 23 reads the length-penalty arithmetic.</p>
+
+<h2 id="v32-tasks-rewards">3. V3.2's task pool and what scores it</h2>
+<h3 id="v32-tasks-pool">3.1 Four populations, three of them in real environments</h3>
+<p>The introduction's "over 1,800 distinct environments and 85,000 complex prompts"<a class="cite" href="#ref-2">2</a> (§1) is two numbers about two different things. Table 1 of the report counts agent tasks in four populations, and the rows sum to 85,267 (derived): 24,667 code-agent tasks, 50,275 search-agent tasks, 4,417 general-agent tasks and 5,908 code-interpreter tasks<a class="cite" href="#ref-2">2</a> (§3.2.3). The 1,827 environments belong to the general-agent row alone; the other three run in real environments (live search APIs, coding tools, Jupyter notebooks) with prompts that are extracted from the internet or synthesized, "rather than obtained from actual user interactions". Figure 2 draws the pool. Module 17 covers how each population is built and filtered.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Two stacked bars of the 85,267 V3.2 agent tasks, split by environment type and by prompt source</title>
+    <text x="60" y="52" class="d-text-light d-small">Environment: real or synthesized</text>
+    <text x="770" y="22" text-anchor="end" class="d-small">General agent: 4,417 (5.2%)</text>
+    <path d="M722,27 L722,58" class="d-line d-stroke-orange"/>
+    <text x="700" y="40" text-anchor="end" class="d-small">Code interpreter: 5,908 (6.9%)</text>
+    <path d="M681,44 L681,58" class="d-line d-stroke-blue"/>
+    <rect x="60" y="60" width="400.9" height="44" class="d-fill-blue"/>
+    <text x="260" y="87" text-anchor="middle" class="d-text-inv d-bold">Search 50,275 · 59.0%</text>
+    <rect x="460.9" y="60" width="196.7" height="44" class="d-fill-blue"/>
+    <text x="559" y="87" text-anchor="middle" class="d-text-inv d-bold">Code 24,667 · 28.9%</text>
+    <rect x="657.6" y="60" width="47.1" height="44" class="d-fill-blue"/>
+    <rect x="704.7" y="60" width="35.2" height="44" class="d-fill-orange"/>
+
+    <text x="60" y="132" class="d-text-light d-small">Prompt source: extracted or synthesized</text>
+    <rect x="60" y="140" width="400.9" height="44" class="d-fill-orange"/>
+    <text x="260" y="167" text-anchor="middle" class="d-text-inv d-bold">synthesized</text>
+    <rect x="460.9" y="140" width="196.7" height="44" class="d-fill-blue"/>
+    <text x="559" y="167" text-anchor="middle" class="d-text-inv d-bold">extracted</text>
+    <rect x="657.6" y="140" width="47.1" height="44" class="d-fill-blue"/>
+    <rect x="704.7" y="140" width="35.2" height="44" class="d-fill-orange"/>
+
+    <path d="M722,188 L722,206" class="d-line d-stroke-orange"/>
+    <text x="770" y="222" text-anchor="end" class="d-small d-mono">1,827 environments, 4,417 tasks</text>
+    <text x="770" y="240" text-anchor="end" class="d-small d-mono">2.42 tasks per environment (derived)</text>
+
+    <rect x="60" y="268" width="14" height="14" class="d-fill-blue"/>
+    <text x="80" y="280" class="d-small">real environment, or prompt extracted from the internet</text>
+    <rect x="450" y="268" width="14" height="14" class="d-fill-orange"/>
+    <text x="470" y="280" class="d-small">synthesized environment or prompt</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> The 85,267 agent tasks of V3.2's Table 1 (sum derived), drawn to scale. Top bar: environment type. Bottom bar: prompt source. Only the general-agent segment has a synthesized environment; the largest segment pairs a real search environment with synthesized prompts. Counts and labels from V3.2 Table 1<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> V3.2's agent task populations: size, environment, prompt source and the scoring the report describes<a class="cite" href="#ref-2">2</a> (Table 1, §3, §3.2.3).</caption>
+  <thead><tr><th>Population</th><th class="num">Tasks</th><th class="num">Share (%)</th><th>Environment</th><th>Prompts</th><th>Scoring the report states</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Search agent</td><td class="num">50,275</td><td class="num">59.0</td><td>real</td><td>synthesized</td><td>Verifiable QA pairs kept only when the ground truth checks out and every candidate answer is verifiably wrong; plus helpfulness prompts scored by a rubric GRM</td></tr>
+    <tr><td class="row">Code agent</td><td class="num">24,667</td><td class="num">28.9</td><td>real</td><td>extracted</td><td>Rule-based outcome reward; an environment is admitted only if the gold patch yields at least one F2P test and zero P2F tests</td></tr>
+    <tr><td class="row">Code interpreter</td><td class="num">5,908</td><td class="num">6.9</td><td>real (Jupyter)</td><td>extracted</td><td>Rule-based outcome reward on math, logic and data-science problems that need code execution</td></tr>
+    <tr><td class="row">General agent</td><td class="num">4,417</td><td class="num">5.2</td><td>synthesized</td><td>synthesized</td><td>A per-task Python verification function; only tasks with non-zero pass@100 after RL with V3.2 are kept</td></tr>
+  </tbody>
+</table>
+
+<h3 id="v32-tasks-judge">3.2 A rubric judge where there is no checker</h3>
+<p>For reasoning and agent tasks the reward is a rule-based outcome reward, a length penalty and a language-consistency reward. "For general tasks, we employ a generative reward model where each prompt has its own rubrics for evaluation"<a class="cite" href="#ref-2">2</a> (§3). The search-agent pipeline shows the hybrid in use: verifiable question-answer pairs reward factual reliability, and "detailed evaluation rubrics across multiple quality dimensions" scored by a generative reward model reward practical helpfulness (§3.2.3). Section 3.1 of the same report says "a set of reward models" scores each output, without saying which<a class="cite" href="#ref-2">2</a>.</p>
+<p>Set that against R1, whose general-purpose reward was a scalar model trained on 66,000 preference pairs that DeepSeek-V3 labeled, and whose authors saw reward rise while Codeforces performance fell<a class="cite" href="#ref-1">1</a> (§3.1, Supp. B.5). V3.2 never says that hacking was the reason for the switch, and it gives no comparison between a scalar model and the rubric judge. The move is documented; the motive and the benefit are not. Module 16 covers rubric judges and their failure modes.</p>
+
+<h3 id="v32-tasks-ablation">3.3 The one measured claim about synthetic tasks</h3>
+<p>Section 4.3 is the only environment-design ablation among the seven reports Module 17 searched. It asks whether the synthesized general-agent tasks are hard and whether RL on them transfers. On 50 sampled tasks, V3.2-Exp reaches 12% at pass@1 and 26% at pass@4, against 34% and 62% for Claude Sonnet 4.5, 51% and 74% for Gemini 3.0 Pro, and 62% and 82% for GPT-5 Thinking<a class="cite" href="#ref-2">2</a> (Table 5). For transfer, RL on only the synthetic tasks in non-thinking mode, starting from the SFT checkpoint, "yields substantial improvements" on τ²-Bench, MCP-Mark and MCP-Universe, whereas RL restricted to code and search "does not improve performance on these benchmarks" (Figure 5, plotted as curves without tabulated values). It is one run per condition on a 50-task sample, so treat it as evidence that the data are not trivially easy and that they add something code-and-search RL does not; Module 17 lists the limits.</p>
+
+<h3 id="v32-tasks-thinking">3.4 Keeping the reasoning when a tool answers</h3>
+<p>V3.2 describes R1's strategy as discarding reasoning content when the second round of messages arrives. In tool use that "forces the model to redundantly re-reason through the entire problem for each subsequent tool call", so V3.2 drops historical reasoning only when a new user message arrives, keeps it while only tool outputs are appended, and always keeps the tool-call history<a class="cite" href="#ref-2">2</a> (§3.2.1). The cold start is deliberately light: system prompts that ask for reasoning, for tool calls, or for tool calls inside the <code>&lt;think&gt;</code> block, with the admission that "the reasoning in tool-use patterns may lack robustness" and the model only "occasionally" produces the wanted trajectories, which is enough to start RL (§3.2.2, Appendix B). V4 goes further and keeps the whole reasoning history across user turns in tool-calling scenarios<a class="cite" href="#ref-3">3</a> (§5.1.1). Module 18 covers what the harness does to the sequence the policy conditions on.</p>
+
+<h2 id="v32-stability">4. V3.2's stability toolbox, drawn as the boundary between engine and trainer</h2>
+<p>After the mean-subtracted advantage, V3.2 lists four "additional strategies that stabilize RL scaling, directly building on the GRPO algorithm"<a class="cite" href="#ref-2">2</a> (§3.1). Read as systems work, each one is either a piece of metadata that has to cross from the rollout engine to the trainer, or a rule for what the trainer does when that metadata says the two have drifted apart. Figure 3 steps through one iteration to show which is which. The mechanisms themselves are derived elsewhere (the KL fix in Module 6 §3.6, the sequence mask in Module 12 §5.3, routing and sampling masks in Module 14); the point here is the pattern.</p>
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 340" role="img" aria-label="Stepper over one V3.2 RL iteration: the rollout engine samples with top-p and top-k and MoE routing and returns old probabilities; the truncation mask, expert indices and old log-probabilities cross to the trainer; rewards give a mean-subtracted advantage; a sequence mask and a corrected KL term act in the loss">
+      <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+      <rect x="20" y="30" width="250" height="290" rx="10" class="d-panel"/>
+      <text x="145" y="52" text-anchor="middle" class="d-bold">Rollout engine</text>
+      <rect x="530" y="30" width="250" height="290" rx="10" class="d-panel"/>
+      <text x="655" y="52" text-anchor="middle" class="d-bold">Trainer</text>
+      <text x="400" y="52" text-anchor="middle" class="d-text-light d-small">what crosses</text>
+      <g data-step="1">
+        <rect x="40" y="66" width="210" height="40" rx="6" class="d-block-2"/>
+        <text x="145" y="84" text-anchor="middle" class="d-text-inv d-bold">Sampler: top-p, top-k</text>
+        <text x="145" y="99" text-anchor="middle" class="d-text-inv d-small">truncates the vocabulary</text>
+        <rect x="40" y="116" width="210" height="40" rx="6" class="d-block-2"/>
+        <text x="145" y="134" text-anchor="middle" class="d-text-inv d-bold">MoE router: top-k experts</text>
+        <text x="145" y="149" text-anchor="middle" class="d-text-inv d-small">picks experts per token</text>
+        <rect x="40" y="166" width="210" height="40" rx="6" class="d-block-2"/>
+        <text x="145" y="184" text-anchor="middle" class="d-text-inv d-bold">π_old per token</text>
+        <text x="145" y="199" text-anchor="middle" class="d-text-inv d-small">returned by the engine</text>
+      </g>
+      <g data-step="2">
+        <path d="M250,86 L550,86" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <text x="400" y="80" text-anchor="middle" class="d-mono d-small">truncation mask</text>
+        <rect x="550" y="66" width="210" height="40" rx="6" class="d-block"/>
+        <text x="655" y="84" text-anchor="middle" class="d-text-inv d-bold">Forward under same mask</text>
+        <text x="655" y="99" text-anchor="middle" class="d-text-inv d-small">same action subspace</text>
+      </g>
+      <g data-step="3">
+        <path d="M250,136 L550,136" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <text x="400" y="130" text-anchor="middle" class="d-mono d-small">expert indices</text>
+        <rect x="550" y="116" width="210" height="40" rx="6" class="d-block"/>
+        <text x="655" y="134" text-anchor="middle" class="d-text-inv d-bold">Forward on same routes</text>
+        <text x="655" y="149" text-anchor="middle" class="d-text-inv d-small">same experts optimized</text>
+      </g>
+      <g data-step="4">
+        <rect x="300" y="216" width="150" height="40" rx="6" class="d-block-muted"/>
+        <text x="375" y="234" text-anchor="middle" class="d-text-inv d-bold">Rewards R_i</text>
+        <text x="375" y="249" text-anchor="middle" class="d-text-inv d-small">rules, length, GRM</text>
+        <path d="M450,236 L550,236" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="550" y="216" width="210" height="40" rx="6" class="d-block"/>
+        <text x="655" y="234" text-anchor="middle" class="d-text-inv d-bold">A = R − mean(R)</text>
+        <text x="655" y="249" text-anchor="middle" class="d-text-inv d-small">no std division</text>
+      </g>
+      <g data-step="5">
+        <path d="M250,186 L550,186" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <text x="400" y="180" text-anchor="middle" class="d-mono d-small">log π_old</text>
+        <rect x="550" y="166" width="210" height="40" rx="6" class="d-block-accent"/>
+        <text x="655" y="184" text-anchor="middle" class="d-text-inv d-bold">M = 0 if A&lt;0, drift&gt;δ</text>
+        <text x="655" y="199" text-anchor="middle" class="d-text-inv d-small">whole sequence dropped</text>
+      </g>
+      <g data-step="6">
+        <rect x="300" y="266" width="150" height="40" rx="6" class="d-block-muted"/>
+        <text x="375" y="284" text-anchor="middle" class="d-text-inv d-bold">π_ref</text>
+        <text x="375" y="299" text-anchor="middle" class="d-text-inv d-small">frozen reference</text>
+        <path d="M450,286 L550,286" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="550" y="266" width="210" height="40" rx="6" class="d-block"/>
+        <text x="655" y="284" text-anchor="middle" class="d-text-inv d-bold">KL: K3 × π_θ/π_old</text>
+        <text x="655" y="299" text-anchor="middle" class="d-text-inv d-small">β set per domain</text>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Sample.</b> The engine draws a group of outputs per prompt with top-p and top-k truncation and MoE routing, and returns each token's probability directly.</li>
+    <li><b>Keep Sampling Mask.</b> The truncation mask crosses to the trainer, which restricts \(\pi_\theta\) to the same kept tokens, so both policies "share identical action subspaces".</li>
+    <li><b>Keep Routing.</b> The expert paths used at sampling are forced in the trainer's forward pass, so the same expert parameters are optimized.</li>
+    <li><b>Reward, then advantage.</b> Rule-based rewards, length penalty, language consistency and the rubric judge give \(R_i\); the advantage subtracts the group mean and does not divide.</li>
+    <li><b>Off-policy sequence mask.</b> A sequence with negative advantage whose mean log-ratio of the engine's \(\pi_{old}\) to the current \(\pi_\theta\) exceeds \(\delta\) is masked out whole. \(\delta\) is not stated.</li>
+    <li><b>KL to the reference.</b> The K3 estimate is weighted by \(\pi_\theta/\pi_{old}\); the coefficient depends on the domain and is weak or absent for mathematics.</li>
+  </ol>
+</div>
+<p><b>Figure 3.</b> One V3.2 iteration, stepped. Cyan is the rollout engine, blue the trainer, orange the mask that changes which sequences count. What crosses the boundary is named in the report's own terms: probabilities "directly returned by the inference framework", truncation masks, expert routing paths<a class="cite" href="#ref-2">2</a> (§3.1). The report does not say how masks and paths are stored or transported.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 3.</b> The five V3.2 operations, the failure each is said to address, and the evidence the report gives<a class="cite" href="#ref-2">2</a> (§3.1).</caption>
+  <thead><tr><th>Operation</th><th>Failure named in the report</th><th>Evidence given</th><th>Derived in</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Advantage \(R_i-\mathrm{mean}(\boldsymbol R)\)</td><td>None stated for dropping the division</td><td>None</td><td>Module 11</td></tr>
+    <tr><td class="row">Importance-corrected K3, per-domain \(\beta\)</td><td>When \(\pi_\theta\ll\pi_{ref}\) the K3 gradient gives "disproportionately large, unbounded weights", producing "noisy gradient updates"</td><td>None shown; "weak KL penalty or even omitting it entirely can yield improved performance" for mathematics</td><td>Module 6 §3.6</td></tr>
+    <tr><td class="row">Off-policy sequence masking</td><td>Minibatch reuse plus engine-versus-trainer differences make rollouts off-policy; "highly off-policy negative samples can be detrimental"</td><td>Reported to improve stability "in certain training scenarios"; no numbers, \(\delta\) not given</td><td>Module 12 §5.3</td></tr>
+    <tr><td class="row">Keep Routing</td><td>Inconsistent expert routing between engines causes "abrupt shifts in the active parameter subspace"</td><td>Operation "found crucial for RL training stability of MoE models"; used since DeepSeek-V3-0324</td><td>Module 14</td></tr>
+    <tr><td class="row">Keep Sampling Mask</td><td>Truncating the action space at sampling but not in training "violates the principles of importance sampling"</td><td>Top-p with the mask "effectively preserves language consistency"</td><td>Modules 13, 14</td></tr>
+  </tbody>
+</table>
+<p>Three observations that the table cannot hold. First, no row has an ablation: every fix is justified by a mechanism and a sentence about observed stability, which is why Module 12 and Module 14 supply the mathematics and the outside evidence. Second, the sequence mask is asymmetric by design. The report masks only negative-advantage sequences because "the model benefits the most by learning from its own mistakes, whereas highly off-policy negative samples can be detrimental"<a class="cite" href="#ref-2">2</a> (§3.1). That is an argument from intuition, and because \(\pi_{old}\) is the engine's own probability the mask reacts to minibatch staleness and to engine mismatch without telling them apart. Third, the KL term is kept, repaired and tuned per domain. R1 used one coefficient, 0.001<a class="cite" href="#ref-1">1</a> (§2.1); DAPO, Olmo 3 and GLM-5 delete the term<a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-5">5</a>; V3.2 chose the option with the most knobs and prints none of the values.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>Treat the sampler configuration as part of the objective, not as a serving detail. Keep Sampling Mask exists because top-p or top-k at rollout time, without the same truncation in the trainer, makes the ratio compare two distributions over different supports<a class="cite" href="#ref-2">2</a> (§3.1). The three operations imply that an engine must export, per token, the sampled id, its probability, the kept-token set and, for MoE, the expert indices (the report does not describe the format). Module 14 lists the checks that follow.</p></aside>
+
+<h2 id="rl-budget-ladder">5. How much compute: a ladder across four DeepSeek reports</h2>
+<p>V3.2 states its RL budget as a share, not as GPU-hours: a "post-training computational budget exceeding 10% of the pre-training cost", and later "consistent performance improvements correlating with extended RL training budget, which already exceeds 10% of the pre-training cost", with the hypothesis that "reasoning capabilities could be further enhanced with additional computational budget allocation"<a class="cite" href="#ref-2">2</a> (§1, §4.1). The report does not define the denominator. DeepSeek's earlier reports give enough to put four points on one scale, if you accept one assumption: the denominator is V3's pre-training, 2,664K H800 GPU-hours<a class="cite" href="#ref-8">8</a> (Table 1). That is exact for V3 and R1, which both start from V3-Base, and a stand-in for V3.2, whose base is V3.1-Terminus plus continued pre-training. Module 15 uses the same stand-in.</p>
+$$\frac{5}{2{,}664}=0.19\%,\qquad \frac{101}{2{,}664}=3.8\%,\qquad \frac{147}{2{,}664}=5.5\%,\qquad 10\%\times2{,}664\mathrm{K}=266.4\mathrm{K}\ \text{GPU-hours}$$
+<p>The numerators are V3's whole post-training (SFT and RL together, 5K<a class="cite" href="#ref-8">8</a>), R1-Zero's RL run (101K), and R1's total including SFT data creation (147K)<a class="cite" href="#ref-1">1</a> (Table 7). Under the assumption, V3.2's floor of 266.4K is 1.8 times everything R1 spent and 53 times what V3 spent on its entire post-training (derived). Figure 4 draws the ladder.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 275" role="img" aria-labelledby="f4t"><title id="f4t">Post-training compute as a percentage of DeepSeek-V3 pre-training cost for V3, R1-Zero, R1 and V3.2</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <path d="M300,30 L300,225" class="d-axis"/>
+    <path d="M300,225 L790,225" class="d-axis"/>
+    <path d="M380,30 L380,225" class="d-grid"/>
+    <path d="M460,30 L460,225" class="d-grid"/>
+    <path d="M540,30 L540,225" class="d-grid"/>
+    <path d="M620,30 L620,225" class="d-grid"/>
+    <path d="M700,30 L700,225" class="d-grid"/>
+    <path d="M780,30 L780,225" class="d-grid"/>
+    <text x="300" y="241" text-anchor="middle" class="d-small d-mono">0</text>
+    <text x="380" y="241" text-anchor="middle" class="d-small d-mono">2</text>
+    <text x="460" y="241" text-anchor="middle" class="d-small d-mono">4</text>
+    <text x="540" y="241" text-anchor="middle" class="d-small d-mono">6</text>
+    <text x="620" y="241" text-anchor="middle" class="d-small d-mono">8</text>
+    <text x="700" y="241" text-anchor="middle" class="d-small d-mono">10</text>
+    <text x="780" y="241" text-anchor="middle" class="d-small d-mono">12</text>
+    <text x="290" y="68" text-anchor="end">V3 post-training (5K)</text>
+    <rect x="300" y="48" width="7.5" height="30" class="d-fill-blue"/>
+    <text x="316" y="68" class="d-mono d-small">0.19%</text>
+    <text x="290" y="113" text-anchor="end">R1-Zero RL (101K)</text>
+    <rect x="300" y="93" width="151.6" height="30" class="d-fill-blue"/>
+    <text x="460" y="113" class="d-mono d-small">3.8%</text>
+    <text x="290" y="158" text-anchor="end">R1 total (147K)</text>
+    <rect x="300" y="138" width="220.8" height="30" class="d-fill-blue"/>
+    <text x="530" y="158" class="d-mono d-small">5.5%</text>
+    <text x="290" y="203" text-anchor="end">V3.2 RL (more than 10%)</text>
+    <rect x="300" y="183" width="400" height="30" class="d-fill-orange-soft"/>
+    <rect x="300" y="183" width="400" height="30" class="d-outline d-stroke-orange d-dashed"/>
+    <path d="M700,198 L760,198" class="d-arrow-active" marker-end="url(#f4-arr)"/>
+    <text x="520" y="203" text-anchor="middle" class="d-small d-mono">≥ 266.4K GPU-hours if the denominator is V3's</text>
+    <text x="545" y="266" text-anchor="middle" class="d-text-light d-small">share of V3 pre-training cost, 2,664K H800 GPU-hours (%)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Post-training compute as a share of one denominator, V3's 2,664K H800 GPU-hours of pre-training<a class="cite" href="#ref-8">8</a>. Blue bars: V3's own SFT and RL (5K), R1-Zero (101K) and R1 including SFT data creation (147K)<a class="cite" href="#ref-1">1</a>; shares are derived. The V3.2 bar sits at its stated lower bound<a class="cite" href="#ref-2">2</a> and is dashed because the report does not define what it is a share of. Hardware and hour definitions are not matched across reports.</figcaption>
+</figure>
+<p>Three limits on reading the ladder. The denominators differ in kind: V3.2's base is V3.1-Terminus plus 945.8B tokens of continued pre-training (2.1B plus 943.7B, derived from §2.1.1), so 10% of its own pre-training cost is a different absolute budget from 10% of V3's. The numerators mix SFT and RL, and V3.2's does not say what it includes. And V4 reports no post-training compute at all in the sections read<a class="cite" href="#ref-3">3</a>, so the ladder stops at V3.2. What the budget bought is also stated rather than plotted: V3.2 reports similar performance to GPT-5-High on reasoning benchmarks, slightly below Gemini-3.0-Pro, and says its headline numbers are "constrained by a length constraint reward model", relaxed only in Speciale<a class="cite" href="#ref-2">2</a> (§4.1). No source in this course fits a compute curve to a production run (Module 15).</p>
+
+<h2 id="v4-specialists-grm">6. DeepSeek-V4: specialists, an actor that judges, three effort modes</h2>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>V4's identifier and date disagree. The paper is arXiv 2606.19348 v1, and an identifier with the 2606 prefix would ordinarily date from June 2026. The PDF's own stamp reads "26 Apr 2026", and the arXiv API record I queried on 2026-10-27 reports <code>published</code> and <code>updated</code> as 2026-04-26<a class="cite" href="#ref-9">9</a>. I cannot explain the gap and do not resolve it; this module cites V4 by title and identifier<a class="cite" href="#ref-3">3</a> and dates nothing from the number. The report calls itself "a preview version of DeepSeek-V4 series", so numbers here may change in a later version.</p></aside>
+<p>V4 comes in two sizes, V4-Pro with 1.6T parameters (49B activated) and V4-Flash with 284B (13B activated), pre-trained on 33T and 32T tokens, both with a one-million-token context<a class="cite" href="#ref-3">3</a> (abstract, §1). Its post-training "largely mirrored that of DeepSeek-V3.2" except for one substitution, which Section 7 reads. This section covers what carried over and what the specialists became.</p>
+
+<h3 id="v4-specialists">6.1 Specialists: the same GRPO, fewer words about it</h3>
+<p>Each domain expert is "sequentially optimized through an initial fine-tuning phase and subsequent Reinforcement Learning (RL) guided by domain-specific prompts and reward signals", using GRPO with "hyper-parameters closely aligned with our prior research", cited as "(DeepSeek-AI, 2025; DeepSeek-AI, 2025)"<a class="cite" href="#ref-3">3</a> (§5.1.1). Its reference list has three DeepSeek-AI entries from 2025: R1, V3.2 and the 3FS file system, so the two citations are presumably R1 and V3.2 (my inference). The domains named in the introduction are mathematics, coding, agent and instruction following (§1). The section prints no group size, learning rate, KL coefficient, advantage form or stability operations, so V3.2's Table 1 gaps carry over and widen. The RL-relevant consistency statements I found sit in the infrastructure sections: bitwise batch-invariant, deterministic kernels so that "bitwise alignment among pre-training, post-training, and inference" holds (§3.3, covered in Module 14), and rollouts that use native FP4 expert weights instead of simulated quantization, "ensur[ing] that model behavior during sampling is fully consistent with online deployment" (§5.2.1). That is a different answer to the mismatch problem from V3.2's: remove the numerical gap instead of masking its consequences.</p>
+
+<h3 id="v4-grm">6.2 The actor is the judge</h3>
+<p>V4 states the reward design for hard-to-verify tasks in one paragraph. It "dispense[s] with these conventional scalar-based reward models", curates "rubric-guided RL data", and employs a generative reward model (GRM) to evaluate trajectories: "Crucially, we apply RL optimization directly to the GRM itself. In this paradigm, the actor network natively functions as the GRM, enabling the joint optimization of the model's evaluative (judging) proficiency alongside its standard generative capabilities"<a class="cite" href="#ref-3">3</a> (§5.1.1). The stated benefits are that reasoning is "inherently fused into its evaluative process, resulting in highly robust scoring", and that the approach "achieves superior performance with only a minimal set of diverse human annotations".</p>
+<p>All of that is the vendor's description. The V4 text contains no ablation of any kind (a search for "ablat" finds nothing), no judge accuracy and no comparison against a separate or frozen judge, so the design is a claim, not a measured result. Two framing facts help. Kimi K2 earlier used the policy as its own critic, but anchored it by refreshing the critic on verifiable-reward rollouts<a class="cite" href="#ref-10">10</a> (§3.2.2); V4 describes no such anchor. And neither V3.2 nor V4 cites DeepSeek's earlier generative-reward-model paper, so this module asserts no lineage between them (Module 16 draws the same line). Two risks follow directly from the design and are not discussed in the report: the judge moves with the policy it scores, and a policy that learns to produce text its own judge likes has no external check in the loop. Module 16 §7 and Module 19 cover those failure modes.</p>
+
+<h3 id="v4-modes">6.3 Three effort modes</h3>
+<p>Both V4 models "support three specific reasoning effort modes. For each mode, we apply distinct length penalties and context windows during RL training"<a class="cite" href="#ref-3">3</a> (§5.1.1). Table 4 collects what the report prints. The penalty values are not stated, and the report does not say whether each mode has its own teachers or how three modes enter one student; Module 23 reads the token counts and the length arithmetic.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> DeepSeek-V4's reasoning modes as printed<a class="cite" href="#ref-3">3</a> (Tables 2, 3, 7; §5.3.1). Evaluation window is the context limit used when scoring, not the RL window, which is not stated. Pro scores: HLE Pass@1 and Terminal Bench 2.0 accuracy (%).</caption>
+  <thead><tr><th>Mode</th><th>Response format</th><th>System-prompt change</th><th class="num">Eval window (tokens)</th><th class="num">Pro HLE</th><th class="num">Pro TB 2.0</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Non-think</td><td>&lt;/think&gt; then summary</td><td>none</td><td class="num">8K</td><td class="num">7.7</td><td class="num">59.1</td></tr>
+    <tr><td class="row">Think High</td><td>&lt;think&gt; reasoning &lt;/think&gt; then summary</td><td>none</td><td class="num">128K</td><td class="num">34.5</td><td class="num">63.3</td></tr>
+    <tr><td class="row">Think Max</td><td>as High</td><td>injected "Reasoning Effort: Absolute maximum with no shortcuts permitted"</td><td class="num">384K</td><td class="num" data-best>37.7</td><td class="num" data-best>67.9</td></tr>
+  </tbody>
+</table>
+<p>The report's own reading is that "the Max mode, which employs longer contexts and reduced length penalties in RL, outperforms the High mode on the most challenging tasks"<a class="cite" href="#ref-3">3</a> (§5.3.2). The table shows the shape: on Pro, High recovers most of the distance from Non-think (HLE 7.7 to 34.5), and Max adds 3.2 points on HLE and 4.6 on Terminal Bench for a window three times as large (derived from Table 7). Max is a prompt plus a separate training configuration, so adding its instruction to a High-trained model is not the same thing; the report does not test that.</p>
+
+<h2 id="v4-opd">7. DeepSeek-V4: on-policy distillation replaces the mixed stage</h2>
+<p>V4's report is blunt about the change: "the mixed Reinforcement Learning (RL) stage was entirely replaced by On-Policy Distillation (OPD; Gu et al., 2024; Lu and Lab, 2025)"<a class="cite" href="#ref-3">3</a> (§5.1). The stated flow is two stages. First "the independent cultivation of domain-specific experts", each by SFT on domain data and then GRPO against domain rewards; then "a single unified model is trained through on-policy distillation, wherein the unified model acts as the student learning to optimize the reverse KL loss with teacher models" (§1). Modules 21 and 22 derive the method; this section records what V4 specifies, what it gives as reasons, and what the report leaves unsaid.</p>
+
+<h3 id="v4-opd-objective">7.1 The objective as printed</h3>
+<p>For \(N\) expert models \(\{\pi_{E_1},\dots,\pi_{E_N}\}\) the objective is Eq. 29:</p>
+$$\mathcal L_{\mathrm{OPD}}(\theta)=\sum_{i=1}^{N} w_i\cdot D_{\mathrm{KL}}\!\left(\pi_\theta\,\Vert\,\pi_{E_i}\right)$$
+<p>with \(w_i\) "the assigned weight for each expert, typically determined by the relative importance of the expert"<a class="cite" href="#ref-3">3</a> (§5.1.2). Computing reverse KL "requires sampling training trajectories from the student \(\pi_\theta\) to maintain on-policy learning", and the policy "selectively learns from the specialized expert relevant to the current task context (e.g., aligning with the mathematics expert for math reasoning tasks and the coding expert for programming tasks)". Read literally, the sum is over all experts; read with the sentence after it, a math prompt pulls toward the math expert. The report does not say whether \(w_i\) is fixed per domain, set per prompt, or non-zero for several experts at once, and it gives no schedule, batch size or run length for this stage. The sampled-token form is not what V4 uses, as Section 7.3 explains.</p>
+<p>Two points of vocabulary. V4 writes "multi-teacher On-Policy Distillation (OPD)" and cites MiniLLM (Gu et al., 2024) and the Thinking Machines post (Lu and Lab, 2025)<a class="cite" href="#ref-11">11</a>; the string "MOPD" does not occur in V4 or in V3.2, and does not occur in GLM-5, which calls its final stage "on-policy cross-stage distillation"<a class="cite" href="#ref-5">5</a> (§1). Lambert's survey groups V4, GLM-5, Kimi K3, Nemotron 3 Ultra and MiMo-V2-Flash under MOPD and says labs "are far from unanimous in its usage"<a class="cite" href="#ref-12">12</a> (§3.2.4), and a separate paper from Xiaomi's LLM Core team is titled MOPD<a class="cite" href="#ref-13">13</a>. The label names a family. V4 is one member, with its own choices, and the controlled comparison in the MOPD paper is of a different instance.</p>
+
+<h3 id="v4-opd-reasons">7.2 The reasons V4 gives</h3>
+<p>The case for replacing mixed RL is one clause: aligning at the logit level consolidates "the knowledge from physically distinct expert weights ... into a unified parameter space ... practically circumventing the performance degradation often encountered in traditional weight-merging or mixed RL techniques"<a class="cite" href="#ref-3">3</a> (§5.1.2). The report presents no mixed-RL run, no merge run and no measurement of degradation. This is the opposite diagnosis from V3.2's, which chose one mixed stage to avoid "catastrophic forgetting issues commonly associated with multi-stage training paradigms"<a class="cite" href="#ref-2">2</a> (§3). The two claims are about different failure modes: V3.2 worried that sequential stages forget earlier skills, V4 that jointly optimizing many reward signals in one RL run degrades each. Both are plausible and neither report tests its own claim against the other. An outside controlled comparison exists on a small model: on Qwen3-30B-A3B with three domains, the MOPD paper reports a normalized score of 0.937 against 0.882 for mixed RL, 0.775 for cascade RL and 0.824 for off-policy fine-tuning, with MOPD's three per-domain scores in a range of 0.044 (the authors' numbers, on one instance of the method whose form Module 22 details)<a class="cite" href="#ref-13">13</a> (§4). That supports the direction of V4's choice at small scale; it does not measure V4's trade at 1.6T parameters with more than ten domains. No matched-compute comparison of MOPD against mixed RL appears in V4 or in the Kimi K3 sections Module 22 read.</p>
+
+<h3 id="v4-opd-fullvocab">7.3 Why full-vocabulary, and what it costs</h3>
+<p>The cheap form of OPD, which V4 describes as what "prior works usually" do, replaces the full-vocabulary KL with "a token-level KL estimate at each token position" and reuses the RL stack by treating \(\mathrm{sg}[\log\pi_{E_i}(y_t\mid x,y_{\lt t})/\pi_\theta(y_t\mid x,y_{\lt t})]\) as the per-token advantage (sg is stop-gradient). The report says this "is resource-efficient" but "leads to high variance in gradient estimation and often causes training instability", and so V4 "adopt[s] full-vocabulary logit distillation"<a class="cite" href="#ref-3">3</a> (§5.1.2). The claim that the sampled-token estimator is unstable has no ablation or training curve in the passages read (Module 21). Module 22 weighs the alternative evidence, including reports that found no gain from richer signals.</p>
+<p>What V4 does show is the engineering that makes the exact form affordable (§5.2.2, §5.2.3), most of it problems an inference engineer will recognize. Teacher weights sit in central distributed storage, are loaded on demand with ZeRO-like sharding, and the framework "supports full-vocabulary On-Policy Distillation (OPD) with an effectively unbounded number of teachers, each potentially comprising trillions of parameters". Only the last-layer hidden states of each teacher are cached; logits are rebuilt through the prediction head at training time with "negligible recomputation overhead" (stated, not measured in the sections read; Module 22 derives that the head is about 1.9% of a Pro-sized forward pass). Samples are ordered by teacher index so each teacher head is loaded once per minibatch and at most one head is resident. The exact KL runs in a TileLang kernel. A further piece concerns rollouts: a token-granular write-ahead log plus saved KV cache lets generation resume after preemption, because "it is mathematically incorrect to regenerate unfinished requests from scratch, as this introduces length bias" (Module 18 §4.2 explains the selection effect).</p>
+
+<h3 id="v4-opd-ledger">7.4 Claim ledger</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> V4's post-training claims sorted by the evidence the report itself provides in the sections read<a class="cite" href="#ref-3">3</a>.</caption>
+  <thead><tr><th>Claim</th><th>Where</th><th>Evidence in the report</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Mixed RL entirely replaced by OPD</td><td>§5.1</td><td>Statement of the pipeline</td><td>Decision, no control</td></tr>
+    <tr><td class="row">Logit-level alignment avoids degradation from merging or mixed RL</td><td>§5.1.2</td><td>None</td><td>Vendor claim</td></tr>
+    <tr><td class="row">Sampled-token OPD is high-variance and unstable</td><td>§5.1.2</td><td>None</td><td>Vendor claim</td></tr>
+    <tr><td class="row">More than ten teachers</td><td>§5.1.2</td><td>Count only</td><td>Stated</td></tr>
+    <tr><td class="row">Hidden-state caching costs negligible recomputation</td><td>§5.2.2</td><td>None quantified</td><td>Stated; derivable (Module 22)</td></tr>
+    <tr><td class="row">The actor as GRM gives robust scoring with minimal annotation</td><td>§5.1.1</td><td>None</td><td>Vendor claim</td></tr>
+    <tr><td class="row">Max mode beats High on the hardest tasks</td><td>§5.3.2, Table 7</td><td>Benchmark scores, one run each</td><td>Measured; confounded by window and penalty</td></tr>
+    <tr><td class="row">Regenerating preempted requests biases length</td><td>§5.2.3</td><td>Argument (shorter responses survive interruption more often)</td><td>Reasoned; correct as a selection effect</td></tr>
+  </tbody>
+</table>
+
+<h2 id="three-recipes-table">8. R1, V3.2 and V4 side by side</h2>
+<p>Table 6 lines up the choices that changed. Cells say "not stated" where the sections read give no value; for R1 they refer to the passages Module 27 reads.</p>
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 6.</b> What changed from R1 to V3.2 to V4, by component<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>. Section references are to each report.</caption>
+  <thead><tr><th>Component</th><th>R1</th><th>V3.2</th><th>V4</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Starting point</td><td>V3-Base (§2.1)</td><td>V3.1-Terminus plus DSA continued pre-training (§2.1)</td><td>New pre-training, 33T (Pro) and 32T (Flash) tokens (§1)</td></tr>
+    <tr><td class="row">Optimizer</td><td>GRPO</td><td>GRPO (§3)</td><td>GRPO "closely aligned" with prior work, per specialist (§5.1.1)</td></tr>
+    <tr><td class="row">Advantage</td><td>\((r_i-\mathrm{mean})/\mathrm{std}\) (Eq. 3)</td><td>\(R_i-\mathrm{mean}(\boldsymbol R)\) (§3.1)</td><td>Not stated</td></tr>
+    <tr><td class="row">KL to reference</td><td>\(\beta=0.001\); reference reset every 400 steps (§2.1)</td><td>Importance-corrected K3; strength per domain, weak or none for math; values not stated (§3.1)</td><td>Not stated</td></tr>
+    <tr><td class="row">Off-policy and mismatch control</td><td>16 minibatches per rollout; clip \(\varepsilon\) printed as 10 (§2.1, §3.2.1)</td><td>Negative-sequence mask, Keep Routing, Keep Sampling Mask (§3.1)</td><td>Batch-invariant deterministic kernels; native FP4 rollouts (§3.3, §5.2.1)</td></tr>
+    <tr><td class="row">Reasoning reward</td><td>Rule-based accuracy and format; language consistency (§2.2, §3.2.1)</td><td>Rule-based outcome, length penalty, language consistency (§3)</td><td>Domain-specific rewards; length penalty per effort mode (§5.1.1)</td></tr>
+    <tr><td class="row">Open-ended reward</td><td>Scalar helpfulness model (66K pairs) and safety model (106K prompts), last 400 of 1,700 steps (§3.1, §3.2.2)</td><td>Generative reward model with per-prompt rubrics (§3)</td><td>No scalar models; the actor is the GRM and is itself RL-trained (§5.1.1)</td></tr>
+    <tr><td class="row">Agent tasks</td><td>Not described in the sections read</td><td>85,267 tasks; 1,827 synthesized environments inside the 4,417 general-agent tasks (§3.2.3)</td><td>DSec sandbox platform, hundreds of thousands of concurrent instances; task counts not stated (§5.2.5)</td></tr>
+    <tr><td class="row">Reasoning kept across tool calls</td><td>Discarded at the next round (as V3.2 describes it)</td><td>Kept until a new user message (§3.2.1)</td><td>Kept across all turns when tools are used (§5.1.1)</td></tr>
+    <tr><td class="row">Skill integration</td><td>SFT mixture of about 600K reasoning and 200K other samples, then RL</td><td>Specialists, then distilled data, then one mixed RL stage (§3)</td><td>Specialists, then multi-teacher OPD with more than ten teachers (§5.1)</td></tr>
+    <tr><td class="row">Effort or length</td><td>Max output 32,768, then 65,536 tokens after step 8.2K (R1-Zero, §2.1)</td><td>Length penalty; Speciale with a reduced one (§3)</td><td>Three modes, each with its own penalty and window (§5.1.1)</td></tr>
+    <tr><td class="row">RL compute</td><td>101K H800 GPU-hours for R1-Zero; 147K total (Table 7)</td><td>"Exceeding 10% of the pre-training cost" (§1)</td><td>Not stated in the sections read</td></tr>
+  </tbody>
+</table>
+<p>What was kept is as informative as what moved. All three keep the critic-free group baseline and the <code>&lt;think&gt;</code> format ("Consistent with our previous version", says V4<a class="cite" href="#ref-3">3</a>, §5.1.1), all three lean on rule-based verifiers where answers can be checked, and all three treat language consistency and length as reward terms. The changes are concentrated in four places: how rollouts and trainer are kept consistent, what judges open-ended output, what the harness does to the reasoning trace, and how skills are combined.</p>
+
+<h3 id="three-recipes-benchmarks">8.1 What the benchmark deltas can and cannot say</h3>
+<p>Table 7 compares V3.2 Thinking with V4-Pro-Max on benchmark names that appear in both reports. It is a record of what the releases scored, not an attribution to post-training: pre-training, architecture, parameter count, context length, evaluation window and agent harness all changed at once.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 7.</b> Shared benchmarks, V3.2 Thinking<a class="cite" href="#ref-2">2</a> (Table 2) against V4-Pro Max<a class="cite" href="#ref-3">3</a> (Tables 6, 7). Pass@1 or accuracy (%) unless noted. Gain is V4 minus V3.2 (derived).</caption>
+  <thead><tr><th>Benchmark</th><th class="num">V3.2 Thinking</th><th class="num">V4-Pro Max</th><th class="num">Gain (points)</th><th>Comparability note</th></tr></thead>
+  <tbody>
+    <tr><td class="row">MMLU-Pro (EM)</td><td class="num">85.0</td><td class="num">87.5</td><td class="num">+2.5</td><td>Same name</td></tr>
+    <tr><td class="row">GPQA Diamond</td><td class="num">82.4</td><td class="num">90.1</td><td class="num">+7.7</td><td>Same name</td></tr>
+    <tr><td class="row">HLE (text only)</td><td class="num">25.1</td><td class="num">37.7</td><td class="num">+12.6</td><td>V3.2 also reports 23.9 with the official template</td></tr>
+    <tr><td class="row">LiveCodeBench</td><td class="num">83.3</td><td class="num">93.5</td><td class="num">+10.2</td><td>V3.2 window 2024.08-2025.04; V4 uses v6</td></tr>
+    <tr><td class="row">IMOAnswerBench</td><td class="num">78.3</td><td class="num">89.8</td><td class="num">+11.5</td><td>Same name</td></tr>
+    <tr><td class="row">SWE Verified</td><td class="num">73.1</td><td class="num">80.6</td><td class="num">+7.5</td><td>Each lab's own harness</td></tr>
+    <tr><td class="row">SWE Multilingual</td><td class="num">70.2</td><td class="num">76.2</td><td class="num">+6.0</td><td>Each lab's own harness</td></tr>
+    <tr><td class="row">Terminal Bench 2.0</td><td class="num">46.4</td><td class="num">67.9</td><td class="num">+21.5</td><td>V3.2 used the Claude Code framework; V4 an internal one; V4 notes environment issues in the benchmark</td></tr>
+    <tr><td class="row">BrowseComp (discard-all)</td><td class="num">67.6</td><td class="num">83.4</td><td class="num">+15.8</td><td>Same strategy; V3.2 at a 128K window, V4 up to 512K context</td></tr>
+    <tr><td class="row">Tool-Decathlon / Toolathlon</td><td class="num">35.2</td><td class="num">51.8</td><td class="num">+16.6</td><td>Same benchmark, spelled differently in the two reports</td></tr>
+  </tbody>
+</table>
+<p>Codeforces is left out on purpose: V3.2 reports 2386 and V4 3206, but V4 describes an internal protocol over 14 Division 1 contests<a class="cite" href="#ref-3">3</a> (§5.3.1) and the two ratings are not defined the same way in the sections read. The largest gains are on the agentic rows, and the smallest is on MMLU-Pro, a mostly knowledge-based benchmark; V4 itself ties knowledge to parameter count when it compares Flash with Pro<a class="cite" href="#ref-3">3</a> (§5.3.2). Beyond that, the table does not license a statement about OPD. A 3,206 or 67.9 would look the same if the gain came from a better base model, a longer window or a different harness.</p>
+
+<h2 id="what-v4-gave-up">9. What dropping mixed RL buys and costs</h2>
+<p>V4 states the substitution and one reason. The trade-offs below combine what the three reports say with what follows from the mechanism; the second kind is marked as my reading, because none of it is ablated in the DeepSeek reports.</p>
+<h3 id="what-v4-buys">9.1 What the change plausibly buys</h3>
+<ul>
+<li><strong>Independence of the specialists.</strong> Each expert is a separate SFT-then-GRPO run, so a failed or restarted domain does not disturb the others (V4 §1; the MOPD paper makes the same argument for parallel pipelines<a class="cite" href="#ref-13">13</a>). In V3.2's single stage, a reward-hacking episode in the rubric judge shares a run with the code and search tasks.</li>
+<li><strong>No cross-domain reward weighting inside one run.</strong> A mixed GRPO stage must choose how rule-based rewards, length penalties and rubric scores trade off on one scale. In OPD the target is a teacher's distribution per domain (V4 Eq. 29), which sidesteps that choice and moves it into \(w_i\) (my reading).</li>
+<li><strong>A dense signal.</strong> Every student token is graded against a teacher on the vocabulary, instead of one scalar per trajectory spread over thousands of tokens. Module 21 derives the information argument and its caveats<a class="cite" href="#ref-11">11</a>.</li>
+<li><strong>Effort modes as separate specialists.</strong> V4 trains specialists "under divergent RL configurations" to realize its three modes<a class="cite" href="#ref-3">3</a> (§5.1.1). Training them separately lets each get its own length penalty and window without the others' rewards in the same run (my reading; how the modes map onto teachers is not stated).</li>
+</ul>
+<h3 id="what-v4-costs">9.2 What it plausibly costs</h3>
+<ul>
+<li><strong>A ceiling at the teachers.</strong> The student is trained to match experts, not to maximize the reward directly. V3.2's mixed stage continued optimizing the real reward on the merged model and, in its words, eliminated the gap to the specialists<a class="cite" href="#ref-2">2</a> (§3). V4's report says the mixed stage was "entirely replaced", so the student's last stage has no outcome reward of its own. That means it can inherit teacher errors, including reward-hacked behavior that a specialist's RL picked up, and the report does not describe a check for that (my reading).</li>
+<li><strong>Skills the student does not sample.</strong> A per-token log-ratio only grades tokens the student can emit. In Nemotron 3 Ultra's MOPD, HLE recovered only 16.9% of the teacher-student gap, which the authors attribute to a general-reasoning teacher that gained from "additional large-scale SFT and RL on a separate reasoning mixture generated by DeepSeek-V4-Pro" that the student never saw<a class="cite" href="#ref-14">14</a> (§3.3.4, Table 5), as Module 22 records. V4's teachers all begin from one base model per its §1, but the report does not say which checkpoint the student starts from, so whether the same-origin condition that the MOPD paper found critical holds is not stated<a class="cite" href="#ref-13">13</a>.</li>
+<li><strong>The teacher fleet.</strong> More than ten teachers, some "potentially comprising trillions of parameters", loaded on demand<a class="cite" href="#ref-3">3</a> (§5.2.2). From the inference side, the OPD stage is a teacher forward pass over every student sample: prefill-shaped, compute-bound work whose last-layer states are cached and whose head is applied per minibatch. V4's hidden-state cache avoids storing \(V\)-sized logits but not the forward pass itself (my reading). The report gives no OPD run time or GPU-hours, so the cost of this stage relative to a mixed RL stage is unknown.</li>
+<li><strong>Agentic coverage.</strong> Nemotron 3 Ultra reports that end-to-end agentic rollouts inside MOPD caused large inefficiency and used single-turn rollouts for most agentic tasks<a class="cite" href="#ref-14">14</a> (§3.3). V4 builds a sandbox platform for agentic work in post-training, "during post-training and evaluation"<a class="cite" href="#ref-3">3</a> (§5.2.5), but does not say whether its OPD stage rolls out agentic episodes end to end.</li>
+</ul>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Mixed RL and OPD answer different questions. Mixed RL asks one policy to satisfy several reward signals at once and risks diluting each. OPD asks one policy to imitate several already-trained policies on its own samples and risks inheriting their flaws and missing what it cannot sample. DeepSeek's two reports pick opposite answers on the same data-generation pipeline, and neither tests the choice.</p></aside>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The two DeepSeek reports read like a natural experiment, one lab and one optimizer with different surrounding choices, but both are descriptions without ablations. Four disagreements run through them. Each block below states the positions as the sources hold them and ends with an assessment that says what would settle it.</p>
+
+<h3 id="disagree-combine">A. How should separately useful skills end up in one model?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>A1. One mixed RL stage</h4>
+    <p class="who">DeepSeek-V3.2<a class="cite" href="#ref-2">2</a> (§3); Qwen3's last stage covers more than 20 task types<a class="cite" href="#ref-15">15</a> (§4.4)</p>
+    <p>Merge reasoning, agent and alignment RL so no stage overwrites another, and V3.2 says this "effectively balances performance across diverse domains".</p>
+    <ul class="pros"><li>One trainer and one recipe; real reward optimized on the final model.</li></ul>
+    <ul class="cons"><li>Each domain gets fewer samples per batch as environments multiply, the dilution argument Nemotron 3 Ultra gives<a class="cite" href="#ref-14">14</a> (§3.3).</li><li>V3.2 prints no measurement of the balance it claims.</li></ul>
+  </article>
+  <article class="position">
+    <h4>A2. Specialists, then distillation into one student</h4>
+    <p class="who">DeepSeek-V4<a class="cite" href="#ref-3">3</a> (§5.1); Kimi K3's nine experts, three domains at three efforts<a class="cite" href="#ref-16">16</a> (§4.1.2); the MOPD paper<a class="cite" href="#ref-13">13</a></p>
+    <p>Train each skill to its peak independently and merge by matching the teachers' distributions on the student's own samples.</p>
+    <ul class="pros"><li>Parallel, restartable specialists; dense signal.</li><li>The one controlled comparison favors it at small scale (0.937 against 0.882)<a class="cite" href="#ref-13">13</a>.</li></ul>
+    <ul class="cons"><li>V4 gives no ablation for the claim that mixed RL degrades.</li><li>Skills outside the student's sampling distribution transfer poorly (HLE recovery 16.9% in Nemotron)<a class="cite" href="#ref-14">14</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>A3. Both: unified RL first, distillation second</h4>
+    <p class="who">Nemotron 3 Ultra<a class="cite" href="#ref-14">14</a> (§3.2, §3.3)</p>
+    <p>Start the student from a unified RLVR run, then use specialist teachers to close the remaining per-domain gaps.</p>
+    <ul class="pros"><li>The student starts strong, and MOPD adds recovery on agentic and instruction-following tasks.</li></ul>
+    <ul class="cons"><li>Pays for both stages, and the first still has the dilution problem.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The choice depends on the number of domains, how different their rollouts are, and whether the missing skill is inside the student's own samples. With few similar domains, A1 is defensible and cheaper. With many environments including long agentic ones, three of the frontier reports read here (V4, Kimi K3, Nemotron 3 Ultra) use specialists as teachers, and the dilution mechanism is sound. A3 is the conservative hedge. V3.2 and V4 are the same lab's two bets, and neither report contains a matched-compute run of the other's method, so "A2 wins at frontier scale" is an inference from adoption. The experiment that would settle it is one SFT checkpoint trained both ways with equal GPU-hours at ten or more domains (Module 22 gives the same verdict at more length).</p></div>
+
+<h3 id="disagree-kl">B. Should the KL term to the reference model stay?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>B1. Keep it, repair it, tune it by domain</h4>
+    <p class="who">DeepSeek-V3.2<a class="cite" href="#ref-2">2</a> (§3.1); ProRL<a class="cite" href="#ref-17">17</a> (§2.2)</p>
+    <p>V3.2 corrects the K3 estimator<a class="cite" href="#ref-18">18</a> with \(\pi_\theta/\pi_{old}\) and lets mathematics use a weak or absent term. ProRL argues a KL term (with reference resets) is a more stable guard against entropy collapse than clipping tricks, and that advice to remove it applies mainly to base models before any SFT.</p>
+    <ul class="pros"><li>A leash against drift in non-verifiable domains such as writing and alignment.</li></ul>
+    <ul class="cons"><li>Extra knobs per domain; V3.2 gives no values and no ablation.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B2. Remove it</h4>
+    <p class="who">DAPO<a class="cite" href="#ref-6">6</a> (§2.3); Olmo 3<a class="cite" href="#ref-7">7</a> (§4.4.1); GLM-5<a class="cite" href="#ref-5">5</a> (§3.2)</p>
+    <p>In long-CoT reasoning the policy should move far from the reference, so the constraint is unnecessary (DAPO), and removing it speeds improvement (GLM-5).</p>
+    <ul class="pros"><li>One fewer estimator to get wrong; no reference-model forward pass.</li></ul>
+    <ul class="cons"><li>No built-in restraint where the reward is soft.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The reports split by reward type. Verifiable reasoning RL drops KL, and V3.2's own sentence about mathematics agrees. V3.2 says only that the strength varies by domain; a nonzero term should matter most where a soft judge can be exploited, as with rubric-scored writing and alignment prompts (my reading). V3.2's contribution is the correction, not the verdict: if you keep the K3 term in an off-policy loop, importance-weight it (derived in Module 6 §3.6). What would settle the question is the same run with and without the term on a rubric-judged domain; none of these reports contains it.</p></div>
+
+<h3 id="disagree-adv">C. Should the advantage be divided by the group standard deviation?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>C1. Do not divide</h4>
+    <p class="who">DeepSeek-V3.2<a class="cite" href="#ref-2">2</a> (§3.1); Dr. GRPO<a class="cite" href="#ref-19">19</a> (§3.1); Olmo 3<a class="cite" href="#ref-7">7</a> (§4.4.1)</p>
+    <p>Dividing weights questions that are too easy or too hard more heavily, a difficulty bias. V3.2 uses \(R_i-\mathrm{mean}(\boldsymbol R)\) and states no reason.</p>
+    <ul class="pros"><li>Removes the bias; keeps the scale of each reward term meaningful.</li></ul>
+    <ul class="cons"><li>The demonstrations are at 1.5B to 3B scale (Module 11).</li></ul>
+  </article>
+  <article class="position">
+    <h4>C2. Keep GRPO's normalization</h4>
+    <p class="who">R1<a class="cite" href="#ref-1">1</a> (Eq. 3); DAPO<a class="cite" href="#ref-6">6</a>, which changes the loss aggregation and leaves the group division in place</p>
+    <p>The original form; every group's advantages have unit scale.</p>
+    <ul class="pros"><li>Comparable updates across prompts of different reward spread.</li></ul>
+    <ul class="cons"><li>Can magnify noise in nearly all-correct or all-wrong groups, and can swamp a small length term (Module 23).</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>V3.2's mixed reward adds a length penalty, a language term and rubric scores to an outcome reward. My reading, not stated in the report, is that this is where not dividing helps: a division by the standard deviation can change how large those small terms are relative to correctness. The evidence is mechanism plus small-scale demonstrations; no frontier report ablates it, and V4 does not say what its specialists use.</p></div>
+
+<h3 id="disagree-judge">D. Who scores open-ended output?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>D1. Rules for reasoning, a scalar model late and briefly</h4>
+    <p class="who">R1<a class="cite" href="#ref-1">1</a> (§2.2, §3.2.2, Supp. B.5)</p>
+    <p>No neural reward model on reasoning because of hacking; helpfulness and safety models only in the last 400 steps.</p>
+    <ul class="pros"><li>Observed hacking: reward rose while Codeforces performance fell.</li></ul>
+    <ul class="cons"><li>Leaves open-ended quality to a short, late stage.</li></ul>
+  </article>
+  <article class="position">
+    <h4>D2. A rubric judge per prompt</h4>
+    <p class="who">DeepSeek-V3.2<a class="cite" href="#ref-2">2</a> (§3); Rubrics as Rewards<a class="cite" href="#ref-20">20</a>; Kimi K2's rubric critic<a class="cite" href="#ref-10">10</a></p>
+    <p>Score against instance-specific criteria. RaR reports up to 31% relative gain on HealthBench over direct Likert judging (the authors' numbers).</p>
+    <ul class="pros"><li>Structured criteria reduce variance across judges.</li></ul>
+    <ul class="cons"><li>V3.2 does not say which model judges or who writes the rubrics.</li></ul>
+  </article>
+  <article class="position">
+    <h4>D3. The actor is the judge, trained jointly</h4>
+    <p class="who">DeepSeek-V4<a class="cite" href="#ref-3">3</a> (§5.1.1)</p>
+    <p>No scalar models; RL applied to the GRM itself; "minimal" human annotation.</p>
+    <ul class="pros"><li>One model; reasoning inside the judgment; low annotation cost (claimed).</li></ul>
+    <ul class="cons"><li>No ablation, no judge accuracy, no comparison with a separate or frozen judge; the judge shifts with the policy.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Only D2 has outside support, and that support is for rubrics, not for the judge's identity. D3 is a vendor claim until someone publishes judge accuracy against human labels, tracked through the RL run, for a joint judge and a frozen one. No citation links V3.2 or V4 to DeepSeek's earlier GRM paper, so treat the three positions as separate designs, not a lineage.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>V4 is a v1 "preview"; its identifier and date disagree (Section 6) and its post-training sections may be revised. Three open items as of 2026-10-27. First, whether the OPD choice survives replication: the controlled evidence is on a 30B-A3B model, Nemotron and Kimi report their own versions, and no matched-compute run against mixed RL exists in the reports read (Module 22). Second, whether the actor-as-judge design is ablated by anyone, since it moves the reward model inside the policy. Third, how RL compute is reported: V3.2's "more than 10%" has an undefined denominator and V4 gives none, so the ladder in Figure 4 stops at V3.2. Modules 31 and 32 read two other recipes (Olmo 3; GLM-5 and Nemotron 3) that took parts of the same toolbox.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv 2501.12948 v2 (4 Jan 2026; the expanded version of the Nature 645, 633-638 article). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: GRPO settings and advantage (§2.1, Eq. 3), rule-based rewards and the stance against neural reward models (§2.2), stages and reward models (§3.1, §3.2.1, §3.2.2), reward hacking (Supp. B.5), SFT data size (Supp. B.3.3), training cost (Supp. B.4.4, Table 7).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv 2512.02556 v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the whole of §3 (specialist distillation, mixed RL, rewards), §3.1 (GRPO objective Eqs. 5-9, the five stability operations), §3.2 (thinking in tool use, task counts in Table 1, synthesis pipeline), §4.1-§4.3 (results, Table 5), §2.1.1 (DSA training), §1 (budget above 10%).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv 2606.19348 v1 (the PDF stamp reads 26 Apr 2026; the identifier prefix is 2606). <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §1 and §5.1 (pipeline, mixed RL replaced by OPD), §5.1.1 (specialists, effort modes, GRM, interleaved thinking), §5.1.2 (Eq. 29, full-vocabulary OPD), §5.2 (FP4 QAT, teacher scheduling, rollout WAL, DSec), §3.3 (deterministic kernels), §5.3 and Tables 6-7 (evaluation).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Shao, Z. et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv 2402.03300 v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the origin of GRPO, the optimizer R1, V3.2 and V4 all name (§4.1).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>GLM-5 Team (Zhipu AI). <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. arXiv 2602.15763 v2, 24 Feb 2026. <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the non-deterministic indexer top-k failure and the <code>torch.topk</code> fix on a DSA model (§3.2), KL term removed (§3.2), "on-policy cross-stage distillation" (§1).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Yu, Q. et al. <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv 2503.14476 v2, 20 May 2025. <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: KL term removed because long-CoT policies are expected to diverge (§2.3); token-level loss that leaves the group-level advantage normalization in place (§3.3, Eq. 8; see Module 11).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Team Olmo (Allen Institute for AI). <em>Olmo 3</em>. arXiv 2512.13961 v2, 14 Apr 2026. <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: OlmoRL with no KL loss and no standard-deviation normalization (§4.4.1).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3 Technical Report</em>. arXiv 2412.19437. <a href="https://arxiv.org/abs/2412.19437">https://arxiv.org/abs/2412.19437</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Table 1, pre-training 2,664K, context extension 119K, post-training 5K, total 2,788K H800 GPU-hours (not in the source map; fetched for this module).</span></li>
+  <li id="ref-9"><span class="ref-type">official</span>arXiv. <em>arXiv API query for id 2606.19348 (record for "DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence", v1)</em>. <a href="https://export.arxiv.org/api/query?id_list=2606.19348">https://export.arxiv.org/api/query?id_list=2606.19348</a>. Accessed 2026-10-27 (server timestamp 2026-10-26 23:14 UTC). <span class="ref-use">Used for: the <code>published</code> and <code>updated</code> fields, both 2026-04-26, against the 2606 identifier prefix (not in the source map; fetched for this module).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Moonshot AI. <em>Kimi K2: Open Agentic Intelligence</em>. arXiv 2507.20534 v2, 3 Feb 2026. <a href="https://arxiv.org/pdf/2507.20534v2">https://arxiv.org/pdf/2507.20534v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the self-critic reward refreshed on verifiable-reward rollouts (§3.2.2).</span></li>
+  <li id="ref-11"><span class="ref-type">blog</span>Lu, K. et al. (Thinking Machines Lab). <em>On-Policy Distillation</em>. Thinking Machines Lab: Connectionism, 27 Oct 2025 (updated June 2026). <a href="https://thinkingmachines.ai/blog/on-policy-distillation/">https://thinkingmachines.ai/blog/on-policy-distillation/</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the reference V4 cites as "Lu and Lab, 2025"; the dense per-token signal argument behind Section 9.1 (derived in Module 21).</span></li>
+  <li id="ref-12"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv 2504.12501 v12, 11 Sep 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: grouping V4, GLM-5, Kimi K3, Nemotron 3 Ultra and MiMo-V2-Flash under MOPD, and "far from unanimous" (§3.2.4).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Ma, W. et al. (Xiaomi LLM Core). <em>MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training</em>. arXiv 2606.30406 v1, 29 Jun 2026. <a href="https://arxiv.org/pdf/2606.30406v1">https://arxiv.org/pdf/2606.30406v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the controlled comparison on Qwen3-30B-A3B (0.937 against 0.882, 0.775 and 0.824; per-domain range 0.044), parallel teachers, the same-origin finding (abstract, §1, §4).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>NVIDIA. <em>Nemotron 3 Ultra: Open, Efficient Mixture-of-Experts Hybrid Mamba-Transformer Model for Agentic Reasoning</em>. arXiv 2606.15007 v1, 12 Jun 2026. <a href="https://arxiv.org/pdf/2606.15007v1">https://arxiv.org/pdf/2606.15007v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: unified RLVR followed by MOPD, the dilution argument (§3.2, §3.3), HLE recovery 16.9% and its explanation (§3.3.4, Table 5), end-to-end agentic rollouts in MOPD (§3.3).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Yang, A. et al. (Qwen Team). <em>Qwen3 Technical Report</em>. arXiv 2505.09388 v1, 14 May 2025. <a href="https://arxiv.org/pdf/2505.09388v1">https://arxiv.org/pdf/2505.09388v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: general RL over more than 20 tasks as a mixed final stage (§4.4).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Moonshot AI. <em>Kimi K3: Open Frontier Intelligence</em>. arXiv 2607.24653 v2, 7 Aug 2026. <a href="https://arxiv.org/pdf/2607.24653v2">https://arxiv.org/pdf/2607.24653v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: nine experts (three domains at three efforts) consolidated by multi-teacher on-policy distillation (§4.1, §4.1.2).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Liu, M. et al. <em>ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models</em>. arXiv 2505.24864 v1, 30 May 2025. <a href="https://arxiv.org/pdf/2505.24864v1">https://arxiv.org/pdf/2505.24864v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: keeping a KL term with reference resets, and the scope of the advice to remove it (§2.2).</span></li>
+  <li id="ref-18"><span class="ref-type">blog</span>Schulman, J. <em>Approximating KL Divergence</em>. 2020. <a href="http://joschu.net/blog/kl-approx.html">http://joschu.net/blog/kl-approx.html</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the K3 estimator that V3.2 corrects with an importance ratio (derived in Module 6).</span></li>
+  <li id="ref-19"><span class="ref-type">paper</span>Liu, Z. R. et al. <em>Understanding R1-Zero-Like Training: A Critical Perspective</em> (Dr. GRPO). arXiv 2503.20783 v2, 6 Oct 2025; COLM 2025. <a href="https://arxiv.org/pdf/2503.20783v2">https://arxiv.org/pdf/2503.20783v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the difficulty bias from dividing by the group standard deviation, and the length bias (§3.1).</span></li>
+  <li id="ref-20"><span class="ref-type">paper</span>Gunjal, A. et al. <em>Rubrics as Rewards: Reinforcement Learning Beyond Verifiable Domains</em>. arXiv 2507.17746 v2, 3 Oct 2025. <a href="https://arxiv.org/abs/2507.17746">https://arxiv.org/abs/2507.17746</a>. Accessed 2026-10-26. <span class="ref-use">Used for: instance-specific rubric rewards and the reported relative gain over Likert-style judging on HealthBench (abstract; authors' numbers).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

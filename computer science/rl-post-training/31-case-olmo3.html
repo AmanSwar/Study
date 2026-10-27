@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case Study: Olmo 3 · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Reads Olmo 3's post-training stage by stage: what SFT, DPO and OlmoRL each bought at 7B and 32B, OlmoRL's seven changes to GRPO and which of them the report tests, the rollout economics of a learner that idles most of a 1,000 s step, and RL-Zero as a decontaminated testbed. Flags the report's internal inconsistencies.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 31</p>
+  <h1>Case Study: Olmo 3: OlmoRL, RL-Zero from a Fully Open Base, and Measured Rollout Economics</h1>
+  <p class="lede">Olmo 3 is the one recipe in this course's source map that publishes its data, code, logs and rollout-infrastructure numbers together. This module reads its post-training stage by stage: what SFT, DPO and RL each bought at 7B and 32B, the seven changes OlmoRL makes to GRPO and which of them the report actually tests, and the rollout economics of a learner that idles most of a 1,000 s step. Afterwards you can reproduce the economics of a rollout-bound run from the published numbers, spot the places where those numbers disagree with each other, and decide which OlmoRL choices to copy.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>14</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Modules 1, 11, 14, 20</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f1t"><title id="f1t">Olmo 3 post-training as three lanes from one base model: Think (SFT, DPO, OlmoRL), Instruct (SFT, DPO with length control, OlmoRL) and RL-Zero (OlmoRL directly from the base), each annotated with prompt counts</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="14" y="22" width="112" height="330" rx="10" class="d-block-muted"/>
+    <text x="70" y="176" text-anchor="middle" class="d-text-inv d-bold">Olmo 3</text>
+    <text x="70" y="198" text-anchor="middle" class="d-text-inv d-bold">Base</text>
+    <text x="70" y="222" text-anchor="middle" class="d-text-inv d-mono d-small">7B · 32B</text>
+
+    <text x="160" y="16" class="d-bold">Think</text>
+    <rect x="160" y="26" width="150" height="74" rx="8" class="d-block"/>
+    <text x="235" y="52" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+    <text x="235" y="72" text-anchor="middle" class="d-text-inv d-mono d-small">2,268,468 prompts</text>
+    <text x="235" y="90" text-anchor="middle" class="d-text-inv d-mono d-small">2 epochs</text>
+    <rect x="340" y="26" width="150" height="74" rx="8" class="d-block-2"/>
+    <text x="415" y="52" text-anchor="middle" class="d-text-inv d-bold">DPO</text>
+    <text x="415" y="72" text-anchor="middle" class="d-text-inv d-mono d-small">200,000 prompts</text>
+    <text x="415" y="90" text-anchor="middle" class="d-text-inv d-mono d-small">1 epoch</text>
+    <rect x="520" y="26" width="150" height="74" rx="8" class="d-block-accent"/>
+    <text x="595" y="52" text-anchor="middle" class="d-text-inv d-bold">OlmoRL</text>
+    <text x="595" y="72" text-anchor="middle" class="d-text-inv d-mono d-small">104,869 prompts</text>
+    <text x="595" y="90" text-anchor="middle" class="d-text-inv d-mono d-small">750 / 1,400 steps</text>
+    <rect x="700" y="26" width="90" height="74" rx="8" class="d-surface"/>
+    <text x="745" y="52" text-anchor="middle" class="d-bold">Think</text>
+    <text x="745" y="72" text-anchor="middle" class="d-mono d-small">7B · 32B</text>
+    <text x="745" y="90" text-anchor="middle" class="d-mono d-small">3.1: 2,300</text>
+    <path d="M126,63 L160,63" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M310,63 L340,63" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M490,63 L520,63" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M670,63 L700,63" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <text x="160" y="140" class="d-bold">Instruct</text>
+    <rect x="160" y="150" width="150" height="74" rx="8" class="d-block"/>
+    <text x="235" y="176" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+    <text x="235" y="198" text-anchor="middle" class="d-text-inv d-small">function calling added</text>
+    <rect x="340" y="150" width="150" height="74" rx="8" class="d-block-2"/>
+    <text x="415" y="176" text-anchor="middle" class="d-text-inv d-bold">DPO</text>
+    <text x="415" y="198" text-anchor="middle" class="d-text-inv d-small">length control</text>
+    <rect x="520" y="150" width="150" height="74" rx="8" class="d-block-accent"/>
+    <text x="595" y="176" text-anchor="middle" class="d-text-inv d-bold">OlmoRL</text>
+    <text x="595" y="196" text-anchor="middle" class="d-text-inv d-mono d-small">171,950 prompts</text>
+    <text x="595" y="214" text-anchor="middle" class="d-text-inv d-mono d-small">450 steps (7B)</text>
+    <rect x="700" y="150" width="90" height="74" rx="8" class="d-surface"/>
+    <text x="745" y="182" text-anchor="middle" class="d-bold">Instruct</text>
+    <text x="745" y="202" text-anchor="middle" class="d-mono d-small">7B · 32B</text>
+    <path d="M126,187 L160,187" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M310,187 L340,187" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M490,187 L520,187" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M670,187 L700,187" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <text x="160" y="264" class="d-bold">RL-Zero</text>
+    <rect x="520" y="274" width="150" height="74" rx="8" class="d-block-accent"/>
+    <text x="595" y="300" text-anchor="middle" class="d-text-inv d-bold">OlmoRL</text>
+    <text x="595" y="320" text-anchor="middle" class="d-text-inv d-mono d-small">13,314 math prompts</text>
+    <text x="595" y="338" text-anchor="middle" class="d-text-inv d-mono d-small">decontaminated</text>
+    <rect x="700" y="274" width="90" height="74" rx="8" class="d-surface"/>
+    <text x="745" y="300" text-anchor="middle" class="d-bold">RL-Zero</text>
+    <text x="745" y="320" text-anchor="middle" class="d-mono d-small">5 variants</text>
+    <path d="M126,311 L520,311" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <text x="323" y="302" text-anchor="middle" class="d-text-light">no SFT, no DPO</text>
+    <path d="M670,311 L700,311" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="160" y="366" width="12" height="12" class="d-block"/><text x="178" y="377" class="d-text-light d-small">imitation</text>
+    <rect x="260" y="366" width="12" height="12" class="d-block-2"/><text x="278" y="377" class="d-text-light d-small">preference</text>
+    <rect x="370" y="366" width="12" height="12" class="d-block-accent"/><text x="388" y="377" class="d-text-light d-small">RL</text>
+    <text x="430" y="377" class="d-text-light d-small">prompt counts: Tables 17, 19, 20, 49</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The three post-training lanes of Olmo 3. Think is SFT on 2,268,468 prompts (the 7B count), DPO on 200,000 prompts and RL on 104,869 prompts<a class="cite" href="#ref-1">1</a> (Tables 17, 19, 20); step counts 750 (32B) and 1,400 (7B) are from Table 49, and 2,300 is the extended 32B run behind Olmo 3.1 Think<a class="cite" href="#ref-1">1</a> (§4.1.2, footnote 30). Instruct reuses the pipeline with a length-controlled DPO and 171,950 RL prompts<a class="cite" href="#ref-1">1</a> (§5.3-5.4, Tables 20 and 49). RL-Zero skips both earlier stages and starts RL from the base<a class="cite" href="#ref-1">1</a> (§6).</figcaption>
+</figure>
+
+<h2 id="olmo3-recipe">1. The recipe: three stages and a base-only branch</h2>
+<p>Olmo 3 is a pair of dense models, 7B and 32B, from the Allen Institute for AI, released with "every stage, checkpoint, data point, and dependency" used to build them<a class="cite" href="#ref-1">1</a> (abstract). Its reasoning variant, Olmo 3 Think, is trained in three stages, SFT, DPO and RL with verifiable rewards, and the report says it observed gains at each<a class="cite" href="#ref-1">1</a> (§4). It titles the RL section "The Cherry on Top" (§4.4), and the 32B wall-clock reads the same way: about two days for SFT and about five for the final RL runs, inside a post-training window of about nine days (Module 1, Section 4.3, has the ledger)<a class="cite" href="#ref-1">1</a> (§2.4). The course's source map lists Olmo 3 as the only fully open end-to-end recipe (data, code, logs) with a consolidated list of GRPO changes and measured RL-infrastructure numbers. That is the map's finding, not a survey of every open model: Tulu 3 also publishes per-phase seconds for its 405B RL run<a class="cite" href="#ref-2">2</a> (§8.1). It is why this case study can check the arithmetic of Modules 1 and 14 against a primary table instead of a headline.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> The Think pipeline, its 3.1 continuation and RL-Zero, as reported<a class="cite" href="#ref-1">1</a>. Sizes are prompts. The 7B SFT count is Table 17's total; the 32B count is 2,253,916. The Instruct lane is in Figure 1 and Section 7.</caption>
+  <thead><tr><th>Stage</th><th>Data</th><th class="num">Size (prompts)</th><th>Training</th><th>Stated purpose</th></tr></thead>
+  <tbody>
+    <tr><td class="row">SFT</td><td>Dolci Think SFT: traces from QwQ-32B and DeepSeek-R1 over math, code, chat, safety, precise instruction following, science</td><td class="num">2,268,468 (7B)</td><td>two epochs, learning-rate sweep, linear merge of two checkpoints (§4.2.2)</td><td>explicit thinking traces that support accurate answers</td></tr>
+    <tr><td class="row">DPO</td><td>Dolci Think DPO: chosen from Qwen3 32B thinking, rejected from Qwen3 0.6B thinking</td><td class="num">200,000</td><td>one epoch, sweep of learning rate and dataset size (§4.3.2)</td><td>capability gains beyond SFT; "primes the model for effective reinforcement learning" (§2.2)</td></tr>
+    <tr><td class="row">RL</td><td>Dolci Think RL: math, code, instruction following, general chat; verifiers plus an LM judge</td><td class="num">104,869</td><td>OlmoRL, 750 steps (32B), 1,400 steps (7B) (Table 49)</td><td>reasoning gains across verifiable and non-verifiable domains</td></tr>
+    <tr><td class="row">RL, Olmo 3.1</td><td>the same RL data, further epochs</td><td class="num">same</td><td>continued for 21 days on 224 GPUs, to 2,300 steps (§2.4, footnote 30)</td><td>shows extended RL still helps</td></tr>
+    <tr><td class="row">RL-Zero</td><td>Dolci RL-Zero: math, code, instruction following, general, a mix</td><td class="num">13,314 (math)</td><td>OlmoRL from the base, 16K responses, 2,000 steps (Table 49)</td><td>a benchmark for RLVR free of data leakage (§6)</td></tr>
+  </tbody>
+</table>
+
+<p>Two stages before RL carry design choices that the RL stage depends on. The DPO stage is the delta-learning construction: the chosen response comes from a stronger model and the rejected one from a weaker model, because continued SFT on the Qwen3-32B responses lowered the report's development average while DPO that paired them with Qwen3-0.6B responses raised it<a class="cite" href="#ref-1">1</a> (Table 21). Module 7 covers the mechanism. And the report's ordering evidence, that RL run from a DPO checkpoint ends above RL run from the SFT checkpoint, is Module 13's DPO-start observation. OlmoRL also succeeds the RLVR stage of Tulu 3, the same lab's earlier recipe, which ran PPO with an 8B value model and a KL coefficient of 0.05 at 8B<a class="cite" href="#ref-2">2</a> (§8.1, Table 21 caption); Module 26 covers it. This module keeps to the RL stage and the systems around it, and points to Modules 1, 7, 13, 14, 16 and 20 where they already hold a slice of the same report, and to Module 19, whose reward-hacking replication used the released 7B and 32B checkpoints.</p>
+
+<h2 id="what-rl-bought">2. What RL bought, stage by stage</h2>
+<p>Table 2 gives the 32B Think model at four checkpoints and the two differences that matter: what RL added on top of DPO, and what the extra 1,550 steps of Olmo 3.1 added on top of that. The report's Table 15 does the same for 7B, with one RL column; Figure 2 plots the DPO-to-RL change for all 17 benchmarks at both sizes.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 2.</b> Olmo 3 32B Think across stages, benchmark points<a class="cite" href="#ref-1">1</a> (Table 14). "RL 3.0" is the initial 750-step model and "RL 3.1" the 2,300-step continuation. Differences are derived. The last column is the mean run-to-run standard deviation the report measured for that benchmark across 3 runs of 14 models (§4.1.1); a dash means the report lists none.</caption>
+  <thead><tr><th>Benchmark</th><th class="num">SFT</th><th class="num">DPO</th><th class="num">RL 3.0</th><th class="num">RL 3.1</th><th class="num">3.0 &#8722; DPO</th><th class="num">3.1 &#8722; 3.0</th><th class="num">Run std</th></tr></thead>
+  <tbody>
+    <tr><td class="row">AIME 2024</td><td class="num">73.5</td><td class="num">76.0</td><td class="num">76.8</td><td class="num">80.6</td><td class="num">+0.8</td><td class="num">+3.8</td><td class="num">0.54</td></tr>
+    <tr><td class="row">AIME 2025</td><td class="num">66.2</td><td class="num">70.7</td><td class="num">72.5</td><td class="num">78.1</td><td class="num">+1.8</td><td class="num">+5.6</td><td class="num">&#8212;</td></tr>
+    <tr><td class="row">OMEGA</td><td class="num">43.1</td><td class="num">45.2</td><td class="num">50.6</td><td class="num">53.4</td><td class="num">+5.4</td><td class="num">+2.8</td><td class="num">0.56</td></tr>
+    <tr><td class="row">MATH</td><td class="num">95.6</td><td class="num">95.9</td><td class="num">96.1</td><td class="num">96.2</td><td class="num">+0.2</td><td class="num">+0.1</td><td class="num">0.25</td></tr>
+    <tr><td class="row">ZebraLogic</td><td class="num">70.5</td><td class="num">74.5</td><td class="num">76.0</td><td class="num">80.1</td><td class="num">+1.5</td><td class="num">+4.1</td><td class="num">0.56</td></tr>
+    <tr><td class="row">LiveCodeBench v3</td><td class="num">75.8</td><td class="num">81.9</td><td class="num">83.5</td><td class="num">83.3</td><td class="num">+1.6</td><td class="num">&#8722;0.2</td><td class="num">0.29</td></tr>
+    <tr><td class="row">IFEval</td><td class="num">83.9</td><td class="num">80.6</td><td class="num">89.0</td><td class="num">93.8</td><td class="num" data-best>+8.4</td><td class="num">+4.8</td><td class="num">0.88</td></tr>
+    <tr><td class="row">IFBench</td><td class="num">37.0</td><td class="num">34.4</td><td class="num">47.6</td><td class="num">68.1</td><td class="num" data-best>+13.2</td><td class="num" data-best>+20.5</td><td class="num">&#8212;</td></tr>
+    <tr><td class="row">GPQA</td><td class="num">55.7</td><td class="num">57.6</td><td class="num">58.1</td><td class="num">56.7</td><td class="num">+0.5</td><td class="num">&#8722;1.4</td><td class="num">1.48</td></tr>
+    <tr><td class="row">PopQA</td><td class="num">33.1</td><td class="num">37.0</td><td class="num">31.9</td><td class="num">30.9</td><td class="num" data-worst>&#8722;5.1</td><td class="num">&#8722;1.0</td><td class="num">0.16</td></tr>
+    <tr><td class="row">AlpacaEval 2 LC</td><td class="num">69.1</td><td class="num">78.6</td><td class="num">74.2</td><td class="num">69.1</td><td class="num" data-worst>&#8722;4.4</td><td class="num" data-worst>&#8722;5.1</td><td class="num">&#8212;</td></tr>
+    <tr><td class="row">Safety</td><td class="num">64.8</td><td class="num">65.3</td><td class="num">68.8</td><td class="num">83.6</td><td class="num">+3.5</td><td class="num">+14.8</td><td class="num">&#8212;</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 510" role="img" aria-labelledby="f2t"><title id="f2t">Change in 17 benchmark scores from the DPO checkpoint to the final RL checkpoint, for Olmo 3 32B Think and 7B Think; instruction following gains most, some benchmarks lose</title>
+<text x="14" y="20" class="d-title">RL stage minus DPO stage, points (derived)</text>
+<rect x="560" y="8" width="12" height="12" class="d-fill-blue"/><text x="578" y="19" class="d-small">32B Think (Table 14)</text>
+<rect x="560" y="26" width="12" height="12" class="d-fill-orange"/><text x="578" y="37" class="d-small">7B Think (Table 15)</text>
+<line x1="200" y1="54" x2="200" y2="470" class="d-grid"/>
+<text x="200" y="486" text-anchor="middle" class="d-mono d-small">&#8722;5</text>
+<line x1="330" y1="54" x2="330" y2="470" class="d-axis"/>
+<text x="330" y="486" text-anchor="middle" class="d-mono d-small">0</text>
+<line x1="460" y1="54" x2="460" y2="470" class="d-grid"/>
+<text x="460" y="486" text-anchor="middle" class="d-mono d-small">+5</text>
+<line x1="590" y1="54" x2="590" y2="470" class="d-grid"/>
+<text x="590" y="486" text-anchor="middle" class="d-mono d-small">+10</text>
+<line x1="720" y1="54" x2="720" y2="470" class="d-grid"/>
+<text x="720" y="486" text-anchor="middle" class="d-mono d-small">+15</text>
+<text x="150" y="76" text-anchor="end">MATH</text>
+<rect x="330.0" y="63" width="5.2" height="9" class="d-fill-blue"/>
+<text x="339.2" y="71" class="d-mono d-small">+0.2</text>
+<rect x="330.0" y="73" width="70.2" height="9" class="d-fill-orange"/>
+<text x="404.2" y="81" class="d-mono d-small">+2.7</text>
+<text x="150" y="100" text-anchor="end">AIME 2024</text>
+<rect x="330.0" y="87" width="20.8" height="9" class="d-fill-blue"/>
+<text x="354.8" y="95" class="d-mono d-small">+0.8</text>
+<rect x="252.0" y="97" width="78.0" height="9" class="d-fill-orange"/>
+<text x="248.0" y="105" text-anchor="end" class="d-mono d-small">&#8722;3.0</text>
+<text x="150" y="124" text-anchor="end">AIME 2025</text>
+<rect x="330.0" y="111" width="46.8" height="9" class="d-fill-blue"/>
+<text x="380.8" y="119" class="d-mono d-small">+1.8</text>
+<rect x="330.0" y="121" width="49.4" height="9" class="d-fill-orange"/>
+<text x="383.4" y="129" class="d-mono d-small">+1.9</text>
+<text x="150" y="148" text-anchor="end">OMEGA</text>
+<rect x="330.0" y="135" width="140.4" height="9" class="d-fill-blue"/>
+<text x="474.4" y="143" class="d-mono d-small">+5.4</text>
+<rect x="330.0" y="145" width="117.0" height="9" class="d-fill-orange"/>
+<text x="451.0" y="153" class="d-mono d-small">+4.5</text>
+<text x="150" y="172" text-anchor="end">BigBenchHard</text>
+<rect x="330.0" y="159" width="18.2" height="9" class="d-fill-blue"/>
+<text x="352.2" y="167" class="d-mono d-small">+0.7</text>
+<rect x="330.0" y="169" width="75.4" height="9" class="d-fill-orange"/>
+<text x="409.4" y="177" class="d-mono d-small">+2.9</text>
+<text x="150" y="196" text-anchor="end">ZebraLogic</text>
+<rect x="330.0" y="183" width="39.0" height="9" class="d-fill-blue"/>
+<text x="373.0" y="191" class="d-mono d-small">+1.5</text>
+<rect x="330.0" y="193" width="153.4" height="9" class="d-fill-orange"/>
+<text x="487.4" y="201" class="d-mono d-small">+5.9</text>
+<text x="150" y="220" text-anchor="end">AGI Eval English</text>
+<rect x="330.0" y="207" width="10.4" height="9" class="d-fill-blue"/>
+<text x="344.4" y="215" class="d-mono d-small">+0.4</text>
+<rect x="330.0" y="217" width="62.4" height="9" class="d-fill-orange"/>
+<text x="396.4" y="225" class="d-mono d-small">+2.4</text>
+<text x="150" y="244" text-anchor="end">HumanEvalPlus</text>
+<rect x="324.8" y="231" width="5.2" height="9" class="d-fill-blue"/>
+<text x="320.8" y="239" text-anchor="end" class="d-mono d-small">&#8722;0.2</text>
+<rect x="291.0" y="241" width="39.0" height="9" class="d-fill-orange"/>
+<text x="287.0" y="249" text-anchor="end" class="d-mono d-small">&#8722;1.5</text>
+<text x="150" y="268" text-anchor="end">MBPP+</text>
+<rect x="330.0" y="255" width="20.8" height="9" class="d-fill-blue"/>
+<text x="354.8" y="263" class="d-mono d-small">+0.8</text>
+<rect x="330.0" y="265" width="44.2" height="9" class="d-fill-orange"/>
+<text x="378.2" y="273" class="d-mono d-small">+1.7</text>
+<text x="150" y="292" text-anchor="end">LiveCodeBench v3</text>
+<rect x="330.0" y="279" width="41.6" height="9" class="d-fill-blue"/>
+<text x="375.6" y="287" class="d-mono d-small">+1.6</text>
+<rect x="330.0" y="289" width="2.6" height="9" class="d-fill-orange"/>
+<text x="336.6" y="297" class="d-mono d-small">+0.1</text>
+<text x="150" y="316" text-anchor="end">IFEval</text>
+<rect x="330.0" y="303" width="218.4" height="9" class="d-fill-blue"/>
+<text x="552.4" y="311" class="d-mono d-small">+8.4</text>
+<rect x="330.0" y="313" width="319.8" height="9" class="d-fill-orange"/>
+<text x="653.8" y="321" class="d-mono d-small">+12.3</text>
+<text x="150" y="340" text-anchor="end">IFBench</text>
+<rect x="330.0" y="327" width="343.2" height="9" class="d-fill-blue"/>
+<text x="677.2" y="335" class="d-mono d-small">+13.2</text>
+<rect x="330.0" y="337" width="345.8" height="9" class="d-fill-orange"/>
+<text x="679.8" y="345" class="d-mono d-small">+13.3</text>
+<text x="150" y="364" text-anchor="end">MMLU</text>
+<rect x="330.0" y="351" width="5.2" height="9" class="d-fill-blue"/>
+<text x="339.2" y="359" class="d-mono d-small">+0.2</text>
+<rect x="330.0" y="361" width="78.0" height="9" class="d-fill-orange"/>
+<text x="412.0" y="369" class="d-mono d-small">+3.0</text>
+<text x="150" y="388" text-anchor="end">PopQA</text>
+<rect x="197.4" y="375" width="132.6" height="9" class="d-fill-blue"/>
+<text x="193.4" y="383" text-anchor="end" class="d-mono d-small">&#8722;5.1</text>
+<rect x="304.0" y="385" width="26.0" height="9" class="d-fill-orange"/>
+<text x="300.0" y="393" text-anchor="end" class="d-mono d-small">&#8722;1.0</text>
+<text x="150" y="412" text-anchor="end">GPQA</text>
+<rect x="330.0" y="399" width="13.0" height="9" class="d-fill-blue"/>
+<text x="347.0" y="407" class="d-mono d-small">+0.5</text>
+<rect x="267.6" y="409" width="62.4" height="9" class="d-fill-orange"/>
+<text x="263.6" y="417" text-anchor="end" class="d-mono d-small">&#8722;2.4</text>
+<text x="150" y="436" text-anchor="end">AlpacaEval 2 LC</text>
+<rect x="215.6" y="423" width="114.4" height="9" class="d-fill-blue"/>
+<text x="211.6" y="431" text-anchor="end" class="d-mono d-small">&#8722;4.4</text>
+<rect x="330.0" y="433" width="39.0" height="9" class="d-fill-orange"/>
+<text x="373.0" y="441" class="d-mono d-small">+1.5</text>
+<text x="150" y="460" text-anchor="end">Safety</text>
+<rect x="330.0" y="447" width="91.0" height="9" class="d-fill-blue"/>
+<text x="425.0" y="455" class="d-mono d-small">+3.5</text>
+<rect x="330.0" y="457" width="78.0" height="9" class="d-fill-orange"/>
+<text x="412.0" y="465" class="d-mono d-small">+3.0</text>
+<text x="330" y="504" text-anchor="middle" class="d-text-light d-small">score change, benchmark points (each benchmark has its own scale)</text>
+</svg>
+  <figcaption><b>Figure 2.</b> RL minus DPO for the 17 benchmarks of Tables 14 and 15, in each benchmark's own points (derived)<a class="cite" href="#ref-1">1</a>. Instruction following (IFEval, IFBench) and OMEGA gain at both sizes. Some benchmarks lose: PopQA and AlpacaEval at 32B; AIME 2024, GPQA and HumanEvalPlus at 7B. The 7B column is a mean of three runs (Table 15 caption); Table 14 does not say.</figcaption>
+</figure>
+
+<p>RL's largest gains sit on the benchmarks closest to its verifiers. IFBench rises 13.2 points at 32B and 13.3 at 7B, IFEval 8.4 and 12.3, OMEGA 5.4 and 4.5 (derived). The instruction-following reward is built from IFEval-style and IFBench-train constraints<a class="cite" href="#ref-1">1</a> (§4.4.2), so IFEval is partly in-distribution; the report calls IFBench the unseen evaluation<a class="cite" href="#ref-1">1</a> (§4.5), which makes the IFBench gain the cleaner evidence. Math and code move little at 32B. MATH gains 0.2, AIME 2024 gains 0.8, and that 0.8 is about 1.5 times the 0.5437 run-to-run standard deviation the report measures for AIME 2024 (Avg@32)<a class="cite" href="#ref-1">1</a> (§4.1.1), so one run does not separate it from noise.</p>
+
+<p>The losses are as informative as the gains. At 32B, PopQA falls 5.1 points against a 0.16 run-to-run deviation, and AlpacaEval 2 LC falls 4.4. At 7B, AIME 2024 falls 3.0 and HumanEvalPlus 1.5 (derived). The AlpacaEval drop follows the report's own finding that RL on IFEval data alone raised IFEval and lowered AlpacaEval, which mixing domains and an LM-judge reward reduced<a class="cite" href="#ref-1">1</a> (§4.5; Modules 13 and 16 take that up). The report comments on the AlpacaEval drop only for the 3.1 step<a class="cite" href="#ref-1">1</a> (§4.1.2). Read together (my reading), RL here improves what its verifiers measure and gives some back elsewhere; the chat reward is an LM judge and it did not stop AlpacaEval from falling at 32B.</p>
+
+<p>Olmo 3.1 is the same run continued. From 750 to 2,300 steps it gains 3.8 points on AIME 2024, 5.6 on AIME 2025, 4.1 on ZebraLogic, 4.8 on IFEval and 20.5 on IFBench, and loses 5.1 on AlpacaEval<a class="cite" href="#ref-1">1</a> (Table 14; the report writes "gains of 4+ points on AIME, 4 points on ZebraLogic, 4 points on IFEval, and 20 points on IFBench" and a "5-point drop" on AlpacaEval, §4.1.2). The Safety column rises from 68.8 to 83.6, which the passage I read does not discuss. The AIME 2025 gain of the extra 1,550 steps is about three times the gain of the first 750 over DPO (5.6 against 1.8, derived), and the report notes that "performance had not yet fully saturated" when compute ran out<a class="cite" href="#ref-1">1</a> (footnote 30). The report shows one continuation, not repeats, so this shows that the 32B model was still improving at 2,300 steps and says nothing about where it would stop.</p>
+
+<p>For the ordering of the stages, the report's development table on 7B checkpoints shows an average over a ten-benchmark subset of 70.1 for SFT, 72.7 for SFT plus DPO, 71.9 for SFT plus 1,000 RL steps and 74.1 for all three<a class="cite" href="#ref-1">1</a> (Table 22, one run). RL adds 1.8 on top of SFT and 1.4 on top of DPO (derived); Module 13 reads why a DPO start is better.</p>
+
+<h2 id="olmorl">3. OlmoRL as a diff against GRPO</h2>
+<p>GRPO samples \(G\) completions per prompt, takes the group mean as the baseline, normalizes each completion's loss by its own length, divides advantages by the group's standard deviation, and puts a KL penalty to a reference policy in the loss<a class="cite" href="#ref-3">3</a>; Dr. GRPO names the second and third of these as a length bias and a difficulty bias<a class="cite" href="#ref-4">4</a> (§3.1). OlmoRL "builds on Group Relative Policy Optimization" and adopts changes from DAPO and Dr. GRPO "among others"<a class="cite" href="#ref-1">1</a> (§4.4.1). The final objective is Equation 1 of the report, with the advantage of Equation 2:</p>
+$$\mathcal{J}(\theta)=\frac{1}{\sum_{i=1}^{G}|y_i|}\sum_{i=1}^{G}\sum_{t=1}^{|y_i|}\min\!\left(\frac{\pi(y_{i,t}\mid x,y_{i,&lt;t};\theta_{\text{old}})}{\pi_{\text{vllm}}(y_{i,t}\mid x,y_{i,&lt;t};\theta_{\text{old}})},\ \rho\right)\min\!\Big(r_{i,t}A_{i,t},\ \mathrm{clip}\big(r_{i,t},\,1-\varepsilon_{\text{low}},\,1+\varepsilon_{\text{high}}\big)A_{i,t}\Big)$$
+$$r_{i,t}=\frac{\pi(y_{i,t}\mid x,y_{i,&lt;t};\theta)}{\pi(y_{i,t}\mid x,y_{i,&lt;t};\theta_{\text{old}})},\qquad A_{i,t}=r(x,y_i)-\operatorname{mean}\big(\{r(x,y_j)\}_{j=1}^{G}\big)$$
+<p>Read left to right: the prefactor divides by the total token count of the group, not by each completion's length; the first \(\min\) is the truncated mismatch weight, the trainer's probability over the one vLLM returned, capped at \(\rho\); the second \(\min\) is PPO's clip with separate bounds \(\varepsilon_{\text{low}}\) and \(\varepsilon_{\text{high}}\); and the advantage is a centered reward with no division by the standard deviation<a class="cite" href="#ref-1">1</a> (Eq. 1-2). Module 12 Section 1.2 factors the two ratios; Module 14 covers where the mismatch comes from. Table 3 lists the seven changes with the reason the report gives for each.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 3.</b> OlmoRL's seven changes to GRPO, with the reason as the report words it, the paper it takes the idea from, and whether this report tests it<a class="cite" href="#ref-1">1</a> (§4.4.1, §4.4.3, §6.2). "Tested" refers to evidence inside the Olmo 3 report only.</caption>
+  <thead><tr><th>Change</th><th>What it does</th><th>Reason given</th><th>Taken from</th><th>Tested here?</th><th>Module</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Zero-gradient filtering</td><td>drops groups whose rewards are all identical</td><td>avoid "training on samples that provide zero gradient"</td><td>DAPO<a class="cite" href="#ref-5">5</a></td><td>no separate ablation</td><td>11</td></tr>
+    <tr><td class="row">Active sampling</td><td>refills the batch from the result queue until it holds the full count of non-zero-gradient groups</td><td>"maintain a consistent batch size"; stabilizes training</td><td>a cheaper form of DAPO's dynamic sampling, which "would oversample" by three times<a class="cite" href="#ref-1">1</a></td><td data-best>yes: with and without, RL-Zero math (Fig. 26)</td><td>11; Section 8</td></tr>
+    <tr><td class="row">Token-level loss</td><td>divides by total tokens in the batch</td><td>"to avoid a length bias"</td><td>DAPO<a class="cite" href="#ref-5">5</a></td><td>no</td><td>11</td></tr>
+    <tr><td class="row">No KL loss</td><td>removes the KL penalty to the reference</td><td>"allows less-restricted policy updates"; removal "does not lead to over-optimization or destabilized training"</td><td>GLM-4.5, DAPO, Dr. GRPO</td><td data-worst>no ablation; KL is plotted (Fig. 41)</td><td>6, 13</td></tr>
+    <tr><td class="row">Clip-higher</td><td>\(\varepsilon_{\text{high}}=0.272\) against \(\varepsilon_{\text{low}}=0.2\)</td><td>"enable larger updates on tokens"</td><td>DAPO<a class="cite" href="#ref-5">5</a></td><td>no</td><td>12</td></tr>
+    <tr><td class="row">Truncated importance sampling</td><td>weights the loss by the trainer-over-vLLM ratio, capped at 2.0 where used</td><td>correct "differences between log probabilities from the inference and training engines"</td><td>Yao et al., second-hand here<a class="cite" href="#ref-6">6</a></td><td data-worst>no ablation; 7B Think ran without it</td><td>14</td></tr>
+    <tr><td class="row">No std normalization</td><td>advantage is reward minus group mean</td><td>removes a "difficulty bias"</td><td>Dr. GRPO<a class="cite" href="#ref-4">4</a></td><td>no</td><td>11</td></tr>
+  </tbody>
+</table>
+
+<h3 id="olmorl-tested">3.1 What the report tests and what it inherits</h3>
+<p>One of the seven changes has an ablation in this report. Active sampling does: on the RL-Zero math run the share of each batch with non-zero advantage is held at 1.0, while the standard loop's share mostly sits between about 0.4 and 0.8 (read by eye from Figure 26), and the training loss variance is "greatly reduced"<a class="cite" href="#ref-1">1</a> (§6.2, Figure 26). The other six are adopted on the strength of other papers. DAPO's own ladder, on a Qwen2.5-32B base, goes from 30 AIME 2024 points for naive GRPO to 36 with overlong filtering, 38 with clip-higher, 41 with soft overlong punishment, 42 with token-level loss and 50 with dynamic sampling<a class="cite" href="#ref-5">5</a> (Table 1), so the evidence for items 1, 3 and 5 comes from a different model, a different data set and a different length cap. The report does not claim otherwise.</p>
+<p>The closest thing to a whole-recipe test is a replication. The first 7B Think run used an earlier infrastructure "without pipelineRL or truncation importance sampling" and took about 15 days; the same run repeated on the newer infrastructure "achiev[ed] similar performance in just 6 days"<a class="cite" href="#ref-1">1</a> (§4.4.2). That changed several things at once, so it says that the combination works and not that truncated importance sampling is needed. The report also records two things it tried and dropped: overlong filtering, which it "did not find ... gave consistent improvements"<a class="cite" href="#ref-1">1</a> (footnote 34), and, for RL-Zero, masking truncated completions, which Section 8 returns to.</p>
+
+<h3 id="olmorl-group-arithmetic">3.2 Where the changes enter one step</h3>
+<p>Figure 3 places the seven changes in one step. Three act between rollout and loss, and four are terms of the objective. The three on the data path sit at different points. The offline difficulty filter runs once before training, using the starting checkpoint: it drops prompts whose pass rate over eight rollouts at temperature 1.0 and top-p 1.0 exceeds 62.5%<a class="cite" href="#ref-1">1</a> (§4.4.2). The zero-gradient filter runs when results arrive, and active sampling is the refill loop that keeps the learner's batch full. RL-Zero's offline rule is looser and removes only prompts "fully solved in 8 out of 8"<a class="cite" href="#ref-1">1</a> (§6.1). Module 10 Section 5.3 works out how soft the 62.5% rule is: with eight rollouts it is exactly 5/8, so every prompt with at least six correct is dropped, including groups of six and seven that still carry gradient. Module 11 Sections 3 and 4 derive the standard-deviation factor and the dead-group probability, and the 32B launch script's data mix names its filtered instruction-following set <code>IF_multi_constraints_upto5_filtered_dpo_0625_filter</code>, a 0.625 filter against the DPO checkpoint<a class="cite" href="#ref-7">7</a> (<code>32b_think_rl.sh</code>).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 350" role="img" aria-labelledby="f3t"><title id="f3t">One OlmoRL step as a pipeline from prompt queue through vLLM actors, verifiers, a group filter and advantage computation to a one-minibatch learner, with the seven changes of Table 3 numbered where they act</title>
+<defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="20" y="62" width="120" height="58" rx="8" class="d-block-muted"/>
+<text x="80.0" y="97" text-anchor="middle" class="d-text-inv d-bold">Prompt queue</text>
+<rect x="175" y="62" width="140" height="58" rx="8" class="d-block-2"/>
+<text x="245.0" y="97" text-anchor="middle" class="d-text-inv d-bold">vLLM actors</text>
+<rect x="350" y="62" width="130" height="58" rx="8" class="d-block"/>
+<text x="415.0" y="97" text-anchor="middle" class="d-text-inv d-bold">Verifiers</text>
+<rect x="515" y="62" width="120" height="58" rx="8" class="d-block-accent"/>
+<text x="575.0" y="97" text-anchor="middle" class="d-text-inv d-bold">Group filter</text>
+<rect x="670" y="62" width="115" height="58" rx="8" class="d-block"/>
+<text x="727.5" y="97" text-anchor="middle" class="d-text-inv d-bold">Advantage</text>
+<path d="M140,91 L175,91" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M315,91 L350,91" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M480,91 L515,91" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M635,91 L670,91" class="d-arrow" marker-end="url(#f3-arr)"/>
+<path d="M575,62 L575,38 L80,38 L80,60" class="d-arrow-active" fill="none" marker-end="url(#f3-arr)"/>
+<text x="328" y="30" text-anchor="middle" class="d-small">refill until the batch is full of non-zero-gradient groups</text>
+<circle cx="530" cy="62" r="10" class="d-fill-orange"/><text x="530" y="66" text-anchor="middle" class="d-text-inv d-bold d-small">1</text>
+<circle cx="552" cy="62" r="10" class="d-fill-orange"/><text x="552" y="66" text-anchor="middle" class="d-text-inv d-bold d-small">2</text>
+<circle cx="685" cy="62" r="10" class="d-fill-orange"/><text x="685" y="66" text-anchor="middle" class="d-text-inv d-bold d-small">7</text>
+<text x="80" y="138" text-anchor="middle" class="d-text-light d-small">offline filter, once:</text>
+<text x="80" y="152" text-anchor="middle" class="d-text-light d-small">pass rate &gt; 62.5% out</text>
+<text x="262" y="138" text-anchor="middle" class="d-text-light d-small">continuous batching</text>
+<text x="415" y="138" text-anchor="middle" class="d-text-light d-small">SymPy, tests, judge</text>
+<text x="575" y="138" text-anchor="middle" class="d-text-light d-small">drop groups with</text><text x="575" y="152" text-anchor="middle" class="d-text-light d-small">equal rewards</text>
+<rect x="175" y="196" width="610" height="124" rx="10" class="d-panel"/>
+<text x="190" y="218" class="d-bold">Learner (DeepSpeed): one minibatch, one epoch</text>
+<rect x="190" y="236" width="135" height="64" rx="8" class="d-surface d-outline"/>
+<circle cx="206" cy="252" r="10" class="d-fill-orange"/><text x="206" y="256" text-anchor="middle" class="d-text-inv d-bold d-small">3</text>
+<text x="257" y="282" text-anchor="middle" class="d-small">divide by batch tokens</text>
+<rect x="340" y="236" width="135" height="64" rx="8" class="d-surface d-outline"/>
+<circle cx="356" cy="252" r="10" class="d-fill-orange"/><text x="356" y="256" text-anchor="middle" class="d-text-inv d-bold d-small">6</text>
+<text x="407" y="282" text-anchor="middle" class="d-small">truncated IS, cap 2.0</text>
+<rect x="490" y="236" width="135" height="64" rx="8" class="d-surface d-outline"/>
+<circle cx="506" cy="252" r="10" class="d-fill-orange"/><text x="506" y="256" text-anchor="middle" class="d-text-inv d-bold d-small">5</text>
+<text x="557" y="282" text-anchor="middle" class="d-small">clip 0.2 / 0.272</text>
+<rect x="640" y="236" width="135" height="64" rx="8" class="d-surface d-outline"/>
+<circle cx="656" cy="252" r="10" class="d-fill-orange"/><text x="656" y="256" text-anchor="middle" class="d-text-inv d-bold d-small">4</text>
+<text x="707" y="282" text-anchor="middle" class="d-small">no KL term</text>
+<path d="M727,120 L727,196" class="d-arrow" marker-end="url(#f3-arr)"/>
+<text x="719" y="162" text-anchor="end" class="d-small d-mono">A for every token</text>
+<path d="M200,196 L200,122" class="d-arrow-active" marker-end="url(#f3-arr)"/>
+<text x="208" y="170" class="d-small">weights, in flight</text>
+<text x="14" y="340" class="d-text-light d-small">Numbers are the rows of Table 3: 1 zero-gradient filter, 2 active sampling, 3 token-level loss, 4 no KL, 5 clip-higher, 6 truncated IS, 7 no std.</text>
+</svg>
+  <figcaption><b>Figure 3.</b> One OlmoRL step with the seven changes of Table 3 numbered where they act. Items 1, 2 and 7 sit between the actors and the loss; items 3 to 6 are terms of the learner's objective. The actor and learner split follows §4.4.3 and Figure 17 of the report, and the one-minibatch learner follows Table 49<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>Dropping the standard deviation has one consequence the report does not discuss. With \(A=r-\operatorname{mean}(r)\) the reward's scale multiplies the update directly, where a std-normalized advantage would cancel it (Module 10 Section 4.1). The text describes a reward of 1 or 0 for math and for instruction following, either a pass fraction or 1 or 0 for code, and a judge score in [0, 1]<a class="cite" href="#ref-1">1</a> (§4.4.1). Its Figure 16 draws instruction following as the fraction of satisfied constraints (0.75), which the text's "1 if all constraints are satisfied, and 0 otherwise" does not match, and code as 0.25 under the pass-fraction variant and 0.00 under the binary one. Yet the reward axes of its Figures 18, 21 and 24 reach about 6, 8 and 10 (by eye), and the text I read does not state the scaling that produces them. If you reproduce OlmoRL, the reward scale is a hyperparameter you have to recover from the code, not a constant of the method.</p>
+
+<h3 id="olmorl-one-minibatch">3.3 With one minibatch the clip is inert and the mismatch weight is the only correction</h3>
+<p>Table 49 lists one minibatch for 7B Think, 32B Think and RL-Zero and four for 7B Instruct<a class="cite" href="#ref-1">1</a>. With one minibatch and one inner epoch, the learner's weights equal \(\theta_{\text{old}}\) when the loss is evaluated, so \(r_{i,t}=1\) in value and the clip cannot bind; the gradient reduces to \(A_{i,t}\nabla\log\pi\) (derived from Equation 1; Module 12 Section 1.1 gives the argument and its Table 1 carries the Olmo rows). The released trainer does this explicitly: with a single minibatch the old log-probabilities are the current ones, detached, and with several they are computed before the update<a class="cite" href="#ref-7">7</a> (<code>resolve_old_logprob</code> in <code>grpo_utils.py</code>, main branch, which post-dates the report). The consequence is that \(\varepsilon_{\text{high}}=0.272\), against DAPO's 0.28<a class="cite" href="#ref-5">5</a> (§3.1) and for a reason the report does not give, shapes the Instruct runs and not the Think or RL-Zero runs (my reading of Equation 1, Table 49 and the code).</p>
+<p>The mismatch weight is then the only importance correction acting in the Think and RL-Zero runs, and Table 49 sets its cap \(\rho\) at 2.0 for 32B Think and RL-Zero and leaves it unset for 7B Think and 7B Instruct<a class="cite" href="#ref-1">1</a>. In the trainer the vLLM log-probabilities are those of the weights that generated the tokens, so in the asynchronous runs the weight also absorbs policy lag of up to the maximum asynchrony, which the report's equation does not separate from engine mismatch<a class="cite" href="#ref-7">7</a> (<code>compute_rho_correction</code>; my reading). Because the trainer's \(\pi(\theta_{\text{old}})\) is the detached output of the loss's own forward pass, the weight costs no extra learner pass in this configuration; Module 14's extra-pass accounting applies to setups that keep a separate old-policy pass, so its Figure 5, which adds that pass to Olmo's 125 s, is an upper bound for these one-minibatch runs. One reproduction trap: the trainer's default KL coefficient is 0.05 with the reference policy loaded<a class="cite" href="#ref-7">7</a> (<code>grpo_utils.py</code>), and the launch scripts set it to 0.0 explicitly (<code>--beta 0.0</code> in <code>32b_think_rl.sh</code> and <code>7b_think_rl_no_pipeline.sh</code>). Table 49 lists no KL coefficient, so "no KL" is a flag you must set, not a default you inherit.</p>
+
+<h2 id="data-and-verifiers">4. Verifiers, data and mixing</h2>
+<p>Four reward types cover the four domains. Math is a rule-based SymPy equivalence check against a reference answer; code runs generated programs against test cases on AWS Lambda so that verification "does not block the trainer"; instruction following checks a set of constraint functions; general chat sends the response to an LM judge, with or without a reference answer<a class="cite" href="#ref-1">1</a> (§4.4.1, footnote 35). The judge is Qwen3 32B with thinking mode off, hosted on vLLM with a 32,768-token input limit and a 2,048-token response limit<a class="cite" href="#ref-1">1</a> (footnote 36). The report also tried puzzle verifiers and length-control verifiers and found neither useful downstream (footnote 36). Module 10 Section 3 covers the verifiers and Module 16 the judge that anchors the mix; the part specific to Olmo is how the prompt pool was assembled.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> Prompts per domain in Dolci-Think-RL and in the Instruct RL pool<a class="cite" href="#ref-1">1</a> (Table 20). Category sums and shares are derived from the per-dataset counts, and they reproduce the stated totals of 104,869 and 171,950.</caption>
+  <thead><tr><th>Domain</th><th>Reward</th><th class="num">Think RL (prompts)</th><th class="num">Share (%)</th><th class="num">Instruct RL (prompts)</th><th class="num">Share (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Precise instruction following</td><td>constraint checker</td><td class="num">30,186</td><td class="num">28.8</td><td class="num">38,000</td><td class="num">22.1</td></tr>
+    <tr><td class="row">Math</td><td>SymPy equivalence</td><td class="num">30,186</td><td class="num">28.8</td><td class="num">64,000</td><td class="num">37.2</td></tr>
+    <tr><td class="row">Code</td><td>unit tests</td><td class="num">23,110</td><td class="num">22.0</td><td class="num">20,000</td><td class="num">11.6</td></tr>
+    <tr><td class="row">General chat</td><td>LM judge</td><td class="num">21,387</td><td class="num">20.4</td><td class="num">49,950</td><td class="num">29.0</td></tr>
+    <tr><td class="row">Total</td><td></td><td class="num">104,869</td><td class="num">100</td><td class="num">171,950</td><td class="num">100</td></tr>
+  </tbody>
+</table>
+
+<p>Four construction details are worth copying or avoiding. Code prompts that came without tests go through problem rewriting, solution generation and test-case generation, and a prompt is kept only if its solution passes more than 80% of the generated tests, after which the failing tests are removed<a class="cite" href="#ref-1">1</a> (§4.4.2). Chat prompts from Tulu 3's SFT set are rewritten with GPT-4.1 to extract reference answers, sampled eight times from a Qwen2.5 7B model fine-tuned on OpenThoughts 2, and dropped if the mean F1 against the reference is below 0.1 or above 0.8, which removes both noisy and overly hard items; this is the same filter-by-pass-rate idea as Section 3.2, with F1 as the score<a class="cite" href="#ref-1">1</a> (§4.4.2). WildChat items are limited to ten per role-play character, because the pool was heavily weighted toward a few characters<a class="cite" href="#ref-1">1</a> (footnote 38). Eight OMEGA subtasks the model struggled with are downsampled by 50%<a class="cite" href="#ref-1">1</a> (footnote 39). The mix comes out near the report's stated aim of "roughly equal amounts of data" per domain "with slightly more focus on math and instruction following" (Table 4, 28.8% each against 22.0% and 20.4%).</p>
+
+<p>The mixing procedure is admitted to be partial. The authors write that RL experiments "were both long and compute-expensive, preventing us from ablating the full space of datasets and algorithmic choices"<a class="cite" href="#ref-1">1</a> (§4.4.2). They ran dataset-specific runs on an intermediate SFT checkpoint and watched the first 500 to 1,000 RL steps, tested algorithm changes on math alone, and periodically ran mixture experiments to check that a mix was stable. They built the mix on the 7B model and reused it for 32B "due to compute and time constraints"<a class="cite" href="#ref-1">1</a> (§4.4.2). The consequence for 32B is a pool filtered by a different model than the one being trained: the 7B model's DPO checkpoint did the offline filtering, and the 32B run "rel[ies] on active sampling", which fills batches only with groups that have a non-zero gradient for the model actually training<a class="cite" href="#ref-1">1</a> (§4.4.2). Active sampling is therefore doing the 32B-specific part of the difficulty filter at run time, which is a reason to read its ablation in Section 8 as more than a stability trick.</p>
+
+<h2 id="rollout-system">5. The rollout system</h2>
+<h3 id="rollout-system-layout">5.1 Layout</h3>
+<p>The learner is a single DeepSpeed-distributed trainer. The actors are a pool of independent vLLM instances: the learner puts prompts on a queue, the queue dispatches them to actors, and completions come back through a results queue<a class="cite" href="#ref-1">1</a> (§4.4.3, Figure 17a). The report describes this as an off-policy asynchronous design after Noukhovitch et al. A 7B actor is one GPU and generation scales by data parallelism; a 32B actor is a whole node with tensor parallelism 8<a class="cite" href="#ref-1">1</a> (footnote 40, Table 49). Figure 4 draws the 32B layout: 8 learner nodes and 20 actor nodes, 28 nodes of 8 H100 in all, which is the same 224 GPUs the report gives for the 21-day Olmo 3.1 continuation<a class="cite" href="#ref-1">1</a> (§2.4, §4.4.3). The learner is deliberately small: "we use the minimal possible sharding configuration to fit the learner in memory and do not prioritize speed at all", and the authors suspect the 32B sharding is suboptimal<a class="cite" href="#ref-1">1</a> (§4.4.3).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 372" role="img" aria-labelledby="f4t"><title id="f4t">Cluster layout of the Olmo 3 32B RL run: 8 learner nodes of 8 GPUs, 20 actor nodes each running one tensor-parallel vLLM engine, joined by a prompts queue and a results queue</title>
+<defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="14" y="30" width="210" height="266" rx="10" class="d-panel d-dashed d-outline"/>
+<text x="26" y="52" class="d-bold">Learner: 8 nodes, 64 GPUs</text>
+<rect x="26" y="70" width="88" height="44" rx="6" class="d-block"/>
+<text x="70" y="97" text-anchor="middle" class="d-text-inv d-mono d-small">8 GPUs</text>
+<rect x="126" y="70" width="88" height="44" rx="6" class="d-block"/>
+<text x="170" y="97" text-anchor="middle" class="d-text-inv d-mono d-small">8 GPUs</text>
+<rect x="26" y="124" width="88" height="44" rx="6" class="d-block"/>
+<text x="70" y="151" text-anchor="middle" class="d-text-inv d-mono d-small">8 GPUs</text>
+<rect x="126" y="124" width="88" height="44" rx="6" class="d-block"/>
+<text x="170" y="151" text-anchor="middle" class="d-text-inv d-mono d-small">8 GPUs</text>
+<rect x="26" y="178" width="88" height="44" rx="6" class="d-block"/>
+<text x="70" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">8 GPUs</text>
+<rect x="126" y="178" width="88" height="44" rx="6" class="d-block"/>
+<text x="170" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">8 GPUs</text>
+<rect x="26" y="232" width="88" height="44" rx="6" class="d-block"/>
+<text x="70" y="259" text-anchor="middle" class="d-text-inv d-mono d-small">8 GPUs</text>
+<rect x="126" y="232" width="88" height="44" rx="6" class="d-block"/>
+<text x="170" y="259" text-anchor="middle" class="d-text-inv d-mono d-small">8 GPUs</text>
+<rect x="350" y="30" width="436" height="266" rx="10" class="d-panel d-dashed d-outline"/>
+<text x="362" y="52" class="d-bold">Actors: 20 nodes, 160 GPUs</text>
+<rect x="362" y="70" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="399" y="97" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="446" y="70" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="483" y="97" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="530" y="70" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="567" y="97" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="614" y="70" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="651" y="97" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="698" y="70" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="735" y="97" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="362" y="124" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="399" y="151" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="446" y="124" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="483" y="151" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="530" y="124" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="567" y="151" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="614" y="124" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="651" y="151" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="698" y="124" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="735" y="151" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="362" y="178" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="399" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="446" y="178" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="483" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="530" y="178" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="567" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="614" y="178" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="651" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="698" y="178" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="735" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="362" y="232" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="399" y="259" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="446" y="232" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="483" y="259" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="530" y="232" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="567" y="259" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="614" y="232" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="651" y="259" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="698" y="232" width="74" height="44" rx="6" class="d-block-2"/>
+<text x="735" y="259" text-anchor="middle" class="d-text-inv d-mono d-small">vLLM TP 8</text>
+<rect x="238" y="88" width="98" height="44" rx="8" class="d-block-muted"/><text x="287" y="115" text-anchor="middle" class="d-text-inv d-small">Prompts queue</text>
+<rect x="238" y="188" width="98" height="44" rx="8" class="d-block-muted"/><text x="287" y="215" text-anchor="middle" class="d-text-inv d-small">Results queue</text>
+<path d="M224,110 L238,110" class="d-arrow" marker-end="url(#f4-arr)"/>
+<path d="M336,110 L350,110" class="d-arrow" marker-end="url(#f4-arr)"/>
+<path d="M350,210 L336,210" class="d-arrow" marker-end="url(#f4-arr)"/>
+<path d="M238,210 L224,210" class="d-arrow" marker-end="url(#f4-arr)"/>
+<text x="14" y="318" class="d-small">Table 49: 64 learner GPUs, 160 actor GPUs, max asynchrony 8, minimal sharding that fits the learner</text>
+<text x="14" y="336" class="d-small">Footnote 41: 1,000 s per step, 125 s of it training. Main text: learner waits 75% of the time</text>
+<text x="14" y="354" class="d-small d-text-light">Actors decode with continuous batching and take new weights in flight; one engine owns a whole node</text>
+</svg>
+  <figcaption><b>Figure 4.</b> The 32B Think RL layout: 64 learner GPUs and 160 actor GPUs, each actor one 8-GPU vLLM engine<a class="cite" href="#ref-1">1</a> (§4.4.3, Table 49, Figure 17a). The utilization notes are the two statements Section 6 reconciles: footnote 41 gives 1,000 s per step with 125 s of training, and the main text says the learner "spends 75% of the time waiting for data".</figcaption>
+</figure>
+
+<h3 id="rollout-system-table49">5.2 The four configurations</h3>
+<p>Table 5 sets Table 49's four RL runs side by side and adds what follows from them. All four use group size 8, temperature 1.0, \(\varepsilon_{\text{low}}=0.2\), \(\varepsilon_{\text{high}}=0.272\), a constant learning-rate schedule and a 2,048-token prompt limit<a class="cite" href="#ref-1">1</a> (Table 49).</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 5.</b> RL hyperparameters and allocation of the four Olmo 3 runs<a class="cite" href="#ref-1">1</a> (Table 49). Rows marked (derived) are the writer's arithmetic: completions are prompts times 8, and "prompts drawn" is steps times prompts per batch, a lower bound because filtered groups cost extra draws under active sampling.</caption>
+  <thead><tr><th>Row</th><th class="num">7B Think</th><th class="num">32B Think</th><th class="num">7B Instruct</th><th class="num">7B RL-Zero</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Training steps</td><td class="num">1,400</td><td class="num">750</td><td class="num">450</td><td class="num">2,000</td></tr>
+    <tr><td class="row">Unique prompts per batch</td><td class="num">64</td><td class="num">128</td><td class="num">64</td><td class="num">32</td></tr>
+    <tr><td class="row">Completions per step (derived)</td><td class="num">512</td><td class="num">1,024</td><td class="num">512</td><td class="num">256</td></tr>
+    <tr><td class="row">Completions in the run (derived)</td><td class="num">716,800</td><td class="num">768,000</td><td class="num">230,400</td><td class="num">512,000</td></tr>
+    <tr><td class="row">Prompt pool</td><td class="num">104,869</td><td class="num">104,869</td><td class="num">171,950</td><td class="num">13,314</td></tr>
+    <tr><td class="row">Prompts drawn, epochs (derived)</td><td class="num">89,600, 0.85</td><td class="num">96,000, 0.92</td><td class="num">28,800, 0.17</td><td class="num">64,000, 4.8</td></tr>
+    <tr><td class="row">Max response (tokens)</td><td class="num">32,768</td><td class="num">32,768</td><td class="num">8,192</td><td class="num">16,384</td></tr>
+    <tr><td class="row">Learning rate</td><td class="num">1.0e-6</td><td class="num">2.0e-6</td><td class="num">1.0e-6</td><td class="num">1.0e-6</td></tr>
+    <tr><td class="row">Minibatches</td><td class="num">1</td><td class="num">1</td><td class="num">4</td><td class="num">1</td></tr>
+    <tr><td class="row">Max asynchrony</td><td class="num">1</td><td class="num">8</td><td class="num">8</td><td class="num">8</td></tr>
+    <tr><td class="row">TIS cap</td><td class="num">none</td><td class="num">2.0</td><td class="num">none</td><td class="num">2.0</td></tr>
+    <tr><td class="row">Learner GPUs</td><td class="num">16</td><td class="num">64</td><td class="num">8</td><td class="num">8</td></tr>
+    <tr><td class="row">Actor GPUs</td><td class="num">56</td><td class="num">160</td><td class="num">56</td><td class="num">64</td></tr>
+    <tr><td class="row">GPUs per actor (TP)</td><td class="num">1</td><td class="num">8</td><td class="num">1</td><td class="num">1</td></tr>
+    <tr><td class="row">Actor to learner GPUs (derived)</td><td class="num">3.5</td><td class="num">2.5</td><td class="num">7</td><td class="num">8</td></tr>
+  </tbody>
+</table>
+
+<p>Three readings follow. The 7B Think column reads as the earlier infrastructure: asynchrony 1 and no truncated importance sampling, consistent with the report's description of the 15-day run<a class="cite" href="#ref-1">1</a> (§4.4.2); the repository's 7B Think "no pipeline" script has exactly this shape, with nine nodes, 16 learner GPUs, 56 single-GPU engines, <code>--async_steps 1</code> and <code>--inflight_updates false</code><a class="cite" href="#ref-7">7</a>. The learner's share of GPUs is 22% for 7B Think, 29% for 32B Think, 12.5% for 7B Instruct and 11% for RL-Zero (derived), so the 32B run is the least inference-heavy of the long-response runs, not the most. And a run is smaller than its step count suggests: 32B Think is 768,000 completions, about one seventh of R1-Zero's 5.3 million (Module 1, Section 3), and the extra 1,550 steps of Olmo 3.1 draw at least 294,400 prompts in total, 2.8 passes over the pool, which agrees with the report's "additional epochs" (derived).</p>
+
+<h3 id="rollout-system-engineering">5.3 What the engineering changes do to the engine</h3>
+<p>The report credits its improvements with a 4x speedup of RL training<a class="cite" href="#ref-1">1</a> (§2.2) and names four infrastructure changes in §4.4.3. Module 1 Section 6.1 tabulates the measured effect (Table 23: 881 to 2,949 tokens/s on one inference node, MFU 0.30% to 1.01%, MBU 12.90% to 43.21%). From the engine's side the four are as follows.</p>
+<ul>
+<li><strong>Continuous batching.</strong> A finished sequence's slot is backfilled at once, against static batching where "that 'slot' of the batch will remain empty until we get a new batch"<a class="cite" href="#ref-1">1</a> (§4.4.3, Figure 17). The waste is \((L_{\max}-\bar L)/L_{\max}\), which at a 32K cap and a 14,628-token mean is "up to 54%" (Module 1 Section 6 derives and draws it).</li>
+<li><strong>Active sampling.</strong> Prompts are resampled continuously into the queue to replace filtered groups, so the learner's batch never shrinks<a class="cite" href="#ref-1">1</a> (§4.4.3). Dynamic sampling in DAPO instead oversampled three times the batch in prompts<a class="cite" href="#ref-1">1</a>.</li>
+<li><strong>Inflight updates.</strong> Rather than finishing every sequence, dumping the KV cache and loading new weights, actors "immediately update the weights without pausing the engine, relying on the generation framework to be thread-safe, and continue generating, without invalidating the KV cache", for up to 4x throughput at the same resources and, per the report, "without hurting accuracy"<a class="cite" href="#ref-1">1</a> (§4.4.3). A sequence in flight therefore continues with cache entries computed under older weights, so one completion can span policy versions. The report shows no table for the accuracy claim in the passage I read.</li>
+<li><strong>Threading.</strong> Actors are decoupled and each syncs on its own schedule, and the CPU side was reworked. The first continuous-batching implementation "was slower than static batching before adding a prefetch thread to our actors that constantly refilled the inference queue"<a class="cite" href="#ref-1">1</a> (§4.4.3).</li>
+</ul>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>For someone who runs inference engines, the transferable parts are small. Give each engine independence, because a global barrier at the slowest sequence is the 54% waste. Keep the engine's input queue ahead of its decode loop, because the Python side, not the GPU, starved the first implementation. And decide what your engine does when weights change mid-sequence: Olmo 3 keeps the KV cache, the max asynchrony of 8 in three of the four runs is also the repository's default <code>async_steps</code><a class="cite" href="#ref-7">7</a> and the optimum ScaleRL found for its pipelined setting<a class="cite" href="#ref-8">8</a> (§3.1), and the report does not say it tuned the value. The 32B launch script snapshot starts its engines with <code>--vllm_enforce_eager</code>, which disables CUDA graphs and torch.compile<a class="cite" href="#ref-9">9</a>, the 7B Instruct and RL-Zero scripts enable prefix caching<a class="cite" href="#ref-9">9</a>, and the repository's README says these scripts are provenance snapshots published after the runs, "not a reproduction procedure"<a class="cite" href="#ref-7">7</a>.</p></aside>
+
+<h2 id="economics">6. Rollout economics, reproduced</h2>
+<p>Module 1 Section 5.1 builds the GPU-second ledger from footnote 41 and Module 14 uses its 125 s of 1,000 s. This section does something narrower: it checks the report's economic statements against each other and against its own day counts, because they do not all agree.</p>
+
+<h3 id="economics-idle">6.1 Two idle figures and two ratios</h3>
+<p>The main text says the 32B learner "spends 75% of the time waiting for data" and that "in terms of GPU utilization, we use approximately 5x as much for inference as for training"; for 7B, with 7 inference nodes and 2 learner nodes, it says about 14x<a class="cite" href="#ref-1">1</a> (§4.4.3). Footnote 41 describes "one of our main RL runs, which was broadly representative": each step averaged 1,000 s, of which 125 s was training, each batched generation took 1,000 s, generation and training overlap, and generation would have to speed up "by &gt; 8&times;" before training became the bottleneck<a class="cite" href="#ref-1">1</a>. The footnote's 8x is \(1{,}000/125\), so it is internally consistent. It implies the learner was busy 12.5% of the time and idle 87.5%, not 75%. I rely on footnote 41 for every derivation in this module, because it is the only statement that gives two durations and says the run is representative, and treat 75% as the report's rounded headline. A reconciliation is possible but is my guess: if the learner spent another 125 s per step on work that "training" excludes, such as weight broadcast, log-probability recomputation or waiting for the last actor, it would be busy 25% of the time. The report does not say.</p>
+
+<p>The two ratios are harder to square with the node counts. Treat the actors as always busy and the learner as busy a fraction \(b\) of the time. Then GPU use for inference over training is \(N_{\text{inf}}/(N_{\text{learn}}\,b)\) (derived). Table 6 evaluates it.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> Inference-to-training GPU use, \(N_{\text{inf}}/(N_{\text{learn}}\,b)\), for the node counts in §4.4.3, at three learner busy fractions \(b\) (derived). The report's stated ratios are in the last column<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Run</th><th class="num">Inference : learner nodes</th><th class="num">b = 50%</th><th class="num">b = 25%</th><th class="num">b = 12.5%</th><th class="num">Report states</th></tr></thead>
+  <tbody>
+    <tr><td class="row">32B Think</td><td class="num">20 : 8</td><td class="num" data-best>5.0</td><td class="num">10.0</td><td class="num">20.0</td><td class="num">about 5x</td></tr>
+    <tr><td class="row">7B Think</td><td class="num">7 : 2</td><td class="num">7.0</td><td class="num" data-best>14.0</td><td class="num">28.0</td><td class="num">about 14x</td></tr>
+  </tbody>
+</table>
+
+<p>The 7B figure of 14x follows from the 75% statement, \(b=25\%\). The 32B figure of 5x follows only if the learner was busy half the time, which contradicts the 75% the same sentence gives for 32B; at 75% idle the 20-to-8 node split gives 10x, and at footnote 41's 87.5% it gives 20x. The report does not show its accounting, so treat "about 5x" as unreproduced, and use the node counts and a stated duration instead of the ratio.</p>
+
+<h3 id="economics-which-run">6.2 Which run is footnote 41?</h3>
+<p>The footnote does not say whether its 1,000 s belongs to the 7B or the 32B run. The report's day counts give a check. Dividing wall-clock by the step counts of Table 49 and §4.1.2 gives an implied seconds per step for four runs (Figure 5b): about 15 days for 1,400 steps of 7B Think on the earlier infrastructure, 926 s per step; about 6 days for the same run on the newer one, assuming the same 1,400 steps, 370 s; about 5 days for the initial 32B run's 750 steps, 576 s; and 21 days for the 1,550 extra steps of Olmo 3.1, 1,171 s<a class="cite" href="#ref-1">1</a> (§2.4, §4.4.2, footnote 30). These include restarts and any lost time, and the 32B initial run lost at least a day, so subtracting that day gives 461 s.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f5t"><title id="f5t">Panel a: one Olmo 3 RL step of 1,000 seconds with 125 seconds of training. Panel b: seconds per step implied by the reported days and step counts for four runs, against the 1,000 second line of footnote 41</title>
+<text x="14" y="20" class="d-title">(a) One step in footnote 41, seconds</text>
+<line x1="110.0" y1="34" x2="110.0" y2="112" class="d-grid"/>
+<text x="110.0" y="128" text-anchor="middle" class="d-mono d-small">0</text>
+<line x1="272.5" y1="34" x2="272.5" y2="112" class="d-grid"/>
+<text x="272.5" y="128" text-anchor="middle" class="d-mono d-small">250</text>
+<line x1="435.0" y1="34" x2="435.0" y2="112" class="d-grid"/>
+<text x="435.0" y="128" text-anchor="middle" class="d-mono d-small">500</text>
+<line x1="597.5" y1="34" x2="597.5" y2="112" class="d-grid"/>
+<text x="597.5" y="128" text-anchor="middle" class="d-mono d-small">750</text>
+<line x1="760.0" y1="34" x2="760.0" y2="112" class="d-grid"/>
+<text x="760.0" y="128" text-anchor="middle" class="d-mono d-small">1000</text>
+<text x="104" y="58" text-anchor="end">generation</text>
+<rect x="110.0" y="42" width="650.0" height="24" rx="3" class="d-block-accent"/>
+<text x="435.0" y="59" text-anchor="middle" class="d-text-inv d-bold">1,000 s, all actors busy</text>
+<text x="104" y="96" text-anchor="end">training</text>
+<rect x="110.0" y="80" width="81.25" height="24" rx="3" class="d-block"/>
+<rect x="191.2" y="80" width="568.8" height="24" rx="3" class="d-outline d-dashed"/>
+<text x="474.0" y="97" text-anchor="middle" class="d-text-light">learner idle, 875 s (87.5%)</text>
+<text x="197.2" y="76" class="d-mono d-small">125 s</text>
+<text x="14" y="146" class="d-small d-text-light">generation must get 8x faster (1,000 s to 125 s) before training sets the pace</text>
+<text x="14" y="184" class="d-title">(b) Implied seconds per step from the reported days and steps (derived)</text>
+<text x="242" y="213" text-anchor="end">7B Think, earlier infra</text>
+<text x="242" y="227" text-anchor="end" class="d-small d-text-light">15 days, 1,400 steps</text>
+<rect x="250" y="200" width="370.3" height="30" class="d-fill-blue"/>
+<text x="626.3" y="219" class="d-mono d-small">926 s</text>
+<text x="242" y="253" text-anchor="end">7B Think, newer infra</text>
+<text x="242" y="267" text-anchor="end" class="d-small d-text-light">6 days, 1,400 steps</text>
+<rect x="250" y="240" width="148.1" height="30" class="d-fill-blue"/>
+<text x="404.1" y="259" class="d-mono d-small">370 s</text>
+<text x="242" y="293" text-anchor="end">32B Think, initial</text>
+<text x="242" y="307" text-anchor="end" class="d-small d-text-light">5 days, 750 steps</text>
+<rect x="250" y="280" width="230.4" height="30" class="d-fill-orange"/>
+<text x="486.4" y="299" class="d-mono d-small">576 s</text>
+<text x="242" y="333" text-anchor="end">32B Think, 3.1 extension</text>
+<text x="242" y="347" text-anchor="end" class="d-small d-text-light">21 days, 1,550 steps</text>
+<rect x="250" y="320" width="468.2" height="30" class="d-fill-orange"/>
+<text x="724.2" y="339" class="d-mono d-small">1,171 s</text>
+<line x1="650.0" y1="192" x2="650.0" y2="364" class="d-line d-stroke-red d-dashed"/>
+<text x="644.0" y="378" text-anchor="end" class="d-small">footnote 41: 1,000 s</text>
+</svg>
+  <figcaption><b>Figure 5.</b> (a) The step of footnote 41 drawn to scale: generation fills the 1,000 s and the learner's 125 s is 12.5% of it<a class="cite" href="#ref-1">1</a> (footnote 41). (b) Seconds per step implied by the reported days and step counts<a class="cite" href="#ref-1">1</a> (§2.4, §4.4.2, Table 49, footnote 30); derived, including restarts. The step counts for the 3.1 extension are 2,300 minus 750.</figcaption>
+</figure>
+
+<p>Footnote 41's 1,000 s sits between the 7B earlier-infrastructure run (926 s) and the Olmo 3.1 extension (1,171 s), and above the initial 32B run (at most 576 s) and the newer 7B run (370 s). That is consistent with either the 7B run before the infrastructure rewrite or the 32B continuation, and it excludes the two faster runs only if the footnote's step average describes the whole run. A second check ties the 32B reading to the throughput the footnote implies. One 32B step is 1,024 completions at the 14,628-token mean, 14,979,072 tokens (derived; the report ties the mean to its 32K-cap discussion, not to a run). Over 160 actor GPUs that is 93.6 tokens/s per GPU at 1,000 s and 80.0 at the extension's 1,171 s, within 15% of each other. So the footnote's numbers are plausible for the 32B layout, and nothing in the report excludes the 7B reading.</p>
+
+<h3 id="economics-speedup">6.3 The speedup claims, three ways</h3>
+<p>The report states the infrastructure payoff three ways. Table 23 measures 881 to 2,949 tokens/s on one inference node, 3.35x (derived)<a class="cite" href="#ref-1">1</a>. Footnote 43 says an initial checkpoint (nine nodes matches the 7B layout) "took 14 straight days of training across 9 nodes to achieve 1 epoch" and, with continuous batching and inflight updates, "1 epoch on 5 nodes in 7 days", which is 126 against 35 node-days, 3.6x (derived)<a class="cite" href="#ref-1">1</a>. The text says "two times faster training on half as many GPUs", which is 4x in GPU-time, and gives the 7B run as about 15 days before and 6 days after (§4.4.2). With footnote 43's five nodes for the 6-day run that is 135 against 30 node-days, 4.5x (derived). The first two agree within 8%, and the range 3.35x to 4.5x brackets the headline 4x. The "up to 4x" for inflight updates alone is a different claim, an upper bound on one change, and the measured step from adding it in Table 23 is 2.17x (Module 1 Section 6.1).</p>
+
+<h2 id="instruct-rl">7. The same loop from a different start: Instruct</h2>
+<p>Olmo 3 Instruct runs the same OlmoRL code with four changes. It trains on a different pool, 171,950 prompts with easier math and code sets and no offline difficulty filtering, because the model is aimed at general instruction following and not at hard reasoning<a class="cite" href="#ref-1">1</a> (§5.4, Table 20). Responses are capped at 8,192 tokens for 7B and 16,384 for 32B, and the report says it tried both lengths at both sizes and chose them after seeing "undesirable behaviors" in an internal demo with 7B at 16K and 32B at 8K<a class="cite" href="#ref-1">1</a> (§5.4.1, footnote 57). It takes four minibatches per rollout (Table 49). And it starts from a length-controlled DPO model, so the RL stage cannot lean on long chains<a class="cite" href="#ref-1">1</a> (§5.5). The checkpoint is chosen by average score, response length and a qualitative "vibe test", with ties broken toward benchmarks that do not improve with test-time compute<a class="cite" href="#ref-1">1</a> (§5.4.1).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 7.</b> What RL added on top of DPO, Think against Instruct, in benchmark points (derived)<a class="cite" href="#ref-1">1</a> (Tables 14, 15, 25, 26). Think 32B is RL 3.0; Instruct 32B is Olmo 3.1 Instruct.</caption>
+  <thead><tr><th>Benchmark</th><th class="num">Think 7B</th><th class="num">Think 32B</th><th class="num">Instruct 7B</th><th class="num">Instruct 32B</th></tr></thead>
+  <tbody>
+    <tr><td class="row">AIME 2024</td><td class="num">&#8722;3.0</td><td class="num">+0.8</td><td class="num">+20.8</td><td class="num" data-best>+32.6</td></tr>
+    <tr><td class="row">AIME 2025</td><td class="num">+1.9</td><td class="num">+1.8</td><td class="num">+12.1</td><td class="num" data-best>+34.6</td></tr>
+    <tr><td class="row">MATH</td><td class="num">+2.7</td><td class="num">+0.2</td><td class="num">+7.7</td><td class="num">+6.8</td></tr>
+    <tr><td class="row">IFEval</td><td class="num" data-best>+12.3</td><td class="num">+8.4</td><td class="num">+3.6</td><td class="num">+1.5</td></tr>
+    <tr><td class="row">IFBench</td><td class="num" data-best>+13.3</td><td class="num" data-best>+13.2</td><td class="num">+3.0</td><td class="num">+3.4</td></tr>
+    <tr><td class="row">AlpacaEval 2 LC</td><td class="num">+1.5</td><td class="num">&#8722;4.4</td><td class="num">&#8722;2.4</td><td class="num" data-worst>&#8722;9.9</td></tr>
+  </tbody>
+</table>
+
+<p>The pattern inverts. Think's RL stage barely moves AIME and moves instruction following by 8 to 13 points; Instruct's RL stage moves AIME 2024 by 21 and 33 points at 7B and 32B and instruction following by 1.5 to 3.6 (derived). The reason is the start. The Instruct DPO checkpoint is a short-answer model at 23.5 AIME 2024 points (7B) and 35.2 (32B), with a lot of headroom under an 8K or 16K cap, while the Think DPO checkpoint already sits at 74.6 and 76.0. RL moves a model toward whatever its verifiers reward and its start leaves room for (my reading). The report's own explanation of why the length-controlled start works at 7B is a conjecture: with a fixed 8K window, "a shorter model may be 'more intelligent per token'"; it also reports that RL "progresses more reliably" from the length-controlled policy than from a higher-scoring uncorrected one, which "tends to show earlier signs of instability or degradation"<a class="cite" href="#ref-1">1</a> (§5.5). Module 23 covers length control as a trained target. The 32B Instruct AlpacaEval fall of 9.9 points is the largest drop in either family, and the report's text I read does not comment on it.</p>
+
+<h2 id="rl-zero">8. RL-Zero: a decontaminated testbed</h2>
+<p>RL-Zero exists because of a measurement problem. The report observes that the leading open RLVR benchmarks and algorithms train on open-weight models that do not reveal their pretraining or mid-training data, which "limits the ability for the community to study the role of pretraining data on RLVR performance" and can leave mid-training data containing the evaluation set, "which makes spurious rewards as effective as true rewards"<a class="cite" href="#ref-1">1</a> (§1, §6). The cited demonstration is Spurious Rewards: random rewards lifted MATH-500 by 21.4 points on Qwen2.5-Math-7B against 29.1 for ground truth, and the effect was model-dependent, with minimal gains or degradation on the other families tested<a class="cite" href="#ref-10">10</a>. Module 20 holds that debate. RL-Zero is Olmo 3's answer in construction terms: RL straight from a base whose pretraining and mid-training data are public, on prompts decontaminated against them (Figure 6).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f6t"><title id="f6t">Two RLVR benchmark pipelines: a typical open-weight base with undisclosed mid-training data and possible overlap with the evaluation set, against Olmo 3 RL-Zero from a fully open base with decontaminated data, and the five uses the report makes of RL-Zero</title>
+<defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<text x="14" y="18" class="d-bold">Typical open RLVR benchmark</text>
+<rect x="14" y="30" width="190" height="56" rx="8" class="d-block-muted"/>
+<text x="109.0" y="53" text-anchor="middle" class="d-text-inv d-bold">Open-weight base</text>
+<text x="109.0" y="73" text-anchor="middle" class="d-text-inv d-mono d-small">mid-training data hidden</text>
+<rect x="260" y="30" width="190" height="56" rx="8" class="d-block"/>
+<text x="355.0" y="63" text-anchor="middle" class="d-text-inv d-bold">RLVR, public data</text>
+<rect x="506" y="30" width="150" height="56" rx="8" class="d-block-2"/>
+<text x="581.0" y="63" text-anchor="middle" class="d-text-inv d-bold">AIME, MATH</text>
+<path d="M204,58 L260,58" class="d-arrow" marker-end="url(#f6-arr)"/>
+<path d="M450,58 L506,58" class="d-arrow" marker-end="url(#f6-arr)"/>
+<path d="M109,86 L109,108 L581,108 L581,88" class="d-arrow-active d-dashed" fill="none" marker-end="url(#f6-arr)"/>
+<text x="345" y="124" text-anchor="middle" class="d-small">possible overlap with the evaluation data</text>
+<text x="14" y="152" class="d-bold">Olmo 3 RL-Zero</text>
+<rect x="14" y="162" width="132" height="56" rx="8" class="d-block-muted"/>
+<text x="80.0" y="185" text-anchor="middle" class="d-text-inv d-bold">Dolma 3 mixes</text>
+<text x="80.0" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">pretrain + midtrain</text>
+<rect x="166" y="162" width="132" height="56" rx="8" class="d-block-muted"/>
+<text x="232.0" y="185" text-anchor="middle" class="d-text-inv d-bold">Olmo 3 Base</text>
+<text x="232.0" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">open weights</text>
+<rect x="318" y="162" width="132" height="56" rx="8" class="d-block"/>
+<text x="384.0" y="185" text-anchor="middle" class="d-text-inv d-bold">Dolci RL-Zero</text>
+<text x="384.0" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">13,314 prompts</text>
+<rect x="470" y="162" width="132" height="56" rx="8" class="d-block-accent"/>
+<text x="536.0" y="185" text-anchor="middle" class="d-text-inv d-bold">OlmoRL</text>
+<text x="536.0" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">32 x 8 per step</text>
+<rect x="622" y="162" width="132" height="56" rx="8" class="d-block-2"/>
+<text x="688.0" y="185" text-anchor="middle" class="d-text-inv d-bold">AIME 2024, 2025</text>
+<text x="688.0" y="205" text-anchor="middle" class="d-text-inv d-mono d-small">decontaminated</text>
+<path d="M146,190 L166,190" class="d-arrow" marker-end="url(#f6-arr)"/>
+<path d="M298,190 L318,190" class="d-arrow" marker-end="url(#f6-arr)"/>
+<path d="M450,190 L470,190" class="d-arrow" marker-end="url(#f6-arr)"/>
+<path d="M602,190 L622,190" class="d-arrow" marker-end="url(#f6-arr)"/>
+<text x="14" y="252" class="d-bold">Uses the report makes of it</text>
+<rect x="14" y="262" width="150" height="34" rx="8" class="d-surface d-outline"/>
+<text x="89" y="283" text-anchor="middle" class="d-small">Fig. 27: random reward</text>
+<rect x="168" y="262" width="150" height="34" rx="8" class="d-surface d-outline"/>
+<text x="243" y="283" text-anchor="middle" class="d-small">Fig. 25: midtraining mix</text>
+<rect x="322" y="262" width="150" height="34" rx="8" class="d-surface d-outline"/>
+<text x="397" y="283" text-anchor="middle" class="d-small">Fig. 26: active sampling</text>
+<rect x="476" y="262" width="150" height="34" rx="8" class="d-surface d-outline"/>
+<text x="551" y="283" text-anchor="middle" class="d-small">Fig. 38: vs DAPO</text>
+<rect x="630" y="262" width="150" height="34" rx="8" class="d-surface d-outline"/>
+<text x="705" y="283" text-anchor="middle" class="d-small">Fig. 24: domain mix</text>
+</svg>
+  <figcaption><b>Figure 6.</b> The RL-Zero design against a typical open-weight RLVR benchmark, and the five uses the report makes of it<a class="cite" href="#ref-1">1</a> (§6, Figures 24 to 27 and 38). Prompt count and sampling (32 prompts by 8 samples per step) are from Table 49.</figcaption>
+</figure>
+
+<h3 id="rl-zero-construction">8.1 Construction</h3>
+<p>The math set is 13.3K prompts from DAPO Math, Klear-Reasoner Math, Open-Reasoner-Zero and OMEGA. DAPO is deduplicated and stripped of non-English items; the three larger sets are grouped by semantic clustering and one representative question per cluster is kept, in addition to DAPO; everything is decontaminated against pretraining and evaluation data; and prompts the final base model solves 8 of 8 are dropped<a class="cite" href="#ref-1">1</a> (§6.1). The decontamination procedure is the one inherited from Tulu 3: n-gram matching with 8-grams and an overlap threshold of 0.5, with heuristics to avoid false positives on common phrases and on short math tokens<a class="cite" href="#ref-1">1</a> (§4.2.1)<a class="cite" href="#ref-2">2</a> (Tulu 3 §3.2). Code, instruction-following and general prompts are subsampled from Dolci Think RL. Prompts are simple zero-shot templates, because "simple" templates "greatly outperform standard post-trained templates (e.g., &lt;think&gt;&lt;/think&gt;)" when the base was mid-trained without special formatting; the evaluation prompts are cleaned of formatting such as <code>\boxed{}</code> to match<a class="cite" href="#ref-1">1</a> (§6.1). The algorithm is OlmoRL with a 16K response cap, evaluated at a 32K cap and temperature 1.0 to keep diversity for pass@k<a class="cite" href="#ref-1">1</a> (§6.1).</p>
+
+<h3 id="rl-zero-uses">8.2 What the report uses it for</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 8.</b> The five uses of RL-Zero and the strength of each reading<a class="cite" href="#ref-1">1</a> (§6.2). Values marked "by eye" are read from the plotted curves, since the text gives no numbers for them.</caption>
+  <thead><tr><th>Use</th><th>Result</th><th>Limit on the reading</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Learning curve (Fig. 24)</td><td>AIME 2024 pass@1 rises from about 20 to about 52 and AIME 2025 to about 39 (by eye); pass@32 shows a "decent improvement"</td><td>The pass@32 result is in a figure only, and its curve is noisy, about 60 rising to about 80 (by eye)</td></tr>
+    <tr><td class="row">Against DAPO (Fig. 38)</td><td>Similar AIME 2024 scores to DAPO's Qwen2.5-32B; the text says DAPO trains "an order of magnitude more steps"</td><td>The figure's axes read about 2.5 times on steps and 5 times on GPU hours (by eye; Module 15 reads the same); different base, size and template; DAPO's GPU hours are "taken from the DAPO reproduction on verl"</td></tr>
+    <tr><td class="row">Midtraining testbed (Fig. 25)</td><td>A base with an "insufficient" reasoning mix keeps a flat response length of about 800 tokens; the other grows to about 1,800 to 2,000 (by eye)</td><td>Two early bases, one run each, math reward only</td></tr>
+    <tr><td class="row">Algorithm ablation (Fig. 26)</td><td>Active sampling holds the non-zero-advantage share at 1.0 and "greatly reduced" loss variance</td><td>One domain, one run; the only ablation of the seven changes</td></tr>
+    <tr><td class="row">Decontamination check (Fig. 27)</td><td>Random binary rewards leave ten benchmarks flat or lower</td><td>A negative control; Module 20 Section 6 reads what it does and does not exclude</td></tr>
+  </tbody>
+</table>
+
+<p>Two further observations belong with the table. The mixed run, in which math, code, instruction following and general chat train together, improves every domain but each less than its single-domain run, which the report offers as a harder benchmark for multi-objective RL<a class="cite" href="#ref-1">1</a> (§6.2, Figure 24). And the comparison with DAPO is the report's argument that RL-Zero is cheaper to experiment on, a claim about experiment cost that the authors support with a curve rather than a controlled comparison.</p>
+
+<h3 id="rl-zero-3-1">8.3 RL-Zero 3.0 to 3.1: masking truncated completions</h3>
+<p>The later Olmo 3.1 RL-Zero Math improved on the first release through two changes the appendix names: a 16K completion length instead of 12K, and not masking truncated sequences, "one of the components of DAPO", plus minor loss fixes<a class="cite" href="#ref-1">1</a> (§A.6.4, Figure 39). Masking looked attractive because it left fewer completions to train on and sped up the trainer. The authors "ultimately found that variations in batch size caused by some examples masked out reduced stability" and that without training on overlong negative sequences "completion lengths were higher, on average", so "any efficiency gains in training speed from masking were outweighed by slowdowns from generating longer sequence lengths"<a class="cite" href="#ref-1">1</a> (§A.6.4). The new setup "improves performance more slowly to begin with but outperforms as training goes longer, plateauing at a higher score ~50%" (Figure 39). That is a datum against one of DAPO's four techniques, whose ablation ladder gains 6 AIME points from overlong filtering<a class="cite" href="#ref-5">5</a> (Table 1), in a setting where the cost of generating longer samples is visible. The launch scripts keep <code>--mask_truncated_completions False</code>, and the later RL-Zero Math script adds <code>--no_resampling_pass_rate 0.875</code>, which the report text I read does not describe<a class="cite" href="#ref-7">7</a>.</p>
+
+<h2 id="ledger">9. Reading the report critically: discrepancies and gaps</h2>
+<p>A report this detailed is checkable, and Table 9 lists where the check fails or the evidence is absent. The ledger is the reason the sections above separate what the report states from what is derived.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 9.</b> Internal inconsistencies and gaps found while reading Olmo 3 against itself and against its repository<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-7">7</a>. "Used" says which figure this module relies on.</caption>
+  <thead><tr><th>Item</th><th>What the sources say</th><th>Used</th><th>Section</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Learner idle share</td><td>75% in §4.4.3; 87.5% implied by footnote 41's 125 s of 1,000 s</td><td>87.5% for derivations</td><td>6.1</td></tr>
+    <tr><td class="row">"About 5x" inference to training, 32B</td><td>20 inference and 8 learner nodes at 25% busy give 10x; the 7B "14x" does follow</td><td>node counts and durations, not the ratio</td><td>6.1</td></tr>
+    <tr><td class="row">Model size of footnote 41</td><td>not stated; day counts fit the 7B earlier-infrastructure run (926 s) or the 32B extension (1,171 s)</td><td>both, undecided</td><td>6.2</td></tr>
+    <tr><td class="row">IFEval and Table 24</td><td>32B Think SFT and DPO are 83.7 and 82.3 in Table 24 and 83.9 and 80.6 in Table 14; 7B Instruct RL is 85.8 against 85.6 in Table 26</td><td>Tables 14, 15, 25, 26</td><td>2, 7</td></tr>
+    <tr><td class="row">RL-Zero domains</td><td>"four benchmarking domains" in §2.2; "five" in §6 (math, code, IF, general, mix)</td><td>five variants</td><td>1</td></tr>
+    <tr><td class="row">RL-Zero steps</td><td>2,000 in Table 49; the math curves in Figures 24 and 38 run to about 2,800 (by eye)</td><td>Table 49 for derived sizes</td><td>5.2, 8</td></tr>
+    <tr><td class="row">Instruction-following reward</td><td>binary in the text, a fraction (0.75) in Figure 16; reward axes reach about 10 with no stated scale</td><td>neither; scale unknown</td><td>3.2</td></tr>
+    <tr><td class="row">Number of runs</td><td>Table 15 is a mean of three runs, Table 22 one run, Table 14's caption silent</td><td>32B deltas treated as single-run</td><td>2</td></tr>
+    <tr><td class="row">DAPO comparison</td><td>text: DAPO trains "an order of magnitude more steps"; Figure 38 reads about 2.5x on steps and 5x on GPU hours (by eye)</td><td>the figure</td><td>8.2</td></tr>
+    <tr><td class="row">Ablations of the seven changes</td><td>one (active sampling); the rest adopted from DAPO, Dr. GRPO and Yao et al.</td><td>stated as inherited</td><td>3.1</td></tr>
+    <tr><td class="row">Launch scripts against Table 49</td><td>7B Think (no pipeline) and 7B Instruct scripts match its learner and actor GPUs; the 32B script (12 learner nodes, 6 TP-8 engines, 64 prompts per step) and the RL-Zero Math script (16 learner GPUs, 56 engines) do not; the README says the scripts are later snapshots</td><td>Table 49 as the record</td><td>5.2, 5.3</td></tr>
+  </tbody>
+</table>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Olmo 3 makes four choices that other strong reports make differently, and its own evidence settles none of them: it has no KL, normalization or mismatch ablation, and its RL-Zero capability reading rests on a figure. Each dispute below is stated with the evidence that exists, and the cheapest experiment the released code and data would allow.</p>
+
+<h3 id="disagree-kl">Keep or remove the KL term?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>Remove it</h4>
+    <p class="who">Olmo 3<a class="cite" href="#ref-1">1</a> (§4.4.1); DAPO<a class="cite" href="#ref-5">5</a> (§2.3)</p>
+    <p>For long chains of thought "the model distribution can diverge significantly from the initial model", so the restriction "is not necessary" (DAPO). Olmo says removal "does not lead to over-optimization or destabilized training".</p>
+    <ul class="pros"><li>No reference model in memory: TRL's default coefficient is 0.0 and the reference is then not loaded<a class="cite" href="#ref-11">11</a>.</li><li>Olmo's 7B Think reward curves "steadily" grow with no KL term, "suggesting smooth training" (Figure 18).</li></ul>
+    <ul class="cons"><li>No with-and-without comparison in the report. AlpacaEval fell 78.6, 74.2, 69.1 and PopQA 37.0, 31.9, 30.9 across the RL stages (Table 14), which fits drift but does not show it.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Keep a small one, with resets</h4>
+    <p class="who">R1<a class="cite" href="#ref-12">12</a> (§2.1); ProRL<a class="cite" href="#ref-13">13</a> (§2.2); Tulu 3<a class="cite" href="#ref-2">2</a></p>
+    <p>R1-Zero used a coefficient of 0.001 and replaced the reference with the latest policy every 400 steps. ProRL keeps KL with periodic resets and says advice to drop it "often applies to base models prior to any supervised fine-tuning".</p>
+    <ul class="pros"><li>ProRL reports KL as a more stable entropy control than DAPO-style tricks from a distilled start.</li></ul>
+    <ul class="cons"><li>ProRL's evidence is a 1.5B distilled model, and the reference costs memory and a forward pass.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Module 13 Section 4 holds the ledger and the argument about ProRL's boundary; Olmo 3 Think starts RL from a DPO checkpoint and drops KL, one unmatched run against ProRL's distilled 1.5B model. What Olmo adds is a cheap test and a trap. The test: the 7B Think DPO checkpoint, data and scripts are released and a run takes about 6 days on the newer infrastructure<a class="cite" href="#ref-1">1</a> (§4.4.2), so a zero-KL arm against a 0.001-with-reset arm is within reach. The trap: the trainer's default coefficient is 0.05 (Section 3.3), so "no KL" needs an explicit flag, and §2.4 mentions a day lost to "stability issues" without saying whether they were training or cluster issues.</p></div>
+
+<h3 id="disagree-norm">How should loss and advantage be normalized?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>Batch-token loss, no std</h4>
+    <p class="who">Olmo 3<a class="cite" href="#ref-1">1</a>; DAPO's token-level loss<a class="cite" href="#ref-5">5</a> (§3.3)</p>
+    <p>Dividing by all tokens in the batch gives every token equal weight, and dropping the std removes the difficulty weighting.</p>
+    <ul class="pros"><li>Removes both per-response length weighting and difficulty weighting; TRL's default loss is the DAPO form<a class="cite" href="#ref-11">11</a>.</li></ul>
+    <ul class="cons"><li>The reward scale then sets the step size (Section 3.2), and no ablation is shown.</li></ul>
+  </article>
+  <article class="position">
+    <h4>A constant normalizer</h4>
+    <p class="who">Dr. GRPO<a class="cite" href="#ref-4">4</a> (§3.2); TRL's <code>dr_grpo</code> option<a class="cite" href="#ref-11">11</a></p>
+    <p>Divide by a constant such as the maximum length and drop the std; it reports 43.3% on AIME 2024 with a 7B base and a minimalist recipe.</p>
+    <ul class="pros"><li>No per-response weight at all; the simplest form.</li></ul>
+    <ul class="cons"><li>The result is on Qwen2.5-Math-7B, a base whose behavior under random rewards is itself disputed<a class="cite" href="#ref-10">10</a>.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Both remove the two biases Dr. GRPO names, and ScaleRL's study of loss aggregation and normalization finds that such details "primarily modulate compute efficiency without materially shifting the asymptote"<a class="cite" href="#ref-8">8</a>. Olmo's choice is therefore defensible and not a place to spend an ablation budget; the ranking between the two forms is not established, and Module 11 Section 7 holds the controlled comparisons. RL-Zero Math is the cheap venue for a matched run.</p></div>
+
+<h3 id="disagree-mismatch">Fix the rollout and trainer mismatch in the loss or in the numerics?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>Reweight the loss</h4>
+    <p class="who">Olmo 3's truncated importance sampling, cap 2.0<a class="cite" href="#ref-1">1</a> (§4.4.1)</p>
+    <p>Multiply the loss by the trainer-over-vLLM probability ratio, truncated, following Yao et al.</p>
+    <ul class="pros"><li>No change to either engine; in Olmo's one-minibatch setup it costs no extra learner pass (Section 3.3).</li></ul>
+    <ul class="cons"><li>Not ablated; the 7B Think run without it and its repeat with it reached "similar performance" while many other things changed.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Remove the numerical gap</h4>
+    <p class="who">Qi et al., FP16<a class="cite" href="#ref-6">6</a> (§1)</p>
+    <p>BF16's rounding error is the root cause. Truncated importance sampling is "insufficient" because of its biased gradient, costs about 25% extra, and leaves a deployment gap.</p>
+    <ul class="pros"><li>One change to precision, no extra pass.</li></ul>
+    <ul class="cons"><li>Needs both engines in FP16, which the Olmo report does not test.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Olmo's configuration weakens the cost argument against reweighting, because the weight is free in learner FLOPs, but not the bias or deployment-gap arguments, which are not about cost. Olmo's evidence cannot separate the two positions. Module 14 holds the full dispute and the other fixes.</p></div>
+
+<h3 id="disagree-capability">Does RLVR add capability, or sharpen?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>It sharpens what the base can already do</h4>
+    <p class="who">Yue et al.<a class="cite" href="#ref-14">14</a>; Spurious Rewards<a class="cite" href="#ref-10">10</a></p>
+    <p>RLVR models win at small k and base models win at large k; RLVR paths already lie inside the base's sampling distribution.</p>
+    <ul class="pros"><li>Several families and algorithms point the same way; coverage at pass@256 falls as pass@1 rises.</li></ul>
+    <ul class="cons"><li>Shorter runs on contaminated or unknown bases, which RL-Zero was built to avoid.</li></ul>
+  </article>
+  <article class="position">
+    <h4>On a clean base RL pushes past the start</h4>
+    <p class="who">Olmo 3 RL-Zero<a class="cite" href="#ref-1">1</a> (§6.2)</p>
+    <p>The authors see "a decent improvement in pass@32" and conclude the run "maintains diversity and RLVR pushes the model beyond its initial capabilities".</p>
+    <ul class="pros"><li>Open, decontaminated base; a random-reward control stays flat.</li></ul>
+    <ul class="cons"><li>The result is in a figure, at k = 32, not at the large k where Yue et al. find the crossover.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The two do not conflict as stated: pass@32 improvement and pass@256 coverage loss can both occur. The right platform to settle it is the one Olmo built: pass@k to k = 256 or more at every checkpoint of an RL-Zero run, with a random-reward arm. Module 20 has the full ledger.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The report stopped Olmo 3.1 Think at 2,300 steps "due to compute limitations" with performance "not yet fully saturated"<a class="cite" href="#ref-1">1</a> (footnote 30), so the extended run is the only measurement past 750 steps and has no repeat. The open-instruct <code>main</code> branch has moved past the report: it offers a CISPO loss, a unified mismatch correction with clamp and mask bounds including a sequence-level mask its docstring calls "DeepSeek-V3.2 style", and an RL-Zero Math script that is the later 3.1 recipe<a class="cite" href="#ref-7">7</a>. Expect the scripts to diverge further from the report; treat Table 49, not the repository, as the record of the published runs.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Team Olmo (Ettinger, A., Bertsch, A., et al.; Allen Institute for AI). <em>Olmo 3</em>. arXiv:2512.13961v2 (14 Apr 2026; v1 15 Dec 2025). <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §2.2-2.4 (pipeline, wall-clock), §4.1-4.5 (Tables 14, 15, 20-24, Figures 16-21), §4.4.1 (Equations 1-2, the seven changes), §4.4.2 (data, filters), §4.4.3 (infrastructure, footnotes 40, 41, 43), §5.4-5.5 (Instruct, Tables 24-26), §6 and A.6.4 (RL-Zero, Figures 24-27, 37-39), Table 49. Page images of the tables and figures were checked against the extracted text.</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S., et al. <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv:2411.15124v5 (14 Apr 2025). <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the prompt decontamination procedure (§3.2: 8-gram matching, more than 50% of test tokens matched) and PPO-based RLVR with a KL coefficient of 0.05 (8B) and 0.07 (70B) (Table 21 caption).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R., et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv:2402.03300v3 (27 Apr 2024). <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the GRPO definition (group baseline, no critic, KL in the loss; §4.1.1).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Liu, Z., Chen, C., Li, W., Qi, P., Pang, T., Du, C., Lee, W. S., Lin, M. <em>Understanding R1-Zero-Like Training: A Critical Perspective</em>. arXiv:2503.20783v2 (6 Oct 2025; COLM 2025). <a href="https://arxiv.org/pdf/2503.20783v2">https://arxiv.org/pdf/2503.20783v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the length bias and difficulty bias of GRPO (§3.1), the constant-normalizer fix and the 43.3% AIME 2024 result (§3.2).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Yu, Q., Zhang, Z., Zhu, R., Yuan, Y., et al. (ByteDance Seed, Tsinghua AIR). <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv:2503.14476v2 (20 May 2025). <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the ablation ladder (Table 1), clip-higher 0.28 (§3.1), dynamic sampling (§3.2), token-level loss (§3.3), KL removal (§2.3).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Qi, P., Liu, Z., Zhou, X., Pang, T., Du, C., Lee, W. S., Lin, M. <em>Defeating the Training-Inference Mismatch via FP16</em>. arXiv:2510.26788v1 (30 Oct 2025). <a href="https://arxiv.org/pdf/2510.26788v1">https://arxiv.org/pdf/2510.26788v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the description of truncated importance sampling as a second-hand source for Yao et al. (whose post renders only "Notion" to a fetch and was not read), its bias and roughly 25% extra cost, and the BF16 rounding argument (§1).</span></li>
+  <li id="ref-7"><span class="ref-type">repo</span>Allen Institute for AI. <em>open-instruct</em> (main branch, fetched 2026-10-27; post-dates the Olmo 3 report). <a href="https://github.com/allenai/open-instruct">https://github.com/allenai/open-instruct</a>; raw files fetched: <a href="https://raw.githubusercontent.com/allenai/open-instruct/main/open_instruct/grpo_utils.py">open_instruct/grpo_utils.py</a>, <a href="https://raw.githubusercontent.com/allenai/open-instruct/main/open_instruct/grpo_fast.py">grpo_fast.py</a>, <a href="https://raw.githubusercontent.com/allenai/open-instruct/main/open_instruct/data_loader.py">data_loader.py</a>, <a href="https://raw.githubusercontent.com/allenai/open-instruct/main/scripts/train/olmo3/README.md">scripts/train/olmo3/README.md</a>, <a href="https://raw.githubusercontent.com/allenai/open-instruct/main/scripts/train/olmo3/32b_think_rl.sh">32b_think_rl.sh</a>, <a href="https://raw.githubusercontent.com/allenai/open-instruct/main/scripts/train/olmo3/7b_think_rl_no_pipeline.sh">7b_think_rl_no_pipeline.sh</a>, <a href="https://raw.githubusercontent.com/allenai/open-instruct/main/scripts/train/olmo3/7b_rlzero_math.sh">7b_rlzero_math.sh</a>, <a href="https://raw.githubusercontent.com/allenai/open-instruct/main/scripts/train/olmo3/7b_instruct_rl.sh">7b_instruct_rl.sh</a>. Accessed 2026-10-27. <span class="ref-use">Used for: <code>resolve_old_logprob</code>, default clip and mismatch bounds, default KL coefficient, <code>async_steps</code> default, active-sampling loop, launch-script settings and the README's provenance caveat. Source added beyond the researcher's map; the scripts are snapshots, not the run configurations.</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Khatri, D., Madaan, L., Tiwari, R., Bansal, R., et al. <em>The Art of Scaling Reinforcement Learning Compute for LLMs</em>. arXiv:2510.13786v1 (15 Oct 2025). <a href="https://arxiv.org/pdf/2510.13786v1">https://arxiv.org/pdf/2510.13786v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: PipelineRL with optimal maximum off-policyness of 8 (§3.1) and the finding that loss aggregation and normalization modulate efficiency, not the asymptote (abstract).</span></li>
+  <li id="ref-9"><span class="ref-type">official</span>vLLM project. <em>Engine Arguments</em> (vLLM documentation, latest). <a href="https://docs.vllm.ai/en/latest/configuration/engine_args.html">https://docs.vllm.ai/en/latest/configuration/engine_args.html</a>. Accessed 2026-10-27. <span class="ref-use">Used for: <code>--enforce-eager</code> ("disable CUDA graph and always execute the model in eager mode"; the page adds that it disables torch.compile too) and <code>--enable-prefix-caching</code>. Source added beyond the researcher's map; the last 14,000 characters of the page were not read.</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Shao, R., Li, S. S., Xin, R., Geng, S., et al. <em>Spurious Rewards: Rethinking Training Signals in RLVR</em>. arXiv:2506.10947v2 (25 Feb 2026). <a href="https://arxiv.org/pdf/2506.10947v2">https://arxiv.org/pdf/2506.10947v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: random rewards giving +21.4 against +29.1 MATH-500 points on Qwen2.5-Math-7B, and the model dependence of the effect (abstract, §1, §3).</span></li>
+  <li id="ref-11"><span class="ref-type">official</span>Hugging Face. <em>TRL documentation: GRPO Trainer</em> (main branch; version not stated on the page). <a href="https://huggingface.co/docs/trl/main/en/grpo_trainer">https://huggingface.co/docs/trl/main/en/grpo_trainer</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the default DAPO-style loss type, the <code>dr_grpo</code> option, and the default KL coefficient of 0.0 under which the reference model is not loaded.</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>DeepSeek-AI (Guo, D., Yang, D., Zhang, H., et al.). <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv:2501.12948v2 (4 Jan 2026; the expanded Nature version). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: R1-Zero's KL coefficient of 0.001 and reference replacement every 400 steps (§2.1).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Liu, M., Diao, S., Lu, X., Hu, J., Dong, X., Choi, Y., Kautz, J., Dong, Y. (NVIDIA). <em>ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models</em>. arXiv:2505.24864v1 (30 May 2025). <a href="https://arxiv.org/pdf/2505.24864v1">https://arxiv.org/pdf/2505.24864v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: KL with periodic reference resets and the statement that dropping KL applies to base models before SFT (§2.2).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Yue, Y., Chen, Z., Lu, R., Zhao, A., Wang, Z., Yue, Y., Song, S., Huang, G. <em>Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?</em> arXiv:2504.13837v5 (24 Nov 2025). <a href="https://arxiv.org/pdf/2504.13837v5">https://arxiv.org/pdf/2504.13837v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: RLVR models winning at small k and base models at large k, and pass@256 coverage falling as pass@1 rises (abstract, Figure 1).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

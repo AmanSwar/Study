@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case Study: Qwen3 · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Reads Qwen3's post-training recipe stage by stage from the technical report: a long-CoT cold start, reasoning RL on 3,995 query-verifier pairs, thinking-mode fusion, general RL over more than 20 tasks with three reward types, and strong-to-weak distillation for six smaller models, with the stage-wise numbers, the comparison with R1, and the list of what the report does not print.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 29</p>
+  <h1>Case Study: Qwen3: Four-Stage Reasoning Pipeline, 3,995 Query-Verifier Pairs, Thinking-Mode Fusion, and Strong-to-Weak Distillation</h1>
+  <p class="lede">Qwen3 (April and May 2025) documents its post-training in about three pages: a deliberately small cold start, one reasoning-RL stage on 3,995 query-verifier pairs, a fusion step that puts thinking and non-thinking behavior into one set of weights, a general-RL stage over more than 20 tasks, and, for six smaller models, distillation in place of all four. This module reads each stage with the report's own numbers, sets the pipeline beside R1's, and lists what the report does not print. Afterwards you can say why Qwen3 distilled its small models, how small its RL set is, what the later stages cost on hard reasoning benchmarks, and which claims about the recipe rest on a table and which on a sentence.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>40 min</b> read</span>
+    <span class="chip"><b>20</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 10</b>, <b>Module 16</b>, <b>Module 21</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 356" role="img" aria-labelledby="f1t"><title id="f1t">Qwen3 post-training as two lanes: four stages for the flagship models, and off-policy then on-policy distillation for the six lightweight models, coloured by where each stage's training samples come from</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f1-arra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+    </defs>
+    <text x="20" y="22" class="d-title d-bold">Flagship route: Qwen3-235B-A22B and Qwen3-32B</text>
+    <rect x="20" y="34" width="70" height="96" rx="8" class="d-surface d-outline"/>
+    <text x="55" y="86" text-anchor="middle" class="d-bold">Base</text>
+    <path d="M90,82 L114,82" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="114" y="34" width="146" height="96" rx="8" class="d-block-muted"/>
+    <text x="187" y="56" text-anchor="middle" class="d-text-inv d-bold">1 Long-CoT cold start</text>
+    <text x="187" y="76" text-anchor="middle" class="d-text-inv d-small">SFT on QwQ-32B traces</text>
+    <text x="187" y="92" text-anchor="middle" class="d-text-inv d-small">query + response filters</text>
+    <text x="187" y="108" text-anchor="middle" class="d-text-inv d-small">small by design</text>
+    <path d="M260,82 L284,82" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="284" y="34" width="146" height="96" rx="8" class="d-block-accent"/>
+    <text x="357" y="56" text-anchor="middle" class="d-text-inv d-bold">2 Reasoning RL</text>
+    <text x="357" y="76" text-anchor="middle" class="d-text-inv d-small">GRPO, 3,995 pairs</text>
+    <text x="357" y="92" text-anchor="middle" class="d-text-inv d-small">rule-based verifiers</text>
+    <text x="357" y="108" text-anchor="middle" class="d-text-inv d-small d-mono">AIME'24 70.1 to 85.1</text>
+    <path d="M430,82 L454,82" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="454" y="34" width="146" height="96" rx="8" class="d-block-2"/>
+    <text x="527" y="56" text-anchor="middle" class="d-text-inv d-bold">3 Mode fusion</text>
+    <text x="527" y="76" text-anchor="middle" class="d-text-inv d-small">continual SFT</text>
+    <text x="527" y="92" text-anchor="middle" class="d-text-inv d-small">own samples + curated</text>
+    <text x="527" y="108" text-anchor="middle" class="d-text-inv d-small">/think and /no think</text>
+    <path d="M600,82 L624,82" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="624" y="34" width="146" height="96" rx="8" class="d-block-accent"/>
+    <text x="697" y="56" text-anchor="middle" class="d-text-inv d-bold">4 General RL</text>
+    <text x="697" y="76" text-anchor="middle" class="d-text-inv d-small">more than 20 tasks</text>
+    <text x="697" y="92" text-anchor="middle" class="d-text-inv d-small">3 reward types</text>
+    <text x="697" y="108" text-anchor="middle" class="d-text-inv d-small">multi-turn agent rollouts</text>
+
+    <path d="M697,130 L697,154 L209,154 L209,204" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <path d="M433,154 L433,204" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <text x="565" y="148" text-anchor="middle" class="d-small d-text-light">flagship models act as teachers</text>
+
+    <text x="20" y="176" class="d-title d-bold">Lightweight route</text>
+    <text x="20" y="192" class="d-small d-text-light">six models, no RL stages</text>
+    <rect x="20" y="204" width="70" height="88" rx="8" class="d-surface d-outline"/>
+    <text x="55" y="253" text-anchor="middle" class="d-bold">Base</text>
+    <path d="M90,248 L114,248" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="114" y="204" width="190" height="88" rx="8" class="d-block-muted"/>
+    <text x="209" y="228" text-anchor="middle" class="d-text-inv d-bold">Off-policy distillation</text>
+    <text x="209" y="248" text-anchor="middle" class="d-text-inv d-small">teacher outputs generated in</text>
+    <text x="209" y="264" text-anchor="middle" class="d-text-inv d-small">/think and /no think modes</text>
+    <path d="M304,248 L328,248" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="328" y="204" width="240" height="88" rx="8" class="d-block-accent"/>
+    <text x="448" y="228" text-anchor="middle" class="d-text-inv d-bold">On-policy distillation</text>
+    <text x="448" y="248" text-anchor="middle" class="d-text-inv d-small">student samples; its logits are</text>
+    <text x="448" y="264" text-anchor="middle" class="d-text-inv d-small">aligned with the teacher (min KL)</text>
+    <path d="M568,248 L592,248" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="592" y="204" width="178" height="88" rx="8" class="d-hl"/>
+    <text x="681" y="228" text-anchor="middle" class="d-bold">Released students</text>
+    <text x="681" y="248" text-anchor="middle" class="d-small">0.6B 1.7B 4B 8B 14B</text>
+    <text x="681" y="264" text-anchor="middle" class="d-small">30B-A3B (MoE)</text>
+
+    <rect x="20" y="322" width="16" height="14" rx="3" class="d-block-muted"/>
+    <text x="42" y="334" class="d-small">another model's outputs</text>
+    <rect x="232" y="322" width="16" height="14" rx="3" class="d-block-2"/>
+    <text x="254" y="334" class="d-small">SFT on own rejection samples + curated data</text>
+    <rect x="552" y="322" width="16" height="14" rx="3" class="d-block-accent"/>
+    <text x="574" y="334" class="d-small">samples from the model in training</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The two Qwen3 post-training routes. Colour marks where each stage's training samples come from, the property that sets its cost (Module 1): grey stages imitate another model's outputs, cyan trains on the policy's own filtered samples plus curated data, orange samples from the model being trained. The 70.1 to 85.1 AIME'24 figure is the only flagship RL result in the report (170 steps, Qwen3-235B-A22B). Stage and teacher names follow Figure 1 and §4.1 to §4.5 of the report<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<h2 id="the-recipe">1. The recipe in one page: two routes, four stages</h2>
+
+<div class="kpis">
+  <div class="kpi"><b>3,995</b><span>query-verifier pairs in the reasoning-RL stage<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-orange"><b>170 steps</b><span>AIME'24 70.1 to 85.1, Qwen3-235B-A22B<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-cyan"><b>more than 20</b><span>tasks in the general-RL reward system<a class="cite" href="#ref-1">1</a></span></div>
+  <div class="kpi kpi-green"><b>6 of 8</b><span>models built by distillation, with no RL stage<a class="cite" href="#ref-1">1</a></span></div>
+</div>
+
+<h3 id="the-recipe-routes">1.1 Two objectives, two routes</h3>
+<p>The report's post-training section opens with two goals. The first is thinking control: a "non-thinking" and a "thinking" mode in one model, with a user-set token budget for the thinking. The second is strong-to-weak distillation: use the large models to cut the cost of building the small ones<a class="cite" href="#ref-1">1</a>. The flagship models, Qwen3-235B-A22B (235B parameters, 22B activated per token) and the dense Qwen3-32B, "follow a sophisticated four-stage training process". The lightweight models, dense 0.6B, 1.7B, 4B, 8B and 14B plus the 30B-A3B MoE, skip those stages and are distilled from the flagships<a class="cite" href="#ref-1">1</a> (§1, §4, §4.5, Figure 1). The first two stages build the thinking ability; the last two add the non-thinking one<a class="cite" href="#ref-1">1</a>.</p>
+<p>Three dates frame how to read it. Qwen's release post is dated 29 April 2025<a class="cite" href="#ref-2">2</a>. The technical report went to arXiv on 14 May 2025, and the arXiv listing shows no later version as of 2026-10-27<a class="cite" href="#ref-1">1</a>. The report therefore describes the April 2025 models only; the last section of this module covers what Qwen shipped afterwards.</p>
+
+<h3 id="the-recipe-lineage">1.2 Where it comes from</h3>
+<p>The nearest ancestor is Qwen's own QwQ-32B, announced on 6 March 2025. Its blog describes a two-stage RL run from a cold-start checkpoint. The first stage covers math and code only, with an accuracy verifier for math answers and a code execution server that runs predefined test cases, and no learned reward model. The second stage targets general capabilities with "rewards from general reward model and some rule-based verifiers", and the post says it used "a small amount of steps"<a class="cite" href="#ref-3">3</a>. Qwen3's stage 2 and stage 4 have the same shape, a verifier-only reasoning stage followed by a broader stage that admits learned rewards. That lineage is my reading; the Qwen3 report does not claim it. The documented link is more direct: QwQ-32B generates the candidate responses for Qwen3's cold-start data and is the main RL-trained baseline in the 32B-class tables<a class="cite" href="#ref-1">1</a> (§4.1, Tables 13 and 15).</p>
+
+<h3 id="the-recipe-evidence">1.3 What the report offers as evidence</h3>
+<p>The training description is about three pages (§4.1 to §4.5, pp. 9 to 12); the rest of §4 is evaluation<a class="cite" href="#ref-1">1</a>. Four results carry everything this module can say quantitatively:</p>
+<ul>
+  <li>One sentence on the flagship's reasoning RL: AIME'24 rises from 70.1 to 85.1 over 170 steps (§4.2).</li>
+  <li>Table 22, which follows Qwen3-32B through Stages 2, 3 and 4 on 13 benchmarks (§4.7).</li>
+  <li>Table 21, which compares RL with on-policy distillation on Qwen3-8B from the same starting checkpoint (§4.7).</li>
+  <li>Tables 11 to 20, which score the final models against baselines (§4.6).</li>
+</ul>
+<p>There are no RL training curves, no per-stage table for the 235B flagship, and no ablation of the 3,995-pair choice, the cold-start size or any reward type. Where a mechanism has its own module, this one points to it instead of re-deriving it: GRPO is Module 9, reward routing and judges Module 16, on-policy distillation and the cost arithmetic of Table 21 Module 21, the chat-template and budget mechanics of fusion Module 23.</p>
+
+<h2 id="cold-start">2. Stage 1: a long-CoT cold start that is a filter, not a training run</h2>
+<p>The cold-start stage is described almost entirely as data selection. The dataset spans math, code, logical reasoning and general STEM, and every problem is paired with verified reference answers or code-based test cases<a class="cite" href="#ref-1">1</a> (§4.1). Two filters build it.</p>
+<p><strong>Query filtering.</strong> Qwen2.5-72B-Instruct removes queries that are not easily verifiable, namely those with several sub-questions or those asking for general text generation. It also removes queries it can answer correctly without chain-of-thought reasoning, which the report says "helps prevent the model from relying on superficial guessing". It labels each query's domain so the mix stays balanced, and a validation query set is held out before any generation<a class="cite" href="#ref-1">1</a> (§4.1).</p>
+<p><strong>Response filtering.</strong> QwQ-32B generates \(N\) candidate responses per remaining query. When QwQ-32B "consistently fails", human annotators assess the responses. For queries with a positive pass@\(N\), six defects are filtered out: wrong final answers, substantial repetition, guesswork without adequate reasoning, inconsistency between the thinking and the summary, inappropriate language mixing or stylistic shifts, and suspected overlap with validation items<a class="cite" href="#ref-1">1</a> (§4.1).</p>
+<p>The stated purpose explains the stage's size policy. The objective is "to instill foundational reasoning patterns in the model without overly emphasizing immediate reasoning performance", so that the model's potential "is not limited" before RL; the report therefore prefers to "minimize both the number of training samples and the training steps"<a class="cite" href="#ref-1">1</a> (§4.1). The stage is under-trained on purpose. It is the format-and-style prior that Stage 2 then optimizes, and the report gives neither \(N\), nor the number of examples, nor the step count, nor the learning rate.</p>
+<p>Two comparisons with R1 are worth holding. R1 also cold-starts, with "thousands" of long chain-of-thought examples, and gives a product reason: it wanted the reasoning to read in the first person, to begin by comprehending the problem, and to keep one language<a class="cite" href="#ref-4">4</a> (§3, Supp. B.3.2). Qwen3 handles the same symptom, language mixing, on the data side: item five of the response filter removes it from the cold-start traces. R1 additionally added a language-consistency term to the RL reward, which its own ablation says costs a slight performance drop<a class="cite" href="#ref-4">4</a> (§3.2.1). Second, the 235B-A22B flagship's cold start imitates a 32B dense predecessor. The stage-1 description names no other generator, so the first stage of the largest model is a distillation step from a smaller reasoning specialist (my reading of §4.1).</p>
+
+<h2 id="reasoning-rl">3. Stage 2: reasoning RL on 3,995 query-verifier pairs</h2>
+
+<h3 id="reasoning-rl-gates">3.1 Four criteria, one number</h3>
+<p>The RL set has to satisfy four criteria. The pairs were not used in the cold-start phase; they are learnable for the cold-start model; they are as challenging as possible; and they cover a broad range of sub-domains. The paragraph ends: "We ultimately collect a total of 3,995 query-verifier pairs"<a class="cite" href="#ref-1">1</a> (§4.2). Figure 2 draws the data gates of both stages. The end count is the only number the report prints for either: the pool before selection, the cold-start subset size, and any pass-rate threshold behind "learnable" and "as challenging as possible" are not given.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 410" role="img" aria-labelledby="f2t"><title id="f2t">Data gates in Qwen3's Stage 1 and Stage 2: a query filter and a response filter build the cold-start set, then four criteria select 3,995 query-verifier pairs</title>
+    <defs>
+      <marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <text x="20" y="22" class="d-title d-bold">Stage 1: build the cold-start set (§4.1)</text>
+    <rect x="20" y="36" width="150" height="86" rx="8" class="d-block-muted"/>
+    <text x="95" y="60" text-anchor="middle" class="d-text-inv d-bold">Candidate queries</text>
+    <text x="95" y="80" text-anchor="middle" class="d-text-inv d-small">math, code, logic, STEM</text>
+    <text x="95" y="96" text-anchor="middle" class="d-text-inv d-small">answer or tests attached</text>
+    <path d="M170,79 L200,79" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="200" y="36" width="170" height="86" rx="8" class="d-block"/>
+    <text x="285" y="60" text-anchor="middle" class="d-text-inv d-bold">Query filter</text>
+    <text x="285" y="80" text-anchor="middle" class="d-text-inv d-small">Qwen2.5-72B-Instruct drops</text>
+    <text x="285" y="96" text-anchor="middle" class="d-text-inv d-small">multi-part, open-ended, and</text>
+    <text x="285" y="112" text-anchor="middle" class="d-text-inv d-small">answerable-without-CoT</text>
+    <path d="M370,79 L400,79" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="400" y="36" width="190" height="86" rx="8" class="d-block"/>
+    <text x="495" y="60" text-anchor="middle" class="d-text-inv d-bold">Response filter</text>
+    <text x="495" y="80" text-anchor="middle" class="d-text-inv d-small">N samples from QwQ-32B;</text>
+    <text x="495" y="96" text-anchor="middle" class="d-text-inv d-small">humans check failures;</text>
+    <text x="495" y="112" text-anchor="middle" class="d-text-inv d-small">6 defect types removed</text>
+    <path d="M590,79 L620,79" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="620" y="36" width="160" height="86" rx="8" class="d-block-muted"/>
+    <text x="700" y="60" text-anchor="middle" class="d-text-inv d-bold">Cold-start subset</text>
+    <text x="700" y="80" text-anchor="middle" class="d-text-inv d-small">size not reported;</text>
+    <text x="700" y="96" text-anchor="middle" class="d-text-inv d-small">few samples, few steps</text>
+
+    <path d="M700,122 L700,152 L500,152 L500,194" class="d-arrow d-dashed" marker-end="url(#f2-arr)"/>
+    <text x="600" y="146" text-anchor="middle" class="d-small d-text-light">excluded from Stage 2</text>
+
+    <text x="20" y="176" class="d-title d-bold">Stage 2: select the RL set (§4.2)</text>
+    <rect x="20" y="194" width="540" height="200" rx="10" class="d-panel d-outline"/>
+    <circle cx="50" cy="226" r="13" class="d-fill-blue"/><text x="50" y="231" text-anchor="middle" class="d-text-inv d-bold">1</text>
+    <text x="76" y="231" class="d-bold">Not used in the cold-start phase</text>
+    <circle cx="50" cy="270" r="13" class="d-fill-blue"/><text x="50" y="275" text-anchor="middle" class="d-text-inv d-bold">2</text>
+    <text x="76" y="275" class="d-bold">Learnable for the cold-start model</text>
+    <text x="376" y="275" class="d-small d-text-light">my reading: pass rate above 0</text>
+    <circle cx="50" cy="314" r="13" class="d-fill-blue"/><text x="50" y="319" text-anchor="middle" class="d-text-inv d-bold">3</text>
+    <text x="76" y="319" class="d-bold">As challenging as possible</text>
+    <text x="376" y="319" class="d-small d-text-light">my reading: pass rate below 1</text>
+    <circle cx="50" cy="358" r="13" class="d-fill-blue"/><text x="50" y="363" text-anchor="middle" class="d-text-inv d-bold">4</text>
+    <text x="76" y="363" class="d-bold">Broad range of sub-domains</text>
+    <path d="M560,294 L610,294" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="610" y="224" width="170" height="140" rx="10" class="d-block-accent"/>
+    <text x="695" y="276" text-anchor="middle" class="d-text-inv d-bold d-title">3,995</text>
+    <text x="695" y="298" text-anchor="middle" class="d-text-inv d-small">query-verifier pairs</text>
+    <text x="695" y="316" text-anchor="middle" class="d-text-inv d-small">GRPO training set</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> The two data-selection stages as the report describes them. The four criteria and the end count of 3,995 are quoted from §4.2; the filters of the top row are §4.1. The two grey notes on criteria 2 and 3 are the writer's reading of what "learnable" and "as challenging as possible" bound, not thresholds the report gives<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>Read together, criteria 2 and 3 bound the same band that Module 10 describes for prompt selection and that Module 11 explains through zero-variance groups: a prompt the cold-start model never solves, or always solves, gives every rollout in a group the same reward and so contributes no group-relative gradient. This is the writer's reading; the report states the criteria without a rationale.</p>
+<p>The scale is the notable part. R1's reasoning RL data is 26K math, 17K code, 22K STEM and 15K logic prompts, 80K in all, plus 66K general prompts<a class="cite" href="#ref-4">4</a> (Supp. Table 4); the text of Supp. B.3.1 adds 8K bug-fixing problems to the 17K algorithm questions, which would make 88K. \(80{,}000 / 3{,}995 = 20.0\) and \(88{,}000 / 3{,}995 = 22.0\), so the R1 set is about twenty times larger (derived; R1's counts are rounded to thousands). Qwen3 chose curation over volume, with the criteria above as the only filter on record.</p>
+
+<h3 id="reasoning-rl-optimizer">3.2 What the report says about the optimizer</h3>
+<p>Four statements, all from §4.2<a class="cite" href="#ref-1">1</a>:</p>
+<ul>
+  <li>The algorithm is GRPO, cited to Shao et al. (2024)<a class="cite" href="#ref-5">5</a>; Module 9 derives it.</li>
+  <li>The authors observe that "using a large batch size and a high number of rollouts per query, along with off-policy training to improve sample efficiency, is beneficial to the training process."</li>
+  <li>The authors "addressed how to balance exploration and exploitation by controlling the model's entropy to increase steadily or remain stable". That is a target; Module 13 notes that no method for reaching it is given.</li>
+  <li>The result is "consistent improvements in both training reward and validation performance over the course of a single RL run, without any manual intervention on hyperparameters".</li>
+</ul>
+<p>No batch size, rollout count, degree of off-policyness, learning rate, KL coefficient, clip range or maximum length is printed. One later paper, ScaleRL, reads more into the report than it says, twice. It states that the PPO-off-policy-\(k\) scheme "has been used previously by Qwen3"<a class="cite" href="#ref-6">6</a> (§3.1); the Qwen3 text says only "off-policy training to improve sample efficiency" and defines no scheme or \(k\). ScaleRL's appendix also lists Qwen3 among works that use interruptions to stop over-long generations during RL<a class="cite" href="#ref-6">6</a> (App. A.10); the only interruption in the Qwen3 report is the stop-thinking string appended at inference time, which the report says "is not explicitly trained"<a class="cite" href="#ref-1">1</a> (§4.3). I could not find an RL-time interruption in the report text. Treat both attributions as second-hand readings.</p>
+
+<h3 id="reasoning-rl-curve">3.3 The one curve, and how many passes it implies</h3>
+<p>The report's only flagship RL measurement is one sentence: "the AIME'24 score of the Qwen3-235B-A22B model increases from 70.1 to 85.1 over a total of 170 RL training steps"<a class="cite" href="#ref-1">1</a> (§4.2). That is \(85.1-70.1 = 15.0\) points, 0.088 points per step on average (derived). The start is not labelled; by its place in the pipeline it is the cold-start checkpoint. A "step" is not defined, and with several minibatches per rollout the number of rollout batches and the number of optimizer updates differ by that factor (Module 1).</p>
+<p>The number of unknowns matters because "3,995 pairs" is only small if the batches are. With \(P\) prompts per step and \(S\) steps, the run makes \(P\cdot S\) prompt draws and \(P\cdot S/3{,}995\) passes over the set. R1-Zero drew 32 unique questions per step<a class="cite" href="#ref-4">4</a> (§2.1); at \(P=32\), 170 steps is 5,440 draws, 1.36 passes. At \(P=128\) it is 21,760 draws, 5.45 passes. The report does not say which regime it is in, and so does not say whether the set is seen about once or more than five times.</p>
+
+<div class="calc">
+  <p class="calc-title">Passes over the 3,995-pair set in a short reasoning-RL run</p>
+  <div class="calc-row"><label for="c3p">Prompts per step</label><input type="range" id="c3p" name="P" min="16" max="1024" step="16" value="128"></div>
+  <div class="calc-row"><label for="c3s">RL steps</label><input type="range" id="c3s" name="S" min="10" max="400" step="10" value="170"></div>
+  <div class="calc-row"><label for="c3g">Rollouts per prompt</label><select id="c3g" name="G"><option value="8">8</option><option value="16" selected>16</option><option value="32">32</option><option value="64">64</option></select><span></span></div>
+  <div class="calc-out">
+    <div>Prompt draws<output data-expr="P * S" data-format="int"></output></div>
+    <div>Passes over the set<output data-expr="P * S / 3995" data-format="fixed:2"></output></div>
+    <div>Steps for one pass<output data-expr="3995 / P" data-format="fixed:1"></output></div>
+    <div>Sampled responses<output data-expr="P * S * G" data-format="si"></output></div>
+  </div>
+  <p class="calc-note">Formulas: \(P S\), \(P S / 3{,}995\), \(3{,}995 / P\), \(P S G\). Qwen3 reports none of \(P\), \(G\) or the meaning of a step; the defaults are illustrative. R1-Zero's values were \(P=32\), \(G=16\), \(S=10{,}400\)<a class="cite" href="#ref-4">4</a>.</p>
+</div>
+
+<p>One more reading error to avoid. The final Qwen3-235B-A22B scores 85.7 on AIME'24 in thinking mode<a class="cite" href="#ref-1">1</a> (Table 11), against 85.1 after reasoning RL. The two numbers sit in different parts of the report, and the report does not say that 85.1 was scored under Table 11's protocol (64 samples per question, 38,912 maximum output tokens for AIME). A +0.6 difference is therefore not evidence that Stages 3 and 4 were free at 235B scale. The only stage-wise measurement is the 32B model's, where AIME'24 goes from 83.8 to 81.4 (Section 5.4).</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat: GRPO in the report, GSPO in a later paper</span><p>The Qwen3 report names GRPO and predates GSPO; its arXiv listing has only v1 (14 May 2025)<a class="cite" href="#ref-1">1</a>. The GSPO paper from the same team (v2, 28 July 2025) says "we have successfully applied GSPO to the RL training of the latest Qwen3 models"<a class="cite" href="#ref-7">7</a> (§5.1), without naming models, stages or dates. Both can be true: the April 2025 models used GRPO as documented, and models released later may have used GSPO. Neither document says which checkpoint or which stage used which. Do not cite the Qwen3 report for GSPO, and do not read the GSPO paper's sentence as independent confirmation, since it comes from the same team. Module 12 covers the algorithm.</p></aside>
+
+<h2 id="mode-fusion">4. Stage 3: thinking-mode fusion, read for its data</h2>
+<p>The mechanics of fusion, meaning the <code>/think</code> and <code>/no think</code> flags, the empty think block kept in non-thinking samples, the rule that in a multi-turn chat the model follows the last flag, and the stop-thinking string that implements the budget, are Module 23 §5's subject. This section stays with what the stage does to the pipeline's data.</p>
+<p>Fusion is "continual supervised fine-tuning (SFT) on the Reasoning RL model"<a class="cite" href="#ref-1">1</a> (§4.3). Its dataset has two halves with different origins. The thinking half is produced by rejection sampling on Stage 1 queries "using the Stage 2 model itself", so that the Stage 2 model's performance "is not compromised by the additional SFT". The non-thinking half is "carefully curated" across coding, mathematics, instruction following, multilingual tasks, creative writing, question answering and role-playing, scored with automatically generated checklists, with the share of translation tasks raised to help low-resource languages. The report gives no sample counts, no thinking-to-non-thinking ratio and no epochs.</p>
+<p>Three readings follow, all the writer's. First, the thinking half is the policy's own filtered output, so it asks the model to change little in thinking behavior; the non-thinking half carries the new behavior. That is a regularizer by construction, and Table 22 measures how well it works: in thinking mode this stage alone moves AIME'24 from 83.8 to 81.9 and LiveCodeBench v5 from 68.4 to 67.2<a class="cite" href="#ref-1">1</a> (Table 22, printed deltas of -1.9 and -1.2). Second, fusion puts an off-policy step between the two RL stages, so Stage 4 starts from an SFT checkpoint and not from the RL one; the report does not discuss what that does to the entropy that Stage 2 managed. Third, the checklist grading of non-thinking data is the report's only rubric-style filter; Module 16 covers rubrics as rewards, and here they select SFT data.</p>
+<p>The budget ability is described as "not explicitly trained but emerges naturally as a result of applying Thinking Mode Fusion"<a class="cite" href="#ref-1">1</a> (§4.3). Module 23 weighs that claim against designs that train the budget.</p>
+
+<h2 id="general-rl">5. Stage 4: general RL over more than 20 tasks</h2>
+
+<h3 id="general-rl-scope">5.1 Capabilities, tasks and where the stage sits</h3>
+<p>The stage "aims to broadly enhance the models' capabilities and stability across diverse scenarios", with "a sophisticated reward system covering over 20 distinct tasks, each with customized scoring criteria"<a class="cite" href="#ref-1">1</a> (§4.4). The report lists five target capability groups and not the tasks themselves:</p>
+<ul>
+  <li><strong>Instruction following:</strong> content, format, length and structured-output requirements.</li>
+  <li><strong>Format following:</strong> responding to the <code>/think</code> and <code>/no think</code> flags by switching modes, and using the <code>&lt;think&gt;</code> and <code>&lt;/think&gt;</code> tokens consistently. This is the RL stage that polishes the mode switching fusion installed (Module 23 gives the ThinkFollow numbers).</li>
+  <li><strong>Preference alignment:</strong> helpfulness, engagement and style on open-ended queries.</li>
+  <li><strong>Agent ability:</strong> invoking tools through designated interfaces, trained with multi-turn rollouts against real environment feedback.</li>
+  <li><strong>Specialized scenarios:</strong> for example retrieval-augmented generation, where reward signals aim to reduce hallucination.</li>
+</ul>
+<p>The MOPD paper files this report under "mixed RL": samples from different domains in one training batch, each still scored by its own per-domain reward and advantage<a class="cite" href="#ref-8">8</a> (§1). Qwen3 is both things at once, a cascade across stages (reasoning RL, then an SFT step, then general RL) and a mixture inside Stage 4. Module 22 compares mixed RL, cascades and multi-teacher distillation; the Qwen3 report itself offers no comparison among them.</p>
+
+<h3 id="general-rl-rewards">5.2 Three reward types, and how little of the map is printed</h3>
+<p>The report names three reward types<a class="cite" href="#ref-1">1</a> (§4.4), each with the reason it gives:</p>
+<ol>
+  <li><strong>Rule-based.</strong> Described as "also useful for general tasks such as instruction following (Lambert et al., 2024) and format adherence"; "well-designed rule-based rewards can assess the correctness of model outputs with high precision, preventing issues like reward hacking". The citation is Tulu 3, whose RLVR stage verifies IFEval-style constraints<a class="cite" href="#ref-9">9</a> (§1).</li>
+  <li><strong>Model-based, with a reference answer.</strong> Qwen2.5-72B-Instruct scores the response against the reference. The stated benefit is "more flexible handling of diverse tasks without requiring strict formatting, avoiding false negatives that can occur with purely rule-based rewards".</li>
+  <li><strong>Model-based, without a reference.</strong> A reward model trained on human preference data assigns scalar scores. It "does not depend on a reference answer", handles "a broader range of queries" and enhances "engagement and helpfulness".</li>
+</ol>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 372" role="img" aria-labelledby="f3t"><title id="f3t">Matrix of Qwen3's five general-RL capability groups against four feedback sources, marking which pairings the report states</title>
+    <rect x="278" y="16" width="124" height="86" rx="8" class="d-block"/>
+    <text x="340" y="38" text-anchor="middle" class="d-text-inv d-bold">Rule-based</text>
+    <text x="340" y="58" text-anchor="middle" class="d-text-inv d-small">high precision</text>
+    <text x="340" y="74" text-anchor="middle" class="d-text-inv d-small">prevents hacking</text>
+    <rect x="408" y="16" width="124" height="86" rx="8" class="d-block-2"/>
+    <text x="470" y="38" text-anchor="middle" class="d-text-inv d-bold">Judge + reference</text>
+    <text x="470" y="58" text-anchor="middle" class="d-text-inv d-small">Qwen2.5-72B-Instruct</text>
+    <text x="470" y="74" text-anchor="middle" class="d-text-inv d-small">flexible formats</text>
+    <rect x="538" y="16" width="124" height="86" rx="8" class="d-block-accent"/>
+    <text x="600" y="38" text-anchor="middle" class="d-text-inv d-bold">Preference RM</text>
+    <text x="600" y="58" text-anchor="middle" class="d-text-inv d-small">no reference</text>
+    <text x="600" y="74" text-anchor="middle" class="d-text-inv d-small">broad queries</text>
+    <rect x="668" y="16" width="124" height="86" rx="8" class="d-block-muted"/>
+    <text x="730" y="38" text-anchor="middle" class="d-text-inv d-bold">Environment</text>
+    <text x="730" y="58" text-anchor="middle" class="d-text-inv d-small">execution feedback</text>
+    <text x="730" y="74" text-anchor="middle" class="d-text-inv d-small">multi-turn rollouts</text>
+
+    <text x="20" y="150" class="d-bold">Instruction following</text>
+    <text x="20" y="194" class="d-bold">Format following</text>
+    <text x="20" y="238" class="d-bold">Preference alignment</text>
+    <text x="20" y="282" class="d-bold">Agent ability</text>
+    <text x="20" y="326" class="d-bold">Specialized (e.g. RAG)</text>
+    <line x1="14" y1="166" x2="792" y2="166" class="d-grid"/>
+    <line x1="14" y1="210" x2="792" y2="210" class="d-grid"/>
+    <line x1="14" y1="254" x2="792" y2="254" class="d-grid"/>
+    <line x1="14" y1="298" x2="792" y2="298" class="d-grid"/>
+
+    <circle cx="340" cy="146" r="10" class="d-fill-blue"/>
+    <circle cx="470" cy="146" r="7" class="d-outline d-dim"/>
+    <circle cx="600" cy="146" r="7" class="d-outline d-dim"/>
+    <circle cx="730" cy="146" r="7" class="d-outline d-dim"/>
+    <circle cx="340" cy="190" r="10" class="d-fill-blue"/>
+    <circle cx="470" cy="190" r="7" class="d-outline d-dim"/>
+    <circle cx="600" cy="190" r="7" class="d-outline d-dim"/>
+    <circle cx="730" cy="190" r="7" class="d-outline d-dim"/>
+    <circle cx="340" cy="234" r="7" class="d-outline d-dim"/>
+    <circle cx="470" cy="234" r="7" class="d-outline d-dim"/>
+    <circle cx="600" cy="234" r="10" class="d-fill-blue"/>
+    <circle cx="730" cy="234" r="7" class="d-outline d-dim"/>
+    <circle cx="340" cy="278" r="7" class="d-outline d-dim"/>
+    <circle cx="470" cy="278" r="7" class="d-outline d-dim"/>
+    <circle cx="600" cy="278" r="7" class="d-outline d-dim"/>
+    <circle cx="730" cy="278" r="10" class="d-fill-blue"/>
+    <circle cx="340" cy="322" r="7" class="d-outline d-dim"/>
+    <circle cx="470" cy="322" r="7" class="d-outline d-dim"/>
+    <circle cx="600" cy="322" r="7" class="d-outline d-dim"/>
+    <circle cx="730" cy="322" r="7" class="d-outline d-dim"/>
+
+    <circle cx="40" cy="356" r="8" class="d-fill-blue"/>
+    <text x="56" y="360" class="d-small">report links this source to this capability</text>
+    <circle cx="372" cy="356" r="6" class="d-outline d-dim"/>
+    <text x="386" y="360" class="d-small">not stated (the judge column is described only as "diverse tasks")</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> What the report ties to what, in §4.4. Rule-based rewards are named for instruction following and format adherence; the preference RM is described by wording that matches the preference-alignment group ("engagement and helpfulness"); agent training is described as using real environment execution feedback, which is a feedback source and not one of the three numbered reward types. Four of twenty cells are filled; the reference-conditioned judge is tied to no named capability, and RAG's reward is described without its type<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>The matrix is sparse because the report is. It does not say which of the 20-plus tasks uses which type, how a 0/1 rule reward, a judge score on an unstated scale and an RM scalar are combined or normalized, what the RM's size or training data are, what the judge prompt looks like, or how many steps the stage ran. Module 16 covers what such a router has to settle (the judge's failure modes, reference-conditioned scoring and rubric alternatives), and Module 19 the hacking that a scalar RM invites.</p>
+<p>R1's authors reach the first two types independently: rule-based reward models and LLMs that judge correctness "against a predefined ground-truth" are, in their words, "robust mechanisms for mitigating issues related to reward hacking", with the LLM route limited to well-defined, concise answers<a class="cite" href="#ref-4">4</a> (Supp. G.1). For open-ended data R1 used reward models too, and capped their exposure: preference reward entered only in the last 400 of 1,700 second-stage steps, because longer exposure "may lead to reward hacking"<a class="cite" href="#ref-4">4</a> (§3.2.2). Qwen3 prints no equivalent exposure figure, no hacking observation and no cap on the preference RM (type 3). It also scores Stage 4 with a fixed, previous-generation judge, Qwen2.5-72B-Instruct, against policies up to 235B parameters; whether that judge's ceiling bound the stage is not discussed.</p>
+
+<h3 id="general-rl-agent">5.3 Agent training: one sentence of mechanism</h3>
+<p>The report's whole description of agent RL is one sentence: "During the RL rollout, the model is allowed to perform complete multi-turn interaction cycles with real environment execution feedback, thereby improving its performance and stability in long-horizon decision-making tasks"<a class="cite" href="#ref-1">1</a> (§4.4). It names no environment, tool set, turn cap, reward definition or sandbox. Module 17 lists what an environment contract has to specify, and Module 18 how multi-turn credit assignment works; neither can be filled in from this report.</p>
+<p>The measurements are in Table 22. The public tool-calling benchmark BFCL v3 moves from 68.4 to 70.3 in thinking mode at Stage 4 (+1.9) and from 61.5 to 63.0 in non-thinking mode (+1.5). The in-house ToolUse benchmark, which scores "intent recognition, format accuracy, and parameter accuracy" across single-turn, multi-turn and multi-step calls, moves from 70.4 to 85.5 (+15.1) and from 73.2 to 86.5 (+13.3)<a class="cite" href="#ref-1">1</a> (Table 22). The two largest Stage 4 gains in thinking mode, ToolUse (+15.1) and ThinkFollow (+10.2), are both on in-house benchmarks the report built to monitor the capabilities that stage trains. That does not show overfitting; the in-house sets measure format and stability behaviors BFCL may not. It does mean the biggest agent number has no external check.</p>
+
+<h3 id="general-rl-cost">5.4 What Stages 3 and 4 bought, and what they cost</h3>
+<p>Table 22 is the report's only stage-by-stage measurement, and it is for the dense 32B model, not the flagship. Figure 4 redraws its thinking-mode columns as the change at each stage and the total from Stage 2 to Stage 4.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 450" role="img" aria-labelledby="f4t"><title id="f4t">Qwen3-32B thinking mode: change in 12 benchmark scores at Stage 3 and Stage 4, with Stage 2 and Stage 4 scores and the total change</title>
+    <rect x="250" y="14" width="14" height="9" rx="1.5" class="d-fill-blue"/>
+    <text x="270" y="23" class="d-small">Stage 3 vs Stage 2 (fusion SFT)</text>
+    <rect x="500" y="14" width="14" height="9" rx="1.5" class="d-fill-orange"/>
+    <text x="520" y="23" class="d-small">Stage 4 vs Stage 3 (general RL)</text>
+    <text x="620" y="50" text-anchor="end" class="d-small d-text-light">Stage 2</text>
+    <text x="690" y="50" text-anchor="end" class="d-small d-text-light">Stage 4</text>
+    <text x="772" y="50" text-anchor="end" class="d-small d-text-light">change</text>
+<rect x="8" y="286" width="784" height="112" rx="6" class="d-fill-red-soft"/>
+<line x1="285" y1="58" x2="285" y2="400" class="d-grid"/>
+<text x="285" y="416" text-anchor="middle" class="d-mono d-small d-text-light">-5</text>
+<line x1="330" y1="58" x2="330" y2="400" class="d-axis"/>
+<text x="330" y="416" text-anchor="middle" class="d-mono d-small d-text-light">0</text>
+<line x1="375" y1="58" x2="375" y2="400" class="d-grid"/>
+<text x="375" y="416" text-anchor="middle" class="d-mono d-small d-text-light">+5</text>
+<line x1="420" y1="58" x2="420" y2="400" class="d-grid"/>
+<text x="420" y="416" text-anchor="middle" class="d-mono d-small d-text-light">+10</text>
+<line x1="465" y1="58" x2="465" y2="400" class="d-grid"/>
+<text x="465" y="416" text-anchor="middle" class="d-mono d-small d-text-light">+15</text>
+<line x1="510" y1="58" x2="510" y2="400" class="d-grid"/>
+<text x="510" y="416" text-anchor="middle" class="d-mono d-small d-text-light">+20</text>
+<text x="14" y="81" class="d-small d-text-light">General</text>
+<text x="215" y="81" text-anchor="end">LiveBench</text>
+<rect x="330.0" y="67" width="20.7" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="354.7" y="75" text-anchor="start" class="d-mono d-small">+2.3</text>
+<rect x="330.0" y="78" width="36.0" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="370.0" y="86" text-anchor="start" class="d-mono d-small">+4.0</text>
+<text x="620" y="81" text-anchor="end" class="d-mono">68.6</text><text x="690" y="81" text-anchor="end" class="d-mono">74.9</text><text x="772" y="81" text-anchor="end" class="d-mono d-bold">+6.3</text>
+<text x="215" y="109" text-anchor="end">Arena-Hard</text>
+<rect x="330.0" y="95" width="23.4" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="357.4" y="103" text-anchor="start" class="d-mono d-small">+2.6</text>
+<rect x="330.0" y="106" width="39.6" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="373.6" y="114" text-anchor="start" class="d-mono d-small">+4.4</text>
+<text x="620" y="109" text-anchor="end" class="d-mono">86.8</text><text x="690" y="109" text-anchor="end" class="d-mono">93.8</text><text x="772" y="109" text-anchor="end" class="d-mono d-bold">+7.0</text>
+<text x="215" y="137" text-anchor="end">CounterFactQA*</text>
+<rect x="330.0" y="123" width="98.1" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="432.1" y="131" text-anchor="start" class="d-mono d-small">+10.9</text>
+<rect x="330.0" y="134" width="61.2" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="395.2" y="142" text-anchor="start" class="d-mono d-small">+6.8</text>
+<text x="620" y="137" text-anchor="end" class="d-mono">50.4</text><text x="690" y="137" text-anchor="end" class="d-mono">68.1</text><text x="772" y="137" text-anchor="end" class="d-mono d-bold">+17.7</text>
+<text x="14" y="165" class="d-small d-text-light">Instruction</text>
+<text x="215" y="165" text-anchor="end">IFEval strict</text>
+<rect x="330.0" y="151" width="48.6" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="382.6" y="159" text-anchor="start" class="d-mono d-small">+5.4</text>
+<rect x="330.0" y="162" width="59.4" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="393.4" y="170" text-anchor="start" class="d-mono d-small">+6.6</text>
+<text x="620" y="165" text-anchor="end" class="d-mono">73.0</text><text x="690" y="165" text-anchor="end" class="d-mono">85.0</text><text x="772" y="165" text-anchor="end" class="d-mono d-bold">+12.0</text>
+<text x="215" y="193" text-anchor="end">Multi-IF</text>
+<rect x="330.0" y="179" width="28.8" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="362.8" y="187" text-anchor="start" class="d-mono d-small">+3.2</text>
+<rect x="330.0" y="190" width="75.6" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="409.6" y="198" text-anchor="start" class="d-mono d-small">+8.4</text>
+<text x="620" y="193" text-anchor="end" class="d-mono">61.4</text><text x="690" y="193" text-anchor="end" class="d-mono">73.0</text><text x="772" y="193" text-anchor="end" class="d-mono d-bold">+11.6</text>
+<text x="215" y="221" text-anchor="end">LengthCtrl*</text>
+<rect x="330.0" y="207" width="72.0" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="406.0" y="215" text-anchor="start" class="d-mono d-small">+8.0</text>
+<rect x="330.0" y="218" width="26.1" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="360.1" y="226" text-anchor="start" class="d-mono d-small">+2.9</text>
+<text x="620" y="221" text-anchor="end" class="d-mono">62.6</text><text x="690" y="221" text-anchor="end" class="d-mono">73.5</text><text x="772" y="221" text-anchor="end" class="d-mono d-bold">+10.9</text>
+<text x="14" y="249" class="d-small d-text-light">Agent</text>
+<text x="215" y="249" text-anchor="end">BFCL v3</text>
+<rect x="324.6" y="235" width="5.4" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="320.6" y="243" text-anchor="end" class="d-mono d-small">-0.6</text>
+<rect x="330.0" y="246" width="17.1" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="351.1" y="254" text-anchor="start" class="d-mono d-small">+1.9</text>
+<text x="620" y="249" text-anchor="end" class="d-mono">69.0</text><text x="690" y="249" text-anchor="end" class="d-mono">70.3</text><text x="772" y="249" text-anchor="end" class="d-mono d-bold">+1.3</text>
+<text x="215" y="277" text-anchor="end">ToolUse*</text>
+<rect x="330.0" y="263" width="63.9" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="397.9" y="271" text-anchor="start" class="d-mono d-small">+7.1</text>
+<rect x="330.0" y="274" width="135.9" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="469.9" y="282" text-anchor="start" class="d-mono d-small">+15.1</text>
+<text x="620" y="277" text-anchor="end" class="d-mono">63.3</text><text x="690" y="277" text-anchor="end" class="d-mono">85.5</text><text x="772" y="277" text-anchor="end" class="d-mono d-bold">+22.2</text>
+<text x="14" y="305" class="d-small d-text-light">Know. / code</text>
+<text x="215" y="305" text-anchor="end">MMLU-Redux</text>
+<rect x="326.4" y="291" width="3.6" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="322.4" y="299" text-anchor="end" class="d-mono d-small">-0.4</text>
+<rect x="329.1" y="302" width="0.9" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="325.1" y="310" text-anchor="end" class="d-mono d-small">-0.1</text>
+<text x="620" y="305" text-anchor="end" class="d-mono">91.4</text><text x="690" y="305" text-anchor="end" class="d-mono">90.9</text><text x="772" y="305" text-anchor="end" class="d-mono d-bold">-0.5</text>
+<text x="215" y="333" text-anchor="end">GPQA-Diamond</text>
+<rect x="330.0" y="319" width="1.8" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="335.8" y="327" text-anchor="start" class="d-mono d-small">+0.2</text>
+<rect x="324.6" y="330" width="5.4" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="320.6" y="338" text-anchor="end" class="d-mono d-small">-0.6</text>
+<text x="620" y="333" text-anchor="end" class="d-mono">68.8</text><text x="690" y="333" text-anchor="end" class="d-mono">68.4</text><text x="772" y="333" text-anchor="end" class="d-mono d-bold">-0.4</text>
+<text x="215" y="361" text-anchor="end">AIME'24</text>
+<rect x="312.9" y="347" width="17.1" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="308.9" y="355" text-anchor="end" class="d-mono d-small">-1.9</text>
+<rect x="325.5" y="358" width="4.5" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="321.5" y="366" text-anchor="end" class="d-mono d-small">-0.5</text>
+<text x="620" y="361" text-anchor="end" class="d-mono">83.8</text><text x="690" y="361" text-anchor="end" class="d-mono">81.4</text><text x="772" y="361" text-anchor="end" class="d-mono d-bold">-2.4</text>
+<text x="215" y="389" text-anchor="end">LiveCodeBench v5</text>
+<rect x="319.2" y="375" width="10.8" height="9" rx="1.5" class="d-fill-blue"/>
+<text x="315.2" y="383" text-anchor="end" class="d-mono d-small">-1.2</text>
+<rect x="316.5" y="386" width="13.5" height="9" rx="1.5" class="d-fill-orange"/>
+<text x="312.5" y="394" text-anchor="end" class="d-mono d-small">-1.5</text>
+<text x="620" y="389" text-anchor="end" class="d-mono">68.4</text><text x="690" y="389" text-anchor="end" class="d-mono">65.7</text><text x="772" y="389" text-anchor="end" class="d-mono d-bold">-2.7</text>
+    <text x="330" y="436" text-anchor="middle" class="d-small d-text-light">change in points; shaded rows lose points between Stage 2 and Stage 4; * = in-house benchmark</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Qwen3-32B in thinking mode through the three stages of Table 22. Blue and orange bars are the per-stage deltas as printed in the table; the right-hand columns are the Stage 2 and Stage 4 scores and their difference (derived; each equals the sum of the two printed deltas to within 0.1 rounding). ThinkFollow* is not drawn: Stage 2 has no score, and the fused model scores 88.7 after Stage 3 and 98.9 after Stage 4<a class="cite" href="#ref-1">1</a>.</figcaption>
+</figure>
+
+<p>Four things follow. The scores and deltas are the report's; the sums, shares and counts below are derived from them.</p>
+<ul>
+  <li><strong>The gains are in what the stages train.</strong> From Stage 2 to Stage 4: ToolUse +22.2, CounterFactQA +17.7, IFEval +12.0, Multi-IF +11.6, LengthCtrl +10.9, Arena-Hard +7.0, LiveBench +6.3. The public agent benchmark BFCL v3 gains +1.3.</li>
+  <li><strong>The costs are on the hardest reasoning benchmarks.</strong> AIME'24 falls 2.4 points (83.8 to 81.4) and LiveCodeBench v5 2.7 (68.4 to 65.7); MMLU-Redux and GPQA-Diamond move by -0.5 and -0.4. The report conjectures the cause is training on "a broader range of general tasks" and states that it chose to accept the trade-off for versatility<a class="cite" href="#ref-1">1</a> (§4.7); Module 23 quotes the passage.</li>
+  <li><strong>Most of the AIME'24 loss arrives at the SFT step, not the RL step.</strong> Stage 3 contributes -1.9 of the -2.4, 79% (derived); for LiveCodeBench v5, -1.2 of -2.7, 44%. The report attributes the drop to "these two training stages" together and offers no split; its own table supports one. With one run per cell, differences under a point should not carry an argument.</li>
+  <li><strong>In non-thinking mode, Stage 4 costs almost nothing.</strong> Between Stage 3 and Stage 4 eleven of twelve shared rows rise (AIME'24 +2.5, GPQA-Diamond +4.3, ToolUse +13.3) and only MMLU-Redux falls (-1.0)<a class="cite" href="#ref-1">1</a> (Table 22). The regression is a thinking-mode phenomenon.</li>
+</ul>
+<p>For scale on the benchmark itself: AIME has 30 questions per year and the report averages 64 samples per question<a class="cite" href="#ref-1">1</a> (§4.6), so one question's worth of accuracy is \(100/30 = 3.33\) points. A 2.4-point change is 0.72 of one question's worth (derived), and the report prints no seeds or intervals; Module 20 treats how much such differences can bear.</p>
+
+<h2 id="strong-to-weak">6. Strong-to-weak distillation: the route for six models</h2>
+
+<h3 id="strong-to-weak-phases">6.1 Two phases, no RL</h3>
+<p>The distillation pipeline covers five dense models (0.6B, 1.7B, 4B, 8B, 14B) and the 30B-A3B MoE<a class="cite" href="#ref-1">1</a> (§4.5). It has two phases.</p>
+<ol>
+  <li><strong>Off-policy distillation.</strong> The outputs of teacher models, generated in both <code>/think</code> and <code>/no think</code> modes, are combined for response distillation. The report says this gives the students "basic reasoning skills and the ability to switch between different modes of thinking".</li>
+  <li><strong>On-policy distillation.</strong> In the report's words, "prompts are sampled, and the student model produces responses in either /think or /no think mode. The student model is then fine-tuned by aligning its logits with those of a teacher model (Qwen3-32B or Qwen3-235B-A22B) to minimize the KL divergence."</li>
+</ol>
+<p>The motivation is a result from "preliminary experiments": directly distilling output logits into lightweight students improves performance while "maintaining fine-grained control over their reasoning processes", and it removes the need to run the four-stage process for each small model. The introduction states the finding bluntly: "Distillation from advanced teacher models significantly outperforms reinforcement learning in performance and training efficiency"<a class="cite" href="#ref-1">1</a> (§1, §4). Module 21 derives the objective. The report does not say which teacher serves which student, the KL direction, the estimator, the number of prompts or steps, or whether the off-policy phase filters teacher outputs for correctness.</p>
+<p>One consequence deserves stating. The six students never see an RL reward. Their thinking behavior, non-thinking behavior and mode switching all come from teacher signals, so the Stage 3 and Stage 4 trade-offs of Section 5.4 are not measured for them; the report has no stage-wise table for any small model.</p>
+
+<h3 id="strong-to-weak-cost">6.2 What the "1/10" figure measures</h3>
+<p>The report writes a GPU-hour ratio of about one tenth twice, for two different comparisons. In the §4 introduction, distillation needs "only 1/10 of the GPU hours compared to the four-stage training method". In §4.7, on-policy distillation reaches higher scores than direct RL "while requiring approximately only 1/10 of the GPU hours", and Table 21 gives the numbers: starting from the same off-policy-distilled Qwen3-8B checkpoint, on math and code queries only, the RL arm used 17,920 GPU-hours and the on-policy-distillation arm 1,800<a class="cite" href="#ref-1">1</a> (Table 21, p. 21; the two figures appear only in the table's GPU Hours column, and no sentence of the text states them). Module 21 §4.3 has the arithmetic (a ratio of 9.96 from the printed numbers), the observation that the passage gives no hardware and does not say whether the teacher is included in the 1,800, and the per-point costs. Module 20 covers how pass@64 should be estimated; the report does not say how it did, and the pass@64 gain for on-policy distillation is exactly one question on each AIME set (Module 21).</p>
+<p>Three further points concern what the ratio is a ratio of.</p>
+<ul>
+  <li><strong>The introduction's 1/10 has no printed support.</strong> The report gives no GPU-hours for the four-stage route, for any of its stages, or for the off-policy phase. Only the §4.7 comparison has numbers.</li>
+  <li><strong>The §4.7 ratio compares two continuations.</strong> Both arms start from the off-policy-distilled checkpoint, so that phase's cost, and the cost of generating teacher outputs for it, sits in neither 17,920 nor 1,800. The table's off-policy row has a dash in the GPU-hours column. It is not a measurement of the whole small-model recipe against the whole flagship recipe.</li>
+  <li><strong>Table 21's final row is not the shipped model.</strong> The released Qwen3-8B scores 76.0 on AIME'24 and 67.3 on AIME'25 in thinking mode<a class="cite" href="#ref-1">1</a> (Table 17), against 74.4 and 65.5 for the Table 21 distillation row. Table 21 restricts to "math and code-related queries" for simplicity; the report does not say how the experiment relates to the released checkpoint.</li>
+</ul>
+<p>The Thinking Machines post builds on this table. It takes the RL cost from the report and starts from its own SFT baseline of 60% on AIME'24, against 55.0 for the off-policy row here<a class="cite" href="#ref-10">10</a>; Module 21 compares the two accountings.</p>
+
+<h3 id="strong-to-weak-results">6.3 What the students score, and where the claim thins</h3>
+<p>Table 1 compares each student's thinking-mode scores with the R1-distilled baselines the report chose, plus QwQ-32B, on the four benchmarks where Tables 15, 17 and 19 overlap and the claim is testable. Differences are student minus baseline, in points, computed from the printed scores.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 1.</b> Qwen3 distilled students against baselines in thinking mode, differences in points (student minus baseline) on AIME'24, AIME'25, LiveCodeBench v5 and GPQA-Diamond. Parameter ratio is baseline parameters divided by the student's activated parameters. Derived from Tables 15, 17 and 19 of the report<a class="cite" href="#ref-1">1</a>. Red cells are where the student scores lower.</caption>
+  <thead><tr><th>Student</th><th>Baseline</th><th class="num">Param ratio</th><th class="num">AIME'24</th><th class="num">AIME'25</th><th class="num">LCB v5</th><th class="num">GPQA-D</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Qwen3-30B-A3B (3B active)</td><td>QwQ-32B</td><td class="num">10.7</td><td class="num">+0.9</td><td class="num">+1.4</td><td class="num" data-worst>-0.1</td><td class="num">+0.2</td></tr>
+    <tr><td class="row">Qwen3-30B-A3B (3B active)</td><td>R1-Distill-Qwen-32B</td><td class="num">10.7</td><td class="num">+7.8</td><td class="num">+21.3</td><td class="num">+8.1</td><td class="num">+3.7</td></tr>
+    <tr><td class="row">Qwen3-14B</td><td>R1-Distill-Qwen-32B</td><td class="num">2.3</td><td class="num">+6.7</td><td class="num">+20.8</td><td class="num">+9.0</td><td class="num">+1.9</td></tr>
+    <tr><td class="row">Qwen3-8B</td><td>R1-Distill-Qwen-32B</td><td class="num">4.0</td><td class="num">+3.4</td><td class="num">+17.7</td><td class="num">+3.0</td><td class="num" data-worst>-0.1</td></tr>
+    <tr><td class="row">Qwen3-8B</td><td>R1-Distill-Qwen-14B</td><td class="num">1.8</td><td class="num">+6.3</td><td class="num">+22.8</td><td class="num">+12.0</td><td class="num">+2.9</td></tr>
+    <tr><td class="row">Qwen3-4B</td><td>R1-Distill-Qwen-32B</td><td class="num">8.0</td><td class="num">+1.2</td><td class="num">+16.0</td><td class="num" data-worst>-0.3</td><td class="num" data-worst>-6.2</td></tr>
+    <tr><td class="row">Qwen3-4B</td><td>R1-Distill-Qwen-14B</td><td class="num">3.5</td><td class="num">+4.1</td><td class="num">+21.1</td><td class="num">+8.7</td><td class="num" data-worst>-3.2</td></tr>
+    <tr><td class="row">Qwen3-1.7B</td><td>R1-Distill-Llama-8B</td><td class="num">4.7</td><td class="num" data-worst>-2.1</td><td class="num">+9.0</td><td class="num" data-worst>-9.3</td><td class="num" data-worst>-8.9</td></tr>
+    <tr><td class="row">Qwen3-1.7B</td><td>R1-Distill-Qwen-1.5B</td><td class="num">0.9</td><td class="num">+19.4</td><td class="num">+14.0</td><td class="num">+20.0</td><td class="num">+6.3</td></tr>
+    <tr><td class="row">Qwen3-0.6B</td><td>R1-Distill-Qwen-1.5B</td><td class="num">2.5</td><td class="num" data-worst>-18.2</td><td class="num" data-worst>-7.7</td><td class="num" data-worst>-0.9</td><td class="num" data-worst>-5.9</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f5t"><title id="f5t">AIME'24 and AIME'25 pass@1 against activated parameters for Qwen3 distilled students, R1-distilled baselines and QwQ-32B</title>
+<text x="220" y="46" text-anchor="middle" class="d-title d-bold">AIME'24, pass@1 (%)</text>
+<line x1="70" y1="270.0" x2="370" y2="270.0" class="d-axis"/>
+<text x="64" y="274.0" text-anchor="end" class="d-mono d-small d-text-light">0</text>
+<line x1="70" y1="223.3" x2="370" y2="223.3" class="d-grid"/>
+<text x="64" y="227.3" text-anchor="end" class="d-mono d-small d-text-light">20</text>
+<line x1="70" y1="176.7" x2="370" y2="176.7" class="d-grid"/>
+<text x="64" y="180.7" text-anchor="end" class="d-mono d-small d-text-light">40</text>
+<line x1="70" y1="130.0" x2="370" y2="130.0" class="d-grid"/>
+<text x="64" y="134.0" text-anchor="end" class="d-mono d-small d-text-light">60</text>
+<line x1="70" y1="83.3" x2="370" y2="83.3" class="d-grid"/>
+<text x="64" y="87.3" text-anchor="end" class="d-mono d-small d-text-light">80</text>
+<line x1="70" y1="60" x2="70" y2="270" class="d-axis"/>
+<line x1="83.9" y1="270" x2="83.9" y2="274" class="d-axis"/>
+<text x="83.9" y="286" text-anchor="middle" class="d-mono d-small d-text-light">0.5</text>
+<line x1="126.9" y1="270" x2="126.9" y2="274" class="d-axis"/>
+<text x="126.9" y="286" text-anchor="middle" class="d-mono d-small d-text-light">1</text>
+<line x1="195.2" y1="270" x2="195.2" y2="274" class="d-axis"/>
+<text x="195.2" y="286" text-anchor="middle" class="d-mono d-small d-text-light">3</text>
+<line x1="270.0" y1="270" x2="270.0" y2="274" class="d-axis"/>
+<text x="270.0" y="286" text-anchor="middle" class="d-mono d-small d-text-light">10</text>
+<line x1="338.3" y1="270" x2="338.3" y2="274" class="d-axis"/>
+<text x="338.3" y="286" text-anchor="middle" class="d-mono d-small d-text-light">30</text>
+<text x="220" y="304" text-anchor="middle" class="d-small d-text-light">activated parameters (B, log scale)</text>
+<polyline points="95.2,245.0 159.9,157.3 213.1,97.8 256.1,92.7 290.9,85.0" class="d-line d-stroke-orange"/>
+<polyline points="152.1,202.6 256.1,152.4 290.9,107.4 342.3,100.6" class="d-line d-stroke-blue"/>
+<circle cx="152.1" cy="202.6" r="5" class="d-fill-blue"/>
+<circle cx="256.1" cy="152.4" r="5" class="d-fill-blue"/>
+<circle cx="290.9" cy="107.4" r="5" class="d-fill-blue"/>
+<circle cx="342.3" cy="100.6" r="5" class="d-fill-blue"/>
+<rect x="337.3" y="79.5" width="10" height="10" class="d-fill-green"/>
+<circle cx="95.2" cy="245.0" r="5" class="d-fill-orange"/>
+<circle cx="159.9" cy="157.3" r="5" class="d-fill-orange"/>
+<circle cx="213.1" cy="97.8" r="5" class="d-fill-orange"/>
+<circle cx="256.1" cy="92.7" r="5" class="d-fill-orange"/>
+<circle cx="290.9" cy="85.0" r="5" class="d-fill-orange"/>
+<path d="M195.2,75.4 L202.2,82.4 L195.2,89.4 L188.2,82.4 z" class="d-fill-orange"/>
+<text x="95.2" y="235.0" text-anchor="middle" class="d-small">0.6B</text>
+<text x="159.9" y="147.3" text-anchor="middle" class="d-small">1.7B</text>
+<text x="205.1" y="111.8" text-anchor="end" class="d-small">4B</text>
+<text x="256.1" y="82.7" text-anchor="middle" class="d-small">8B</text>
+<text x="290.9" y="75.0" text-anchor="middle" class="d-small">14B</text>
+<text x="186.2" y="76.4" text-anchor="end" class="d-small">30B-A3B</text>
+<text x="152.1" y="220.6" text-anchor="middle" class="d-small">1.5B</text>
+<text x="256.1" y="170.4" text-anchor="middle" class="d-small">8B</text>
+<text x="290.9" y="125.4" text-anchor="middle" class="d-small">14B</text>
+<text x="342.3" y="118.6" text-anchor="middle" class="d-small">32B</text>
+<text x="342.3" y="74.5" text-anchor="middle" class="d-small">QwQ-32B</text>
+<text x="600" y="46" text-anchor="middle" class="d-title d-bold">AIME'25, pass@1 (%)</text>
+<line x1="450" y1="270.0" x2="750" y2="270.0" class="d-axis"/>
+<text x="444" y="274.0" text-anchor="end" class="d-mono d-small d-text-light">0</text>
+<line x1="450" y1="223.3" x2="750" y2="223.3" class="d-grid"/>
+<text x="444" y="227.3" text-anchor="end" class="d-mono d-small d-text-light">20</text>
+<line x1="450" y1="176.7" x2="750" y2="176.7" class="d-grid"/>
+<text x="444" y="180.7" text-anchor="end" class="d-mono d-small d-text-light">40</text>
+<line x1="450" y1="130.0" x2="750" y2="130.0" class="d-grid"/>
+<text x="444" y="134.0" text-anchor="end" class="d-mono d-small d-text-light">60</text>
+<line x1="450" y1="83.3" x2="750" y2="83.3" class="d-grid"/>
+<text x="444" y="87.3" text-anchor="end" class="d-mono d-small d-text-light">80</text>
+<line x1="450" y1="60" x2="450" y2="270" class="d-axis"/>
+<line x1="463.9" y1="270" x2="463.9" y2="274" class="d-axis"/>
+<text x="463.9" y="286" text-anchor="middle" class="d-mono d-small d-text-light">0.5</text>
+<line x1="506.9" y1="270" x2="506.9" y2="274" class="d-axis"/>
+<text x="506.9" y="286" text-anchor="middle" class="d-mono d-small d-text-light">1</text>
+<line x1="575.2" y1="270" x2="575.2" y2="274" class="d-axis"/>
+<text x="575.2" y="286" text-anchor="middle" class="d-mono d-small d-text-light">3</text>
+<line x1="650.0" y1="270" x2="650.0" y2="274" class="d-axis"/>
+<text x="650.0" y="286" text-anchor="middle" class="d-mono d-small d-text-light">10</text>
+<line x1="718.3" y1="270" x2="718.3" y2="274" class="d-axis"/>
+<text x="718.3" y="286" text-anchor="middle" class="d-mono d-small d-text-light">30</text>
+<text x="600" y="304" text-anchor="middle" class="d-small d-text-light">activated parameters (B, log scale)</text>
+<polyline points="475.2,234.8 539.9,184.1 593.1,116.9 636.1,113.0 670.9,105.7" class="d-line d-stroke-orange"/>
+<polyline points="532.1,216.8 636.1,205.1 670.9,166.2 722.3,154.3" class="d-line d-stroke-blue"/>
+<circle cx="532.1" cy="216.8" r="5" class="d-fill-blue"/>
+<circle cx="636.1" cy="205.1" r="5" class="d-fill-blue"/>
+<circle cx="670.9" cy="166.2" r="5" class="d-fill-blue"/>
+<circle cx="722.3" cy="154.3" r="5" class="d-fill-blue"/>
+<rect x="717.3" y="102.8" width="10" height="10" class="d-fill-green"/>
+<circle cx="475.2" cy="234.8" r="5" class="d-fill-orange"/>
+<circle cx="539.9" cy="184.1" r="5" class="d-fill-orange"/>
+<circle cx="593.1" cy="116.9" r="5" class="d-fill-orange"/>
+<circle cx="636.1" cy="113.0" r="5" class="d-fill-orange"/>
+<circle cx="670.9" cy="105.7" r="5" class="d-fill-orange"/>
+<path d="M575.2,97.6 L582.2,104.6 L575.2,111.6 L568.2,104.6 z" class="d-fill-orange"/>
+<text x="475.2" y="224.8" text-anchor="middle" class="d-small">0.6B</text>
+<text x="539.9" y="174.1" text-anchor="middle" class="d-small">1.7B</text>
+<text x="585.1" y="130.9" text-anchor="end" class="d-small">4B</text>
+<text x="636.1" y="103.0" text-anchor="middle" class="d-small">8B</text>
+<text x="670.9" y="95.7" text-anchor="middle" class="d-small">14B</text>
+<text x="566.2" y="98.6" text-anchor="end" class="d-small">30B-A3B</text>
+<text x="532.1" y="234.8" text-anchor="middle" class="d-small">1.5B</text>
+<text x="636.1" y="223.1" text-anchor="middle" class="d-small">8B</text>
+<text x="670.9" y="184.2" text-anchor="middle" class="d-small">14B</text>
+<text x="722.3" y="172.3" text-anchor="middle" class="d-small">32B</text>
+<text x="722.3" y="97.8" text-anchor="middle" class="d-small">QwQ-32B</text>
+<circle cx="130" cy="14" r="5" class="d-fill-orange"/><text x="140" y="18" class="d-small">Qwen3 distilled (diamond: 30B-A3B MoE)</text>
+<circle cx="420" cy="14" r="5" class="d-fill-blue"/><text x="430" y="18" class="d-small">R1-distilled, SFT only</text>
+<rect x="590" y="9" width="10" height="10" class="d-fill-green"/><text x="606" y="18" class="d-small">QwQ-32B (RL)</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Thinking-mode AIME scores against activated parameters (log axis), from Tables 15, 17 and 19 of the Qwen3 report<a class="cite" href="#ref-1">1</a>. Orange: Qwen3 students (the diamond is the 30B-A3B MoE, plotted at its 3B activated parameters). Blue: R1-distilled baselines, which mix Qwen- and Llama-based models; DeepSeek says they were trained with SFT only<a class="cite" href="#ref-4">4</a> (Supp. F). Green: QwQ-32B. Lines join points in size order. The report does not state how the baseline scores were obtained.</figcaption>
+</figure>
+
+<p>Read the table in three bands. From 4B up, the students lead the R1-distilled baselines on AIME'25 by 16.0 to 22.8 points and on AIME'24 by 1.2 to 7.8, with 4B against R1-Distill-Qwen-32B the tightest (+1.2) and 8 times fewer parameters. On LiveCodeBench v5 and GPQA-Diamond the lead is smaller or absent: the 4B student trails R1-Distill-Qwen-32B by 0.3 and 6.2 points, and Qwen3-8B ties it on GPQA-Diamond (-0.1). At the bottom, the claim thins. Qwen3-1.7B loses to R1-Distill-Llama-8B on three of four benchmarks, and Qwen3-0.6B trails a 1.5B baseline on all four. The report's sentence, that the edge-side models "outperform baselines even with more parameters"<a class="cite" href="#ref-1">1</a> (§4.6), holds on AIME from 4B up and holds only in part below.</p>
+<p>Four cautions bound any attribution to the on-policy phase. First, the baselines are SFT-only models, since R1's authors "apply only SFT and do not include an RL stage"<a class="cite" href="#ref-4">4</a> (Supp. F), so the comparison is partly SFT-only against SFT plus on-policy distillation; but bases, teachers, data and sizes all differ too. Second, the baselines' AIME'24 and GPQA-Diamond scores in Tables 15, 17 and 19 (AIME'24 28.9, 50.4, 69.7, 72.6; GPQA-Diamond 33.8, 49.0, 59.1, 62.1) equal, to the decimal, those DeepSeek printed for the same models<a class="cite" href="#ref-4">4</a> (Supp. Table 15), which suggests they were carried over rather than re-run. Their LiveCodeBench values were not: the report's 54.5 for R1-Distill-Qwen-32B against DeepSeek's 57.2, and 45.5 against 53.1 for the 14B, are different measurements on a different window (Qwen's 2024.10 to 2025.02 against DeepSeek's 2024-08 to 2025-01), and DeepSeek's table has no AIME'25 column at all. The Qwen3 report does not say which baseline cells were taken and which were run, so a mixed protocol is possible. Third, the Qwen3 students are scored at 32,768 maximum output tokens (38,912 for AIME), and the baselines' settings are not stated<a class="cite" href="#ref-1">1</a> (§4.6). Fourth, every cell is one run.</p>
+
+<h3 id="strong-to-weak-qwq">6.4 The parity with QwQ-32B</h3>
+<p>The first row of Table 1 is the result the report highlights: Qwen3-30B-A3B "achieves comparable performance to QwQ-32B with a smaller model size and less than 1/10 activated parameters"<a class="cite" href="#ref-1">1</a> (§4.6). QwQ-32B is an RL-trained model<a class="cite" href="#ref-3">3</a>, and the distilled MoE matches it within 1.4 points on all four benchmarks. For decode, the arithmetic is direct: weights read per generated token at batch 1 in BF16 are about \(3\times10^9 \times 2\ \mathrm{B} = 6\) GB for 3B activated parameters against \(32\times10^9\times 2\ \mathrm{B} = 64\) GB for 32B (derived; this ignores the KV cache and the larger set of experts touched at bigger batch sizes). It is not a controlled RL-versus-distillation experiment, since base model, data, size and architecture all differ. It does show what a distilled MoE can reach against an RL-trained dense model of the previous generation, at about a tenth of the activated weight traffic.</p>
+
+<h2 id="beside-r1">7. Qwen3 beside R1: one skeleton, different choices</h2>
+<p>Module 27 reads R1 in full. Table 2 lists only what the comparison needs. The skeleton is shared: a small long-CoT cold start, a verifier-driven reasoning RL stage, an SFT step built by rejection sampling from that RL model, a broader final RL stage that admits learned rewards, and distilled small models. The choices inside each box differ, and so does how much each report prints.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 2.</b> DeepSeek-R1 (v2 of the arXiv report) and Qwen3's flagship pipeline, stage by stage, with the section of each report<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Stage</th><th>DeepSeek-R1</th><th>Qwen3 flagship</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Cold start</td><td>"Thousands" of long-CoT examples in first-person style; readability is the stated motive (§3, Supp. B.3.2)</td><td>QwQ-32B traces after query and response filters; count not reported; kept small on purpose (§4.1)</td></tr>
+    <tr><td class="row">RL prompts</td><td>80K reasoning prompts by Table 4 (26K math, 17K code, 22K STEM, 15K logic); 88K if the text's 8K bug-fixing problems are added (Supp. B.3.1)</td><td>3,995 query-verifier pairs (§4.2)</td></tr>
+    <tr><td class="row">Reasoning reward</td><td>Rule-based accuracy and format, plus a language-consistency term (§2.2, §3.2.1)</td><td>Rule-based verifiers (§4.2, §4.4)</td></tr>
+    <tr><td class="row">Reasoning-RL settings</td><td>Learning rate 3e-6, KL 0.001, clip ratio printed as 10, 16 samples per question, 32 questions per step, temperature 1, 32,768 tokens (§3.2.1)</td><td>None printed; "large batch", "high number of rollouts", off-policy training (§4.2)</td></tr>
+    <tr><td class="row">Middle SFT step</td><td>Rejection sampling from the stage-1 RL model: about 600K reasoning (correct only) plus about 200K non-reasoning samples (Supp. B.3.3)</td><td>Fusion SFT: thinking data by rejection sampling from the Stage 2 model, plus curated non-thinking data; counts not reported (§4.3)</td></tr>
+    <tr><td class="row">Final RL</td><td>1,700 steps at temperature 0.7; preference reward only in the last 400 steps (§3.2.2)</td><td>More than 20 tasks, three reward types; step count not reported (§4.4)</td></tr>
+    <tr><td class="row">Small models</td><td>SFT on the 800K samples for 2 to 3 epochs, no RL stage (Supp. B.4.3, F)</td><td>Off-policy then on-policy logit distillation from Qwen3-32B or Qwen3-235B-A22B (§4.5)</td></tr>
+    <tr><td class="row">Compute printed</td><td>147K GPU-hours in total, $294K at $2 per H800 GPU-hour (Supp. Table 7)</td><td>Only Table 21: 17,920 and 1,800 GPU-hours for the RL and on-policy-distillation arms; hardware and teacher cost not stated (§4.7)</td></tr>
+  </tbody>
+</table>
+
+<p>Two things stand out. The RL data differs by a factor of 20 while the scaffolding is the same, which makes the 3,995-pair set a deliberate bet that a few well-chosen verifiable prompts are enough from a cold-started model, a bet the Qwen3 report does not test. And the R1 authors end their distillation appendix by leaving "the exploration of the RL stage" on top of distilled models "to the broader research community"<a class="cite" href="#ref-4">4</a> (Supp. F). Qwen3's on-policy phase is one answer in kind, and Table 21 compares it with RL from the same start. The Qwen3 report does not present it as an answer to R1, and the comparison is on one model size and one query domain.</p>
+
+<h2 id="not-reported">8. What the report does not print</h2>
+<p>A reader who wants to reproduce or budget a Qwen3-style run needs the items in Table 3. Each row was checked against the post-training text of the report (§4.1 to §4.7); the report's hyperparameter statements elsewhere concern pretraining.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 3.</b> Reproduction ledger for Qwen3's post-training: what the report states and what it leaves out<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Stage</th><th>Stated</th><th>Not reported</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Cold start</td><td>Filters, generator (QwQ-32B), six response defects, "minimize" samples and steps (§4.1)</td><td>Number of candidates \(N\), dataset size, steps, learning rate</td></tr>
+    <tr><td class="row">Reasoning RL</td><td>GRPO; 3,995 pairs; four criteria; entropy kept steady or rising; AIME'24 70.1 to 85.1 in 170 steps at 235B (§4.2)</td><td>Pool size and pass-rate thresholds; batch size, rollouts per query, off-policy degree, learning rate, KL, clip range, maximum length; how entropy is controlled</td></tr>
+    <tr><td class="row">Fusion</td><td>Data construction and the chat template (§4.3, Table 9)</td><td>Sample counts, epochs, thinking-to-non-thinking ratio</td></tr>
+    <tr><td class="row">General RL</td><td>Five capability groups; three reward types; judge identity; agent rollouts with execution feedback (§4.4)</td><td>The 20-plus tasks; task-to-reward mapping; reward scales and mixing; RM size and data; judge prompt; environments, tools, turn limits; steps</td></tr>
+    <tr><td class="row">Distillation</td><td>Two phases; teachers named as Qwen3-32B or Qwen3-235B-A22B; "minimize the KL divergence" (§4.5)</td><td>Teacher per student, prompts, steps, KL direction and estimator, correctness filtering in the off-policy phase</td></tr>
+    <tr><td class="row">Compute</td><td>17,920 and 1,800 GPU-hours (Table 21); "1/10" twice</td><td>GPU type and count; any other stage's cost; whether the 1,800 includes the teacher</td></tr>
+    <tr><td class="row">Evidence</td><td>Table 22 (32B, stage by stage); Table 21 (8B); final-model tables</td><td>Flagship stage-wise results; seeds and intervals; the pass@64 estimator; ablations of the 3,995-pair choice, the cold-start size and the reward types</td></tr>
+  </tbody>
+</table>
+
+<p>The most consequential omissions for a practitioner are the batch geometry and the entropy method of Stage 2, because the report's one positive claim, "without any manual intervention on hyperparameters", cannot be tested without them, and the task-to-reward mapping of Stage 4, because the mapping decides where hacking risk sits.</p>
+
+<h2 id="serving-layer">9. What the recipe leaves at the serving layer</h2>
+<p>For an inference engineer the post-training choices surface as decoding settings and conversation rules. Table 4 collects them from the report's evaluation protocol and from the model cards; the cards are the only source for the practitioner-facing recommendations.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 4.</b> Sampling and length settings by source. The report's evaluation protocol (§4.6) is what the benchmark numbers were produced with; the model cards are Qwen's own recommendations<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-13">13</a>.</caption>
+  <thead><tr><th>Source</th><th>Mode</th><th class="num">Temperature</th><th class="num">Top-p</th><th class="num">Top-k</th><th class="num">Min-p</th><th>Presence penalty</th><th>Output length (tokens)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Report evaluation</td><td>Thinking</td><td class="num">0.6</td><td class="num">0.95</td><td class="num">20</td><td class="num">not stated</td><td>1.5 on two writing benchmarks only</td><td>32,768; 38,912 for AIME</td></tr>
+    <tr><td class="row">Report evaluation</td><td>Non-thinking</td><td class="num">0.7</td><td class="num">0.8</td><td class="num">20</td><td class="num">not stated</td><td>1.5</td><td>32,768; 38,912 for AIME</td></tr>
+    <tr><td class="row">Qwen3-8B card</td><td>Thinking</td><td class="num">0.6</td><td class="num">0.95</td><td class="num">20</td><td class="num">0</td><td>0 to 2, optional</td><td>32,768 for most queries; 38,912 for highly complex math and programming benchmarks</td></tr>
+    <tr><td class="row">Qwen3-8B card</td><td>Non-thinking</td><td class="num">0.7</td><td class="num">0.8</td><td class="num">20</td><td class="num">0</td><td>0 to 2, optional</td><td>32,768 for most queries; 38,912 for highly complex math and programming benchmarks</td></tr>
+    <tr><td class="row">Instruct-2507 card</td><td>Non-thinking only</td><td class="num">0.7</td><td class="num">0.8</td><td class="num">20</td><td class="num">0</td><td>0 to 2, optional</td><td>16,384 for most queries</td></tr>
+    <tr><td class="row">Thinking-2507 card</td><td>Thinking only</td><td class="num">0.6</td><td class="num">0.95</td><td class="num">20</td><td class="num">0</td><td>0 to 2, optional</td><td>32,768 for most queries; up to 81,920 for highly complex math and programming benchmarks</td></tr>
+  </tbody>
+</table>
+
+<p>Three further statements from the Qwen3-8B card matter to a runtime. "DO NOT use greedy decoding, as it can lead to performance degradation and endless repetitions". In multi-turn conversations "the historical model output should only include the final output part", with the provided chat template handling that stripping. And <code>enable_thinking</code> defaults to true; with it set to false the model emits no think block and the <code>/think</code> and <code>/no_think</code> soft switches "are not valid"<a class="cite" href="#ref-11">11</a>.</p>
+<p>Three consequences are the writer's reading, not claims of the sources. One set of weights now serves two output-length profiles, so a scheduler that mixes the modes sees a bimodal length distribution, the situation Module 1's static-batching waste arithmetic describes. Stripping earlier thinking from the history means the prompt for turn \(n+1\) no longer contains the thinking tokens whose KV entries were computed while generating turn \(n\), so prefix-cache reuse across turns stops where the previous assistant message begins. And the budget, which the report implements by halting the thinking at a threshold and appending a stop string<a class="cite" href="#ref-1">1</a> (§4.3), is a serving-time action: the runtime must inject text mid-decode and continue from the extended prefix. The 2507 releases ship one mode per checkpoint, which turns the first issue from a scheduling problem into a deployment choice between two models (last section).</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Qwen3 sits inside four live disputes. Each is stated below as its own set of positions, with the Qwen3 evidence placed where it belongs and no more weight than it can bear.</p>
+
+<h3 id="disagree-rl-distill">Disagreement 1: RL or distillation for strong small reasoning models?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>Distill: a teacher signal beats RL for the student</h4>
+    <p class="who">Qwen3 team<a class="cite" href="#ref-1">1</a>; DeepSeek-R1 authors<a class="cite" href="#ref-4">4</a>; Thinking Machines<a class="cite" href="#ref-10">10</a></p>
+    <p>Qwen3 reports on-policy distillation ahead of RL on all six Table 21 benchmarks at about a tenth of the GPU-hours. R1 found that 10K+ RL steps on Qwen2.5-32B only matched QwQ-32B-Preview while distilling R1 did "significantly better". Thinking Machines reproduces the direction with its own accounting.</p>
+    <ul class="pros"><li>Three groups, one direction (R1's comparison is off-policy SFT distillation, not on-policy), and Table 21 starts both arms from the same checkpoint.</li><li>The cost is paid once per teacher and reused across six students.</li></ul>
+    <ul class="cons"><li>The 17,920 and 1,800 GPU-hours come with no hardware and no statement on whether the teacher is counted (Module 21).</li><li>The teacher is itself the product of a four-stage RL pipeline, so distillation depends on RL rather than replacing it.</li><li>The RL arm's recipe is not described; it may not be a tuned run.</li></ul>
+  </article>
+  <article class="position">
+    <h4>RL remains necessary at the frontier and may close the gap with enough steps</h4>
+    <p class="who">DeepSeek-R1 authors, same appendix<a class="cite" href="#ref-4">4</a>; ProRL authors<a class="cite" href="#ref-14">14</a></p>
+    <p>R1's authors add that "advancing beyond the boundaries of human intelligence may still require more powerful base models and larger-scale reinforcement learning". ProRL reports that prolonged RL from a distilled 1.5B model, with KL control, reference resets and diverse tasks, finds strategies the base model cannot reach.</p>
+    <ul class="pros"><li>Distillation cannot exceed the teacher; only RL has a path past it.</li><li>ProRL's 2,000-plus steps is a different regime from a short RL arm.</li></ul>
+    <ul class="cons"><li>Needs a long run: ProRL used four nodes of 8 H100 for about 16K GPU-hours<a class="cite" href="#ref-14">14</a> (§3.2), the same order as Qwen3's RL arm of 17,920 (hardware unstated), so cost alone does not separate the two.</li><li>No source compares a long RL run with on-policy distillation at matched total compute.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>For a small student with an existing strong teacher that shares the tokenizer and an SFT start, distillation is the cheaper route in every comparison available, and Qwen3 shows it at product scale (six models). That is a statement about copying a capability, not creating one: the teachers cost four RL-shaped stages that Qwen3 never prices. Whether RL given Qwen3-sized compute and ProRL-style stabilizers would match OPD is untested. The evidence that would settle it is one starting checkpoint, teacher cost counted, matched total GPU-hours, several seeds, and pass@k over more than 30 problems.</p></div>
+
+<h3 id="disagree-sharpen">Disagreement 2: does RLVR create reasoning capability or sharpen what exists?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>RL sharpens; distillation expands</h4>
+    <p class="who">Yue et al.<a class="cite" href="#ref-15">15</a>; DeepSeekMath's Maj@K versus Pass@K observation<a class="cite" href="#ref-5">5</a>; Qwen3's Table 21<a class="cite" href="#ref-1">1</a></p>
+    <p>RLVR models beat their base at small \(k\) and lose at large \(k\), and the reasoning paths of RLVR models were already inside the base model's samples. Distillation, unlike RLVR, can introduce new patterns from a teacher. Qwen3's Table 21 has the same shape: RL left AIME pass@64 at 90.0 and 83.3, on-policy distillation raised it to 93.3 and 86.7.</p>
+    <ul class="pros"><li>Yue et al. report the pattern across six RLVR algorithms.</li><li>Gives a mechanism: a teacher's logits carry information RL's one-bit reward cannot.</li></ul>
+    <ul class="cons"><li>Table 21's expansion is one question out of 30 on each AIME set, from one run, with no stated estimator (Modules 20 and 21).</li><li>The RL arm's length and recipe are not given, and the report's RL pass@64 is for a model that started from an already distilled checkpoint.</li></ul>
+  </article>
+  <article class="position">
+    <h4>RL can expand, in a second phase or with prolonged training</h4>
+    <p class="who">ProRL<a class="cite" href="#ref-14">14</a>; the two-stage dynamics view<a class="cite" href="#ref-16">16</a></p>
+    <p>ProRL reports gains "inaccessible to base models, even under extensive sampling" and ties them to base-model weakness on the task and to training duration. The two-stage view argues both camps are partly right: an exploitation phase that sharpens, then an exploration phase in which rare good tokens gain probability.</p>
+    <ul class="pros"><li>Explains why short runs (Qwen3's RL stage ran 170 steps at 235B) look like sharpening.</li></ul>
+    <ul class="cons"><li>Results are on a 1.5B model; the two-stage paper is a theoretical reconciliation by its own authors' account.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Much of the gain is prior amplification</h4>
+    <p class="who">Spurious Rewards authors<a class="cite" href="#ref-17">17</a></p>
+    <p>On Qwen2.5-Math-7B, randomly assigned rewards gave a 21.4-point MATH-500 gain against 29.1 for true rewards; the effect is model-dependent and absent for other families. The paper's mechanism is a clipping bias that amplifies high-prior behavior.</p>
+    <ul class="pros"><li>A control any pass@k claim should survive.</li></ul>
+    <ul class="cons"><li>The paper's gains are specific to Qwen2.5-Math and minimal or negative for Qwen2.5, Olmo 2 and Llama 3; it tests no Qwen3 model.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Qwen3's own contribution is thin and should be filed as a consistent data point, not a test: a one-question margin from a single run cannot distinguish a real expansion from noise, and the RL arm never had the long horizon where ProRL sees expansion. What the report does support is narrower. Starting from the same checkpoint, a teacher-driven signal gave higher pass@1 at a tenth of the stated cost (hardware and teacher cost not stated). I found no spurious-rewards control on a Qwen3 checkpoint in the sources, and it is among the cheapest experiments that would reduce the uncertainty.</p></div>
+
+<h3 id="disagree-rewards">Disagreement 3: verifiers, learned reward models, or judges?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>Verifiers only for reasoning; keep learned rewards on a short leash</h4>
+    <p class="who">DeepSeek-R1 authors<a class="cite" href="#ref-4">4</a></p>
+    <p>R1 abstains from neural reward models on reasoning tasks because they are susceptible to hacking at scale, and confines the preference reward to the last 400 of 1,700 second-stage steps.</p>
+    <ul class="pros"><li>Hacking was observed: reward rose while reasoning fell (Supp. B.5).</li></ul>
+    <ul class="cons"><li>Silent on open-ended tasks where no verifier exists.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Route by task: rules where possible, a reference judge or an RM elsewhere</h4>
+    <p class="who">Qwen3 team<a class="cite" href="#ref-1">1</a></p>
+    <p>Qwen3 keeps rules for precision, adds a 72B judge with a reference "avoiding false negatives", and a preference RM for queries with no reference, over more than 20 tasks.</p>
+    <ul class="pros"><li>Covers instruction following, format, agent and open-ended preference in one stage; ThinkFollow rises to 98.9.</li></ul>
+    <ul class="cons"><li>No hacking analysis, no exposure cap, no task-to-reward mapping; the judge is fixed and older than the policy.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Rubric judges, trained in the loop</h4>
+    <p class="who">DeepSeek-V3.2<a class="cite" href="#ref-18">18</a>; DeepSeek-V4<a class="cite" href="#ref-19">19</a></p>
+    <p>V3.2 uses a generative reward model with per-prompt rubrics for general tasks. V4 uses no scalar reward models and applies RL to the generative judge, which is the actor itself.</p>
+    <ul class="pros"><li>Removes the fixed-judge ceiling, and needs no separate judge model.</li></ul>
+    <ul class="cons"><li>Shared weights mean shared failure modes; the report cannot audit them from inside (Module 16).</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Qwen3 is the middle position, and the evidence is not there to rank it. Where a checker exists, all three agree on using it. For the rest, each design trades a different risk: R1 limits exposure, Qwen3 relies on a fixed judge that is a generation older than the policies it scores, V4 gives up independence for scale. The measurement that separates them is judge accuracy on labelled pairs tracked through training, which none of the three reports prints.</p></div>
+
+<h3 id="disagree-fusion">Disagreement 4: one fused model, or separate thinking and non-thinking models?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>Fuse the modes in one set of weights</h4>
+    <p class="who">Qwen3 report, April and May 2025<a class="cite" href="#ref-1">1</a></p>
+    <p>One model saves the cost and complexity of deploying separate models and gets budget control as a side effect. At 32B, thinking-mode AIME'24 goes from 83.8 (Stage 2, before fusion) to 81.4 (Stage 4, fused), and the fused model's non-thinking mode scores 31.0.</p>
+    <ul class="pros"><li>One deployment; budgets from a stop string without extra training.</li></ul>
+    <ul class="cons"><li>Table 22 shows a 2.4-point AIME'24 and 2.7-point LiveCodeBench drop in thinking mode, accepted "to enhance the model's overall versatility".</li></ul>
+  </article>
+  <article class="position">
+    <h4>Train Instruct and Thinking models separately</h4>
+    <p class="who">Qwen team's July 2025 decision, as quoted by The Register<a class="cite" href="#ref-20">20</a>; the 2507 model cards<a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-13">13</a></p>
+    <p>The team's post, as quoted, says: "After talking with the community and thinking it through, we decided to stop using hybrid thinking mode." It adds: "We believe that providing better-quality performance is more important than the unification at this moment." The Instruct-2507 card says the model "supports only non-thinking mode"; the Thinking-2507 card says it "supports only thinking mode".</p>
+    <ul class="pros"><li>Each checkpoint is tuned for one length profile; the Thinking-2507 card prints AIME25 92.3 against 81.5 for the original and a longer thinking length.</li></ul>
+    <ul class="cons"><li>Two deployments. The comparison is confounded: three months of reasoning work, longer thinking and possibly other changes came with the split, so the card's gap is not the cost of fusion.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Qwen's own reversal is the strongest evidence, and it is a statement of priorities, not a measurement. The team says it keeps researching hybrid thinking<a class="cite" href="#ref-20">20</a>. DeepSeek's V4 trains three reasoning-effort modes per model<a class="cite" href="#ref-19">19</a>, so multi-mode single-model designs are still being built, and Module 23 compares the mechanisms. What would settle it is the same model trained both ways with equal data and compute. The primary Qwen post was not retrievable here (the X page returned HTTP 402 to the fetch tool, and I did not work around it), so the quotes are taken from The Register's labelled secondary account.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<ol class="timeline">
+  <li><time>2025-03-06</time><b>QwQ-32B</b><p>Two-stage RL from a cold-start checkpoint, verifiers first, then a general reward model plus rule-based verifiers<a class="cite" href="#ref-3">3</a>.</p></li>
+  <li><time>2025-04-29</time><b>Qwen3 release post</b><p>Four-stage pipeline announced; the post gives no hardware or cost and no reward details beyond the task categories<a class="cite" href="#ref-2">2</a>.</p></li>
+  <li><time>2025-05-14</time><b>Technical report, v1</b><p>The only version of the report; the arXiv listing shows none later<a class="cite" href="#ref-1">1</a>.</p></li>
+  <li><time>2025-07</time><b>Instruct-2507 and Thinking-2507, hybrid mode dropped</b><p>Separate checkpoints with a 262,144-token native context; the Thinking card lists "Pretraining &amp; Post-training" and does not mention RL or GSPO<a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-13">13</a><a class="cite" href="#ref-20">20</a>.</p></li>
+  <li><time>2025-07-28</time><b>GSPO paper, v2</b><p>States that GSPO contributed to "the latest Qwen3 models"<a class="cite" href="#ref-7">7</a>.</p></li>
+</ol>
+<p>Two threads are open. First, no later Qwen report in the source map documents a post-training recipe. The Thinking Machines post's June 2026 update says the Qwen3-32B and Qwen3-8B-Base models it used "have since been retired" from its platform and that its recipes now use Qwen3.5-9B<a class="cite" href="#ref-10">10</a>; I found no Qwen3.5 technical report in the sources and do not describe that model's training. Second, the Qwen3 models have become the substrate for other groups' distillation studies. The MOPD paper trains a Qwen3-30B-A3B student, and swapping its same-origin RL teacher for Qwen3-235B-A22B hurt<a class="cite" href="#ref-8">8</a> (§4.4.2); Module 21 §5.1 reads that as a reachability condition that Qwen3's off-policy phase may exist to satisfy, which is that module's synthesis and not a claim of the Qwen3 report. The model snapshots will keep changing; the one stable fact is the April 2025 report, which has not been revised since 14 May 2025.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Qwen Team (An Yang et al.). <em>Qwen3 Technical Report</em>. arXiv:2505.09388 v1, 14 May 2025 (no later version listed on the arXiv page). <a href="https://arxiv.org/pdf/2505.09388v1">https://arxiv.org/pdf/2505.09388v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §4 introduction and Figure 1 (pipeline, 1/10 GPU hours), §4.1 (cold start), §4.2 (3,995 pairs, four criteria, 70.1 to 85.1 in 170 steps), §4.3 and Table 9 (fusion), §4.4 (general RL, three reward types, agent rollouts), §4.5 (strong-to-weak distillation), §4.6 (evaluation protocol, Tables 11 to 20), §4.7 (Tables 21 and 22, thinking-budget discussion).</span></li>
+  <li id="ref-2"><span class="ref-type">official</span>Qwen Team. <em>Qwen3: Think Deeper, Act Faster</em>. Qwen blog, 29 April 2025. <a href="https://qwenlm.github.io/blog/qwen3/">https://qwenlm.github.io/blog/qwen3/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: release date; the four-stage pipeline as announced; the absence of hardware, cost and reward details in the post (extracted by the fetch tool).</span></li>
+  <li id="ref-3"><span class="ref-type">official</span>Qwen Team. <em>QwQ-32B: Embracing the Power of Reinforcement Learning</em>. Qwen blog, 6 March 2025. <a href="https://qwenlm.github.io/blog/qwq-32b/">https://qwenlm.github.io/blog/qwq-32b/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: QwQ-32B's two-stage RL (accuracy verifier, code execution server, general reward model plus rule-based verifiers, "a small amount of steps"); QwQ-32B as an RL-trained model. Quotes are fetch-tool extractions.</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>DeepSeek-AI (Daya Guo et al.). <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv:2501.12948 v2, 4 January 2026 (the expanded version). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: cold-start motive (§3, Supp. B.3.2), first-stage settings and language-consistency reward (§3.2.1), second-stage schedule (§3.2.2), RL data Table 4, 800K SFT data (Supp. B.3.3, B.4.3), compute Table 7, distillation as SFT only and the RL comparison (Supp. F, Tables 15 and 16), verifier findings (Supp. G.1). Read in the cached copy.</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Shao, Z. et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv:2402.03300 v3, 27 April 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the origin of GRPO (the algorithm Qwen3 names in §4.2); the Maj@K versus Pass@K observation (§5.2.2).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Khatri, D. et al. <em>The Art of Scaling Reinforcement Learning Compute for LLMs</em>. arXiv:2510.13786 v1, 15 October 2025. <a href="https://arxiv.org/pdf/2510.13786v1">https://arxiv.org/pdf/2510.13786v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the statements that PPO-off-policy-k "has been used previously by Qwen3" (§3.1) and that Qwen3 uses interruptions (App. A.10), both flagged here as second-hand readings.</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Zheng, C. et al. (Qwen Team). <em>Group Sequence Policy Optimization</em>. arXiv:2507.18071 v2, 28 July 2025. <a href="https://arxiv.org/pdf/2507.18071v2">https://arxiv.org/pdf/2507.18071v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the statements that GSPO was applied to "the latest Qwen3 models" (abstract, §5.1, conclusion); no model, stage or date is named.</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Xiaomi (internship work). <em>MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training</em>. arXiv:2606.30406 v1, 29 June 2026. <a href="https://arxiv.org/pdf/2606.30406v1">https://arxiv.org/pdf/2606.30406v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the "Mix-RL" classification of the Qwen3 report (§1); the same-origin teacher result on a Qwen3-30B-A3B student (§4.4.2).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Lambert, N. et al. (Allen Institute for AI). <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv:2411.15124 v5, 14 April 2025. <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the verifiable-reward stage on IFEval-style constraints (§1), the work Qwen3 cites for rule-based instruction-following rewards.</span></li>
+  <li id="ref-10"><span class="ref-type">blog</span>Lu, K. and Thinking Machines Lab. <em>On-Policy Distillation</em>. Thinking Machines Lab: Connectionism, 27 October 2025; update note June 2026. <a href="https://thinkingmachines.ai/blog/on-policy-distillation/">https://thinkingmachines.ai/blog/on-policy-distillation/</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the 60% AIME'24 SFT baseline against Table 21's 55.0, the RL cost taken from the Qwen3 report, and the June 2026 note that the Qwen3 models used were retired and recipes now use Qwen3.5-9B.</span></li>
+  <li id="ref-11"><span class="ref-type">official</span>Qwen Team. <em>Qwen/Qwen3-8B</em>, Hugging Face model card. <a href="https://huggingface.co/Qwen/Qwen3-8B">https://huggingface.co/Qwen/Qwen3-8B</a>. Accessed 2026-10-27. <span class="ref-use">Used for: <code>enable_thinking</code>, soft switches, recommended sampling parameters, no-greedy warning, output-length recommendations, history handling (Best Practices; extracted by the fetch tool).</span></li>
+  <li id="ref-12"><span class="ref-type">official</span>Qwen Team. <em>Qwen/Qwen3-235B-A22B-Instruct-2507</em>, Hugging Face model card. <a href="https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507">https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507</a>. Accessed 2026-10-27. <span class="ref-use">Used for: non-thinking-only statement, context length, sampling settings, training-stage listing without RL or GSPO. Quotes are fetch-tool extractions.</span></li>
+  <li id="ref-13"><span class="ref-type">official</span>Qwen Team. <em>Qwen/Qwen3-235B-A22B-Thinking-2507</em>, Hugging Face model card. <a href="https://huggingface.co/Qwen/Qwen3-235B-A22B-Thinking-2507">https://huggingface.co/Qwen/Qwen3-235B-A22B-Thinking-2507</a>. Accessed 2026-10-27. <span class="ref-use">Used for: thinking-only statement, AIME25 92.3 against 81.5 for the original, context length, sampling and output-length settings, training-stage listing without RL or GSPO. Quotes are fetch-tool extractions.</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Liu, M. et al. (NVIDIA). <em>ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models</em>. arXiv:2505.24864 v1, 30 May 2025. <a href="https://arxiv.org/pdf/2505.24864v1">https://arxiv.org/pdf/2505.24864v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the expansion claim (abstract), the 2,000-plus step run (§1), 4 nodes of 8 H100 for about 16K GPU-hours (§3.2).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Yue, Y. et al. <em>Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?</em> arXiv:2504.13837 v5, 24 November 2025. <a href="https://arxiv.org/pdf/2504.13837v5">https://arxiv.org/pdf/2504.13837v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the pass@k sharpening result and the distillation contrast (abstract; abstract-level read).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span><em>The Debate on RLVR Reasoning Capability Boundary: Shrinkage, Expansion, or Both? A Two-Stage Dynamic View</em>. arXiv:2510.04028 v1, 5 October 2025. <a href="https://arxiv.org/abs/2510.04028">https://arxiv.org/abs/2510.04028</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the exploitation-then-exploration reconciliation (abstract; abstract-level read).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Shao, R. et al. <em>Spurious Rewards: Rethinking Training Signals in RLVR</em>. arXiv:2506.10947 v2, 25 February 2026. <a href="https://arxiv.org/pdf/2506.10947v2">https://arxiv.org/pdf/2506.10947v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the 21.4 versus 29.1 MATH-500 result on Qwen2.5-Math-7B, the model-family dependence, the clipping-bias mechanism (abstract, §1).</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv:2512.02556 v1, 2 December 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the generative reward model with per-prompt rubrics for general tasks (§3).</span></li>
+  <li id="ref-19"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv:2606.19348 v1 (cited by title and id; the arXiv API date and the id month disagree, so no date is given). <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: no scalar reward models and the actor as generative judge (§5.1.1); three reasoning-effort modes per model with distinct length penalties and context windows (§5.1.1).</span></li>
+  <li id="ref-20"><span class="ref-type">analysis</span>Mann, T. <em>Alibaba admits Qwen3's hybrid-thinking mode was dumb</em>. The Register, 31 July 2025. <a href="https://www.theregister.com/2025/07/31/alibaba_qwen3_hybrid_thinking/">https://www.theregister.com/2025/07/31/alibaba_qwen3_hybrid_thinking/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the Qwen team's July 2025 statement on stopping hybrid thinking mode, quoted by the article from a post on X that the fetch tool could not retrieve (HTTP 402); secondary source with the outlet's own vendor-benchmark caveat; quotes are fetch-tool extractions. The headline is the outlet's, not Qwen's.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

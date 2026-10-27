@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The GRPO Loss and Advantage Under the Microscope: Length Bias, Difficulty Bias, Token-Level Averaging, and Zero-Variance Groups · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="What the per-sequence 1/|o| average and the group-std division do to per-token gradient weight in GRPO, and the competing fixes in Dr. GRPO, DAPO, DeepSeek-V3.2, Olmo 3 and ScaleRL.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 11</p>
+  <h1>The GRPO Loss and Advantage Under the Microscope: Length Bias, Difficulty Bias, Token-Level Averaging, and Zero-Variance Groups</h1>
+  <p class="lede">Two denominators decide how much gradient each token of a GRPO update receives: the response length |o<sub>i</sub>| in the loss, and the group's reward standard deviation in the advantage. This module derives the weight a token gets under every published aggregation, shows what Dr. GRPO, DAPO, DeepSeek-V3.2, Olmo 3 and ScaleRL each changed and why, and states what their ablations do and do not show. You can compute the per-token weight and the dead-group fraction for your own batch and pick a normalization with the evidence in hand.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>13</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisite: <b>Module 9</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f1t"><title id="f1t">One GRPO gradient: group rewards become advantages through a scale choice s, then each token of a response is weighted by 1/Z, and the two choices differ across recipes</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="14" y="30" width="150" height="64" rx="8" class="d-block"/>
+    <text x="89" y="58" text-anchor="middle" class="d-text-inv d-bold">G rewards</text><text x="89" y="78" text-anchor="middle" class="d-text-inv d-small">one per sample</text>
+    <path d="M164,62 L200,62" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="200" y="30" width="190" height="64" rx="8" class="d-block-2"/>
+    <text x="295" y="58" text-anchor="middle" class="d-text-inv d-bold">Advantage A_i</text><text x="295" y="78" text-anchor="middle" class="d-text-inv d-mono">(R_i &#8722; mean) / s</text>
+    <path d="M390,62 L426,62" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="426" y="30" width="180" height="64" rx="8" class="d-block-2"/>
+    <text x="516" y="58" text-anchor="middle" class="d-text-inv d-bold">Token weight</text><text x="516" y="78" text-anchor="middle" class="d-text-inv d-mono">1 / Z, per token</text>
+    <path d="M606,62 L642,62" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="642" y="30" width="144" height="64" rx="8" class="d-block"/>
+    <text x="714" y="58" text-anchor="middle" class="d-text-inv d-bold">Gradient</text><text x="714" y="78" text-anchor="middle" class="d-text-inv d-mono">&#931; (A_i/Z) &#8711;log &#960;</text>
+    <path d="M295,94 L295,128" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <path d="M516,94 L516,128" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <rect x="14" y="132" width="376" height="170" rx="10" class="d-fill-orange-soft"/><rect x="14" y="132" width="376" height="170" rx="10" class="d-outline d-stroke-orange"/>
+    <text x="28" y="156" class="d-bold">Knob s: scale of the advantage</text>
+    <text x="28" y="184">group std</text><text x="150" y="184" class="d-small d-text-light">GRPO, DAPO, GLM-5, TRL default</text>
+    <text x="28" y="212">none</text><text x="150" y="212" class="d-small d-text-light">Dr. GRPO, DeepSeek-V3.2, Olmo 3</text>
+    <text x="28" y="240">batch std</text><text x="150" y="240" class="d-small d-text-light">ScaleRL, TRL scale_rewards=batch</text>
+    <text x="28" y="280" class="d-small d-text-light">Changes how much each prompt pulls, not the ranking inside it.</text>
+    <rect x="410" y="132" width="376" height="170" rx="10" class="d-fill-orange-soft"/><rect x="410" y="132" width="376" height="170" rx="10" class="d-outline d-stroke-orange"/>
+    <text x="424" y="156" class="d-bold">Knob Z: denominator of the token average</text>
+    <text x="424" y="184">G |o_i|</text><text x="560" y="184" class="d-small d-text-light">original GRPO, V3.2 as printed</text>
+    <text x="424" y="212">&#931; |o| in the group</text><text x="560" y="212" class="d-small d-text-light">DAPO Eq. 8</text>
+    <text x="424" y="240">&#931; |o| in the batch</text><text x="560" y="240" class="d-small d-text-light">Olmo 3, TRL loss_type=dapo</text>
+    <text x="424" y="268">G L_max</text><text x="560" y="268" class="d-small d-text-light">Dr. GRPO, a constant</text>
+    <text x="424" y="290" class="d-small d-text-light">Changes how much each response pulls, and which one wins.</text>
+    <rect x="14" y="322" width="772" height="44" rx="8" class="d-panel"/>
+    <text x="30" y="342" class="d-bold">Before the loss</text><text x="170" y="342" class="d-small">drop groups whose rewards are all equal (A = 0 for every token);</text>
+    <text x="170" y="358" class="d-small">mask or soft-penalise truncated samples (DAPO, ScaleRL, Olmo 3 differ).</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The two normalization knobs in a GRPO-family update. Original GRPO sets s to the group standard deviation and Z to G|o<sub>i</sub>|<a class="cite" href="#ref-1">1</a>; Dr. GRPO removes both<a class="cite" href="#ref-2">2</a>; DAPO changes Z but keeps s<a class="cite" href="#ref-3">3</a>. Recipes named in the panels are mapped, with sources, in Table 7.</figcaption>
+</figure>
+
+<h2 id="per-token-weight">1. Where the gradient weight of a token comes from</h2>
+
+<h3 id="per-token-weight-setup">1.1 One formula for every variant</h3>
+<p>Take one prompt \(q\), a group of \(G\) samples \(o_1,\dots,o_G\) drawn from the rollout policy, lengths \(|o_i|\), and one scalar reward \(R_i\) per sample. DeepSeekMath's GRPO objective averages a clipped per-token surrogate first over the tokens of each response and then over the group<a class="cite" href="#ref-1">1</a> (§4.1.1, Eq. 3), with the advantage \(\hat A_i = (R_i-\mathrm{mean}(R))/\mathrm{std}(R)\) copied to every token of response \(i\)<a class="cite" href="#ref-1">1</a> (§4.1.2). Dr. GRPO writes the same objective in its Eq. 3<a class="cite" href="#ref-2">2</a>.</p>
+<p>When the policy takes one gradient step per rollout the ratio is exactly 1, the clip is inactive and the surrogate's gradient is \(\hat A\,\nabla\log\pi\) (Module 9, §3.3 derives this; DeepSeekMath-RL uses a single update per exploration stage<a class="cite" href="#ref-1">1</a>, §4.2). Drop the KL term and every aggregation covered in this module collapses to one expression:</p>
+$$\nabla\mathcal J=\sum_{i=1}^{G}\sum_{t=1}^{|o_i|}\frac{\hat A_i}{Z_i}\,\nabla\log\pi_\theta(o_{i,t}\mid q,o_{i,\lt t}),\qquad \hat A_i=\frac{R_i-\mathrm{mean}(R)}{s}.$$
+<p>Two choices remain: the scale \(s\) in the advantage and the denominator \(Z_i\) of the token average. They are the two knobs of Figure 1. (For a batch of \(P\) prompts, sum over all \(B=PG\) responses and read \(Z_i\) as in Table 1; for a single prompt, \(P=1\) and \(B=G\).) Every token of response \(i\) receives the same coefficient \(\hat A_i/Z_i\) in front of its score function, so "how much does this token matter" is the same question as "what is \(Z_i\)". The rest of the module asks what each choice of \(Z\) and \(s\) does to the weights, and what the experiments say.</p>
+
+<h3 id="per-token-weight-four">1.2 Four denominators in use</h3>
+<p>Table 1 lists the denominators that appear in the reports and in Hugging Face TRL, which exposes most of them as <code>loss_type</code> values<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>. Lambert's textbook describes the same three families of aggregation<a class="cite" href="#ref-6">6</a> (§6.3.2).</p>
+<table class="tbl tbl-dense tbl-compare">
+  <caption><b>Table 1.</b> Aggregation schemes for a batch of \(P\) prompts with \(G\) samples each. \(L_i=|o_i|\); \(B=PG\) responses; \(N\) response tokens in the batch; \(L_{\max}\) the generation cap. "Total" is the weight of the whole response, \(L_i\) times the per-token weight. For one prompt, set \(P=1\).</caption>
+  <thead><tr><th>Scheme</th><th>Denominator \(Z_i\)</th><th>Per-token weight</th><th>Total for response \(i\)</th><th>Where it appears</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Sample-level</td><td>\(B\,L_i\)</td><td>\(1/(B L_i)\)</td><td>\(1/B\), any length</td><td>DeepSeekMath Eq. 3<a class="cite" href="#ref-1">1</a>; GLM-5 Eq. 1<a class="cite" href="#ref-7">7</a>; V3.2 as printed<a class="cite" href="#ref-8">8</a>; TRL <code>grpo</code><a class="cite" href="#ref-4">4</a></td></tr>
+    <tr><td class="row">Prompt-level token mean</td><td>\(P\sum_{j\in\text{group}} L_j\)</td><td>\(1/(P\sum_j L_j)\)</td><td>\(L_i/(P\sum_j L_j)\)</td><td>DAPO Eq. 8<a class="cite" href="#ref-3">3</a>; "prompt average" in ScaleRL<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">Batch-level token mean</td><td>\(N\) (all tokens in the batch)</td><td>\(1/N\)</td><td>\(L_i/N\)</td><td>Olmo 3<a class="cite" href="#ref-10">10</a>; TRL <code>dapo</code> (default)<a class="cite" href="#ref-4">4</a>; "token average" in ScaleRL<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">Constant</td><td>\(B\,L_{\max}\)</td><td>\(1/(B L_{\max})\)</td><td>\(L_i/(B L_{\max})\)</td><td>Dr. GRPO<a class="cite" href="#ref-2">2</a>; TRL <code>dr_grpo</code><a class="cite" href="#ref-5">5</a></td></tr>
+  </tbody>
+</table>
+<p>Three relations follow directly (derived). First, only the sample-level scheme makes the total weight of a response independent of its length; all other schemes make it proportional to \(L_i\). Second, the batch-level token mean and the constant normalizer give every token in a batch the same weight, so they differ by one scalar per batch, \(N/(B L_{\max})\), and by nothing else. Third, DAPO's Eq. 8 normalizes inside each prompt, so tokens of a prompt whose group happened to be long get a smaller weight than tokens of a prompt whose group was short: it removes the length weighting among the samples of one prompt and introduces a prompt-to-prompt weighting by \(1/\sum_j L_j\), the same kind of effect as the standard-deviation division of Section 3.</p>
+<p>Dr. GRPO's Listing 1 comments that per-batch normalization, as in TRL and verl at the time, is also biased<a class="cite" href="#ref-2">2</a>; TRL's documentation summarizes the paper as saying the DAPO formulation "reduces this bias" but does "not eliminate it completely"<a class="cite" href="#ref-4">4</a>. By the second relation above, the residual for the batch-level mean is only that \(N\) is itself random and contains the sampled tokens (a ratio estimator), an effect that shrinks with batch size; neither source quantifies it.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 360" role="img" aria-labelledby="f2t"><title id="f2t">Per-token and per-sequence gradient weight versus response length under sample-level, token-level and constant normalization</title>
+<line x1="70" y1="248.7" x2="370" y2="248.7" class="d-grid"/><text x="64" y="252.7" text-anchor="end" class="d-small d-text-light">0.5</text>
+<line x1="70" y1="213.5" x2="370" y2="213.5" class="d-grid"/><text x="64" y="217.5" text-anchor="end" class="d-small d-text-light">1</text>
+<line x1="70" y1="178.3" x2="370" y2="178.3" class="d-grid"/><text x="64" y="182.3" text-anchor="end" class="d-small d-text-light">2</text>
+<line x1="70" y1="131.7" x2="370" y2="131.7" class="d-grid"/><text x="64" y="135.7" text-anchor="end" class="d-small d-text-light">5</text>
+<line x1="70" y1="96.5" x2="370" y2="96.5" class="d-grid"/><text x="64" y="100.5" text-anchor="end" class="d-small d-text-light">10</text>
+<line x1="70" y1="61.3" x2="370" y2="61.3" class="d-grid"/><text x="64" y="65.3" text-anchor="end" class="d-small d-text-light">20</text>
+<text x="70.0" y="276" text-anchor="middle" class="d-small d-text-light">0</text>
+<text x="143.2" y="276" text-anchor="middle" class="d-small d-text-light">5,000</text>
+<text x="216.5" y="276" text-anchor="middle" class="d-small d-text-light">10,000</text>
+<text x="289.7" y="276" text-anchor="middle" class="d-small d-text-light">15,000</text>
+<text x="363.0" y="276" text-anchor="middle" class="d-small d-text-light">20,000</text>
+<line x1="70" y1="260" x2="370" y2="260" class="d-axis"/><line x1="70" y1="50" x2="70" y2="260" class="d-axis"/>
+<polyline points="75.9,50.0 77.3,61.3 80.3,78.4 84.6,96.5 92.0,117.1 99.3,131.7 113.9,152.3 128.6,166.9 157.9,187.5 187.2,202.1 245.8,222.7 304.4,237.3 370.0,249.9" class="d-line d-stroke-blue"/>
+<line x1="70.0" y1="187.5" x2="370.0" y2="187.5" class="d-line d-stroke-orange"/>
+<line x1="70.0" y1="249.9" x2="370.0" y2="249.9" class="d-line d-stroke-green"/>
+<circle cx="157.9" cy="187.5" r="4.5" class="d-fill-orange"/>
+<text x="165.9" y="179.5" class="d-small d-text-light">mean length 6,000</text>
+<text x="70" y="34" class="d-title">Weight per token</text>
+<text x="220" y="294" class="d-small d-text-light" text-anchor="middle">response length |o| (tokens)</text>
+<text x="14" y="155" class="d-small d-text-light" transform="rotate(-90 14 155)" text-anchor="middle">G x weight, 1e-4 per token (log)</text>
+<line x1="470" y1="260.0" x2="770" y2="260.0" class="d-grid"/><text x="464" y="264.0" text-anchor="end" class="d-small d-text-light">0</text>
+<line x1="470" y1="200.0" x2="770" y2="200.0" class="d-grid"/><text x="464" y="204.0" text-anchor="end" class="d-small d-text-light">1</text>
+<line x1="470" y1="140.0" x2="770" y2="140.0" class="d-grid"/><text x="464" y="144.0" text-anchor="end" class="d-small d-text-light">2</text>
+<line x1="470" y1="80.0" x2="770" y2="80.0" class="d-grid"/><text x="464" y="84.0" text-anchor="end" class="d-small d-text-light">3</text>
+<text x="470.0" y="276" text-anchor="middle" class="d-small d-text-light">0</text>
+<text x="543.2" y="276" text-anchor="middle" class="d-small d-text-light">5,000</text>
+<text x="616.5" y="276" text-anchor="middle" class="d-small d-text-light">10,000</text>
+<text x="689.7" y="276" text-anchor="middle" class="d-small d-text-light">15,000</text>
+<text x="763.0" y="276" text-anchor="middle" class="d-small d-text-light">20,000</text>
+<line x1="470" y1="260" x2="770" y2="260" class="d-axis"/><line x1="470" y1="50" x2="470" y2="260" class="d-axis"/>
+<line x1="470.0" y1="200.0" x2="770.0" y2="200.0" class="d-line d-stroke-blue"/>
+<line x1="470.0" y1="260.0" x2="770.0" y2="55.2" class="d-line d-stroke-orange"/>
+<line x1="470.0" y1="260.0" x2="770.0" y2="200.0" class="d-line d-stroke-green"/>
+<circle cx="557.9" cy="200.0" r="4.5" class="d-fill-orange"/>
+<text x="470" y="34" class="d-title">Weight per sequence</text>
+<text x="620" y="294" class="d-small d-text-light" text-anchor="middle">response length |o| (tokens)</text>
+<text x="424" y="155" class="d-small d-text-light" transform="rotate(-90 424 155)" text-anchor="middle">G x total weight of one sequence</text>
+<line x1="70" y1="322" x2="94" y2="322" class="d-line d-stroke-blue"/><text x="100" y="326">sample-level 1/(G|o_i|)</text>
+<line x1="290" y1="322" x2="314" y2="322" class="d-line d-stroke-orange"/><text x="320" y="326">token-mean 1/&#931;|o|</text>
+<line x1="500" y1="322" x2="524" y2="322" class="d-line d-stroke-green"/><text x="530" y="326">constant 1/(G L_max)</text>
+</svg>
+<figcaption><b>Figure 2.</b> Left: the weight one token receives, scaled by G, as a function of the length of the response it sits in. Sample-level averaging (blue) falls as 1/|o|; token-level and constant normalization are flat. Right: the total weight a whole response receives. Sample-level gives every response the same total; the other two grow linearly with length. Illustrative group: mean length 6,000 tokens (orange dot), L_max = 20,480 (DAPO&#8217;s generation cap<a class="cite" href="#ref-3">3</a>). Derived from the normalizers in Table 1; no measured data.</figcaption>
+</figure>
+
+<h3 id="per-token-weight-example">1.3 One group, worked through</h3>
+<p>Take \(G=8\) samples of one prompt, three correct (reward 1) and five wrong (reward 0), with wrong answers longer than correct ones, as is typical when wrong attempts ramble or run to the cap. The lengths below are illustrative; the shape matches Dr. GRPO's measurements, where the y-axes of its Figure 5 run from roughly 200 to 400 tokens for correct and 1.0k to 1.8k tokens for incorrect responses<a class="cite" href="#ref-2">2</a> (read off the axes). The centered advantage is \(+0.625\) for a correct sample and \(-0.375\) for a wrong one (derived: mean \(3/8\)).</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 2.</b> Weights inside one group (P = 1, G = 8, k = 3 correct, L_max = 8,192; illustrative lengths). "Relative per-token weight" is the weight of one token of this response divided by the weight under token-level averaging, which is \(\bar L/L_i\) with \(\bar L=2{,}822.5\) tokens. Derived from Table 1.</caption>
+  <thead><tr><th>i</th><th>Outcome</th><th class="num">Tokens \(L_i\)</th><th class="num">\(A_i\), centered</th><th class="num">Relative per-token weight, sample-level</th><th class="num">Share of group weight, sample-level</th><th class="num">Share of group weight, token-level or constant</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>correct</td><td class="num">640</td><td class="num">+0.625</td><td class="num" data-best>4.41</td><td class="num">12.5%</td><td class="num">2.8%</td></tr>
+    <tr><td>2</td><td>correct</td><td class="num">910</td><td class="num">+0.625</td><td class="num">3.10</td><td class="num">12.5%</td><td class="num">4.0%</td></tr>
+    <tr><td>3</td><td>correct</td><td class="num">1,280</td><td class="num">+0.625</td><td class="num">2.21</td><td class="num">12.5%</td><td class="num">5.7%</td></tr>
+    <tr><td>4</td><td>wrong</td><td class="num">1,150</td><td class="num">&#8722;0.375</td><td class="num">2.45</td><td class="num">12.5%</td><td class="num">5.1%</td></tr>
+    <tr><td>5</td><td>wrong</td><td class="num">2,100</td><td class="num">&#8722;0.375</td><td class="num">1.34</td><td class="num">12.5%</td><td class="num">9.3%</td></tr>
+    <tr><td>6</td><td>wrong</td><td class="num">3,500</td><td class="num">&#8722;0.375</td><td class="num">0.81</td><td class="num">12.5%</td><td class="num">15.5%</td></tr>
+    <tr><td>7</td><td>wrong</td><td class="num">5,200</td><td class="num">&#8722;0.375</td><td class="num">0.54</td><td class="num">12.5%</td><td class="num">23.0%</td></tr>
+    <tr><td>8</td><td>wrong</td><td class="num">7,800</td><td class="num">&#8722;0.375</td><td class="num" data-worst>0.36</td><td class="num">12.5%</td><td class="num">34.5%</td></tr>
+    <tr><td class="row" colspan="2">Total push on correct samples</td><td class="num">2,830</td><td class="num">&#8203;</td><td class="num">&#8203;</td><td class="num">0.234</td><td class="num">0.078</td></tr>
+    <tr><td class="row" colspan="2">Total push on wrong samples</td><td class="num">19,750</td><td class="num">&#8203;</td><td class="num">&#8203;</td><td class="num">0.234</td><td class="num">0.328</td></tr>
+  </tbody>
+</table>
+<p>Read the table in two directions. Per token, the first correct response (640 tokens) counts 12.2 times as much as a token of the last wrong one (7,800 tokens) under sample-level averaging (\(7{,}800/640\)); under the other schemes the two weigh the same. Per response, sample-level averaging gives all eight the same 12.5% of the group's weight, and the positive and negative sides balance exactly because \(\sum_i A_i=0\). Under token-level averaging the weights follow length, and the negative side carries \(0.3280/0.0783=4.19\) times the positive side. That ratio is not an accident: because the advantages sum to zero, it equals the ratio of mean lengths of wrong to correct responses, \(3{,}950/943=4.19\) (derived). So the choice of \(Z\) decides whether a long wrong answer is pushed down once, as one response, or in proportion to its length. MiniMax-M1 reports this effect from the other side in Section 7.</p>
+
+<h3 id="per-token-weight-code">1.4 The aggregation as code</h3>
+<p>The four schemes differ in one line each. The function below mirrors Dr. GRPO's Listing 1<a class="cite" href="#ref-2">2</a> and the normalizers in TRL's <code>compute_loss</code><a class="cite" href="#ref-5">5</a> (single-device case; TRL's <code>dapo</code> and <code>cispo</code> normalize by the token count of the global accumulated batch). I checked that autograd gives the per-token weights of Table 1 for random lengths with torch 2.10.</p>
+<pre class="code" data-lang="python" data-title="aggregate.py"><code>import torch
+
+def aggregate(per_token_loss, mask, kind, group_size=None, l_max=None):
+    """per_token_loss, mask: (B, T). Rows are consecutive groups of group_size samples."""
+    if kind == "sample":      # original GRPO; TRL loss_type="grpo"
+        return ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1)).mean()
+    if kind == "prompt":      # DAPO Eq. 8; ScaleRL "prompt average"
+        P = per_token_loss.size(0) // group_size
+        num = (per_token_loss * mask).reshape(P, -1).sum(-1)
+        den = mask.reshape(P, -1).sum(-1).clamp(min=1)
+        return (num / den).mean()
+    if kind == "batch":       # Olmo 3; TRL loss_type="dapo" on one device
+        return (per_token_loss * mask).sum() / mask.sum().clamp(min=1)
+    if kind == "constant":    # Dr. GRPO; TRL loss_type="dr_grpo"
+        return (per_token_loss * mask).sum() / (per_token_loss.size(0) * l_max)</code></pre>
+
+<h2 id="length-bias">2. Response-level length bias</h2>
+
+<h3 id="length-bias-identity">2.1 GRPO ascends a different reward</h3>
+<p>Dr. GRPO's first diagnosis is that dividing by \(|o_i|\) makes the update favor short responses when the advantage is positive and long responses when it is negative: "for positive advantages [...] this bias results in greater gradient updates for shorter responses", while for negative ones "longer responses are penalized less due to their larger \(|o_i|\)"<a class="cite" href="#ref-2">2</a> (§3.1). The same mechanism can be stated exactly, which also shows what the bias is a bias <em>of</em>.</p>
+<p>Fix a baseline \(b\) (the group mean in the limit of a large group) and a scale \(s\). The sample-level estimator is \(\frac1G\sum_i \frac{R_i-b}{s\,|o_i|}\nabla\log\pi_\theta(o_i)\), where \(\nabla\log\pi_\theta(o_i)=\sum_t\nabla\log\pi_\theta(o_{i,t}\mid\cdot)\). For samples drawn from \(\pi_\theta\) its expectation is the policy gradient of a modified reward, treated as a fixed function of the response (derived; the identity \(\mathbb E[f(o)\nabla\log\pi_\theta(o)]=\nabla\mathbb E[f(o)]\) is Module 2's score-function step):</p>
+$$\mathbb E\Big[\tfrac{R-b}{s|o|}\,\nabla\log\pi_\theta(o)\Big]=\nabla_\theta\,\mathbb E_{o\sim\pi_\theta}\big[\tilde r(o)\big],\qquad \tilde r(o)=\frac{R(o)-b}{s\,|o|}.$$
+<p>A constant denominator (Dr. GRPO) leaves \(\tilde r=(R-b)/s\), the reward you meant. The sample-level denominator makes the reward depend on length. Compare two responses with the same outcome. If both are correct (\(R-b>0\)), \(\tilde r\) is larger for the shorter one. If both are wrong (\(R-b<0\)), \(\tilde r\) is closer to zero, that is larger, for the longer one. Inside each outcome class the objective has acquired a length preference whose sign depends on the sign of the advantage. That is the Dr. GRPO statement, restated as an objective.</p>
+<p>The standard-deviation division is a different kind of change. Dividing by \(s_q\), a constant per prompt, multiplies every \(\tilde r\) of that prompt by the same positive number, so it cannot reorder two samples of the same prompt; it only changes how loudly the prompt speaks relative to others (Section 3). The length term does reorder samples inside a prompt.</p>
+<p>The length normalization did not originate in GRPO. Dr. GRPO checked five open-source PPO implementations (TRL, OpenRLHF, verl, SimpleRL-Zero, Open-Reasoner-Zero) and found all of them normalize the loss by response length, "even before the publication of GRPO"; it speculates the habit comes from pretraining, where <code>loss.mean(-1)</code> over a fixed packed context is a harmless stabilizer<a class="cite" href="#ref-2">2</a> (§3.1, Table 2).</p>
+
+<h3 id="length-bias-toy">2.2 Which way does length move? A toy with a closed form</h3>
+<p>The identity says the objective prefers short-among-correct and long-among-wrong. Whether mean length rises or falls depends on the mix, and a small model shows how (derived here; not in the source). One prompt, four response types: correct or wrong, crossed with short (\(S\) tokens) or long (\(L\) tokens). The probability of being correct is \(p\) and does not depend on length, so a correct reward has no reason to change length. The policy is a softmax over the four types, updated by gradient flow on the expected modified reward, with the baseline at its large-group limit \(b=p\). With long and short equally likely, the expected change in mean length is</p>
+$$\frac{d\,\mathbb E[\text{length}]}{dt}\;\propto\;(1-2p)\,p(1-p)\,\frac{(L-S)^2}{8\,S\,L},$$
+<p>and exactly zero when the denominator is a constant, because then the reward ignores length. The sign is the point: sample-level averaging lengthens responses on prompts the policy mostly fails (\(p<\tfrac12\)) and shortens them on prompts it mostly solves (\(p>\tfrac12\)), with no length signal in the reward at all.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 3.</b> The toy of Section 2.2 evaluated for S = 500, L = 2,000 tokens, equal chance of long and short. Entries are the expected drift of mean length in the units of the gradient flow (only signs and ratios carry meaning). Derived; a tabular softmax model, not an LLM.</caption>
+  <thead><tr><th>Pass rate \(p\)</th><th class="num">0.1</th><th class="num">0.2</th><th class="num">0.3</th><th class="num">0.5</th><th class="num">0.7</th><th class="num">0.8</th><th class="num">0.9</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Sample-level \(1/|o_i|\)</td><td class="num">+0.0203</td><td class="num" data-worst>+0.0270</td><td class="num">+0.0236</td><td class="num">0</td><td class="num">&#8722;0.0236</td><td class="num" data-worst>&#8722;0.0270</td><td class="num">&#8722;0.0203</td></tr>
+    <tr><td class="row">Constant or token-level</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td></tr>
+  </tbody>
+</table>
+<p>Real prompts mix both regimes, and real wrong answers are longer than right ones for reasons that are not an artifact (more flailing, more truncation), so the net effect on a training run depends on the pass-rate distribution. What the toy establishes is narrower: the bias has a direction that depends on accuracy, it needs no correlation between length and reward, and the token-level and constant normalizers remove it in expectation. The toy also says why the symptom appears on hard prompts and early in training: that is where \(p<\tfrac12\).</p>
+
+<h3 id="length-bias-evidence">2.3 What Dr. GRPO measured, and how far it reaches</h3>
+<p>Dr. GRPO's main training comparison uses Qwen2.5-1.5B with the R1 prompt template, MATH training questions, a 0/1 Math-Verify reward, eight samples per question, a 3,000-token generation cap, learning rate \(10^{-6}\), no KL term and clip 0.2, on 8 A100 GPUs<a class="cite" href="#ref-2">2</a> (§3.2; App. G, Table 6). Four observations matter here.</p>
+<ul>
+  <li>Both algorithms show response length rising with training reward, as in R1-Zero, whose report presents the rise as the model learning "to solve reasoning tasks with more thinking time"<a class="cite" href="#ref-11">11</a> (Fig. 1b). GRPO keeps lengthening "even when the reward improvement slows down"; Dr. GRPO does not, and the length of <em>incorrect</em> evaluation responses is substantially lower<a class="cite" href="#ref-2">2</a> (§3.2, Fig. 5). The authors' claim is that the rise "may also be attributed to" the bias and is "confounded" by it, not that it is only the bias.</li>
+  <li>On Llama-3.2-3B continued-pretrained on math, GRPO produces a "double-increase" of accuracy and length that could be misread as emerging long chain-of-thought; Dr. GRPO limits the length growth<a class="cite" href="#ref-2">2</a> (§3.4, Fig. 7).</li>
+  <li>In the ablation (Qwen2.5-1.5B, 3K mixed questions), removing only the length normalization and full Dr. GRPO both produce shorter responses than the other two variants, and all three modified variants beat vanilla GRPO on training reward and evaluation accuracy<a class="cite" href="#ref-2">2</a> (App. C, Fig. 8). This matches Section 2.1: the length term moves length; the std term does not.</li>
+  <li>Across three independent runs Dr. GRPO is better in both token efficiency and final accuracy, "statistically significant" by the paper's account<a class="cite" href="#ref-2">2</a> (App. C, Fig. 9).</li>
+</ul>
+<p>DAPO arrives at the same place from the other direction. It argues that with sample-level averaging "tokens within longer responses [...] may have a disproportionately lower contribution to the overall loss", which prevents learning from good long samples and fails to punish gibberish in bad ones, and its Figure 4 shows entropy and length growing less wildly with a token-level loss<a class="cite" href="#ref-3">3</a> (§3.3). The ablation table credits the change with one point on AIME but says it "enhances training stability and makes the length increase more healthily"<a class="cite" href="#ref-3">3</a> (§4.2, Table 1; Section 7 below).</p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Every demonstration of the length bias above is at 1.5B to 3B parameters, eight samples per prompt and a 3,000-token cap<a class="cite" href="#ref-2">2</a> (App. G). Nothing in the cited reports isolates the bias at 32K to 64K contexts in frontier-scale runs. GLM-5 and the printed DeepSeek-V3.2 objective still carry \(1/|o_i|\)<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-8">8</a>, and MiniMax-M1 found token-level weighting harmful at 80K tokens (Section 7).</p></aside>
+
+<h2 id="difficulty-bias">3. Division by the group standard deviation</h2>
+
+<h3 id="difficulty-bias-algebra">3.1 The algebra for binary rewards</h3>
+<p>With a 0/1 verifier and \(k\) correct answers out of \(G\), let \(\hat p=k/G\). The group mean is \(\hat p\) and the population standard deviation is \(\sigma=\sqrt{\hat p(1-\hat p)}\). A correct sample then has advantage \((1-\hat p)/\sigma=\sqrt{(1-\hat p)/\hat p}\) and a wrong one \(-\hat p/\sigma=-\sqrt{\hat p/(1-\hat p)}\); without the division they are \(1-\hat p\) and \(-\hat p\) (Module 9, Table 3 tabulates these at \(G=8\)). The mean absolute advantage over the group, which measures how hard the prompt pulls on the update, is</p>
+$$\overline{|A|}_{\text{centered}}=2\hat p(1-\hat p),\qquad \overline{|A|}_{\text{divided}}=\frac{2\hat p(1-\hat p)}{\sigma}=2\sqrt{\hat p(1-\hat p)}.$$
+<p>The division multiplies a prompt's pull by \(1/\sigma\). Figure 3 plots both. Without the division, a prompt with one success in 64 samples pulls with weight 0.031 against 0.500 for a balanced prompt, a ratio of 16. With it the weights are 0.248 against 1.000, a ratio of 4. In general the weight of a one-success group relative to a balanced one rises from \(1/(2\sigma)=1.51\) at \(G=8\) to 2.07 at \(G=16\) and 4.03 at \(G=64\) (derived; the single-success weight is \(G/\sqrt{G-1}\) against 2).</p>
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f3t"><title id="f3t">Mean absolute advantage per sample versus group pass rate, with and without division by the group standard deviation</title>
+<line x1="80" y1="270.0" x2="520" y2="270.0" class="d-grid"/><text x="74" y="274.0" text-anchor="end" class="d-small d-text-light">0</text>
+<line x1="80" y1="212.5" x2="520" y2="212.5" class="d-grid"/><text x="74" y="216.5" text-anchor="end" class="d-small d-text-light">0.25</text>
+<line x1="80" y1="155.0" x2="520" y2="155.0" class="d-grid"/><text x="74" y="159.0" text-anchor="end" class="d-small d-text-light">0.5</text>
+<line x1="80" y1="97.5" x2="520" y2="97.5" class="d-grid"/><text x="74" y="101.5" text-anchor="end" class="d-small d-text-light">0.75</text>
+<line x1="80" y1="40.0" x2="520" y2="40.0" class="d-grid"/><text x="74" y="44.0" text-anchor="end" class="d-small d-text-light">1</text>
+<text x="80.0" y="286" text-anchor="middle" class="d-small d-text-light">0</text>
+<text x="190.0" y="286" text-anchor="middle" class="d-small d-text-light">0.25</text>
+<text x="300.0" y="286" text-anchor="middle" class="d-small d-text-light">0.5</text>
+<text x="410.0" y="286" text-anchor="middle" class="d-small d-text-light">0.75</text>
+<text x="520.0" y="286" text-anchor="middle" class="d-small d-text-light">1</text>
+<line x1="80" y1="270" x2="520" y2="270" class="d-axis"/><line x1="80" y1="40" x2="80" y2="270" class="d-axis"/>
+<polyline points="80.0,270.0 84.4,265.4 88.8,261.0 93.2,256.6 97.6,252.3 102.0,248.2 106.4,244.1 110.8,240.1 115.2,236.1 119.6,232.3 124.0,228.6 128.4,225.0 132.8,221.4 137.2,218.0 141.6,214.6 146.0,211.3 150.4,208.2 154.8,205.1 159.2,202.1 163.6,199.2 168.0,196.4 172.4,193.7 176.8,191.1 181.2,188.5 185.6,186.1 190.0,183.8 194.4,181.5 198.8,179.3 203.2,177.3 207.6,175.3 212.0,173.4 216.4,171.6 220.8,169.9 225.2,168.3 229.6,166.8 234.0,165.4 238.4,164.0 242.8,162.8 247.2,161.6 251.6,160.6 256.0,159.6 260.4,158.7 264.8,157.9 269.2,157.3 273.6,156.7 278.0,156.1 282.4,155.7 286.8,155.4 291.2,155.2 295.6,155.0 300.0,155.0 304.4,155.0 308.8,155.2 313.2,155.4 317.6,155.7 322.0,156.2 326.4,156.7 330.8,157.3 335.2,157.9 339.6,158.7 344.0,159.6 348.4,160.6 352.8,161.6 357.2,162.8 361.6,164.0 366.0,165.4 370.4,166.8 374.8,168.3 379.2,169.9 383.6,171.6 388.0,173.4 392.4,175.3 396.8,177.3 401.2,179.3 405.6,181.5 410.0,183.8 414.4,186.1 418.8,188.5 423.2,191.1 427.6,193.7 432.0,196.4 436.4,199.2 440.8,202.1 445.2,205.1 449.6,208.2 454.0,211.3 458.4,214.6 462.8,218.0 467.2,221.4 471.6,225.0 476.0,228.6 480.4,232.3 484.8,236.1 489.2,240.1 493.6,244.1 498.0,248.1 502.4,252.3 506.8,256.6 511.2,261.0 515.6,265.4 520.0,270.0" class="d-line d-stroke-blue"/>
+<polyline points="80.0,270.0 84.4,224.2 88.8,205.6 93.2,191.5 97.6,179.9 102.0,169.7 106.4,160.8 110.8,152.6 115.2,145.2 119.6,138.4 124.0,132.0 128.4,126.1 132.8,120.5 137.2,115.3 141.6,110.4 146.0,105.7 150.4,101.4 154.8,97.2 159.2,93.3 163.6,89.5 168.0,86.0 172.4,82.6 176.8,79.4 181.2,76.4 185.6,73.5 190.0,70.8 194.4,68.2 198.8,65.8 203.2,63.5 207.6,61.3 212.0,59.2 216.4,57.3 220.8,55.4 225.2,53.7 229.6,52.1 234.0,50.6 238.4,49.2 242.8,47.9 247.2,46.7 251.6,45.6 256.0,44.6 260.4,43.8 264.8,43.0 269.2,42.3 273.6,41.7 278.0,41.2 282.4,40.7 286.8,40.4 291.2,40.2 295.6,40.0 300.0,40.0 304.4,40.0 308.8,40.2 313.2,40.4 317.6,40.7 322.0,41.2 326.4,41.7 330.8,42.3 335.2,43.0 339.6,43.8 344.0,44.6 348.4,45.6 352.8,46.7 357.2,47.9 361.6,49.2 366.0,50.6 370.4,52.1 374.8,53.7 379.2,55.4 383.6,57.3 388.0,59.2 392.4,61.3 396.8,63.5 401.2,65.8 405.6,68.2 410.0,70.8 414.4,73.5 418.8,76.4 423.2,79.4 427.6,82.6 432.0,86.0 436.4,89.5 440.8,93.3 445.2,97.2 449.6,101.4 454.0,105.7 458.4,110.4 462.8,115.3 467.2,120.5 471.6,126.1 476.0,132.0 480.4,138.4 484.8,145.2 489.2,152.6 493.6,160.8 498.0,169.7 502.4,179.9 506.8,191.5 511.2,205.6 515.6,224.2 520.0,270.0" class="d-line d-stroke-orange"/>
+<circle cx="135.0" cy="219.7" r="4" class="d-fill-blue"/><circle cx="135.0" cy="117.9" r="4" class="d-fill-orange"/>
+<circle cx="107.5" cy="243.0" r="4" class="d-fill-blue"/><circle cx="107.5" cy="158.7" r="4" class="d-fill-orange"/>
+<circle cx="86.9" cy="262.9" r="4" class="d-fill-blue"/><circle cx="86.9" cy="213.0" r="4" class="d-fill-orange"/>
+<text x="300" y="306" class="d-small d-text-light" text-anchor="middle">group pass rate k/G</text>
+<text x="22" y="155" class="d-small d-text-light" transform="rotate(-90 22 155)" text-anchor="middle">mean |advantage| per sample</text>
+<text x="238.4" y="32.0" class="d-text">divided by std</text>
+<text x="344.0" y="154.4" class="d-text">centered only</text>
+<rect x="550" y="46" width="236" height="150" rx="8" class="d-label-bg"/>
+<text x="564" y="68" class="d-bold">One success in the group (k = 1)</text>
+<text x="564" y="90" class="d-small d-text-light">G      centered   divided by std</text>
+<text x="564" y="112" class="d-mono">8  </text><text x="618" y="112" class="d-mono">0.219</text><text x="690" y="112" class="d-mono">0.661</text>
+<text x="564" y="136" class="d-mono">16 </text><text x="618" y="136" class="d-mono">0.117</text><text x="690" y="136" class="d-mono">0.484</text>
+<text x="564" y="160" class="d-mono">64 </text><text x="618" y="160" class="d-mono">0.031</text><text x="690" y="160" class="d-mono">0.248</text>
+<text x="564" y="188" class="d-small d-text-light">at k/G = 1/2 both are 0.5 / 1.0</text>
+<text x="564" y="206" class="d-small d-text-light">population std; binary reward</text>
+</svg>
+<figcaption><b>Figure 3.</b> The average size of an advantage on one prompt, as a function of how many of its G samples are correct. Centered rewards (blue, 2p(1&#8722;p)) vanish at the extremes; dividing by the group standard deviation (orange, 2&#8730;(p(1&#8722;p))) keeps them large. Dots mark a single success in G samples. Derived from the definitions of the advantage in DeepSeekMath and Dr. GRPO<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a> for binary rewards and population standard deviation; Section 3.1 gives the algebra.</figcaption>
+</figure>
+
+<h3 id="difficulty-bias-conventions">3.2 Which standard deviation?</h3>
+<p>The sources are not uniform, and the choice matters at small \(G\). DeepSeekMath writes \(\mathrm{std}(\mathbf r)\) and R1 writes \(\mathrm{std}(\{r_1,\dots,r_G\})\), with neither stating population or sample convention nor any epsilon<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-11">11</a> (§4.1.2; Eq. 3 of the R1 paper). DAPO (Eq. 9) and Dr. GRPO (Eq. 3) likewise<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-2">2</a>. ScaleRL's Eq. 5 adds an unspecified \(\epsilon\) to the denominator and does not state the convention<a class="cite" href="#ref-9">9</a>. I read the TRL source rather than its documentation: <code>grpo_trainer.py</code> computes the group statistic with <code>nanstd</code>, which applies Bessel's correction, and divides by <code>std + 1e-4</code><a class="cite" href="#ref-5">5</a> (commit 63d9074, 2026-10-21). Bessel's correction multiplies \(\sigma\) by \(\sqrt{G/(G-1)}\): 1.155 at \(G=4\), 1.069 at \(G=8\), 1.033 at \(G=16\), 1.008 at \(G=64\) (derived). The closed forms in this module use the population convention; the sample convention shrinks every divided advantage by that factor and changes no ranking. The \(10^{-4}\) epsilon matters only for groups whose reward spread is of that order, such as near-ties of a continuous reward.</p>
+<p>"Batch-level" normalization also has two meanings. ScaleRL divides by the standard deviation of all advantages in the batch, \(\hat A_i/\hat A_{\mathrm{std}}\), where the advantages are already group-centered<a class="cite" href="#ref-9">9</a> (§4). TRL's <code>scale_rewards="batch"</code> divides the group-centered advantage by the standard deviation of the raw rewards over the whole batch<a class="cite" href="#ref-5">5</a>, which also contains the spread between prompts of different difficulty. Both are a single scalar per batch, so they rescale the update without changing the relative pull of any two prompts (derived), unlike the per-group division.</p>
+
+<h3 id="difficulty-bias-meaning">3.3 What it changes, what it does not, and whether to call it a bias</h3>
+<p>Dr. GRPO's complaint is that questions with low reward spread, "those that are too easy or too hard", "are given higher weights during policy updates", whereas advantage normalization is usually computed "across an entire batch"<a class="cite" href="#ref-2">2</a> (§3.1). Figure 3 sharpens the statement. Relative to the centered advantage, extreme prompts are indeed amplified (by 8.1 at one success in 64); relative to a balanced prompt they still pull less (0.25 against 1.0). The division does not make the extremes dominate; it softens their suppression. It also cannot reorder samples within a prompt, so unlike the length term it leaves each prompt's own optimum unchanged (Section 2.1).</p>
+<p>Whether softening is desirable is a judgment about the training distribution. Lambert's textbook argues that removing the division "comes at the cost of downweighting questions that were all incorrect with a few correct answers", the hardest cases, whose rare success is the most informative sample in the batch<a class="cite" href="#ref-6">6</a> (pp. 73–74). The opposite worry is noise. When the reward is continuous, a group of near-ties has a tiny standard deviation, and dividing by it hands unit-variance advantages to what is essentially measurement noise (derived). Section 6 shows where this bites. And no normalization can validate a reward: after division, \(\sum_i A_i^2\) equals \(G\) (population convention) for every non-degenerate group regardless of what the reward means. Training with randomly assigned rewards still raised Qwen2.5-Math-7B's MATH-500 score by 21.4 points against 29.1 for ground-truth rewards; the authors attribute that to a clipping bias in GRPO rather than to normalization<a class="cite" href="#ref-12">12</a>, but it is a reminder that normalized advantages are only as informative as the correlation between reward and response.</p>
+<p>The controlled evidence is thin and says the effect is second-order: in ScaleRL's forward ablation, no normalization, batch-level and prompt-level division reach asymptotic pass rates of 0.525, 0.530 and 0.520, "similar performance"<a class="cite" href="#ref-9">9</a> (App. A.9, Fig. 14b); Section 7 reads those numbers against their noise.</p>
+
+<h2 id="zero-variance">4. Zero-variance groups</h2>
+
+<h3 id="zero-variance-probability">4.1 How many groups are dead</h3>
+<p>If every sample of a prompt gets the same reward, the centered advantage is zero for all of them, and so is every token's coefficient \(\hat A_i/Z_i\) in the gradient. DAPO states the consequence plainly: "A zero advantage results in zero policy gradients, shrinking the magnitude and increasing the noise sensitivity of the batch gradient"<a class="cite" href="#ref-3">3</a> (§3.2). For a prompt with pass rate \(p\) and a binary verifier the chance of a dead group is</p>
+$$P_0(p,G)=p^{G}+(1-p)^{G}.$$
+<p>Module 2 derived this, tabulated its complement and plotted it (Table 6 and Figure 6 there); Figure 4 here shows the dead side for \(G=4,8,16,64\). The two features that matter are that increasing \(G\) empties the middle of the curve but barely touches the ends (a prompt solved 1% of the time is dead 85% of the time at \(G=16\) and 53% at \(G=64\)), and that the curve is symmetric, so prompts that are nearly always solved are as useless as prompts that are never solved.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f4t"><title id="f4t">Probability that all G samples for a prompt get the same binary reward, versus the prompt pass rate, for G = 4, 8, 16 and 64</title>
+<line x1="80" y1="270.0" x2="520" y2="270.0" class="d-grid"/><text x="74" y="274.0" text-anchor="end" class="d-small d-text-light">0</text>
+<line x1="80" y1="212.5" x2="520" y2="212.5" class="d-grid"/><text x="74" y="216.5" text-anchor="end" class="d-small d-text-light">0.25</text>
+<line x1="80" y1="155.0" x2="520" y2="155.0" class="d-grid"/><text x="74" y="159.0" text-anchor="end" class="d-small d-text-light">0.5</text>
+<line x1="80" y1="97.5" x2="520" y2="97.5" class="d-grid"/><text x="74" y="101.5" text-anchor="end" class="d-small d-text-light">0.75</text>
+<line x1="80" y1="40.0" x2="520" y2="40.0" class="d-grid"/><text x="74" y="44.0" text-anchor="end" class="d-small d-text-light">1</text>
+<text x="80.0" y="286" text-anchor="middle" class="d-small d-text-light">0</text>
+<text x="190.0" y="286" text-anchor="middle" class="d-small d-text-light">0.25</text>
+<text x="300.0" y="286" text-anchor="middle" class="d-small d-text-light">0.5</text>
+<text x="410.0" y="286" text-anchor="middle" class="d-small d-text-light">0.75</text>
+<text x="520.0" y="286" text-anchor="middle" class="d-small d-text-light">1</text>
+<line x1="80" y1="270" x2="520" y2="270" class="d-axis"/><line x1="80" y1="40" x2="80" y2="270" class="d-axis"/>
+<polyline points="80.0,40.0 82.2,44.6 84.4,49.1 86.6,53.5 88.8,57.9 91.0,62.2 93.2,66.4 95.4,70.5 97.6,74.6 99.8,78.7 102.0,82.7 104.2,86.6 106.4,90.4 108.6,94.2 110.8,97.9 113.0,101.6 115.2,105.2 117.4,108.8 119.6,112.3 121.8,115.7 124.0,119.1 126.2,122.4 128.4,125.7 130.6,128.9 132.8,132.0 135.0,135.1 137.2,138.2 139.4,141.2 141.6,144.1 143.8,147.0 146.0,149.8 148.2,152.6 150.4,155.3 152.6,158.0 154.8,160.7 157.0,163.2 159.2,165.8 161.4,168.3 163.6,170.7 165.8,173.1 168.0,175.4 170.2,177.7 172.4,180.0 174.6,182.2 176.8,184.3 179.0,186.4 181.2,188.5 183.4,190.5 185.6,192.5 187.8,194.4 190.0,196.3 192.2,198.2 194.4,200.0 196.6,201.7 198.8,203.5 201.0,205.1 203.2,206.8 205.4,208.4 207.6,209.9 209.8,211.4 212.0,212.9 214.2,214.3 216.4,215.7 218.6,217.1 220.8,218.4 223.0,219.7 225.2,220.9 227.4,222.1 229.6,223.3 231.8,224.4 234.0,225.5 236.2,226.5 238.4,227.5 240.6,228.5 242.8,229.5 245.0,230.4 247.2,231.2 249.4,232.0 251.6,232.8 253.8,233.6 256.0,234.3 258.2,235.0 260.4,235.6 262.6,236.2 264.8,236.8 267.0,237.4 269.2,237.9 271.4,238.3 273.6,238.8 275.8,239.2 278.0,239.5 280.2,239.9 282.4,240.1 284.6,240.4 286.8,240.6 289.0,240.8 291.2,241.0 293.4,241.1 295.6,241.2 297.8,241.2 300.0,241.2 302.2,241.2 304.4,241.2 306.6,241.1 308.8,241.0 311.0,240.8 313.2,240.6 315.4,240.4 317.6,240.1 319.8,239.9 322.0,239.5 324.2,239.2 326.4,238.8 328.6,238.3 330.8,237.9 333.0,237.4 335.2,236.8 337.4,236.2 339.6,235.6 341.8,235.0 344.0,234.3 346.2,233.6 348.4,232.8 350.6,232.0 352.8,231.2 355.0,230.4 357.2,229.5 359.4,228.5 361.6,227.5 363.8,226.5 366.0,225.5 368.2,224.4 370.4,223.3 372.6,222.1 374.8,220.9 377.0,219.7 379.2,218.4 381.4,217.1 383.6,215.7 385.8,214.3 388.0,212.9 390.2,211.4 392.4,209.9 394.6,208.4 396.8,206.8 399.0,205.1 401.2,203.5 403.4,201.7 405.6,200.0 407.8,198.2 410.0,196.3 412.2,194.4 414.4,192.5 416.6,190.5 418.8,188.5 421.0,186.4 423.2,184.3 425.4,182.2 427.6,180.0 429.8,177.7 432.0,175.4 434.2,173.1 436.4,170.7 438.6,168.3 440.8,165.8 443.0,163.2 445.2,160.7 447.4,158.0 449.6,155.3 451.8,152.6 454.0,149.8 456.2,147.0 458.4,144.1 460.6,141.2 462.8,138.2 465.0,135.1 467.2,132.0 469.4,128.9 471.6,125.7 473.8,122.4 476.0,119.1 478.2,115.7 480.4,112.3 482.6,108.8 484.8,105.2 487.0,101.6 489.2,97.9 491.4,94.2 493.6,90.4 495.8,86.6 498.0,82.7 500.2,78.7 502.4,74.6 504.6,70.5 506.8,66.4 509.0,62.2 511.2,57.9 513.4,53.5 515.6,49.1 517.8,44.6 520.0,40.0" class="d-line d-stroke-blue"/>
+<polyline points="80.0,40.0 82.2,49.0 84.4,57.8 86.6,66.2 88.8,74.3 91.0,82.2 93.2,89.7 95.4,97.0 97.6,104.1 99.8,110.9 102.0,117.4 104.2,123.7 106.4,129.8 108.6,135.7 110.8,141.3 113.0,146.7 115.2,152.0 117.4,157.0 119.6,161.8 121.8,166.5 124.0,171.0 126.2,175.3 128.4,179.5 130.6,183.4 132.8,187.3 135.0,191.0 137.2,194.5 139.4,197.9 141.6,201.2 143.8,204.3 146.0,207.3 148.2,210.2 150.4,213.0 152.6,215.6 154.8,218.2 157.0,220.6 159.2,223.0 161.4,225.2 163.6,227.4 165.8,229.4 168.0,231.4 170.2,233.3 172.4,235.1 174.6,236.8 176.8,238.5 179.0,240.1 181.2,241.6 183.4,243.0 185.6,244.4 187.8,245.7 190.0,247.0 192.2,248.2 194.4,249.3 196.6,250.4 198.8,251.4 201.0,252.4 203.2,253.4 205.4,254.3 207.6,255.1 209.8,256.0 212.0,256.7 214.2,257.5 216.4,258.2 218.6,258.8 220.8,259.5 223.0,260.1 225.2,260.6 227.4,261.2 229.6,261.7 231.8,262.2 234.0,262.6 236.2,263.1 238.4,263.5 240.6,263.8 242.8,264.2 245.0,264.6 247.2,264.9 249.4,265.2 251.6,265.5 253.8,265.7 256.0,266.0 258.2,266.2 260.4,266.4 262.6,266.6 264.8,266.8 267.0,267.0 269.2,267.2 271.4,267.3 273.6,267.5 275.8,267.6 278.0,267.7 280.2,267.8 282.4,267.9 284.6,268.0 286.8,268.0 289.0,268.1 291.2,268.1 293.4,268.2 295.6,268.2 297.8,268.2 300.0,268.2 302.2,268.2 304.4,268.2 306.6,268.2 308.8,268.1 311.0,268.1 313.2,268.0 315.4,268.0 317.6,267.9 319.8,267.8 322.0,267.7 324.2,267.6 326.4,267.5 328.6,267.3 330.8,267.2 333.0,267.0 335.2,266.8 337.4,266.6 339.6,266.4 341.8,266.2 344.0,266.0 346.2,265.7 348.4,265.5 350.6,265.2 352.8,264.9 355.0,264.6 357.2,264.2 359.4,263.8 361.6,263.5 363.8,263.1 366.0,262.6 368.2,262.2 370.4,261.7 372.6,261.2 374.8,260.6 377.0,260.1 379.2,259.5 381.4,258.8 383.6,258.2 385.8,257.5 388.0,256.7 390.2,256.0 392.4,255.1 394.6,254.3 396.8,253.4 399.0,252.4 401.2,251.4 403.4,250.4 405.6,249.3 407.8,248.2 410.0,247.0 412.2,245.7 414.4,244.4 416.6,243.0 418.8,241.6 421.0,240.1 423.2,238.5 425.4,236.8 427.6,235.1 429.8,233.3 432.0,231.4 434.2,229.4 436.4,227.4 438.6,225.2 440.8,223.0 443.0,220.6 445.2,218.2 447.4,215.6 449.6,213.0 451.8,210.2 454.0,207.3 456.2,204.3 458.4,201.2 460.6,197.9 462.8,194.5 465.0,191.0 467.2,187.3 469.4,183.4 471.6,179.5 473.8,175.3 476.0,171.0 478.2,166.5 480.4,161.8 482.6,157.0 484.8,152.0 487.0,146.7 489.2,141.3 491.4,135.7 493.6,129.8 495.8,123.7 498.0,117.4 500.2,110.9 502.4,104.1 504.6,97.0 506.8,89.7 509.0,82.2 511.2,74.3 513.4,66.2 515.6,57.8 517.8,49.0 520.0,40.0" class="d-line d-stroke-cyan"/>
+<polyline points="80.0,40.0 82.2,57.7 84.4,74.2 86.6,89.4 88.8,103.5 91.0,116.6 93.2,128.7 95.4,139.9 97.6,150.3 99.8,159.9 102.0,168.8 104.2,177.0 106.4,184.5 108.6,191.5 110.8,198.0 113.0,203.9 115.2,209.4 117.4,214.5 119.6,219.1 121.8,223.4 124.0,227.4 126.2,231.0 128.4,234.4 130.6,237.4 132.8,240.3 135.0,242.8 137.2,245.2 139.4,247.4 141.6,249.4 143.8,251.2 146.0,252.9 148.2,254.5 150.4,255.9 152.6,257.2 154.8,258.3 157.0,259.4 159.2,260.4 161.4,261.3 163.6,262.1 165.8,262.8 168.0,263.5 170.2,264.1 172.4,264.7 174.6,265.2 176.8,265.7 179.0,266.1 181.2,266.5 183.4,266.8 185.6,267.2 187.8,267.4 190.0,267.7 192.2,267.9 194.4,268.1 196.6,268.3 198.8,268.5 201.0,268.7 203.2,268.8 205.4,268.9 207.6,269.0 209.8,269.1 212.0,269.2 214.2,269.3 216.4,269.4 218.6,269.5 220.8,269.5 223.0,269.6 225.2,269.6 227.4,269.7 229.6,269.7 231.8,269.7 234.0,269.8 236.2,269.8 238.4,269.8 240.6,269.8 242.8,269.9 245.0,269.9 247.2,269.9 249.4,269.9 251.6,269.9 253.8,269.9 256.0,269.9 258.2,269.9 260.4,270.0 262.6,270.0 264.8,270.0 267.0,270.0 269.2,270.0 271.4,270.0 273.6,270.0 275.8,270.0 278.0,270.0 280.2,270.0 282.4,270.0 284.6,270.0 286.8,270.0 289.0,270.0 291.2,270.0 293.4,270.0 295.6,270.0 297.8,270.0 300.0,270.0 302.2,270.0 304.4,270.0 306.6,270.0 308.8,270.0 311.0,270.0 313.2,270.0 315.4,270.0 317.6,270.0 319.8,270.0 322.0,270.0 324.2,270.0 326.4,270.0 328.6,270.0 330.8,270.0 333.0,270.0 335.2,270.0 337.4,270.0 339.6,270.0 341.8,269.9 344.0,269.9 346.2,269.9 348.4,269.9 350.6,269.9 352.8,269.9 355.0,269.9 357.2,269.9 359.4,269.8 361.6,269.8 363.8,269.8 366.0,269.8 368.2,269.7 370.4,269.7 372.6,269.7 374.8,269.6 377.0,269.6 379.2,269.5 381.4,269.5 383.6,269.4 385.8,269.3 388.0,269.2 390.2,269.1 392.4,269.0 394.6,268.9 396.8,268.8 399.0,268.7 401.2,268.5 403.4,268.3 405.6,268.1 407.8,267.9 410.0,267.7 412.2,267.4 414.4,267.2 416.6,266.8 418.8,266.5 421.0,266.1 423.2,265.7 425.4,265.2 427.6,264.7 429.8,264.1 432.0,263.5 434.2,262.8 436.4,262.1 438.6,261.3 440.8,260.4 443.0,259.4 445.2,258.3 447.4,257.2 449.6,255.9 451.8,254.5 454.0,252.9 456.2,251.2 458.4,249.4 460.6,247.4 462.8,245.2 465.0,242.8 467.2,240.3 469.4,237.4 471.6,234.4 473.8,231.0 476.0,227.4 478.2,223.4 480.4,219.1 482.6,214.5 484.8,209.4 487.0,203.9 489.2,198.0 491.4,191.5 493.6,184.5 495.8,177.0 498.0,168.8 500.2,159.9 502.4,150.3 504.6,139.9 506.8,128.7 509.0,116.6 511.2,103.5 513.4,89.4 515.6,74.2 517.8,57.7 520.0,40.0" class="d-line d-stroke-orange"/>
+<polyline points="80.0,40.0 82.2,103.1 84.4,149.1 86.6,182.6 88.8,206.9 91.0,224.5 93.2,237.3 95.4,246.5 97.6,253.1 99.8,257.9 102.0,261.4 104.2,263.8 106.4,265.6 108.6,266.9 110.8,267.8 113.0,268.4 115.2,268.9 117.4,269.2 119.6,269.4 121.8,269.6 124.0,269.7 126.2,269.8 128.4,269.9 130.6,269.9 132.8,269.9 135.0,270.0 137.2,270.0 139.4,270.0 141.6,270.0 143.8,270.0 146.0,270.0 148.2,270.0 150.4,270.0 152.6,270.0 154.8,270.0 157.0,270.0 159.2,270.0 161.4,270.0 163.6,270.0 165.8,270.0 168.0,270.0 170.2,270.0 172.4,270.0 174.6,270.0 176.8,270.0 179.0,270.0 181.2,270.0 183.4,270.0 185.6,270.0 187.8,270.0 190.0,270.0 192.2,270.0 194.4,270.0 196.6,270.0 198.8,270.0 201.0,270.0 203.2,270.0 205.4,270.0 207.6,270.0 209.8,270.0 212.0,270.0 214.2,270.0 216.4,270.0 218.6,270.0 220.8,270.0 223.0,270.0 225.2,270.0 227.4,270.0 229.6,270.0 231.8,270.0 234.0,270.0 236.2,270.0 238.4,270.0 240.6,270.0 242.8,270.0 245.0,270.0 247.2,270.0 249.4,270.0 251.6,270.0 253.8,270.0 256.0,270.0 258.2,270.0 260.4,270.0 262.6,270.0 264.8,270.0 267.0,270.0 269.2,270.0 271.4,270.0 273.6,270.0 275.8,270.0 278.0,270.0 280.2,270.0 282.4,270.0 284.6,270.0 286.8,270.0 289.0,270.0 291.2,270.0 293.4,270.0 295.6,270.0 297.8,270.0 300.0,270.0 302.2,270.0 304.4,270.0 306.6,270.0 308.8,270.0 311.0,270.0 313.2,270.0 315.4,270.0 317.6,270.0 319.8,270.0 322.0,270.0 324.2,270.0 326.4,270.0 328.6,270.0 330.8,270.0 333.0,270.0 335.2,270.0 337.4,270.0 339.6,270.0 341.8,270.0 344.0,270.0 346.2,270.0 348.4,270.0 350.6,270.0 352.8,270.0 355.0,270.0 357.2,270.0 359.4,270.0 361.6,270.0 363.8,270.0 366.0,270.0 368.2,270.0 370.4,270.0 372.6,270.0 374.8,270.0 377.0,270.0 379.2,270.0 381.4,270.0 383.6,270.0 385.8,270.0 388.0,270.0 390.2,270.0 392.4,270.0 394.6,270.0 396.8,270.0 399.0,270.0 401.2,270.0 403.4,270.0 405.6,270.0 407.8,270.0 410.0,270.0 412.2,270.0 414.4,270.0 416.6,270.0 418.8,270.0 421.0,270.0 423.2,270.0 425.4,270.0 427.6,270.0 429.8,270.0 432.0,270.0 434.2,270.0 436.4,270.0 438.6,270.0 440.8,270.0 443.0,270.0 445.2,270.0 447.4,270.0 449.6,270.0 451.8,270.0 454.0,270.0 456.2,270.0 458.4,270.0 460.6,270.0 462.8,270.0 465.0,270.0 467.2,269.9 469.4,269.9 471.6,269.9 473.8,269.8 476.0,269.7 478.2,269.6 480.4,269.4 482.6,269.2 484.8,268.9 487.0,268.4 489.2,267.8 491.4,266.9 493.6,265.6 495.8,263.8 498.0,261.4 500.2,257.9 502.4,253.1 504.6,246.5 506.8,237.3 509.0,224.5 511.2,206.9 513.4,182.6 515.6,149.1 517.8,103.1 520.0,40.0" class="d-line d-stroke-green"/>
+<text x="300" y="306" class="d-small d-text-light" text-anchor="middle">prompt pass rate p</text>
+<text x="22" y="155" class="d-small d-text-light" transform="rotate(-90 22 155)" text-anchor="middle">P(zero-variance group) = p^G + (1&#8722;p)^G</text>
+<rect x="550" y="46" width="236" height="206" rx="8" class="d-label-bg"/>
+<text x="564" y="68" class="d-bold">Dead-group probability</text>
+<text x="600" y="90" class="d-small d-text-light">p = 0.05</text><text x="690" y="90" class="d-small d-text-light">p = 0.01</text>
+<line x1="560" y1="112" x2="580" y2="112" class="d-line d-stroke-blue"/>
+<text x="586" y="116" class="d-mono">4</text>
+<text x="610" y="116" class="d-mono">81.5%</text><text x="700" y="116" class="d-mono">96.1%</text>
+<line x1="560" y1="138" x2="580" y2="138" class="d-line d-stroke-cyan"/>
+<text x="586" y="142" class="d-mono">8</text>
+<text x="610" y="142" class="d-mono">66.3%</text><text x="700" y="142" class="d-mono">92.3%</text>
+<line x1="560" y1="164" x2="580" y2="164" class="d-line d-stroke-orange"/>
+<text x="586" y="168" class="d-mono">16</text>
+<text x="610" y="168" class="d-mono">44.0%</text><text x="700" y="168" class="d-mono">85.1%</text>
+<line x1="560" y1="190" x2="580" y2="190" class="d-line d-stroke-green"/>
+<text x="586" y="194" class="d-mono">64</text>
+<text x="610" y="194" class="d-mono">3.8%</text><text x="700" y="194" class="d-mono">52.6%</text>
+<text x="564" y="224" class="d-small d-text-light">symmetric in p and 1&#8722;p</text>
+<text x="564" y="242" class="d-small d-text-light">G = 8: 0.8% at p = 0.5</text>
+</svg>
+<figcaption><b>Figure 4.</b> The chance that a group of G samples contains no learning signal (all correct or all wrong), for G = 4 (blue), 8 (cyan), 16 (orange) and 64 (green). A larger group empties the middle of the curve but the ends stay high: a prompt solved 1% of the time is dead 85% of the time at G = 16. Derived from p^G + (1&#8722;p)^G; Module 2 plots the complement (Figure 6 there).</figcaption>
+</figure>
+
+<p>A batch holds prompts of many difficulties, so the batch-level dead fraction is the average of \(P_0\) over the pass-rate distribution. For a Beta\((a,b)\) population it has a closed form, \(\mathbb E[P_0]=\big[B(a+G,b)+B(a,b+G)\big]/B(a,b)\) (derived). Table 4 evaluates it for four assumed populations. They are illustrations of shape, not measurements: a mid-heavy population, a uniform one, and two U-shaped ones in which most prompts are nearly always or nearly never solved.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> Expected fraction of dead groups, and the oversampling factor \(1/(1-P_0)\) a "drop and refill" scheme needs, for assumed Beta pass-rate populations. Derived from \(P_0\); not measured data.</caption>
+  <thead><tr><th>Pass-rate population</th><th class="num">\(G=4\)</th><th class="num">\(G=8\)</th><th class="num">\(G=16\)</th><th class="num">\(G=64\)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Beta(2, 2), mid-heavy</td><td class="num">28.6% (1.40x)</td><td class="num">10.9% (1.12x)</td><td class="num">3.5% (1.04x)</td><td class="num" data-best>0.3% (1.00x)</td></tr>
+    <tr><td class="row">Beta(1, 1), uniform</td><td class="num">40.0% (1.67x)</td><td class="num">22.2% (1.29x)</td><td class="num">11.8% (1.13x)</td><td class="num">3.1% (1.03x)</td></tr>
+    <tr><td class="row">Beta(0.5, 0.5), U-shaped</td><td class="num">54.7% (2.21x)</td><td class="num">39.3% (1.65x)</td><td class="num">28.0% (1.39x)</td><td class="num">14.1% (1.16x)</td></tr>
+    <tr><td class="row">Beta(0.3, 0.3), strongly U-shaped</td><td class="num" data-worst>65.9% (2.93x)</td><td class="num">53.4% (2.15x)</td><td class="num">43.4% (1.77x)</td><td class="num">28.6% (1.40x)</td></tr>
+  </tbody>
+</table>
+<p>The one measured trace in the source set drifts toward the solved end. In DAPO's run the share of prompts with avg@32 equal to 100% rises from near zero to roughly 0.55 to 0.6 by step 8,000 (read off its Figure 3b; approximate)<a class="cite" href="#ref-3">3</a>. With more than half the prompts dead from that one side alone, refilling needs at least \(1/(1-0.55)\approx 2.2\) to \(2.5\) times as many prompts as the batch holds (derived; a lower bound, since accuracy-0 prompts are dropped too). Olmo 3 describes DAPO's dynamic sampling as generating "three times the number of prompts used in each training batch"<a class="cite" href="#ref-10">10</a> (§4.4.3), the same order.</p>
+<p>A larger \(G\) is not a free fix. Informative prompts per rollout fall as \(G\) grows: for the U-shaped Beta(0.5, 0.5) population, 11.3, 7.6, 4.5 and 1.3 informative prompts per 100 rollouts at \(G=4,8,16,64\) (derived from Table 4). Group size buys a better baseline and rarer dead groups at the price of fewer prompts. ScaleRL's one test at fixed total batch, sweeping 8, 16, 24 and 32 generations per prompt, left the fitted scaling curves "essentially unchanged"<a class="cite" href="#ref-9">9</a> (§5).</p>
+
+<div class="calc">
+  <p class="calc-title">Dead groups and the cost of refilling a batch, for one pass rate</p>
+  <div class="calc-row"><label for="c4-p">Pass rate p</label><input type="range" id="c4-p" name="p" min="0.01" max="0.99" step="0.01" value="0.2"></div>
+  <div class="calc-row"><label for="c4-g">Group size G</label><input type="range" id="c4-g" name="G" min="2" max="64" step="1" value="8"></div>
+  <div class="calc-row"><label for="c4-b">Prompts per batch</label><input type="range" id="c4-b" name="B" min="32" max="1024" step="32" value="512"></div>
+  <div class="calc-out">
+    <div>Dead groups<output data-expr="pow(p, G) + pow(1 - p, G)" data-format="pct"></output></div>
+    <div>Informative prompts in the batch<output data-expr="B * (1 - pow(p, G) - pow(1 - p, G))" data-format="int"></output></div>
+    <div>Prompts to sample to fill it<output data-expr="B / (1 - pow(p, G) - pow(1 - p, G))" data-format="int"></output></div>
+    <div>Rollouts to sample to fill it<output data-expr="B * G / (1 - pow(p, G) - pow(1 - p, G))" data-format="si"></output></div>
+  </div>
+  <p class="calc-note">Formula: \(P_0=p^G+(1-p)^G\); prompts to fill \(=B/(1-P_0)\). Assumes every prompt has the same pass rate \(p\); real batches mix rates (Table 4).</p>
+</div>
+
+<h3 id="zero-variance-cost">4.2 What a dead group costs</h3>
+<p>Two different bills arrive. The first is generation. Olmo 3's 32B reasoner used 8 H100 nodes for training and 20 for inference; its learner waits for data 75% of the time, about five times as many GPUs serve inference as training, and in one representative run a step averaged 1,000 s of which 125 s was training<a class="cite" href="#ref-10">10</a> (§4.4.3, footnote 41). A dead group is paid for entirely in that dominant phase and returns nothing. The second is statistical. Under batch-level token averaging the dead group's tokens stay in the denominator \(N\), so the gradient is the informative groups' sum divided by a count that includes the dead ones: the nominal batch of 512 prompts becomes an effective batch of roughly \(512\times(1-\text{dead fraction})\), and gradient noise grows as one over the effective count (derived). Adam, which divides by a running scale of the gradient, largely undoes the smaller magnitude that DAPO points to (derived), so what survives is the noise.</p>
+
+<h3 id="zero-variance-fixes">4.3 Four remedies</h3>
+<table class="tbl tbl-dense tbl-compare">
+  <caption><b>Table 5.</b> Remedies for zero-variance groups in the reports. "Extra rollouts" means generation beyond the nominal batch. LOO = leave-one-out from the full ScaleRL recipe (8B dense, math); A is the fitted asymptotic pass rate with run-to-run noise of about 0.02.</caption>
+  <thead><tr><th>Remedy</th><th>Mechanism</th><th>Extra rollouts</th><th>Reported effect</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Dynamic sampling</td><td>Oversample, drop groups with accuracy 0 or 1, repeat until the buffer holds N informative groups</td><td>Yes, about 2 to 3 times the prompts late in training (Table 4)</td><td>Last step of the ladder, 42 to 50 on AIME24 avg@32; reaches the same score in fewer steps and, the authors say, not much more wall-clock time</td><td>DAPO §3.2, Alg. 1, Fig. 6<a class="cite" href="#ref-3">3</a></td></tr>
+    <tr><td class="row">Zero-gradient filtering with active sampling</td><td>Filter dead groups; the asynchronous actors keep pulling completions and prompts until the batch is full of non-zero-advantage samples</td><td>Yes, but continuous batching leaves no idle slots</td><td>Keeps the batch size from decaying; "greatly reduced loss variance" in an RL-Zero math run</td><td>Olmo 3 §4.4.1, §4.4.3, Fig. 26<a class="cite" href="#ref-10">10</a></td></tr>
+    <tr><td class="row">Zero-variance filtering</td><td>Drop dead groups from the loss; the batch simply shrinks</td><td>No</td><td>Higher asymptote in the forward test; LOO without it: A 0.595 against 0.610, B 1.69 against 2.01</td><td>ScaleRL §3.2, Fig. 6a, Fig. 7<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">No-Positive-Resampling</td><td>Remove a prompt for good once its historical pass rate reaches 0.9</td><td>Fewer: dead groups are never generated</td><td>Higher asymptote in the forward test; LOO without it: A 0.605, B 1.62, the lowest B of the nine variants</td><td>ScaleRL §3.2, Fig. 6b, Fig. 7<a class="cite" href="#ref-9">9</a></td></tr>
+  </tbody>
+</table>
+<p>The two filters are different in kind. Dynamic sampling and active sampling keep the number of informative prompts constant and pay in generation. Zero-variance filtering accepts a smaller effective batch. ScaleRL notes the distinction (filtering "merely drop[s] the prompts" while DAPO "resamples more prompts until the batch is full") and its DAPO baseline filters rather than refills, because refilling stalled generators in its pre-assigned PipelineRL layout<a class="cite" href="#ref-9">9</a> (§3.2, App. A.16). Hugging Face TRL's <code>GRPOTrainer</code> implements none of these; it logs <code>frac_reward_zero_std</code>, the fraction of samples whose group has zero reward spread, and leaves the choice to the user<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>. A zero-variance filter keyed on the total reward fires only when the whole reward is constant, which Section 6 shows is a weaker condition than "accuracy is constant".</p>
+
+<h2 id="overlong">5. Truncated samples: overlong filtering and soft punishment</h2>
+<p>A generation cap \(L_{\max}\) makes an unfinished chain of thought score as wrong; DAPO's default assigns truncated samples a punitive reward. DAPO's objection is that this is noise: "a sound reasoning process can be penalized solely due to its excessive length"<a class="cite" href="#ref-3">3</a> (§3.4). The loss aggregation makes it worse (derived). Truncated samples are the longest samples in the batch. Under sample-level averaging each of their tokens gets the smallest weight in the group; under token-level averaging they hold the largest share, as the 7,800-token response holds 34.5% of the weight in Table 2. A scheme that fixes the length bias therefore sends most of the negative push to the samples most likely to be unfinished rather than wrong, which is why DAPO ships the fix together with truncation handling.</p>
+<p>DAPO has two remedies. <strong>Overlong filtering</strong> masks the loss of truncated samples. <strong>Soft overlong punishment</strong> keeps them but adds a graded length reward to the correctness reward<a class="cite" href="#ref-3">3</a> (§3.4, Eq. 13):</p>
+$$R_{\text{length}}(y)=\begin{cases}0,&|y|\le L_{\max}-L_{\text{cache}}\\[2pt] \dfrac{(L_{\max}-L_{\text{cache}})-|y|}{L_{\text{cache}}},&L_{\max}-L_{\text{cache}}<|y|\le L_{\max}\\[6pt] -1,&L_{\max}<|y|.\end{cases}$$
+<p>The paper sets an expected maximum of 16,384 tokens and a punishment cache of 4,096, so the hard cap is \(L_{\max}=16{,}384+4{,}096=20{,}480\)<a class="cite" href="#ref-3">3</a> (§4.1). A response of 18,432 tokens, halfway through the ramp, receives \((16{,}384-18{,}432)/4{,}096=-0.5\), so a correct answer there scores 0.5 where a correct answer under 16,384 tokens scores 1 and a wrong one scores 0 (derived). TRL ships the same function as <code>get_soft_overlong_punishment(max_completion_len, soft_punish_cache)</code> and a <code>mask_truncated_completions</code> option for the filtering variant, default <code>False</code><a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-4">4</a>.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 320" role="img" aria-labelledby="f5t"><title id="f5t">Soft overlong punishment as a function of response length with a 16,384-token threshold and 4,096-token ramp</title>
+<rect x="375.0" y="48" width="266.2" height="204" class="d-fill-amber-soft"/>
+<line x1="90" y1="60.0" x2="740" y2="60.0" class="d-grid"/><text x="84" y="64.0" text-anchor="end" class="d-small d-text-light">0.0</text>
+<line x1="90" y1="150.0" x2="740" y2="150.0" class="d-grid"/><text x="84" y="154.0" text-anchor="end" class="d-small d-text-light">&#8722;0.5</text>
+<line x1="90" y1="240.0" x2="740" y2="240.0" class="d-grid"/><text x="84" y="244.0" text-anchor="end" class="d-small d-text-light">&#8722;1.0</text>
+<text x="90.0" y="274" text-anchor="middle" class="d-small d-text-light">12,000</text>
+<text x="220.0" y="274" text-anchor="middle" class="d-small d-text-light">14,000</text>
+<text x="480.0" y="274" text-anchor="middle" class="d-small d-text-light">18,000</text>
+<text x="740.0" y="274" text-anchor="middle" class="d-small d-text-light">22,000</text>
+<line x1="375.0" y1="48" x2="375.0" y2="252" class="d-axis d-dashed"/><text x="375.0" y="274" text-anchor="middle" class="d-small d-text-light">16,384</text>
+<line x1="641.2" y1="48" x2="641.2" y2="252" class="d-axis d-dashed"/><text x="641.2" y="274" text-anchor="middle" class="d-small d-text-light">20,480</text>
+<polyline points="90.0,60.0 375.0,60.0 641.2,240.0 740.0,240.0" class="d-line d-stroke-blue"/>
+<circle cx="508.1" cy="150.0" r="5" class="d-fill-orange"/>
+<text x="518.1" y="142.0" class="d-small d-text-light">18,432 tokens: &#8722;0.5</text>
+<text x="232.5" y="48.0" text-anchor="middle">no penalty</text>
+<text x="508.1" y="40.0" text-anchor="middle">soft zone, L_cache = 4,096</text>
+<text x="690.6" y="228.0" text-anchor="middle">truncated: &#8722;1</text>
+<text x="415" y="296" class="d-small d-text-light" text-anchor="middle">response length |y| (tokens)</text>
+<text x="24" y="150" class="d-small d-text-light" transform="rotate(-90 24 150)" text-anchor="middle">length reward R_length</text>
+</svg>
+<figcaption><b>Figure 5.</b> DAPO&#8217;s soft overlong punishment (Eq. 13) with the paper&#8217;s settings: an expected maximum of 16,384 tokens, a 4,096-token punishment interval and a hard cap L_max = 20,480. The penalty is added to the correctness reward. Plotted from Eq. 13 and &#167;4.1 of the paper<a class="cite" href="#ref-3">3</a>; the TRL helper implements the same piecewise function<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<p>The evidence is mixed. In DAPO's ladder, overlong filtering is the first and, after dynamic sampling, the second largest step (30 to 36), and soft punishment adds three more (38 to 41)<a class="cite" href="#ref-3">3</a> (Table 1). Olmo 3 tried "additional changes (e.g., overlong filtering)" and "did not find these gave consistent improvements"<a class="cite" href="#ref-10">10</a> (footnote 34). ScaleRL compared two ways to bound length under its recipe, forced interruption (inserting an end-of-thinking phrase at a random point between 10,000 and 12,000 tokens) and a DAPO-style penalty applied to correct traces only, and found that replacing interruption with the penalty "does not improve performance"; the penalty's leave-one-out run has \(B=1.75\) against 2.01 for the full recipe at an unchanged \(A=0.610\)<a class="cite" href="#ref-9">9</a> (App. A.10, Fig. 7). ScaleRL also treats truncation rate as a health signal: at batch size 768, truncation of 10% to 15% "typically destabilized training", while its own runs stayed below 5% for over 90% of training<a class="cite" href="#ref-9">9</a> (App. A.15). DeepSeek-V3.2 uses a length penalty inside the reward for reasoning and agent tasks and trains its Speciale variant "with a reduced length penalty"<a class="cite" href="#ref-8">8</a> (§3), so length control by reward is alive at the frontier next to the loss-side fixes of Section 2.</p>
+
+<h2 id="advantage-no-std">6. Advantage without the standard deviation</h2>
+<p>DeepSeek-V3.2 sets the advantage to "subtracting the average reward of the group from the reward of output", \(\hat A_{i,t}=R_i-\mathrm{mean}(\boldsymbol R)\), with no division<a class="cite" href="#ref-8">8</a> (§3.1). The objective printed beside it still averages with \(1/|o_i|\) and carries the KL term, as a review of GRPO, and the report does not say whether its implementation aggregates at sample or token level or why the standard deviation was dropped<a class="cite" href="#ref-8">8</a>. Olmo 3 states its reason: "no standard deviation normalization [...] removes a difficulty bias", following Dr. GRPO, alongside a token-level loss normalized over the batch's tokens and no KL loss<a class="cite" href="#ref-10">10</a> (§4.4.1). Two consequences follow, both derived here.</p>
+<p><strong>Update size now follows the reward scale.</strong> TRL's documentation says so directly: turning off std scaling "removes variance normalization, so update magnitudes depend directly on the raw reward scale and batch composition"<a class="cite" href="#ref-4">4</a>. For a binary reward the centered advantage has standard deviation \(\sqrt{\hat p(1-\hat p)}\le 0.5\), so a balanced prompt's advantages are at most half the size they would be after division (a quarter of the energy \(\sum_iA_i^2\)), and those of extreme prompts are far smaller (Figure 3). A global factor like that is absorbed by Adam; the relative scale between prompts and between reward components is what remains, and with reward terms of different magnitude that is a design decision rather than a side effect.</p>
+<p><strong>Composite rewards change what "dead" means.</strong> Suppose the reward is accuracy (0 or 1) plus \(0.1\,c\), where \(c\in[0,1]\) is a continuous auxiliary term such as a language-consistency fraction, and take an all-correct group whose \(c\) values have a standard deviation of 0.015. The reward spread is 0.0015. Centered, the advantages are about \(\pm 0.0015\), roughly 300 times smaller than the \(\pm0.5\) of a balanced accuracy group. Divided by the group standard deviation they become unit-variance and the jitter in a 10%-weight bonus drives the gradient of a prompt the verifier calls solved with the full strength of an informative one (illustrative numbers; Module 10, §2.4 works the language-consistency reward in detail). The same composite reward also defeats a filter keyed on total reward: groups are "all identical" only when every component ties, so dead-in-accuracy groups pass through Olmo 3's filter ("rewards are all identical")<a class="cite" href="#ref-10">10</a> or TRL's <code>frac_reward_zero_std</code> counter<a class="cite" href="#ref-5">5</a>. DAPO's constraint is written on accuracy, \(0<|\{o_i:\text{is\_equivalent}(a,o_i)\}|\lt G\)<a class="cite" href="#ref-3">3</a> (Eq. 8), which ignores the auxiliary term by construction. Which condition to filter on is a choice that interacts with whether you divide by the standard deviation.</p>
+
+<h2 id="evidence">7. What the controlled comparisons show</h2>
+
+<h3 id="evidence-dapo">7.1 DAPO's ladder</h3>
+<p>DAPO's headline is 50 AIME 2024 points on Qwen2.5-32B against 30 for "naive GRPO" on the same base and 47 for DeepSeek-R1-Zero-Qwen-32B<a class="cite" href="#ref-3">3</a> (Fig. 1, Table 1). Figure 6 plots the ladder. Of its five rungs, two concern this module (token-level loss, dynamic sampling), two are truncation fixes (Section 5) and one belongs to Module 12 (Clip-Higher).</p>
+<figure class="fig">
+<svg viewBox="0 0 800 345" role="img" aria-labelledby="f6t"><title id="f6t">DAPO ablation ladder on AIME 2024 avg@32 with Qwen2.5-32B base</title>
+<line x1="230.0" y1="30" x2="230.0" y2="298" class="d-grid"/><text x="230.0" y="314" text-anchor="middle" class="d-small d-text-light">0</text>
+<line x1="320.0" y1="30" x2="320.0" y2="298" class="d-grid"/><text x="320.0" y="314" text-anchor="middle" class="d-small d-text-light">10</text>
+<line x1="410.0" y1="30" x2="410.0" y2="298" class="d-grid"/><text x="410.0" y="314" text-anchor="middle" class="d-small d-text-light">20</text>
+<line x1="500.0" y1="30" x2="500.0" y2="298" class="d-grid"/><text x="500.0" y="314" text-anchor="middle" class="d-small d-text-light">30</text>
+<line x1="590.0" y1="30" x2="590.0" y2="298" class="d-grid"/><text x="590.0" y="314" text-anchor="middle" class="d-small d-text-light">40</text>
+<line x1="680.0" y1="30" x2="680.0" y2="298" class="d-grid"/><text x="680.0" y="314" text-anchor="middle" class="d-small d-text-light">50</text>
+<text x="455.0" y="334" text-anchor="middle" class="d-small d-text-light">AIME 2024 avg@32 (%)</text>
+<text x="222" y="63" text-anchor="end">DeepSeek-R1-Zero-Qwen-32B</text>
+<rect x="230" y="48" width="423.0" height="24" rx="3" class="d-block-muted"/>
+<text x="659.0" y="65" class="d-mono">47</text>
+<text x="222" y="99" text-anchor="end">Naive GRPO</text>
+<rect x="230" y="84" width="270.0" height="24" rx="3" class="d-fill-blue"/>
+<text x="506.0" y="101" class="d-mono">30</text>
+<text x="222" y="135" text-anchor="end">+ overlong filtering</text>
+<rect x="230" y="120" width="324.0" height="24" rx="3" class="d-fill-blue"/>
+<text x="560.0" y="137" class="d-mono">36</text>
+<text x="790" y="137" text-anchor="end" class="d-mono d-text-light">+6</text>
+<text x="222" y="171" text-anchor="end">+ Clip-Higher</text>
+<rect x="230" y="156" width="342.0" height="24" rx="3" class="d-fill-blue"/>
+<text x="578.0" y="173" class="d-mono">38</text>
+<text x="790" y="173" text-anchor="end" class="d-mono d-text-light">+2</text>
+<text x="222" y="207" text-anchor="end">+ soft overlong punishment</text>
+<rect x="230" y="192" width="369.0" height="24" rx="3" class="d-fill-blue"/>
+<text x="605.0" y="209" class="d-mono">41</text>
+<text x="790" y="209" text-anchor="end" class="d-mono d-text-light">+3</text>
+<text x="222" y="243" text-anchor="end">+ token-level loss</text>
+<rect x="230" y="228" width="378.0" height="24" rx="3" class="d-fill-blue"/>
+<text x="614.0" y="245" class="d-mono">42</text>
+<text x="790" y="245" text-anchor="end" class="d-mono d-text-light">+1</text>
+<text x="222" y="279" text-anchor="end">+ dynamic sampling (DAPO)</text>
+<rect x="230" y="264" width="450.0" height="24" rx="3" class="d-fill-orange"/>
+<text x="686.0" y="281" class="d-mono">50</text>
+<text x="790" y="281" text-anchor="end" class="d-mono d-text-light">+8</text>
+<text x="790" y="38" text-anchor="end" class="d-small d-text-light">step gain</text>
+</svg>
+<figcaption><b>Figure 6.</b> DAPO&#8217;s cumulative ablation: each row adds one technique to the row above. Qwen2.5-32B base, AIME 2024, avg@32 at temperature 1.0 and top-p 0.7; one number per row, no error bars; the gain column is the difference between adjacent rows, so it depends on the order. Data: DAPO Table 1 and &#167;4.1<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<p>Three limits apply before using the ladder to rank techniques. It is cumulative, so each gain is conditional on the rows above it and would differ in another order; dynamic sampling's +8 comes last, when more than half the prompts are dead (Section 4.1), which is when it has the most to recover (derived reading). It is one base model and one benchmark: AIME 2024 has 30 problems, and avg@32 removes most sampling noise but not problem-set noise. Even so, sampling alone leaves a standard error of up to \(\sqrt{30\times0.25/32}/30=1.6\) points when each problem's accuracy is near one half (derived), so the +1 of the token-level loss and the +2 of Clip-Higher cannot be separated from zero without repeated runs, and the table reports one number per row. The authors themselves describe the token-level loss as bringing "less performance improvement" but better stability<a class="cite" href="#ref-3">3</a> (§4.2).</p>
+
+<h3 id="evidence-scalerl">7.2 ScaleRL's two tests</h3>
+<p>ScaleRL (Khatri et al.) is the only study in the source set that varies loss aggregation and advantage normalization in a controlled way and fits a compute curve to each: pass rate \(R\) as a saturating function of GPU-hours with an asymptote \(A\) and an efficiency exponent \(B\)<a class="cite" href="#ref-9">9</a> (Eq. 1). Its forward ablations start from a PipelineRL baseline on an 8B dense model, with 48 prompts of 16 generations (batch 768) from the Polaris-53K math set. Loss aggregation: prompt average and token average both reach \(A=0.535\) (\(B=2.98\) and \(2.04\)), sample average \(A=0.520\) (\(B=4.55\)). Advantage normalization: none \(A=0.525\) (\(B=3.69\)), batch-level 0.530 (3.15), prompt-level 0.520 (4.55)<a class="cite" href="#ref-9">9</a> (App. A.9, Fig. 14; values read from the printed legends). The paper adopts prompt average because it "achieves the highest asymptotic performance", and batch-level normalization because it is "theoretically sound and marginally better" while "all three methods are observed to yield similar performance"<a class="cite" href="#ref-9">9</a> (§3.2).</p>
+<p>The spreads are 0.015 and 0.010 in \(A\), smaller than the \(\pm0.02\) seen across three independent runs of the final recipe<a class="cite" href="#ref-9">9</a> (Fig. 8a). \(B\) cannot be compared across runs with different \(A\), because the two fitted parameters trade off: sample average and prompt-level normalization both fit \(B=4.55\) at the lowest \(A\). The paper therefore pins \(A=0.605\) in its leave-one-out table (Figure 7), where each choice is reverted from the full recipe at 16,000 GPU-hours per run.</p>
+<figure class="fig">
+<svg viewBox="0 0 800 380" role="img" aria-labelledby="f7t"><title id="f7t">ScaleRL leave-one-out: fitted efficiency exponent B at fixed asymptote A = 0.605 for nine reverted design choices</title>
+<line x1="250.0" y1="30" x2="250.0" y2="316" class="d-grid"/><text x="250.0" y="332" text-anchor="middle" class="d-small d-text-light">1.5</text>
+<line x1="325.0" y1="30" x2="325.0" y2="316" class="d-grid"/><text x="325.0" y="332" text-anchor="middle" class="d-small d-text-light">1.6</text>
+<line x1="400.0" y1="30" x2="400.0" y2="316" class="d-grid"/><text x="400.0" y="332" text-anchor="middle" class="d-small d-text-light">1.7</text>
+<line x1="475.0" y1="30" x2="475.0" y2="316" class="d-grid"/><text x="475.0" y="332" text-anchor="middle" class="d-small d-text-light">1.8</text>
+<line x1="550.0" y1="30" x2="550.0" y2="316" class="d-grid"/><text x="550.0" y="332" text-anchor="middle" class="d-small d-text-light">1.9</text>
+<line x1="625.0" y1="30" x2="625.0" y2="316" class="d-grid"/><text x="625.0" y="332" text-anchor="middle" class="d-small d-text-light">2.0</text>
+<line x1="700.0" y1="30" x2="700.0" y2="316" class="d-grid"/><text x="700.0" y="332" text-anchor="middle" class="d-small d-text-light">2.1</text>
+<line x1="632.5" y1="30" x2="632.5" y2="316" class="d-axis d-dashed"/>
+<text x="475.0" y="354" text-anchor="middle" class="d-small d-text-light">fitted B at fixed A = 0.605 (axis starts at 1.5)</text>
+<text x="790" y="38" text-anchor="end" class="d-small d-text-light">own fit A</text>
+<text x="240" y="63" text-anchor="end">ScaleRL (reference)</text>
+<circle cx="632.5" cy="59" r="7" class="d-fill-blue"/>
+<text x="644.5" y="63" class="d-mono">2.01</text>
+<text x="790" y="63" text-anchor="end" class="d-mono d-text-light">0.610</text>
+<text x="240" y="93" text-anchor="end">no FP32 logits</text>
+<circle cx="602.5" cy="89" r="7" class="d-block-muted"/>
+<text x="614.5" y="93" class="d-mono">1.97</text>
+<text x="790" y="93" text-anchor="end" class="d-mono d-text-light">0.610</text>
+<text x="240" y="123" text-anchor="end">off-policy k = 8 (PPO)</text>
+<circle cx="542.5" cy="119" r="7" class="d-block-muted"/>
+<text x="554.5" y="123" class="d-mono">1.89</text>
+<text x="790" y="123" text-anchor="end" class="d-mono d-text-light">0.605</text>
+<text x="240" y="153" text-anchor="end">sample-average loss</text>
+<circle cx="505.0" cy="149" r="7" class="d-fill-orange"/>
+<text x="517.0" y="153" class="d-mono">1.84</text>
+<text x="790" y="153" text-anchor="end" class="d-mono d-text-light">0.600</text>
+<text x="240" y="183" text-anchor="end">DAPO loss (not CISPO)</text>
+<circle cx="497.5" cy="179" r="7" class="d-fill-orange"/>
+<text x="509.5" y="183" class="d-mono">1.83</text>
+<text x="790" y="183" text-anchor="end" class="d-mono d-text-light">0.610</text>
+<text x="240" y="213" text-anchor="end">prompt-level adv. norm</text>
+<circle cx="490.0" cy="209" r="7" class="d-fill-orange"/>
+<text x="502.0" y="213" class="d-mono">1.82</text>
+<text x="790" y="213" text-anchor="end" class="d-mono d-text-light">0.590</text>
+<text x="240" y="243" text-anchor="end">length penalty</text>
+<circle cx="437.5" cy="239" r="7" class="d-fill-orange"/>
+<text x="449.5" y="243" class="d-mono">1.75</text>
+<text x="790" y="243" text-anchor="end" class="d-mono d-text-light">0.610</text>
+<text x="240" y="273" text-anchor="end">no zero-variance filter</text>
+<circle cx="392.5" cy="269" r="7" class="d-fill-orange"/>
+<text x="404.5" y="273" class="d-mono">1.69</text>
+<text x="790" y="273" text-anchor="end" class="d-mono d-text-light">0.595</text>
+<text x="240" y="303" text-anchor="end">uniform prompt sampling</text>
+<circle cx="340.0" cy="299" r="7" class="d-fill-orange"/>
+<text x="352.0" y="303" class="d-mono">1.62</text>
+<text x="790" y="303" text-anchor="end" class="d-mono d-text-light">0.605</text>
+</svg>
+<figcaption><b>Figure 7.</b> ScaleRL&#8217;s leave-one-out table: starting from the full recipe, revert one choice and refit. Dots are the efficiency exponent B with the asymptote pinned at A = 0.605 (higher is faster); the right column is each run&#8217;s own fitted A. Orange dots are the choices this module covers. Run-to-run variation in A across three ScaleRL runs is &#177;0.02. 8B dense model, math, 16,000 GPU-hours per run. Values transcribed from the printed table in Figure 7 of the paper<a class="cite" href="#ref-9">9</a>.</figcaption>
+</figure>
+
+<p>Every reverted choice here lands within 0.02 of the full recipe's \(A=0.610\); the largest gap, prompt-level standard-deviation division at 0.590, sits on the noise margin. Pinned-\(A\) efficiency falls from 2.01 to 1.84 (sample-average loss), 1.82 (prompt-level division), 1.69 (no zero-variance filtering) and 1.62 (uniform prompt sampling), that is by 8%, 9%, 16% and 19% (derived), though the paper gives no margin for \(B\) and does not translate the differences into GPU-hours. This is the evidence behind the claim that these choices "primarily modulate compute efficiency without materially shifting the asymptote"<a class="cite" href="#ref-9">9</a> (abstract). Two reservations. The asymptote is a fitted parameter extrapolated from runs of at most 16,000 GPU-hours (fits up to 8,000), and the 100,000 GPU-hour validation run is the full recipe only. And the same study finds that the loss <em>type</em> (CISPO or GSPO against DAPO) and FP32 logits do move the fitted asymptote in the forward tests, from 0.52 to 0.61 for the latter<a class="cite" href="#ref-9">9</a> (§3.2, Fig. 5), so "mostly efficiency" describes aggregation and normalization specifically (Modules 12 and 14 cover the others). One model family, one data domain, one benchmark protocol.</p>
+
+<h3 id="evidence-ledger">7.3 The ledger</h3>
+<table class="tbl tbl-dense">
+  <caption><b>Table 6.</b> Controlled evidence on the choices of this module, with what limits each entry. Sources are cited in the first column.</caption>
+  <thead><tr><th>Evidence</th><th>Setting</th><th>Contrast</th><th>Result</th><th>Limit</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DAPO Table 1<a class="cite" href="#ref-3">3</a></td><td>Qwen2.5-32B base, DAPO-Math-17K, AIME24 avg@32</td><td>six cumulative rows</td><td>30, 36, 38, 41, 42, 50</td><td>one run per row, order-dependent, 30 problems; sampling s.e. up to 1.6 (derived)</td></tr>
+    <tr><td class="row">Dr. GRPO Figs. 8 and 9<a class="cite" href="#ref-2">2</a></td><td>Qwen2.5-1.5B, 3K questions, 8 samples, 3,000 tokens</td><td>GRPO, without length norm, without std norm, Dr. GRPO</td><td>both single removals beat vanilla; length term drives length; Dr. GRPO better across 3 seeds</td><td>small model, short cap, curves rather than a table</td></tr>
+    <tr><td class="row">Dr. GRPO Table 4<a class="cite" href="#ref-2">2</a></td><td>Qwen2.5-Math-7B, MATH levels 3 to 5, greedy, 3,000-token budget</td><td>Oat-Zero-7B against other 7B recipes</td><td>AIME24 43.3 (13 of 30 problems), five-benchmark average 51.4</td><td>different data, templates and frameworks across rows: not a loss ablation</td></tr>
+    <tr><td class="row">ScaleRL Fig. 14<a class="cite" href="#ref-9">9</a></td><td>8B dense, math, batch 768, PipelineRL baseline</td><td>3 aggregations, 3 advantage scalings</td><td>A spread 0.015 and 0.010</td><td>inside the 0.02 run-to-run margin; B not comparable across A</td></tr>
+    <tr><td class="row">ScaleRL Fig. 7<a class="cite" href="#ref-9">9</a></td><td>same, 16,000 GPU-hours per run</td><td>revert one choice from the full recipe</td><td>A 0.590 to 0.610; pinned-A B 1.62 to 2.01</td><td>one run per variant; no margin on B; fitted asymptote extrapolated</td></tr>
+    <tr><td class="row">Olmo 3 Fig. 26, footnote 34<a class="cite" href="#ref-10">10</a></td><td>RL-Zero math, 7B</td><td>active sampling on and off; overlong filtering tried</td><td>active sampling keeps the batch full and lowers loss variance; overlong filtering no consistent gain</td><td>figure and one sentence; no table</td></tr>
+    <tr><td class="row">MiniMax-M1 §5<a class="cite" href="#ref-13">13</a></td><td>M1 at 40K to 80K output length</td><td>token-level loss with GRPO advantage normalization at long length</td><td>negative samples lengthen faster, "disproportionately large negative gradients" in sequence tails</td><td>narrative; no ablation numbers for the fix</td></tr>
+  </tbody>
+</table>
+<p>The last row is the counterweight to Section 2. MiniMax-M1 scaled generation from 40K to 80K tokens and observed pattern collapse late in each length window, with the tails of generations turning into incoherent text and perplexity rising. Its diagnosis: negative samples "increase in length substantially faster than positive samples", so "disproportionately large negative gradients accumulate in the latter segments of generation sequences", an imbalance it traces to "the inherently unequal nature of GRPO's advantage normalization and the token-level loss we adopt"<a class="cite" href="#ref-13">13</a> (§5). That is the 4.19-fold negative-to-positive imbalance of Table 2, seen in a production run. Its remedies were early stopping on repetitive patterns, "combined sample-level loss and token-level normalization", and lower gradient-clipping and \(\epsilon_{\text{high}}\) thresholds<a class="cite" href="#ref-13">13</a>. The report does not publish an ablation of any of the three.</p>
+
+<h2 id="recipe-map">8. The choices side by side</h2>
+<table class="tbl tbl-dense tbl-compare">
+  <caption><b>Table 7.</b> Loss aggregation and advantage normalization in nine documented recipes, as printed in each source. "Not stated" means not stated in the sections read; none of these reports defines the std convention except TRL's code (Section 3.2).</caption>
+  <thead><tr><th>Recipe</th><th>Loss aggregation</th><th>Advantage scale</th><th>KL</th><th>Dead groups</th><th class="num">G</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DeepSeekMath-RL (original GRPO)</td><td>sample-level</td><td>group std</td><td>in the loss, 0.04</td><td>not discussed</td><td class="num">64</td><td>§4.1 to §4.2<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">DAPO</td><td>prompt-level token mean (Eq. 8)</td><td>group std (Eq. 9)</td><td>none</td><td>dynamic sampling on accuracy</td><td class="num">16</td><td>§2.3, §3, §4.1<a class="cite" href="#ref-3">3</a></td></tr>
+    <tr><td class="row">Dr. GRPO</td><td>constant (generation budget, 3,000 tokens in its runs)</td><td>none</td><td>none</td><td>not discussed</td><td class="num">8</td><td>§3.2, Table 6<a class="cite" href="#ref-2">2</a></td></tr>
+    <tr><td class="row">DeepSeek-V3.2</td><td>sample-level as printed; implementation not stated</td><td>\(R_i-\mathrm{mean}(R)\)</td><td>unbiased K3 estimate; weak or none for math</td><td>not stated</td><td class="num">not stated</td><td>§3.1<a class="cite" href="#ref-8">8</a></td></tr>
+    <tr><td class="row">OlmoRL</td><td>batch-level token mean</td><td>none</td><td>none</td><td>zero-gradient filtering, active sampling</td><td class="num">8</td><td>§4.4.1, Table 49<a class="cite" href="#ref-10">10</a></td></tr>
+    <tr><td class="row">ScaleRL</td><td>prompt-level averaging, CISPO loss</td><td>batch std of the advantages</td><td>none in the printed loss</td><td>zero-variance filtering, no-positive-resampling</td><td class="num">16</td><td>§3.2, §4<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">GLM-5 reasoning RL</td><td>sample-level (Eq. 1)</td><td>group std</td><td>removed</td><td>not stated</td><td class="num">32</td><td>§3.2<a class="cite" href="#ref-7">7</a></td></tr>
+    <tr><td class="row">MiniMax-M1</td><td>token-level (Eq. 4); sample-plus-token hybrid at 80K</td><td>group std (Eq. 2)</td><td>none</td><td>dynamic sampling from DAPO</td><td class="num">not stated</td><td>§3.1, §5<a class="cite" href="#ref-13">13</a></td></tr>
+    <tr><td class="row">TRL defaults</td><td><code>dapo</code>: token mean over the global accumulated batch</td><td><code>group</code>: Bessel std plus 1e-4</td><td>0.0</td><td>none; logs <code>frac_reward_zero_std</code></td><td class="num">8</td><td>config and trainer source<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-4">4</a></td></tr>
+  </tbody>
+</table>
+<p>No two rows are the same recipe. The three with controlled experiments behind them (DAPO, Olmo 3, ScaleRL) share a direction: aggregate by tokens or by prompt rather than by response, handle dead groups explicitly, and drop the KL term for verifiable rewards. They disagree on the standard deviation: group-level in DAPO, absent in Olmo 3, batch-level in ScaleRL. The library default is a mixture, DAPO's loss with GRPO's group division, a combination whose std half Dr. GRPO argues against and Olmo 3 and V3.2 do not use.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>The knobs map onto TRL as <code>loss_type</code> (<code>grpo</code> original; <code>dr_grpo</code> constant normalizer equal to <code>max_completion_length</code>; <code>dapo</code> batch-level token mean, the default) and <code>scale_rewards</code> (<code>group</code>, the default; <code>batch</code>; <code>none</code>)<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-5">5</a>. TRL has no prompt-level option corresponding to DAPO's Eq. 8 (derived from its normalizer code). Whichever you choose, four quantities from this module are cheap to log and say whether the choice is hurting: the dead-group fraction (TRL logs it), the truncation rate (ScaleRL's 10% to 15% warning level<a class="cite" href="#ref-9">9</a>), the ratio of mean lengths of wrong to correct responses (the negative-to-positive weight imbalance of Section 1.3 under token-level averaging), and the effective number of informative prompts per batch.</p></aside>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The question is how the GRPO loss and advantage should be normalized. Everyone who has measured it agrees that original GRPO's per-response length average is unsatisfactory in long-chain-of-thought runs. They disagree on the replacement, on whether the standard deviation belongs in the advantage, and on whether token-level weighting is safe when responses reach tens of thousands of tokens.</p>
+<div class="positions">
+  <article class="position">
+    <h4>A. Remove both normalizers</h4>
+    <p class="who">Dr. GRPO<a class="cite" href="#ref-2">2</a>; Olmo 3 (token-level loss over the batch, no std)<a class="cite" href="#ref-10">10</a>; DeepSeek-V3.2 on the advantage<a class="cite" href="#ref-8">8</a>; TRL's documentation recommends no scaling on the Dr. GRPO authority<a class="cite" href="#ref-4">4</a></p>
+    <p>Dividing by \(|o_i|\) changes the objective inside each prompt and dividing by the standard deviation changes the weight of each prompt. Take both out and the estimator is the plain Monte Carlo policy gradient with a leave-one-out-equivalent baseline, equal to RLOO up to a factor \(G/(G-1)\)<a class="cite" href="#ref-2">2</a> (App. A).</p>
+    <ul class="pros"><li>Unbiased by construction; fewer knobs; the length term moves length and the std term does not (Dr. GRPO ablation).</li><li>Adopted independently by a fully open pipeline (Olmo 3) and a frontier report (V3.2, advantage only).</li></ul>
+    <ul class="cons"><li>Evidence is small-scale (1.5B to 7B, 3,000-token caps) and the final comparison is not a loss ablation.</li><li>Down-weights rare-success prompts<a class="cite" href="#ref-6">6</a>; update size now tracks the raw reward scale<a class="cite" href="#ref-4">4</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B. Token-level loss fixes length; keep the group std</h4>
+    <p class="who">DAPO<a class="cite" href="#ref-3">3</a>; TRL's defaults<a class="cite" href="#ref-5">5</a>; MiniMax-M1's CISPO loss<a class="cite" href="#ref-13">13</a></p>
+    <p>Sample-level averaging underweights long samples and cannot penalize gibberish in them; a token-level loss fixes that and leaves the advantage as in GRPO, with dynamic sampling removing dead groups.</p>
+    <ul class="pros"><li>The best-documented full recipe on a hard benchmark: 30 to 50 AIME24 points on one base model.</li><li>Keeps every non-dead prompt at unit advantage scale.</li></ul>
+    <ul class="cons"><li>Eq. 8's per-prompt denominator brings back a prompt-to-prompt weighting; the std division is the difficulty bias of Section 3.</li><li>The token-level gain is +1 on the ladder, inside sampling noise.</li></ul>
+  </article>
+  <article class="position">
+    <h4>C. These are efficiency knobs; look elsewhere for the asymptote</h4>
+    <p class="who">ScaleRL (Khatri et al.)<a class="cite" href="#ref-9">9</a></p>
+    <p>Under fitted compute curves, loss aggregation, advantage normalization, curriculum and off-policy algorithm "primarily modulate compute efficiency without materially shifting the asymptote"; use prompt-level averaging and batch-level normalization and spend effort on loss type and numerics.</p>
+    <ul class="pros"><li>The only study that fits curves, reports a noise margin and reverts one choice at a time at 16,000 GPU-hours.</li><li>Consistent with the small A spreads in Table 6.</li></ul>
+    <ul class="cons"><li>One 8B dense model, one math domain, one protocol; the asymptote is extrapolated.</li><li>An 8% to 19% change in the efficiency exponent is not nothing, and B has no stated margin.</li></ul>
+  </article>
+  <article class="position">
+    <h4>D. Token-level weighting is unsafe at extreme length; keep sample-level or a hybrid</h4>
+    <p class="who">MiniMax-M1 at 80K tokens<a class="cite" href="#ref-13">13</a>; GLM-5 reasoning RL keeps \(1/|y_i|\) and group std<a class="cite" href="#ref-7">7</a>; V3.2's printed objective<a class="cite" href="#ref-8">8</a></p>
+    <p>When negative samples are far longer than positive ones, token-level weighting lets long, degenerate tails dominate the negative gradient; sample-level averaging keeps positive and negative mass balanced (1.0 against 4.19 in Table 2).</p>
+    <ul class="pros"><li>Observed failure mode in a real 80K run, with a stated mechanism.</li><li>Balanced push per response regardless of length.</li></ul>
+    <ul class="cons"><li>Reintroduces the length preference of Section 2.1 and its accuracy-dependent drift.</li><li>No published ablation for M1's hybrid or GLM-5's choice; V3.2's implementation is unstated.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>On the length term, A and B are right and the toy of Section 2.2 shows why: the 1/|o| factor changes each prompt's optimum with a sign that depends on accuracy, and every controlled comparison that touched it points the same way. D is right about a different problem. The token-level estimator is unbiased, but unbiasedness does not make a very long repetition loop a good thing to weight in proportion to its length. At 80K the remedy M1 reports for that (repetition detection and early stopping, with truncation handling) addresses the cause; reintroducing \(1/|o|\) trades one known bias for another, and no one has measured that trade. On the standard deviation, the evidence is thin and says second-order. Use a batch-level scale or none; if you keep the group division, filter dead groups on accuracy and look at the spread of each reward component before trusting the normalized advantage (Section 6). C is the best-calibrated reading of the data, with the scope warning that it is one model family. The experiment that would settle this is a matched grid of \(\{\)sample, prompt, token, constant\(\}\times\{\)group, batch, none\(\}\) with at least three seeds and error bars at both a short and a very long generation cap, logging the wrong-to-correct length ratio and the dead-group fraction. It does not exist yet.</p><p>A second, smaller disagreement is how to control response length. Dr. GRPO argues the unbiased loss itself curbs overthinking<a class="cite" href="#ref-2">2</a>; DAPO, V3.2 and others add a length penalty<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-8">8</a>; ScaleRL prefers forced interruption<a class="cite" href="#ref-9">9</a>. No source reverts the loss fix and the penalty jointly (derived from the evidence ledger), so the defensible order is to fix the loss first, since it costs nothing, and enforce a length budget with a penalty or interruption separately.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Hugging Face TRL's <code>loss_type</code> now lists variants beyond the papers read here, among them <code>luspo</code>, "Length-Unbiased Sequence Policy Optimization", a sequence-level loss that scales each sequence's loss by its length and modifies GSPO, and <code>vespo</code> and <code>sapo</code> (pointer only: described in the TRL configuration and documentation, not read at the paper level)<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-4">4</a>. That a length-unbiased loss was written for sequence-level ratios shows the length question returns whenever a method averages at the response level (Module 12 covers GSPO and its relatives). TRL also offers <code>multi_objective_aggregation="normalize_then_sum"</code>, which normalizes each reward component within the group before summing, aimed at the composite-reward problem of Section 6<a class="cite" href="#ref-5">5</a>. Open as of 2026-10-27: whether the aggregation results hold at 32B and above and for mixture-of-experts policies, since the ScaleRL ablations are dense 8B, and which aggregation DeepSeek-V3.2 actually runs.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R. et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv:2402.03300v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the GRPO objective (§4.1.1, Eq. 3) and the outcome-supervision advantage written with std(r) (§4.1.2); DeepSeekMath-RL settings (§4.2: KL 0.04, 64 outputs per question, one policy update per exploration stage).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Liu, Z., Chen, C., Li, W., Qi, P., Pang, T., Du, C., Lee, W. S., Lin, M. <em>Understanding R1-Zero-Like Training: A Critical Perspective</em>. COLM 2025; arXiv:2503.20783v2, 6 Oct 2025. <a href="https://arxiv.org/pdf/2503.20783v2">https://arxiv.org/pdf/2503.20783v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the two biases (§3.1), Dr. GRPO and Listing 1 (§3.2), Table 2 (PPO implementations), Figs. 5 and 7, Table 4 (App. B), Figs. 8 and 9 (App. C), RLOO equivalence (App. A), hyperparameters (App. G, Table 6).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Yu, Q., Zhang, Z., Zhu, R., Yuan, Y. et al. (ByteDance Seed, Tsinghua AIR). <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv:2503.14476v2, 20 May 2025. <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Eqs. 8, 9 and 13; dynamic sampling and Algorithm 1 (§3.2); token-level loss (§3.3); overlong reward shaping (§3.4); training details (§4.1); Table 1 ladder (§4.2); Fig. 3b read off the rendered plot.</span></li>
+  <li id="ref-4"><span class="ref-type">official</span>Hugging Face. <em>TRL documentation: GRPO Trainer</em> (main branch; no version stated on the page). <a href="https://huggingface.co/docs/trl/main/en/grpo_trainer">https://huggingface.co/docs/trl/main/en/grpo_trainer</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the loss-type formulas and the DAPO and Dr. GRPO remarks (&quot;Loss Types&quot;), the scale_rewards note on raw reward scale, the frac_reward_zero_std metric, defaults.</span></li>
+  <li id="ref-5"><span class="ref-type">repo</span>Hugging Face. <em>TRL source</em>: trl/trainer/grpo_trainer.py (last changed in commit 63d9074e, 2026-10-21), grpo_config.py, utils.py (nanstd) and rewards/other_rewards.py, main branch. <a href="https://github.com/huggingface/trl/tree/main/trl">https://github.com/huggingface/trl/tree/main/trl</a>. Accessed 2026-10-27. <span class="ref-use">Used for: per-loss-type normalizers in compute_loss, nanstd with Bessel&#8217;s correction and the +1e-4 epsilon in advantage scaling, the scale_rewards="batch" computation, get_soft_overlong_punishment, mask_truncated_completions default, loss_type and multi_objective_aggregation options. Files fetched from raw.githubusercontent.com/huggingface/trl/main/.</span></li>
+  <li id="ref-6"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv:2504.12501v12, 11 Sep 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the trade-off of removing std normalization (pp. 73–74) and the three loss-aggregation strategies (§6.3.2).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>GLM-5 Team (Zeng, A., Lv, X. et al.; Zhipu AI and Tsinghua University). <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. arXiv:2602.15763v2, 24 Feb 2026. <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the reasoning-RL loss with 1/|y_i|, group-std advantage, KL removed, group size 32 (§3.2, Eq. 1).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv:2512.02556v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Mixed RL rewards and the Speciale variant (§3); the printed GRPO objective and the advantage \(R_i-\mathrm{mean}(R)\) (§3.1, Eqs. 5 and 6).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Khatri, D., Madaan, L., Tiwari, R., Bansal, R. et al. <em>The Art of Scaling Reinforcement Learning Compute for LLMs</em>. arXiv:2510.13786v1, 15 Oct 2025. <a href="https://arxiv.org/pdf/2510.13786v1">https://arxiv.org/pdf/2510.13786v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: loss-aggregation and advantage-normalization ablations (§3.2, Fig. 14), the ScaleRL recipe and leave-one-out table (§4, Figs. 7 and 8), length control (App. A.10), truncation rates (App. A.15), recipe descriptions (App. A.2, A.16). Values in Figs. 7 and 14 read from the rendered PDF.</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Team Olmo (Ettinger, A., Bertsch, A. et al.; Allen Institute for AI). <em>Olmo 3</em>. arXiv:2512.13961v2, 14 Apr 2026 (v1 15 Dec 2025). <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: OlmoRL algorithm details and footnote 34 (§4.4.1), active sampling and rollout cost (§4.4.3, footnote 41), Table 49 hyperparameters, Fig. 26 (RL-Zero active sampling).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>DeepSeek-AI (Guo, D., Yang, D., Zhang, H. et al.). <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv:2501.12948v2 (expanded Nature version), 4 Jan 2026. <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the group-normalized advantage (Eq. 3) and the thinking-time reading of the response-length curve (Fig. 1b).</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Shao, R., Li, S. S., Xin, R., Geng, S., Wang, Y., Oh, S., Du, S. S., Lambert, N., Min, S., Krishna, R., Tsvetkov, Y., Hajishirzi, H., Koh, P. W., Zettlemoyer, L. <em>Spurious Rewards: Rethinking Training Signals in RLVR</em>. arXiv:2506.10947v2, 25 Feb 2026. <a href="https://arxiv.org/pdf/2506.10947v2">https://arxiv.org/pdf/2506.10947v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the random-reward result (abstract: +21.4 against +29.1 points on MATH-500) and its clipping-bias explanation.</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>MiniMax (Chen, A., Li, A. et al.). <em>MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention</em>. arXiv:2506.13585v1, 16 Jun 2025. <a href="https://arxiv.org/pdf/2506.13585v1">https://arxiv.org/pdf/2506.13585v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the CISPO objective with token-level loss and group-std advantage (§3.1, Eqs. 2–4); the 80K length-scaling instability and its remedies (§5).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

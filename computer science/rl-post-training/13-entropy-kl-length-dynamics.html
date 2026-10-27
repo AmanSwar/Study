@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training Dynamics: Entropy Collapse, KL Drift, Length Growth, and the Controls That Work · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Why policy entropy falls during RL on verifiable rewards (a covariance between token probability and advantage), the controls that have been tried (Clip-Higher, Clip-Cov and KL-Cov, entropy bonuses, KL with reference resets, temperature schedules), the keep-or-drop-KL ledger across reports, and what response length and language drift tell you about a run.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 13</p>
+  <h1>Training Dynamics: Entropy Collapse, KL Drift, Length Growth, and the Controls That Work</h1>
+  <p class="lede">A long RL run on a verifier is not a smooth climb: entropy falls within a few hundred steps, KL to the start drifts, response length grows (sometimes into repetition), and each has a documented mechanism and a documented fix with limited evidence behind it. This module derives the covariance mechanism behind entropy collapse, sets the interventions side by side with the models they were tested on, lays out the keep-or-drop-KL ledger, and ends with a run-health guide. After it you can read a run's entropy, KL, length, clip-fraction and zero-advantage curves and say which intervention a report would have tried, and how far to trust it.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>50 min</b> read</span>
+    <span class="chip"><b>20</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Modules 6, 11, 12</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 360" role="img" aria-labelledby="f1t"><title id="f1t">The RL training loop with five documented levers (orange) attached to the step each one acts on, and the monitoring signals (blue strip) that show whether the loop is healthy</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="20" y="26" class="d-title">The loop</text>
+    <rect x="20" y="40" width="136" height="76" rx="8" class="d-block"/>
+    <text x="88" y="68" text-anchor="middle" class="d-text-inv d-bold">Rollouts</text><text x="88" y="88" text-anchor="middle" class="d-text-inv d-small">G samples at</text><text x="88" y="104" text-anchor="middle" class="d-text-inv d-small">temperature T</text>
+    <rect x="176" y="40" width="136" height="76" rx="8" class="d-block"/>
+    <text x="244" y="68" text-anchor="middle" class="d-text-inv d-bold">Advantage A</text><text x="244" y="88" text-anchor="middle" class="d-text-inv d-small">reward minus</text><text x="244" y="104" text-anchor="middle" class="d-text-inv d-small">group baseline</text>
+    <rect x="332" y="40" width="136" height="76" rx="8" class="d-block"/>
+    <text x="400" y="68" text-anchor="middle" class="d-text-inv d-bold">Token update</text><text x="400" y="88" text-anchor="middle" class="d-text-inv d-small">logit change</text><text x="400" y="104" text-anchor="middle" class="d-text-inv d-small">grows with p · A</text>
+    <rect x="488" y="40" width="136" height="76" rx="8" class="d-block-2"/>
+    <text x="556" y="68" text-anchor="middle" class="d-text-inv d-bold">Entropy H</text><text x="556" y="88" text-anchor="middle" class="d-text-inv d-small">falls when</text><text x="556" y="104" text-anchor="middle" class="d-text-inv d-small">Cov(log p, A) &gt; 0</text>
+    <rect x="644" y="40" width="136" height="76" rx="8" class="d-block-2"/>
+    <text x="712" y="68" text-anchor="middle" class="d-text-inv d-bold">Drift, ceiling</text><text x="712" y="88" text-anchor="middle" class="d-text-inv d-small">R = b − a at H = 0;</text><text x="712" y="104" text-anchor="middle" class="d-text-inv d-small">KL to start grows</text>
+    <path d="M156,78 L176,78" class="d-arrow" marker-end="url(#f1-arr)"/><path d="M312,78 L332,78" class="d-arrow" marker-end="url(#f1-arr)"/><path d="M468,78 L488,78" class="d-arrow" marker-end="url(#f1-arr)"/><path d="M624,78 L644,78" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M712,40 L712,28 L88,28 L88,38" class="d-arrow d-dashed d-stroke-blue" marker-end="url(#f1-arr)"/>
+    <text x="400" y="22" text-anchor="middle" class="d-small d-text-light">the next rollout is sampled from the policy this loop just changed</text>
+
+    <text x="20" y="152" class="d-title">Levers</text>
+    <rect x="20" y="164" width="136" height="74" rx="8" class="d-fill-orange-soft"/><rect x="20" y="164" width="136" height="74" rx="8" class="d-outline d-stroke-orange"/>
+    <text x="88" y="188" text-anchor="middle" class="d-bold">Temperature</text><text x="88" y="208" text-anchor="middle" class="d-small">high, then decayed</text><text x="88" y="224" text-anchor="middle" class="d-small d-text-light">Kimi K2, ProRL</text>
+    <rect x="176" y="164" width="136" height="74" rx="8" class="d-fill-orange-soft"/><rect x="176" y="164" width="136" height="74" rx="8" class="d-outline d-stroke-orange"/>
+    <text x="244" y="188" text-anchor="middle" class="d-bold">Drop dead groups</text><text x="244" y="208" text-anchor="middle" class="d-small">dynamic or active</text><text x="244" y="224" text-anchor="middle" class="d-small d-text-light">DAPO, Olmo 3</text>
+    <rect x="332" y="164" width="136" height="74" rx="8" class="d-fill-orange-soft"/><rect x="332" y="164" width="136" height="74" rx="8" class="d-outline d-stroke-orange"/>
+    <text x="400" y="188" text-anchor="middle" class="d-bold">Clip-Higher</text><text x="400" y="208" text-anchor="middle" class="d-small">Clip-Cov, KL-Cov</text><text x="400" y="224" text-anchor="middle" class="d-small d-text-light">DAPO, Cui et al.</text>
+    <rect x="488" y="164" width="136" height="74" rx="8" class="d-outline d-stroke-orange d-dashed"/>
+    <text x="556" y="188" text-anchor="middle" class="d-bold">Entropy bonus</text><text x="556" y="208" text-anchor="middle" class="d-small">fragile in tests</text><text x="556" y="224" text-anchor="middle" class="d-small d-text-light">Cui, Magistral</text>
+    <rect x="644" y="164" width="136" height="74" rx="8" class="d-fill-orange-soft"/><rect x="644" y="164" width="136" height="74" rx="8" class="d-outline d-stroke-orange"/>
+    <text x="712" y="188" text-anchor="middle" class="d-bold">KL + resets</text><text x="712" y="208" text-anchor="middle" class="d-small">or no KL at all</text><text x="712" y="224" text-anchor="middle" class="d-small d-text-light">ProRL vs DAPO</text>
+    <path d="M88,164 L88,120" class="d-arrow-active" marker-end="url(#f1-arr)"/><path d="M244,164 L244,120" class="d-arrow-active" marker-end="url(#f1-arr)"/><path d="M400,164 L400,120" class="d-arrow-active" marker-end="url(#f1-arr)"/><path d="M556,164 L556,120" class="d-arrow" marker-end="url(#f1-arr)"/><path d="M712,164 L712,120" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+
+    <text x="20" y="274" class="d-title">Monitors</text>
+    <rect x="20" y="286" width="760" height="52" rx="10" class="d-panel"/>
+    <rect x="30" y="296" width="112" height="32" rx="8" class="d-fill-blue-soft"/><text x="86" y="317" text-anchor="middle" class="d-small d-bold">entropy</text>
+    <rect x="152" y="296" width="112" height="32" rx="8" class="d-fill-blue-soft"/><text x="208" y="317" text-anchor="middle" class="d-small d-bold">KL to start</text>
+    <rect x="274" y="296" width="112" height="32" rx="8" class="d-fill-blue-soft"/><text x="330" y="317" text-anchor="middle" class="d-small d-bold">response length</text>
+    <rect x="396" y="296" width="136" height="32" rx="8" class="d-fill-blue-soft"/><text x="464" y="317" text-anchor="middle" class="d-small d-bold">zero-advantage share</text>
+    <rect x="542" y="296" width="100" height="32" rx="8" class="d-fill-blue-soft"/><text x="592" y="317" text-anchor="middle" class="d-small d-bold">clip fraction</text>
+    <rect x="652" y="296" width="118" height="32" rx="8" class="d-fill-blue-soft"/><text x="711" y="317" text-anchor="middle" class="d-small d-bold">validation acc.</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> One RL step feeds the next, so a bias in the token update shows up as a trend in the monitors. Orange boxes are the documented levers of §3 and §4 and the step each one acts on; the dashed box marks a lever that failed or was dataset-dependent in the tests read here. The mechanism in the two cyan boxes is derived in §2 from Cui et al.<a class="cite" href="#ref-1">1</a>; levers and monitors come from DAPO<a class="cite" href="#ref-2">2</a>, ProRL<a class="cite" href="#ref-3">3</a>, Kimi K2<a class="cite" href="#ref-4">4</a> and Magistral<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<h2 id="entropy-collapse">1. Entropy collapse as a measured curve</h2>
+
+<h3 id="entropy-measure">1.1 What is being measured</h3>
+<p>Policy entropy in these papers is the entropy of the next-token distribution, averaged over the generated positions of the training prompts: \(H(\pi_\theta,\mathcal D)=-\mathbb E_{x\sim\mathcal D,\,y\sim\pi_\theta}\big[\tfrac1{|y|}\sum_t\log\pi_\theta(y_t\mid y_{&lt;t},x)\big]\)<a class="cite" href="#ref-1">1</a> (§2.1, Eq. 5). TRL logs the same quantity from the logits as <code>entropy</code><a class="cite" href="#ref-6">6</a>. Two choices change the number you read. The logits: TRL builds its fused log-probability head with the same temperature it passes to generation<a class="cite" href="#ref-7">7</a>, so with \(T\ne1\) the reported entropy is that of the distribution actually sampled; for logits \((2,1,0,-1)\) it is 0.588, 0.948 and 1.051 nats at \(T=0.6,\,1.0,\,1.2\) (derived), so a temperature change alone moves the logged curve. The prompts: Cui et al. measure on training batches<a class="cite" href="#ref-1">1</a>, ScaleRL on a held-out validation set<a class="cite" href="#ref-8">8</a> (App. A.12).</p>
+
+<pre class="code" data-lang="python" data-title="token_stats.py" data-hl="4-7"><code>import torch
+
+def token_stats(logits, tokens, adv, temperature=1.0):
+    """logits [N, V] at generated positions; tokens [N]; adv [N] per-token advantage."""
+    logp = torch.log_softmax(logits.float() / temperature, dim=-1)   # the distribution that was sampled
+    ent = -(logp.exp() * logp).sum(-1)                               # H(pi(.|s_t)) in nats, per position
+    lp_tok = logp.gather(-1, tokens[:, None]).squeeze(-1)            # log pi(y_t | s_t)
+    cov = (lp_tok - lp_tok.mean()) * (adv - adv.mean())              # Cui et al. Eq. 10, per token
+    return ent, lp_tok, cov</code></pre>
+<p class="small muted"><code>ent</code> is the quantity of §1.2–§1.3 and <code>cov</code> the per-token term of §2 and §3.3. Checked against a pure-Python softmax on random logits.</p>
+
+<h3 id="entropy-numbers">1.2 The curve, in numbers</h3>
+<p>Cui et al. ran 11 base models in four families (Qwen2.5 from 0.5B to 32B, three Mistral models, two LLaMA models, DeepSeekMath-7B) on math and code with GRPO, RLOO, REINFORCE++ and PRIME. The runs had no entropy bonus and no reference-KL term (KL coefficient 0, \(\epsilon=0.2\)), 512 prompts with 8 responses each, and all-correct or all-wrong prompts filtered<a class="cite" href="#ref-1">1</a> (§2.2). Averaged over 2,400-step runs, 73% of the entropy consumed and 76% of the performance gained occurred in the first 200 gradient steps, one twelfth of training; by step 800, one third, the figures are 94% and over 93%, so "over 2/3 of the training steps yielded marginal returns"<a class="cite" href="#ref-1">1</a> (§2.3, Fig. 2). DAPO's naive PPO and GRPO baselines show the same shape on Qwen2.5-32B: entropy "decreases quickly", and the sampled responses of some prompts become "nearly identical"<a class="cite" href="#ref-2">2</a> (§3.1, Fig. 2b).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 310" role="img" aria-labelledby="f2t"><title id="f2t">Left: the published functional form R = b − a·exp(H) drawn with illustrative coefficients, with the ceiling at zero entropy. Right: share of entropy consumed and performance gained after 200 and 800 of 2,400 steps</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="60" y="24" class="d-title">A. Performance is bought with entropy</text>
+    <line x1="60" y1="50" x2="60" y2="250" class="d-axis"/><line x1="60" y1="250" x2="380" y2="250" class="d-axis"/>
+    <line x1="60" y1="150" x2="380" y2="150" class="d-grid"/><line x1="60" y1="100" x2="380" y2="100" class="d-grid"/><line x1="60" y1="200" x2="380" y2="200" class="d-grid"/>
+    <line x1="60" y1="83.3" x2="380" y2="83.3" class="d-line d-stroke-orange d-dashed"/>
+    <text x="376" y="76" text-anchor="end" class="d-small d-bold">ceiling b − a at H = 0</text>
+    <polyline points="60.0,83.3 73.3,86.8 86.7,90.3 100.0,94.1 113.3,98.1 126.7,102.3 140.0,106.7 153.3,111.3 166.7,116.1 180.0,121.2 193.3,126.6 206.7,132.2 220.0,138.1 233.3,144.4 246.7,150.9 260.0,157.8 273.3,165.0 286.7,172.6 300.0,180.6 313.3,189.0 326.7,197.9 340.0,207.2 353.3,216.9 366.7,227.2 380.0,238.0" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+    <circle cx="353.3" cy="216.9" r="5" class="d-fill-cyan"/><circle cx="220" cy="138.1" r="5" class="d-fill-cyan"/><circle cx="100" cy="94.1" r="5" class="d-fill-cyan"/>
+    <text x="60" y="266" text-anchor="middle" class="d-small d-mono">0</text><text x="166.7" y="266" text-anchor="middle" class="d-small d-mono">0.4</text><text x="273.3" y="266" text-anchor="middle" class="d-small d-mono">0.8</text><text x="380" y="266" text-anchor="middle" class="d-small d-mono">1.2</text>
+    <text x="220" y="284" text-anchor="middle" class="d-small d-text-light">policy entropy H (nats per token)</text>
+    <text x="52" y="46" text-anchor="end" class="d-small d-text-light">R</text>
+    <path d="M372,298 L110,298" class="d-arrow-active" marker-end="url(#f2-arr)"/><text x="240" y="308" text-anchor="middle" class="d-small d-text-light">training: entropy spent</text>
+
+    <text x="440" y="24" class="d-title">B. Share used by step 200 and 800</text>
+    <line x1="440" y1="50" x2="440" y2="250" class="d-axis"/><line x1="440" y1="250" x2="780" y2="250" class="d-axis"/>
+    <line x1="440" y1="200" x2="780" y2="200" class="d-grid"/><line x1="440" y1="150" x2="780" y2="150" class="d-grid"/><line x1="440" y1="100" x2="780" y2="100" class="d-grid"/><line x1="440" y1="50" x2="780" y2="50" class="d-grid"/>
+    <text x="432" y="254" text-anchor="end" class="d-small d-mono">0</text><text x="432" y="204" text-anchor="end" class="d-small d-mono">25</text><text x="432" y="154" text-anchor="end" class="d-small d-mono">50</text><text x="432" y="104" text-anchor="end" class="d-small d-mono">75</text><text x="432" y="54" text-anchor="end" class="d-small d-mono">100</text>
+    <rect x="490" y="104" width="40" height="146" class="d-fill-cyan"/><rect x="534" y="98" width="40" height="152" class="d-fill-blue"/>
+    <text x="510" y="98" text-anchor="middle" class="d-small d-mono">73</text><text x="554" y="92" text-anchor="middle" class="d-small d-mono">76</text>
+    <rect x="650" y="62" width="40" height="188" class="d-fill-cyan"/><rect x="694" y="64" width="40" height="186" class="d-fill-blue"/>
+    <text x="670" y="56" text-anchor="middle" class="d-small d-mono">94</text><text x="714" y="58" text-anchor="middle" class="d-small d-mono">93</text>
+    <text x="532" y="270" text-anchor="middle" class="d-small">step 200 (1/12)</text><text x="692" y="270" text-anchor="middle" class="d-small">step 800 (1/3)</text>
+    <rect x="452" y="56" width="12" height="12" class="d-fill-cyan"/><text x="470" y="67" class="d-small">entropy used, %</text>
+    <rect x="452" y="74" width="12" height="12" class="d-fill-blue"/><text x="470" y="85" class="d-small">performance gain, %</text>
+    <text x="610" y="296" text-anchor="middle" class="d-small d-text-light">cumulative, mean of 11 runs</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> A: the functional form \(R=-a\,e^{H}+b\) drawn with illustrative coefficients \(a=0.2,\ b=0.7\) (not fitted values; the paper's fits vary with model and data). The three markers are equal steps in entropy; the vertical gaps between them are the performance each step buys, and they shrink as \(H\to0\). B: cumulative share of entropy consumed and performance gained after 200 and 800 of 2,400 gradient steps, averaged over 11 runs; the 800-step gain is reported as "over 93%". Data: Cui et al.<a class="cite" href="#ref-1">1</a> (§2.3, Fig. 2).</figcaption>
+</figure>
+
+<h3 id="entropy-law">1.3 The empirical law and what it implies</h3>
+<p>Across those runs, validation accuracy \(R\) and entropy \(H\) fit \(R=-a\,e^{H}+b\) with two coefficients over more than 200 data points<a class="cite" href="#ref-1">1</a> (§2.4, Eq. 6). Three consequences follow by calculus (derived, not stated in that form by the paper):</p>
+<ul>
+<li><strong>Ceiling.</strong> At \(H=0\), \(R=b-a\): the policy has nothing left to explore and the curve ends. The paper states this ceiling as "fully predictable"<a class="cite" href="#ref-1">1</a> (abstract).</li>
+<li><strong>Diminishing price.</strong> \(dR/dH=-a\,e^{H}\), so one nat of entropy spent at \(H=1\) buys \(e\,a\approx2.72a\) of performance at the margin, and at \(H=0.1\) it buys \(1.105a\): a factor of 2.46 less.</li>
+<li><strong>Headroom is proportional to what is left.</strong> \(R(0)-R(H)=a\,(e^{H}-1)\approx aH\) for small \(H\). When entropy is down to a tenth of a nat, the fit predicts about \(0.105a\) of performance still to come.</li>
+</ul>
+<p>The authors use the form as a forecaster: coefficients fitted on the first 36 steps of the Qwen2.5 runs predicted the next 200 steps with root-mean-square error 0.9% (math) and 1.2% (code)<a class="cite" href="#ref-1">1</a> (§2.4, Fig. 5). The coefficients did not depend on the algorithm (GRPO, RLOO, PRIME and REINFORCE++ gave one curve on Qwen2.5-7B) and varied log-linearly with parameter count across the Qwen2.5 family<a class="cite" href="#ref-1">1</a> (§2.5, Figs. 6–7).</p>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>The law describes one run moving along its own trajectory with no entropy or KL regularization; it does not say that two recipes at equal entropy have equal accuracy (the second clause is the writer's reading). The authors flag that other work with different policy models, or with off-policy data, saw different entropy patterns, so the predictability is "not arguably universal"<a class="cite" href="#ref-1">1</a> (§2.6). ScaleRL supplies a direct counterexample: runs with batch sizes 768 and 2,048 had nearly identical per-step entropy trajectories while the larger batch performed "much stronger" at every stage, and the authors conclude entropy "is not necessarily a reliable predictor of downstream performance"<a class="cite" href="#ref-8">8</a> (Appendix A.12). Entropy is a necessary health signal, not a sufficient score.</p></aside>
+
+<h2 id="covariance">2. Why entropy falls: a covariance between probability and advantage</h2>
+
+<h3 id="covariance-derivation">2.1 The derivation</h3>
+<p>Take one state (a prefix) with a softmax policy over next tokens, \(\pi_a=e^{z_a}/\sum_b e^{z_b}\), and entropy \(H=-\sum_a\pi_a\log\pi_a\). The derivative of entropy with respect to a logit is \(\partial H/\partial z_k=-\pi_k(\log\pi_k+H)\). Because \(\mathbb E_\pi[\log\pi]=-H\), a first-order change of the logits \(\Delta z\) therefore changes entropy by</p>
+$$ \Delta H\;\approx\;-\sum_k \pi_k\,(\log\pi_k+H)\,\Delta z_k\;=\;-\,\mathrm{Cov}_{a\sim\pi}\big(\log\pi_a,\;\Delta z_a\big). $$
+<p>This is Lemma 1 of Cui et al., adapted from Liu (2025)<a class="cite" href="#ref-1">1</a> (§3.1). It holds for any update and says only that entropy falls when the tokens whose logits rise are already the likely ones. What the update does to the logits depends on the algorithm. For a tabular softmax with centered advantages (\(\mathbb E_\pi[A]=0\)), the gradient of \(J=\mathbb E_\pi[A]\) with respect to \(z_k\) is \(\pi_k A_k\), so one policy-gradient step of size \(\eta\) gives \(\Delta z_k=\eta\,\pi_kA_k\) (their Proposition 1), and a natural-gradient step gives \(\Delta z_k=\eta A_k\) up to a constant that softmax ignores. Substituting:</p>
+$$ \Delta H_{\mathrm{PG}}\approx-\eta\,\mathrm{Cov}_{a\sim\pi}\big(\log\pi_a,\;\pi_a A_a\big),\qquad \Delta H_{\mathrm{NPG}}\approx-\eta\,\mathrm{Cov}_{a\sim\pi}\big(\log\pi_a,\;A_a\big). $$
+<p>These are their Theorems 1 and 2<a class="cite" href="#ref-1">1</a> (§3.2). The sampled-token update that a trainer actually applies, \(\Delta z=\eta A_y(e_y-\pi)\) for a drawn token \(y\), has expectation \(\eta\pi_k(A_k-\mathbb E_\pi A)=\eta\pi_kA_k\), which is Proposition 1 again (derived). The abstract states the reading: "a high-probability action with high advantage would reduce policy entropy, while a rare action with high advantage would increase policy entropy"<a class="cite" href="#ref-1">1</a>. One refinement the algebra makes precise: "high probability" means above the state's own average log-probability, \(\pi_a>e^{-H(s)}\), the inverse perplexity of that state.</p>
+<p>The derivation assumes a tabular policy, a small step and the exact expected gradient. A transformer shares parameters across positions, the optimizer rescales steps and PPO clipping removes some tokens, so the formula is a diagnosis, not a simulator; the paper's check is empirical (§2.4 below).</p>
+
+<h3 id="covariance-example">2.2 A three-token state, worked</h3>
+<p>Let the policy at one position be \(\pi=(0.70,\,0.25,\,0.05)\). Then \(H=0.7460\) nats and the "likely" threshold is \(e^{-H}=0.474\): only the first token is above it. Suppose a verifier rewards exactly one token with \(Q=1\) and the others get 0, so \(A_a=Q_a-\mathbb E_\pi Q\). Take one policy-gradient step with \(\eta=1\), \(\Delta z_a=\pi_aA_a\). Table 1 compares the first-order prediction with the exact entropy after the step (derived; the script checks the first-order formula against exact softmax recomputation).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> One policy-gradient step (\(\eta=1\)) at a state with \(\pi=(0.70,0.25,0.05)\), \(H=0.7460\) nats, depending on which token the verifier rewards. \(\Delta H\) in nats. Derived from the formulas of §2.1; first-order values use \(-\mathrm{Cov}(\log\pi,\pi A)\), exact values recompute the softmax<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Rewarded token</th><th class="num">\(A\) (token 1, 2, 3)</th><th class="num">\(\Delta z=\pi A\)</th><th class="num">New \(\pi\)</th><th class="num">First-order \(\Delta H\)</th><th class="num">Exact \(\Delta H\)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">1 (p = 0.70, above threshold)</td><td class="num">+0.30, −0.70, −0.70</td><td class="num">+0.210, −0.175, −0.035</td><td class="num">0.770, 0.187, 0.043</td><td class="num">−0.0892</td><td class="num">−0.0957</td></tr>
+    <tr><td class="row">2 (p = 0.25, below threshold)</td><td class="num">−0.25, +0.75, −0.25</td><td class="num">−0.175, +0.188, −0.013</td><td class="num">0.626, 0.321, 0.053</td><td class="num">+0.0763</td><td class="num">+0.0669</td></tr>
+    <tr><td class="row">3 (p = 0.05, rare)</td><td class="num">−0.05, −0.05, +0.95</td><td class="num">−0.035, −0.013, +0.048</td><td class="num">0.693, 0.253, 0.054</td><td class="num">+0.0129</td><td class="num">+0.0130</td></tr>
+  </tbody>
+</table>
+
+<p>Same state, same reward size, three entropy outcomes. Rewarding the dominant token costs 0.096 nats in one step, 12.8% of the state's entropy at \(\eta=1\); rewarding the 0.25 token raises it by 0.067. Rewarding the rare token raises entropy by only 0.013 even though its advantage is 0.95, because the policy-gradient step scales the logit change by \(\pi_a\): the rare token's logit moves by 0.048 while the dominant token's moves by 0.210 on an advantage three times smaller. A natural-gradient step (\(\Delta z=\eta A\)) would move the rare token by 0.95 and raise entropy by 0.135, ten times as much, so the optimizer's geometry matters as well as the sign (derived; first-order +0.1125).</p>
+
+<h3 id="covariance-quadrants">2.3 Four quadrants</h3>
+<p>Each sampled token adds \((\log\pi-\overline{\log\pi})(A-\bar A)\) to the covariance, and the net sign decides the direction of the entropy change. Figure 3 sorts the four cases. Rewarding a likely token and penalizing a rare one are the ordinary business of reinforcement, and both sharpen the policy; rewarding a rare token and penalizing a likely one spread probability mass out. Early in a run the policy's confidence is informative, so the sharpening quadrants dominate: Cui et al. observe a large positive covariance at the start, read it as confidence being "well-calibrated", and find it declines but stays positive, "continually dragging policy entropy even lower"<a class="cite" href="#ref-1">1</a> (§1, §3.3).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 290" role="img" aria-labelledby="f3t"><title id="f3t">Two by two table: advantage sign against whether the sampled token is more or less probable than the state's inverse perplexity, giving the direction of the entropy change and which intervention touches each cell</title>
+    <text x="20" y="24" class="d-title">One sampled token's push on entropy</text>
+    <text x="248" y="54" text-anchor="middle" class="d-small d-bold">p above e^(−H)</text><text x="452" y="54" text-anchor="middle" class="d-small d-bold">p below e^(−H)</text>
+    <text x="140" y="116" text-anchor="end" class="d-bold">A &gt; 0</text><text x="140" y="222" text-anchor="end" class="d-bold">A &lt; 0</text>
+    <rect x="150" y="62" width="196" height="96" rx="8" class="d-fill-cyan-soft"/><rect x="150" y="62" width="196" height="96" rx="8" class="d-outline d-stroke-cyan"/>
+    <text x="248" y="88" text-anchor="middle" class="d-bold">Likely token rewarded</text><text x="248" y="110" text-anchor="middle">entropy falls ↓</text>
+    <rect x="164" y="124" width="168" height="24" rx="12" class="d-fill-orange-soft"/><text x="248" y="141" text-anchor="middle" class="d-small">capped by Clip-Cov, KL-Cov</text>
+    <rect x="354" y="62" width="196" height="96" rx="8" class="d-fill-orange-soft"/><rect x="354" y="62" width="196" height="96" rx="8" class="d-outline d-stroke-orange"/>
+    <text x="452" y="88" text-anchor="middle" class="d-bold">Rare token rewarded</text><text x="452" y="110" text-anchor="middle">entropy rises ↑</text>
+    <rect x="368" y="124" width="168" height="24" rx="12" class="d-fill-blue-soft"/><text x="452" y="141" text-anchor="middle" class="d-small">admitted by Clip-Higher</text>
+    <rect x="150" y="166" width="196" height="96" rx="8" class="d-fill-orange-soft"/><rect x="150" y="166" width="196" height="96" rx="8" class="d-outline d-stroke-orange"/>
+    <text x="248" y="192" text-anchor="middle" class="d-bold">Likely token penalized</text><text x="248" y="214" text-anchor="middle">entropy rises ↑</text>
+    <text x="248" y="244" text-anchor="middle" class="d-small d-text-light">repetition, filler, gibberish</text>
+    <rect x="354" y="166" width="196" height="96" rx="8" class="d-fill-cyan-soft"/><rect x="354" y="166" width="196" height="96" rx="8" class="d-outline d-stroke-cyan"/>
+    <text x="452" y="192" text-anchor="middle" class="d-bold">Rare token penalized</text><text x="452" y="214" text-anchor="middle">entropy falls ↓</text>
+    <text x="452" y="244" text-anchor="middle" class="d-small d-text-light">sampled-away mistakes</text>
+    <text x="574" y="92" class="d-small">Token contribution to the</text><text x="574" y="108" class="d-small">covariance:</text>
+    <text x="574" y="130" class="d-mono d-small">(log p − mean)(A − mean)</text>
+    <text x="574" y="156" class="d-small">mean log p = −H, so "likely"</text><text x="574" y="172" class="d-small">means p &gt; e^(−H), the inverse</text><text x="574" y="188" class="d-small">perplexity of that state.</text>
+    <text x="574" y="214" class="d-small d-text-light">Net covariance &gt; 0 : H falls.</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The four cases behind \(\Delta H\approx-\eta\,\mathrm{Cov}(\log\pi,A)\). Cyan cells push entropy down, orange cells push it up. The cell tags place the interventions of §3: Clip-Cov and KL-Cov restrict the highest-covariance tokens in the top-left cell, and Clip-Higher keeps more of the top-right cell inside the gradient<a class="cite" href="#ref-1">1</a> (§4.2, §4.5). The bottom-left cell's examples (repetition, filler, gibberish) are the writer's reading of DAPO's observation that sample-level loss lets low-quality long samples raise entropy<a class="cite" href="#ref-2">2</a> (§3.3).</figcaption>
+</figure>
+
+<h3 id="covariance-measured">2.4 What was measured</h3>
+<p>The paper checks Theorem 1 on Qwen2.5-7B with on-policy GRPO (no PPO surrogate), treating the whole response as the action, normalizing log-probability by length (their Eqs. 8–9), and averaging covariance per prompt group. The empirical \(-\Delta H\) and the covariance "exhibit highly similar dynamics"; covariance stays positive for the whole run, so entropy falls monotonically<a class="cite" href="#ref-1">1</a> (§3.3, Fig. 8). Split by prompt difficulty, covariance is smaller for hard prompts (accuracy 0.125) and larger for easy ones (0.875): when the model struggles, "high-probability actions are not reliably associated with higher expected returns"<a class="cite" href="#ref-1">1</a>. The writer's inference is that an easy training set should therefore collapse entropy faster; the paper does not run that comparison.</p>
+<p>The token-level distribution is heavy-tailed. At step 1 of the same run the mean covariance per token is 5.654 in the top 0.02% of tokens, 3.112 in the top 0.2%, 1.385 in the top 2%, 0.351 in the top 20%, 0.152 in the top 50%, and 0.003 over all tokens<a class="cite" href="#ref-1">1</a> (Table 1). The top 2% alone contribute \(0.02\times1.385=0.028\) per token of the batch, nine times the all-token mean (derived; the paper rounds that mean to 0.003), so the net covariance is a small residual of a large positive tail minus a negative bulk (the second half is the writer's inference). Controlling that tail is what Clip-Cov and KL-Cov do (§3.3).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 250" role="img" aria-labelledby="f4t"><title id="f4t">Bar chart of mean per-token covariance between log probability and advantage by percentile group, step 1 of Qwen2.5-7B GRPO: 5.654 for the top 0.02 percent down to 0.003 over all tokens</title>
+    <text x="20" y="22" class="d-title">Mean token covariance by percentile group</text>
+    <line x1="170" y1="36" x2="170" y2="226" class="d-axis"/><line x1="170" y1="226" x2="770" y2="226" class="d-axis"/>
+    <line x1="270" y1="36" x2="270" y2="226" class="d-grid"/><line x1="370" y1="36" x2="370" y2="226" class="d-grid"/><line x1="470" y1="36" x2="470" y2="226" class="d-grid"/><line x1="570" y1="36" x2="570" y2="226" class="d-grid"/><line x1="670" y1="36" x2="670" y2="226" class="d-grid"/><line x1="770" y1="36" x2="770" y2="226" class="d-grid"/>
+    <text x="170" y="242" text-anchor="middle" class="d-small d-mono">0</text><text x="270" y="242" text-anchor="middle" class="d-small d-mono">1</text><text x="370" y="242" text-anchor="middle" class="d-small d-mono">2</text><text x="470" y="242" text-anchor="middle" class="d-small d-mono">3</text><text x="570" y="242" text-anchor="middle" class="d-small d-mono">4</text><text x="670" y="242" text-anchor="middle" class="d-small d-mono">5</text><text x="770" y="242" text-anchor="middle" class="d-small d-mono">6</text>
+    <text x="160" y="58" text-anchor="end" class="d-small">top 0.02% of tokens</text><rect x="170" y="44" width="565.4" height="22" class="d-fill-orange"/><text x="722" y="60" text-anchor="end" class="d-small d-mono d-text-inv">5.654</text>
+    <text x="160" y="92" text-anchor="end" class="d-small">top 0.2%</text><rect x="170" y="78" width="311.2" height="22" class="d-fill-blue"/><text x="487" y="94" class="d-small d-mono">3.112</text>
+    <text x="160" y="126" text-anchor="end" class="d-small">top 2%</text><rect x="170" y="112" width="138.5" height="22" class="d-fill-blue"/><text x="314" y="128" class="d-small d-mono">1.385</text>
+    <text x="160" y="160" text-anchor="end" class="d-small">top 20%</text><rect x="170" y="146" width="35.1" height="22" class="d-fill-blue"/><text x="211" y="162" class="d-small d-mono">0.351</text>
+    <text x="160" y="194" text-anchor="end" class="d-small">top 50%</text><rect x="170" y="180" width="15.2" height="22" class="d-fill-blue"/><text x="191" y="196" class="d-small d-mono">0.152</text>
+    <text x="160" y="222" text-anchor="end" class="d-small">all tokens</text><rect x="170" y="208" width="1" height="14" class="d-fill-blue"/><text x="178" y="220" class="d-small d-mono">0.003</text>
+    <text x="770" y="22" text-anchor="end" class="d-small d-text-light">covariance (centered cross-product)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Mean per-token covariance \((\log\pi-\overline{\log\pi})(A-\bar A)\) within each percentile group, step 1, Qwen2.5-7B, GRPO. The all-token bar is 0.003, about 1,900 times smaller than the top group (derived from the rounded value). A handful of tokens carry the signal that drains entropy. Data: Cui et al.<a class="cite" href="#ref-1">1</a> (Table 1); one model, one step.</figcaption>
+</figure>
+
+<h2 id="entropy-controls">3. Controls on the entropy side, and the evidence for each</h2>
+
+<h3 id="controls-failed">3.1 The textbook tools: an entropy bonus and a reference KL</h3>
+<p>The default RL answer to collapsing entropy is a bonus term, \(\mathcal L_{\mathrm{ent}}=\mathcal L-\alpha H(\pi_\theta)\). Cui et al. tried \(\alpha\in\{10^{-4},10^{-3},5\times10^{-3},10^{-2}\}\): the two smallest had "a minor influence on entropy", 0.01 produced "entropy explosion", and 0.005 stabilized entropy but "does not outperform other baselines". A KL penalty to the reference (0.001 to 0.1) held entropy stable but "fails to improve policy and instead leads to a degradation in performance"<a class="cite" href="#ref-1">1</a> (§4.1, Figs. 9–10). Magistral saw the fragility from another side: the same coefficient made entropy fall on a math-only set and rise "excessively" on a math-and-code set, and a KL term, even against an exponential moving average of the weights, "primarily hinders training"<a class="cite" href="#ref-5">5</a> (§7.4.2, Fig. 12).</p>
+<p>The bonus is not gone. TRL ships a static one (<code>entropy_coef</code>, default 0.0) and an adaptive one "introduced in Skywork-OR1": the coefficient rises by <code>entropy_coef_delta</code> per optimizer step while logged entropy is at or below <code>entropy_target</code> and falls otherwise, so the bonus engages only near collapse<a class="cite" href="#ref-6">6</a>. That turns a sensitive constant into a feedback loop, the move Ziegler et al. made for the KL coefficient (Module 6 §4.3); I found no ablation of it in the sources read. A trap in its docs: the default <code>entropy_target</code> is 0.2, while the docs say typical models have 2–10 nats and use 5.0 in their example<a class="cite" href="#ref-6">6</a>; DAPO's Qwen2.5-32B run plots entropy on a 0.3 to 0.7 axis (Fig. 7c)<a class="cite" href="#ref-2">2</a>. Calibrate the target on your model's early-run entropy (§6.2).</p>
+
+<h3 id="controls-clip-higher">3.2 Clip-Higher and dead-group filters</h3>
+<p>DAPO's diagnosis is that the upper clip, not the entropy bonus, is what throttles exploration. With \(\hat A>0\) a likely token can climb almost to 1 while a token at 0.01 is stopped at 0.012, and the up-clipped tokens have a mean probability below 0.2<a class="cite" href="#ref-2">2</a> (§3.1, Fig. 3a). The fix raises only the upper bound, \(\epsilon_{\mathrm{high}}=0.28\) with \(\epsilon_{\mathrm{low}}=0.2\), because a higher lower bound would "suppress the probability of these tokens to 0, resulting in the collapse of the sampling space"<a class="cite" href="#ref-2">2</a>. Module 3 (Table 4) has the headroom arithmetic and Module 12 (§2.3) the evidence on how the constant interacts with off-policy reuse; Figure 5 adds the frontier at which the up-clip can bind at all, and the two larger values later reports used.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 270" role="img" aria-labelledby="f5t"><title id="f5t">Up-clip frontier: the probability below which the upper clip can bind for three epsilon-high values, and the ceiling reached by a token at probability 0.01 after one clipped update</title>
+    <text x="20" y="22" class="d-title">Where the upper clip can bind (A &gt; 0)</text>
+    <rect x="130" y="40" width="533.3" height="26" class="d-fill-orange-soft"/><rect x="663.3" y="40" width="106.7" height="26" class="d-panel"/><text x="122" y="58" text-anchor="end" class="d-small d-mono">ε_high 0.20</text><text x="396" y="58" text-anchor="middle" class="d-small">p &lt; 0.833: clip can bind</text><text x="716" y="58" text-anchor="middle" class="d-small d-text-light">never</text>
+    <rect x="130" y="76" width="500" height="26" class="d-fill-orange-soft"/><rect x="630" y="76" width="140" height="26" class="d-panel"/><text x="122" y="94" text-anchor="end" class="d-small d-mono">ε_high 0.28</text><text x="380" y="94" text-anchor="middle" class="d-small">p &lt; 0.781</text><text x="700" y="94" text-anchor="middle" class="d-small d-text-light">never</text>
+    <rect x="130" y="112" width="457.1" height="26" class="d-fill-orange-soft"/><rect x="587.1" y="112" width="182.9" height="26" class="d-panel"/><text x="122" y="130" text-anchor="end" class="d-small d-mono">ε_high 0.40</text><text x="358" y="130" text-anchor="middle" class="d-small">p &lt; 0.714</text><text x="678" y="130" text-anchor="middle" class="d-small d-text-light">never</text>
+    <line x1="130" y1="146" x2="770" y2="146" class="d-axis"/>
+    <text x="130" y="162" text-anchor="middle" class="d-small d-mono">0</text><text x="290" y="162" text-anchor="middle" class="d-small d-mono">0.25</text><text x="450" y="162" text-anchor="middle" class="d-small d-mono">0.5</text><text x="610" y="162" text-anchor="middle" class="d-small d-mono">0.75</text><text x="770" y="162" text-anchor="middle" class="d-small d-mono">1.0</text>
+    <text x="450" y="178" text-anchor="middle" class="d-small d-text-light">probability of the sampled token under the old policy</text>
+    <text x="20" y="204" class="d-title">A token at p_old = 0.01: highest probability it can reach in one update</text>
+    <line x1="130" y1="244" x2="770" y2="244" class="d-axis"/>
+    <circle cx="130" cy="244" r="5" class="d-fill-blue"/><circle cx="386" cy="244" r="5" class="d-fill-orange"/><circle cx="488.4" cy="244" r="5" class="d-fill-orange"/><circle cx="642" cy="244" r="5" class="d-fill-orange"/>
+    <text x="130" y="262" text-anchor="middle" class="d-small d-mono">0.0100</text><text x="386" y="262" text-anchor="middle" class="d-small d-mono">0.0120</text><text x="488.4" y="262" text-anchor="middle" class="d-small d-mono">0.0128</text><text x="642" y="262" text-anchor="middle" class="d-small d-mono">0.0140</text>
+    <text x="386" y="230" text-anchor="middle" class="d-small">ε 0.20</text><text x="488.4" y="230" text-anchor="middle" class="d-small">0.28</text><text x="642" y="230" text-anchor="middle" class="d-small">0.40</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Top: the up-clip is a no-op for any token whose old probability is at least \(1/(1+\epsilon_{\mathrm{high}})\), so raising \(\epsilon_{\mathrm{high}}\) only changes behavior for tokens below that frontier. Bottom: for a rare token the absolute gain is tiny, \(0.01\to0.0120,\ 0.0128,\ 0.0140\); going from 0.2 to 0.4 lifts the one-update ceiling by 17% (derived from the clip definition, as in Module 3 Table 4). The values 0.28 (DAPO), 0.272 (Olmo 3) and 0.4 (ProRL) are from their reports<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<p>Four reports converged on this lever with different values. Olmo 3 uses 0.2 and 0.272 in all four RL runs<a class="cite" href="#ref-9">9</a> (Table 49); GLM-5 uses 0.2 and 0.28<a class="cite" href="#ref-10">10</a> (§3.2). Magistral Medium adjusted \(\epsilon_{\mathrm{high}}\) "between 0.26 and 0.28 during the training to keep the group entropy stable", and Magistral Small, which starts from a cold-started SFT checkpoint, used 0.3 "as the cold-started model yielded responses with far lower entropy"<a class="cite" href="#ref-5">5</a> (§2.1, §5.3). ProRL, from a distilled 1.5B model, used 0.4<a class="cite" href="#ref-3">3</a> (§3.2). The two largest values belong to the two reports that start from low-entropy checkpoints, and one says why; two data points are a pattern to test, not a rule. Qwen3 states only the target: its reasoning RL controls entropy "to increase steadily or remain stable"<a class="cite" href="#ref-11">11</a> (§4.2).</p>
+<p>How much does it buy? In DAPO's ladder on Qwen2.5-32B (AIME 2024 avg@32), Clip-Higher moves 36 to 38 points<a class="cite" href="#ref-2">2</a> (Table 1; Module 11 carries the ladder). In Cui et al.'s runs it beat plain GRPO by 0.2 average points on Qwen2.5-7B and 1.4 on 32B, and "although it can also increase entropy and lead to performance improvement in the early stage of training, it gradually becomes unstable, with performance saturating and declining"<a class="cite" href="#ref-1">1</a> (§4.3, Table 2). The strongest statement is in Module 12 §2.3: in ScaleRL the upper bound moves the fitted asymptote itself<a class="cite" href="#ref-8">8</a> (App. A.17.1). Cui et al. explain why it raises entropy in the terms of Figure 3: the upper threshold only touches positive-advantage tokens, so raising it adds "low-covariance (low probability, high advantage, with average covariance of ∼−0.03)" tokens<a class="cite" href="#ref-1">1</a> (§4.5), the top-right cell.</p>
+<p>The second half of DAPO's recipe works on the batch. Once entropy has fallen, the \(G\) samples of a prompt tend to be near-identical, the reward is the same for all of them, and the group advantage is zero; DAPO's dynamic sampling oversamples and drops groups with accuracy 0 or 1<a class="cite" href="#ref-2">2</a> (§3.2), and Olmo 3's active sampling does the same continuously, with "greatly reduced" loss variance in its RL-Zero ablation<a class="cite" href="#ref-9">9</a> (§6.2, Fig. 26). Module 11 §4 derives the dead-group arithmetic. Here it matters as a monitor: the zero-advantage share is the second-order symptom of an entropy collapse (the causal direction, entropy first and dead groups second, is the writer's reading of DAPO's description).</p>
+
+<h3 id="controls-cov">3.3 Clip-Cov and KL-Cov: select the tokens that drain entropy</h3>
+<p>If a few tokens carry the covariance (Figure 4), restrict only those. With the token covariance \(\mathrm{Cov}(y_i)=\big(\log\pi_\theta(y_i)-\tfrac1N\sum_j\log\pi_\theta(y_j)\big)\big(A(y_i)-\tfrac1N\sum_jA(y_j)\big)\) over the \(N\) rollout tokens of a batch, <strong>Clip-Cov</strong> picks \(\lfloor rN\rfloor\) tokens uniformly at random among those with covariance in \([\omega_{\mathrm{low}},\omega_{\mathrm{high}}]\) and detaches them from the policy gradient; <strong>KL-Cov</strong> ranks tokens by covariance and adds \(-\beta\,D_{\mathrm{KL}}(\pi_{\theta_{\mathrm{old}}}\Vert\pi_\theta)\) to the top fraction \(k\)<a class="cite" href="#ref-1">1</a> (§4.2, Eqs. 10–14). The KL here is to the rollout policy, a per-iteration trust region, not to the reference model. Settings: \(r=2\times10^{-4}\), \(\omega_{\mathrm{low}}=1\), \(\omega_{\mathrm{high}}=5\) (over 500 times the average covariance); \(k=2\times10^{-3}\) for 7B and \(2\times10^{-4}\) for 32B; \(\beta=1\); DAPO-MATH prompts, 256 prompts with 8 responses at temperature 1, 8 updates per rollout, dead groups filtered, 8,192-token maximum<a class="cite" href="#ref-1">1</a> (§4.3).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Clip-Cov and KL-Cov against GRPO and GRPO with Clip-Higher, Qwen2.5 base models, math. AIME columns are avg@32 at temperature 0.6; MATH-500 is greedy; Avg is over seven benchmarks (AIME24, AIME25, AMC, MATH-500, OMNI-MATH, OlympiadBench, Minerva). Percent accuracy; Δ is in points against plain GRPO (derived)<a class="cite" href="#ref-1">1</a> (Table 2).</caption>
+  <thead><tr><th>Model</th><th>Method</th><th class="num">AIME24</th><th class="num">AIME25</th><th class="num">MATH-500</th><th class="num">Avg</th><th class="num">Δ Avg</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Qwen2.5-7B</td><td>GRPO</td><td class="num">21.2</td><td class="num">9.6</td><td class="num">78.8</td><td class="num">38.6</td><td class="num">–</td></tr>
+    <tr><td></td><td>+ Clip-Higher</td><td class="num">18.1</td><td class="num">11.5</td><td class="num">79.2</td><td class="num">38.8</td><td class="num">+0.2</td></tr>
+    <tr><td></td><td>+ Clip-Cov</td><td class="num">22.1</td><td class="num" data-best>15.8</td><td class="num">80.4</td><td class="num">40.4</td><td class="num">+1.8</td></tr>
+    <tr><td></td><td>+ KL-Cov</td><td class="num" data-best>22.6</td><td class="num">12.9</td><td class="num" data-best>80.8</td><td class="num" data-best>40.6</td><td class="num">+2.0</td></tr>
+    <tr><td class="row">Qwen2.5-32B</td><td>GRPO</td><td class="num">21.8</td><td class="num">16.2</td><td class="num">84.2</td><td class="num">45.8</td><td class="num">–</td></tr>
+    <tr><td></td><td>+ Clip-Higher</td><td class="num">35.6</td><td class="num">22.3</td><td class="num" data-worst>77.2</td><td class="num">47.2</td><td class="num">+1.4</td></tr>
+    <tr><td></td><td>+ Clip-Cov</td><td class="num">32.3</td><td class="num">22.7</td><td class="num" data-best>87.0</td><td class="num">50.3</td><td class="num">+4.5</td></tr>
+    <tr><td></td><td>+ KL-Cov</td><td class="num" data-best>36.8</td><td class="num" data-best>30.8</td><td class="num">84.6</td><td class="num" data-best>52.2</td><td class="num">+6.4</td></tr>
+  </tbody>
+</table>
+
+<p>Both methods raise the average on both models, KL-Cov by 2.0 and 6.4 points; on the 32B model AIME24 rises by 15.0 points and AIME25 by 14.6 (derived from Table 2). The entropy curves are the stronger evidence: when the baseline's entropy has plateaued, KL-Cov "still sustains an entropy level over 10× higher", response length keeps rising, and held-out accuracy does not plateau<a class="cite" href="#ref-1">1</a> (§4.3, Fig. 11). Entropy becomes a dial: more clipped tokens (Clip-Cov) or a larger \(\beta\) (KL-Cov) gives higher entropy, with KL-Cov the steadier of the two (§4.4, Fig. 12). The method touches only \(10^{-4}\) to \(10^{-3}\) of tokens "yet totally change[s] the entropy curve", which the authors read as a handful of "pivotal" tokens; they also report that they "don't observe a relationship between the intervened entropy and model performance", leaving open whether an optimal entropy exists<a class="cite" href="#ref-1">1</a> (§4.5).</p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>The evidence is two Qwen2.5 base models, one math dataset, a context of 8,192 tokens against the 16,384 to 65,536 that DAPO, Olmo 3 Think and R1 use, and a single run per cell as far as the paper reports. The 32B GRPO baseline scores 21.8 on AIME24, below the 30 DAPO reports for naive GRPO on the same-size model under a larger generation budget (different setups, so the comparison is indicative only)<a class="cite" href="#ref-2">2</a> (Table 1). The Clip-Higher arm loses 7 points on MATH-500 at 32B (84.2 to 77.2) while gaining 13.8 on AIME24, which shows how much one benchmark can move. None of the production recipes read for this module (Olmo 3, GLM-5, DeepSeek-V3.2, Magistral, Kimi K2, Qwen3) uses Clip-Cov or KL-Cov; I found no independent replication in the sources.</p></aside>
+
+<h3 id="controls-tokens">3.4 Selecting by entropy rather than covariance</h3>
+<p>A neighboring line of work selects tokens by the entropy of the state's distribution. Wang et al. report that only a minority of tokens have high entropy, that these act as forks steering the reasoning, and that restricting the update to about the top 20% of tokens by entropy matches full-gradient training on Qwen3-8B and beats it on Qwen3-14B and 32B (AIME'24 and AIME'25), while training only on the lowest-entropy 80% hurts performance markedly (abstract level; I did not read the full paper)<a class="cite" href="#ref-12">12</a>. TRL exposes it as <code>top_entropy_quantile</code> (default 1.0; "The paper recommends a value of 0.2")<a class="cite" href="#ref-6">6</a>. The two selections differ in one respect: Clip-Cov and KL-Cov brake the update on confident, rewarded tokens, while the top-entropy rule drops confident tokens' updates altogether; both leave the uncertain forks in the gradient (the unification is the writer's reading).</p>
+
+<h3 id="controls-temperature">3.5 Temperature as an entropy lever</h3>
+<p>Raising the rollout temperature is the cheapest knob and the least trusted. ProRL "did employ high rollout temperature" (1.2) because it "encourages exploration by increasing the initial entropy", but found it "only delays the onset of entropy collapse rather than preventing it altogether, as entropy continues to decline steadily"<a class="cite" href="#ref-3">3</a> (§2.2, §3.2). Magistral settled on 1.0 as "the best balance between avoiding the lack of diversity seen at lower temperatures and the incoherent outputs generated at higher temperatures"<a class="cite" href="#ref-5">5</a> (§5.3). R1-Zero, Olmo 3 and DAPO's evaluation use 1.0<a class="cite" href="#ref-13">13</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-2">2</a>. Kimi K2 schedules it: a high temperature early is "crucial" for creative writing and complex reasoning because it facilitates "the discovery of effective strategies and reducing the risk of premature convergence to suboptimal solutions", but keeping it high later "introduces excessive randomness", so "we employ a temperature decay schedule, to shift from exploration to exploitation"<a class="cite" href="#ref-4">4</a> (§3.2.3). The report gives neither the schedule nor an ablation.</p>
+<p>Temperature acts before the gradient: it changes which tokens get sampled, and so which cells of Figure 3 the batch populates, not how an update treats a sampled token (the writer's reading). It has a systems consequence an inference engineer will recognize: the sampler's temperature and the trainer's log-probabilities must agree. TRL passes the same <code>temperature</code> to the vLLM call and to the fused head that computes the trainer's log-probabilities and entropy<a class="cite" href="#ref-7">7</a>; if they differed, the importance ratio and the logged entropy would describe a distribution the sampler never used (Module 14).</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 3.</b> Entropy-side interventions, where each was tested and what the report shows. "Effect" is as reported; "Limit" is what the evidence does not cover. Sources in the last column.</caption>
+  <thead><tr><th>Intervention</th><th>Acts on</th><th>Tested on</th><th>Reported effect</th><th>Limit</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Entropy bonus, static</td><td>loss</td><td>Qwen2.5 (Cui); 3B, math and math+code (Magistral)</td><td>0.005 stable but no better; 0.01 explodes</td><td>coefficient- and dataset-sensitive</td><td>Cui §4.1; Magistral §7.4.2</td></tr>
+    <tr><td class="row">Entropy bonus, adaptive</td><td>loss</td><td>none read</td><td>implemented in TRL (Skywork-OR1)</td><td>no ablation in sources</td><td>TRL docs</td></tr>
+    <tr><td class="row">KL to reference as entropy tool</td><td>loss</td><td>Qwen2.5, \(\beta\) 0.001 to 0.1</td><td>stable entropy, worse accuracy</td><td>one setup</td><td>Cui §4.1</td></tr>
+    <tr><td class="row">Clip-Higher</td><td>clip</td><td>Qwen2.5-32B (DAPO); 7B and 32B (Cui)</td><td>AIME24 36 to 38; avg +0.2 and +1.4</td><td>unstable later (Cui); ScaleRL: moves asymptote</td><td>DAPO Tab. 1; Cui Tab. 2</td></tr>
+    <tr><td class="row">Drop dead groups</td><td>batch</td><td>Qwen2.5-32B (DAPO); Olmo 3</td><td>42 to 50 AIME24 in ladder; lower loss variance</td><td>needs oversampling</td><td>DAPO Tab. 1; Olmo 3 Fig. 26</td></tr>
+    <tr><td class="row">Clip-Cov, KL-Cov</td><td>clip, penalty</td><td>Qwen2.5-7B and 32B, 8,192 tokens</td><td>avg +1.8/+2.0 (7B), +4.5/+6.4 (32B)</td><td>one family, short context, unreplicated</td><td>Cui Tab. 2</td></tr>
+    <tr><td class="row">Top-entropy token mask</td><td>loss mask</td><td>Qwen3-8B, 14B, 32B</td><td>20% of tokens match or beat full gradient</td><td>abstract level only</td><td>Wang et al.; TRL</td></tr>
+    <tr><td class="row">Temperature, high or decayed</td><td>sampling</td><td>1.5B (ProRL); K2 (decay)</td><td>delays collapse; K2 gives no ablation</td><td>no schedule or ablation</td><td>ProRL §2.2; K2 §3.2.3</td></tr>
+  </tbody>
+</table>
+
+<h2 id="kl-drift">4. KL drift: three different KLs, what the curve does, and the ledger</h2>
+<p>Module 6 teaches the KL-regularized objective, the \(k_1/k_2/k_3\) estimators and Table 6 of coefficients and placements. This section takes the question it leaves open: when the policy is meant to travel far, what does the leash do, and what do reports that dropped it still watch?</p>
+
+<h3 id="kl-three">4.1 "KL" names three different things</h3>
+<ul>
+<li><strong>KL to a fixed reference</strong> (the SFT or starting checkpoint): the RLHF leash of Module 6. It is the quantity Tulu 3's \(\beta\) sweep and Olmo 3's logged curve measure<a class="cite" href="#ref-14">14</a><a class="cite" href="#ref-9">9</a>.</li>
+<li><strong>KL to the rollout policy</strong> \(\pi_{\mathrm{old}}\): a per-iteration trust region. The PPO ratio bounds it implicitly; KL-Cov adds it explicitly on selected tokens<a class="cite" href="#ref-1">1</a>; Kimi K2's squared loss, inherited from K1.5, carries a \(\tau\log(\pi_\theta/\pi_{\mathrm{old}})\) term<a class="cite" href="#ref-4">4</a> (§3.2.3; Module 9 derives it). It limits step size and says nothing about distance from the start.</li>
+<li><strong>KL to a moving reference</strong>: a fixed-anchor KL whose anchor is periodically replaced. R1 replaces the reference with the latest policy every 400 steps<a class="cite" href="#ref-13">13</a> (§2.1); ProRL hard-resets it, with the optimizer state, when validation metrics degrade or plateau<a class="cite" href="#ref-3">3</a> (App. E); DeepSeekMath's iterative GRPO resets it each outer iteration<a class="cite" href="#ref-15">15</a> (§4.1.4); TRL implements the TR-DPO rule \(\pi_{\mathrm{ref}}\leftarrow\alpha\pi_\theta+(1-\alpha)\pi_{\mathrm{ref}}\) with \(\alpha=0.6\) every 512 steps, off by default<a class="cite" href="#ref-6">6</a>.</li>
+</ul>
+<p>A KL curve in a log means one of these, and which one decides how to read it (Figure 6).</p>
+
+<h3 id="kl-monitor">4.2 What the curve does in runs that do not penalize it</h3>
+<p>Olmo 3 removes the KL loss and still plots the KL divergence for its 7B Think run: it "grows gradually and reflects stronger deviation from the reference policy", while response length "becomes longer and stabilizes at a higher level"<a class="cite" href="#ref-9">9</a> (App. A.6.3, Fig. 41). Read from the figure (approximate), KL rises from near 0 to about 0.09 by roughly step 1,000 and ends near 0.08 at about 1,400 steps, while overall reward climbs from about 4.2 to 5.8. A smooth rise then plateau, tracking reward, is the healthy picture without a leash. A catch: TRL logs <code>kl</code> "only if beta is nonzero", and its default \(\beta=0\) does not load the reference model<a class="cite" href="#ref-6">6</a>, so the default removes the penalty and the instrument together. Watching KL without penalizing it still costs the reference forward pass (Module 1).</p>
+<p>Tulu 3 shows what the leash protected against. In its PPO-based RLVR from the DPO checkpoint, lowering \(\beta\) from 0.1 toward 0.01 raised KL from the initial model, and "more KL divergence typically results in lower average scores", with one exception: "as the model diverges more from the initial model, overoptimization happens as the average scores drop significantly"<a class="cite" href="#ref-14">14</a> (§6.2.1, Figs. 21–22). What drops is the average over all evaluations, not only the rewarded task. Olmo 3 sees the same symptom with no KL term and fixes it with data: OlmoRL on IFEval alone traded higher IFEval for lower AlpacaEval, while "training on a mix yields steady improvements across different domains"<a class="cite" href="#ref-9">9</a> (§4.5, Fig. 20). Same failure (off-target regression as the policy drifts), two cures: a price on drift, or a broader reward.</p>
+
+<h3 id="kl-ledger">4.3 The ledger</h3>
+<p>Table 4 lists the keep-or-drop decisions with what the report says and what it shows. It deliberately omits estimators, placement and coefficient values, which are in Module 6 Table 6; the new columns are the starting checkpoint and the kind of evidence.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 4.</b> KL-to-reference decisions in reasoning-RL reports (as of 2026-10). "Evidence" separates an ablation or sweep in the report from a statement of practice. Coefficients and estimators: Module 6, Table 6.</caption>
+  <thead><tr><th>Recipe</th><th>Starts from</th><th>Decision</th><th>Reason given</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DeepSeekMath-RL</td><td>instruction-tuned 7B</td><td>keep, \(\beta=0.04\); iterative GRPO resets reference</td><td>in the loss so the advantage stays simple</td><td>practice<a class="cite" href="#ref-15">15</a></td></tr>
+    <tr><td class="row">Tulu 3 RLVR</td><td>DPO checkpoint, 8B and 70B</td><td>keep, 0.05 and 0.07</td><td>over-optimization as KL grows</td><td>sweep, \(\beta\) 0.1 to 0.01<a class="cite" href="#ref-14">14</a></td></tr>
+    <tr><td class="row">R1-Zero, R1 stage 1</td><td>DeepSeek-V3-Base (Zero)</td><td>keep, 0.001; reference replaced every 400 steps</td><td>not stated</td><td>practice<a class="cite" href="#ref-13">13</a></td></tr>
+    <tr><td class="row">DAPO</td><td>Qwen2.5-32B base</td><td>remove</td><td>the model "can diverge significantly from the initial model, thus this restriction is not necessary"</td><td>practice; no KL row in the ablation ladder<a class="cite" href="#ref-2">2</a></td></tr>
+    <tr><td class="row">ProRL</td><td>R1-Distill-Qwen-1.5B</td><td>keep, with hard resets</td><td>"stronger and more stable" against entropy collapse; "remove KL" applies to base models</td><td>practice; confounded with Clip-Higher, T = 1.2<a class="cite" href="#ref-3">3</a></td></tr>
+    <tr><td class="row">DeepSeek-V3.2</td><td>specialist-distilled data, then mixed RL</td><td>keep, domain-dependent; weak or none for math</td><td>"different domains benefit from varying strengths"</td><td>practice; no numbers<a class="cite" href="#ref-16">16</a></td></tr>
+    <tr><td class="row">Olmo 3</td><td>DPO checkpoint (Think); base (RL-Zero)</td><td>remove</td><td>"allows less-restricted policy updates"; no over-optimization seen</td><td>practice; KL still logged<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">GLM-5 reasoning RL</td><td>first RL stage</td><td>remove</td><td>"to accelerate RL improvement"</td><td>practice<a class="cite" href="#ref-10">10</a></td></tr>
+    <tr><td class="row">Magistral</td><td>Mistral Medium 3 Instruct; SFT-bootstrapped Small</td><td>remove</td><td>the policy diverges anyway; reference copy "incurs a compute cost we find unjustified"</td><td>tried a KL term and an EMA reference: it "primarily hinders training"<a class="cite" href="#ref-5">5</a></td></tr>
+    <tr><td class="row">MiniMax-M1, ScaleRL</td><td>M1 base; ScaleRL base algorithm</td><td>remove</td><td>"similar to other recent works"; "in line with large-scale training reports"</td><td>practice<a class="cite" href="#ref-17">17</a><a class="cite" href="#ref-8">8</a></td></tr>
+    <tr><td class="row">TRL GRPOTrainer</td><td>user's choice</td><td>default \(\beta=0\); reference not loaded</td><td>memory and speed</td><td>documented default<a class="cite" href="#ref-6">6</a></td></tr>
+  </tbody>
+</table>
+
+<p>Two things stand out. First, none of the "remove" decisions carries an ablation in the source: DAPO's ladder has no KL row and Olmo 3 states the decision as common practice. Magistral tested a KL term and reports harm, and Cui et al.'s entropy experiments (§3.1) add a second negative result for a KL penalty used to hold entropy. Second, ProRL's rule (keep KL from a distilled checkpoint, drop it for a raw base) does not sort the rows: Tulu 3 and Olmo 3 Think both start from a DPO checkpoint and decide opposite ways. What separates them, if anything, is the task: Tulu 3's RLVR uses 1,024 to 2,048-token response caps on a narrow verifiable set<a class="cite" href="#ref-14">14</a> (Table 21), Olmo 3 runs 32,768-token responses over a mixed reward (Table 49). That is the writer's reading; nothing in the sources isolates it.</p>
+
+<h3 id="kl-resets">4.4 Resets, and the ProRL case</h3>
+<p>ProRL's is the only sustained argument, in the sources read, for keeping the term in long-chain-of-thought RL. Its premise: DAPO-style components and a high temperature "help slow entropy collapse", but "explicit regularization via a KL divergence penalty provides a stronger and more stable solution", and it also "prevent[s] the online policy from drifting too far from a stable reference"<a class="cite" href="#ref-3">3</a> (§2.3.1). The cost it observes is that "the KL term may increasingly dominate the loss, leading to diminishing policy updates"; the cure is a periodic hard reset of the reference to a more recent snapshot of the online policy, with the optimizer state reinitialized<a class="cite" href="#ref-3">3</a>. Its qualification of the "remove KL" advice is that the perspective "often applies to base models prior to any supervised fine-tuning", whereas ProRL starts from DeepSeek-R1-Distill-Qwen-1.5B, a checkpoint "already capable of generating coherent CoT outputs".</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 290" role="img" aria-labelledby="f6t"><title id="f6t">Schematic of two KL curves in one run: KL to the initial checkpoint grows without bound; KL to a reference reset every 400 steps rises and falls back to zero at each reset</title>
+    <defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="70" y="22" class="d-title">What a reference reset does to the logged KL (schematic shapes, not data)</text>
+    <line x1="70" y1="40" x2="70" y2="220" class="d-axis"/><line x1="70" y1="220" x2="760" y2="220" class="d-axis"/>
+    <line x1="208" y1="40" x2="208" y2="220" class="d-grid"/><line x1="346" y1="40" x2="346" y2="220" class="d-grid"/><line x1="484" y1="40" x2="484" y2="220" class="d-grid"/><line x1="622" y1="40" x2="622" y2="220" class="d-grid"/>
+    <polyline points="70.0,220.0 104.5,183.8 139.0,168.8 173.5,157.3 208.0,147.6 242.5,139.0 277.0,131.3 311.5,124.2 346.0,117.5 380.5,111.3 415.0,105.4 449.5,99.9 484.0,94.5 518.5,89.4 553.0,84.5 587.5,79.7 622.0,75.1 656.5,70.6 691.0,66.3 725.5,62.1 760.0,58.0" class="d-line d-stroke-blue d-dashed" style="stroke-width:2.5"/>
+    <polyline points="70.0,220.0 87.2,197.7 104.5,188.5 121.8,181.4 139.0,175.5 156.2,170.2 173.5,165.4 190.8,161.1 208.0,157.0 208.0,220.0 225.2,197.7 242.5,188.5 259.8,181.4 277.0,175.5 294.2,170.2 311.5,165.4 328.8,161.1 346.0,157.0 346.0,220.0 363.2,197.7 380.5,188.5 397.8,181.4 415.0,175.5 432.2,170.2 449.5,165.4 466.7,161.1 484.0,157.0 484.0,220.0 501.2,197.7 518.5,188.5 535.8,181.4 553.0,175.5 570.2,170.2 587.5,165.4 604.8,161.1 622.0,157.0 622.0,220.0 639.2,197.7 656.5,188.5 673.8,181.4 691.0,175.5 708.2,170.2 725.5,165.4 742.8,161.1 760.0,157.0" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+    <text x="70" y="236" text-anchor="middle" class="d-small d-mono">0</text><text x="208" y="236" text-anchor="middle" class="d-small d-mono">400</text><text x="346" y="236" text-anchor="middle" class="d-small d-mono">800</text><text x="484" y="236" text-anchor="middle" class="d-small d-mono">1,200</text><text x="622" y="236" text-anchor="middle" class="d-small d-mono">1,600</text><text x="760" y="236" text-anchor="middle" class="d-small d-mono">2,000</text>
+    <text x="415" y="254" text-anchor="middle" class="d-small d-text-light">training step; reset every 400 steps (R1's cadence)</text>
+    <text x="62" y="46" text-anchor="end" class="d-small d-text-light">KL</text>
+    <rect x="480" y="262" width="12" height="12" class="d-fill-orange"/><text x="498" y="273" class="d-small">KL the penalty and the default log see</text>
+    <line x1="96" y1="268" x2="122" y2="268" class="d-line d-stroke-blue d-dashed" style="stroke-width:2.5"/><text x="130" y="273" class="d-small">KL to the initial checkpoint (what drift is)</text>
+    <path d="M208,40 L208,220" class="d-arrow-active" marker-end="url(#f6-arr)"/><text x="214" y="52" class="d-small d-bold">reset</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Under periodic resets the KL the objective sees (orange) is a sawtooth that never exceeds its per-segment peak, while the distance from the starting checkpoint (blue, dashed) keeps growing. The shapes are illustrative; the 400-step cadence is R1's, and R1's 10,400 steps imply 26 replacements (derived)<a class="cite" href="#ref-13">13</a>. Module 6 §4.2 derives the idealized consequence: after \(k\) converged stages the effective coefficient relative to the start is \(\beta/k\).</figcaption>
+</figure>
+
+<p>ProRL's Appendix E shows the resets inside a sequence of eight runs. Run 1 (four task types, 8k cap) ran until "instability and degradation in validation performance"; Run 2 hard-reset the reference and continued; Run 3 added instruction-following data until "a sudden increase in response length, primarily due to the model repeating answers and failing to terminate with an &lt;eos&gt; token"; Runs 4 and 5 penalized non-terminating responses; Runs 6 and 7 doubled rollouts from 16 to 32 with two hard resets; Run 8 extended the context to 16k<a class="cite" href="#ref-3">3</a> (App. E). The resets are bundled with data, reward and hyperparameter changes, which the authors present as a feature ("an opportunity to adjust training hyperparameters") and which makes the KL term's own contribution unmeasurable from this record. The entropy trace stays near 1 on a 0–6 axis through more than 2,000 steps (Fig. 2; approximate). The final model's gains, from Tables 1–3, are in Figure 7.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f7t"><title id="f7t">Grouped bars: base DeepSeek-R1-Distill-Qwen-1.5B against the ProRL model on five domains, with absolute gains in points</title>
+    <text x="80" y="22" class="d-title">ProRL: 1.5B base against the final model, pass@1 (%)</text>
+    <line x1="80" y1="40" x2="80" y2="250" class="d-axis"/><line x1="80" y1="250" x2="780" y2="250" class="d-axis"/>
+    <line x1="80" y1="190" x2="780" y2="190" class="d-grid"/><line x1="80" y1="130" x2="780" y2="130" class="d-grid"/><line x1="80" y1="70" x2="780" y2="70" class="d-grid"/>
+    <text x="72" y="254" text-anchor="end" class="d-small d-mono">0</text><text x="72" y="194" text-anchor="end" class="d-small d-mono">20</text><text x="72" y="134" text-anchor="end" class="d-small d-mono">40</text><text x="72" y="74" text-anchor="end" class="d-small d-mono">60</text>
+    <rect x="104" y="116.6" width="44" height="133.4" class="d-fill-blue"/><rect x="152" y="69.6" width="44" height="180.4" class="d-fill-orange"/>
+    <text x="126" y="110" text-anchor="middle" class="d-small d-mono">44.45</text><text x="174" y="63" text-anchor="middle" class="d-small d-mono">60.14</text>
+    <rect x="244" y="180.8" width="44" height="69.2" class="d-fill-blue"/><rect x="292" y="137.5" width="44" height="112.5" class="d-fill-orange"/>
+    <text x="266" y="174" text-anchor="middle" class="d-small d-mono">23.08</text><text x="314" y="131" text-anchor="middle" class="d-small d-mono">37.49</text>
+    <rect x="384" y="202.4" width="44" height="47.6" class="d-fill-blue"/><rect x="432" y="124.7" width="44" height="125.3" class="d-fill-orange"/>
+    <text x="406" y="196" text-anchor="middle" class="d-small d-mono">15.86</text><text x="454" y="118" text-anchor="middle" class="d-small d-mono">41.78</text>
+    <rect x="524" y="117.8" width="44" height="132.2" class="d-fill-blue"/><rect x="572" y="51.9" width="44" height="198.1" class="d-fill-orange"/>
+    <text x="546" y="111" text-anchor="middle" class="d-small d-mono">44.05</text><text x="594" y="45" text-anchor="middle" class="d-small d-mono">66.02</text>
+    <rect x="664" y="237.3" width="44" height="12.7" class="d-fill-blue"/><rect x="712" y="72.8" width="44" height="177.2" class="d-fill-orange"/>
+    <text x="686" y="231" text-anchor="middle" class="d-small d-mono">4.24</text><text x="734" y="67" text-anchor="middle" class="d-small d-mono">59.06</text>
+    <text x="150" y="268" text-anchor="middle" class="d-small">Math (6 sets)</text><text x="290" y="268" text-anchor="middle" class="d-small">Code (6 sets)</text><text x="430" y="268" text-anchor="middle" class="d-small">GPQA-Diamond</text><text x="570" y="268" text-anchor="middle" class="d-small">IFEval</text><text x="710" y="268" text-anchor="middle" class="d-small">Reasoning Gym</text>
+    <text x="150" y="286" text-anchor="middle" class="d-small d-bold">+15.7</text><text x="290" y="286" text-anchor="middle" class="d-small d-bold">+14.4</text><text x="430" y="286" text-anchor="middle" class="d-small d-bold">+25.9</text><text x="570" y="286" text-anchor="middle" class="d-small d-bold">+22.0</text><text x="710" y="286" text-anchor="middle" class="d-small d-bold">+54.8</text>
+    <rect x="620" y="26" width="12" height="12" class="d-fill-blue"/><text x="638" y="37" class="d-small">R1-Distill-Qwen-1.5B</text>
+    <rect x="620" y="42" width="12" height="12" class="d-fill-orange"/><text x="638" y="53" class="d-small">ProRL model</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> One 1.5B model, one training run of more than 2,000 steps, about 16,000 H100 GPU hours<a class="cite" href="#ref-3">3</a> (§3.2). Bars are the paper's Tables 1–3 (math and code are averages over six benchmarks each; math, code and GPQA are pass@1 from 16 samples at temperature 0.6, top-p 0.95, 32k tokens, and IFEval and Reasoning Gym are mean verifier reward); the bold figures are absolute gains in points (derived: they equal the gains in the paper's §3.4). The paper's introduction states 14.7, 13.9, 25.1 and 18.1 for math, code, STEM and instruction following, which do not match its tables; the table arithmetic supports §3.4. The run bundles Clip-Higher (\(\epsilon_{\mathrm{high}}=0.4\)), dynamic sampling, temperature 1.2, a KL term with resets and changing data, so no bar isolates any of them.</figcaption>
+</figure>
+
+<h2 id="length-language">5. Length growth and language drift as run-health signals</h2>
+<p>Module 11 §2 derives why a per-response length normalizer pushes length one way or the other depending on pass rate, and Module 23 covers controlling length on purpose. This section is about reading the length curve, because it is the one monitor that is also a bill: every extra token is decode work in the rollout engine.</p>
+
+<h3 id="length-r1">5.1 What the reports show</h3>
+<p>R1-Zero is the reference curve. Its average response length rises steadily through 10,400 steps, from under 1,000 tokens near step 0 to roughly 14,000 near step 10,000, with a jump at step 8.2k, exactly where the maximum length was raised from 32,768 to 65,536 (approximate reading of Fig. 1b)<a class="cite" href="#ref-13">13</a> (§2.1). The report reads it as the model learning "to solve reasoning tasks with more thinking time" (Fig. 1 caption) and ties it to growing reflection, including a sudden increase in the word "wait" (§2.3). The rollout bill follows: each rollout generates 8,192 outputs, so 14,000 tokens each is about 115 million generated tokens, against about 4 million at 500 tokens, roughly 28 times the decode work per rollout between start and end (derived from approximate readings; 500 is an assumed start). Table 5 collects what other reports saw.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 5.</b> Response-length behavior in reasoning-RL reports, the interpretation each gives, and the control applied. Length values are as stated or approximate readings of the cited figure. Deliberate length control is Module 23.</caption>
+  <thead><tr><th>Report</th><th>Length behavior</th><th>Stated interpretation</th><th>Control or check</th></tr></thead>
+  <tbody>
+    <tr><td class="row">R1-Zero</td><td>under 1,000 to about 14,000 tokens, jump at step 8.2k</td><td>"more thinking time"; reflection words rise</td><td>cap raised 32,768 to 65,536<a class="cite" href="#ref-13">13</a></td></tr>
+    <tr><td class="row">DAPO</td><td>not monotone; stagnation or decline for "considerable periods"</td><td>length and validation accuracy together tell you if a run is deteriorating</td><td>overlong filtering; soft punishment over a 4,096-token cache; token-level loss<a class="cite" href="#ref-2">2</a></td></tr>
+    <tr><td class="row">Olmo 3 Think 7B</td><td>dips, then "slowly increase over time"; about 14,500 trough, about 18,000 at end</td><td>SFT and DPO already trained 32K-token traces</td><td>none specific (§4.5)<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">Olmo 3 RL-Zero, weak mid-training mix</td><td>flat</td><td>the base lacks backtracking and verification behaviors to amplify</td><td>change the mid-training data<a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">ProRL</td><td>correlates with validation score; one run spikes</td><td>"does not appear to be decisive"; spike is repetition without termination</td><td>8k cap; penalty for non-terminating answers<a class="cite" href="#ref-3">3</a></td></tr>
+    <tr><td class="row">Magistral</td><td>grows with reward until it meets the length penalty and cap</td><td>"increasing completion length is the main resource that improves the performance"</td><td>\(l_{\max}-l_{\mathrm{cache}}\) soft penalty<a class="cite" href="#ref-5">5</a></td></tr>
+    <tr><td class="row">R1-Zero as analyzed by Dr. GRPO</td><td>correct 621 to 4,965, incorrect 1,039 to 8,206 (string length)</td><td>wrong answers come from harder prompts that need longer responses, or from the \(1/|o_i|\) bias</td><td>constant normalizer<a class="cite" href="#ref-18">18</a></td></tr>
+    <tr><td class="row">Kimi K2, DeepSeek-V3.2</td><td>"substantial increase" in RL generally</td><td>cost not justified outside reasoning domains</td><td>per-task token budget; length penalty in the reward<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-16">16</a></td></tr>
+  </tbody>
+</table>
+
+<h3 id="length-explanations">5.2 Four readings of a rising length curve</h3>
+<ul>
+<li><strong>Capability.</strong> Longer reasoning is the thing being learned. R1-Zero's account, and Magistral's: along the weight-space direction RL moves, "mean reward and output length grow up", and raw reward without the length penalty scales logarithmically with output length for checkpoints averaging 1,500 to 8,000 tokens<a class="cite" href="#ref-5">5</a> (§7.1, Figs. 8–9). That is a cross-section of perturbed checkpoints, so it shows co-movement along one direction, not that length causes reward.</li>
+<li><strong>Loss artifact.</strong> The \(1/|o_i|\) normalizer rewards short correct and long wrong answers; Dr. GRPO finds GRPO keeps lengthening "even when the reward improvement slows down" while the unbiased variant does not<a class="cite" href="#ref-18">18</a> (§3.2). The effect is shown at 1.5B to 3B with 3,000-token caps (Module 11 §2.3).</li>
+<li><strong>Selection.</strong> Wrong answers are longer than right ones partly because they come from harder prompts. Dr. GRPO states this hypothesis itself for R1-Zero's Table 5<a class="cite" href="#ref-18">18</a> (Appendix, Table 5), so a gap between incorrect and correct length is not by itself evidence of a bias.</li>
+<li><strong>Degeneration.</strong> The model repeats itself and never emits end-of-sequence. This one is a failure, and on a mean-length plot it looks like the capability reading.</li>
+</ul>
+
+<h3 id="length-degenerate">5.3 Telling runaway from reasoning</h3>
+<p>ProRL's Run 3 shows the degenerate case: length rose suddenly "primarily due to the model repeating answers and failing to terminate", and reward shaping that penalizes non-terminating responses reduced it modestly<a class="cite" href="#ref-3">3</a> (App. E). R1's notes record the small-model version: with a 7B dense or 16B MoE base, "as response lengths increased, these smaller models exhibited a tendency toward repetition and were unable to effectively leverage long chains of thought (CoT)"<a class="cite" href="#ref-13">13</a> (Supp. G.1). Tulu 3 charged a flat −10 for any response without an end-of-sequence token<a class="cite" href="#ref-14">14</a> (Table 21). DAPO ties the runaway to entropy. With sample-level loss, long low-quality samples with "gibberish and repetitive words" go unpunished, which "leads to an unhealthy increase in entropy and response length": entropy climbs from about 0.6 to about 3 within 5,000 steps, while the token-level-loss run creeps from about 0.4 to about 1.0 over 9,000 (approximate readings of Fig. 4a). Without overlong filtering, entropy sat near zero until roughly step 3,500 and then jumped to about 4.5 (approximate reading of Fig. 5b)<a class="cite" href="#ref-2">2</a> (§3.3, §3.4). So entropy can fail in both directions, and an upward excursion alongside a length spike is the signature of runaway, not of healthier exploration.</p>
+<p>TRL's logged metrics make the distinction measurable (the use is the writer's suggestion): <code>completions/mean_length</code> averages all completions, <code>completions/mean_terminated_length</code> only those that ended with EOS, and <code>completions/clipped_ratio</code> is the truncated share<a class="cite" href="#ref-6">6</a>. If the mean rises while the terminated mean stays flat and the clipped ratio climbs, the growth is truncated runaways; if the terminated mean rises with accuracy and the clipped ratio is flat, longer reasoning is being learned. DAPO's overlong filtering masks the loss of truncated samples and "significantly stabilizes training"; TRL exposes it as <code>mask_truncated_completions</code><a class="cite" href="#ref-6">6</a>.</p>
+
+<h3 id="language-mixing">5.4 Language mixing</h3>
+<p>R1-Zero's report lists "poor readability and language mixing, occasionally combining English and Chinese" and suggests DeepSeek-V3-Base's Chinese and English data "might be the cause"<a class="cite" href="#ref-13">13</a> (§1, Supp. A). The remedy was a reward equal to the fraction of target-language words in the chain of thought (Eq. 7); without it consistency "gradually deteriorates", with it consistency holds, math is comparable and coding drops slightly<a class="cite" href="#ref-13">13</a> (§3.2.1, Supp. B.6; Module 10 §2.4). Magistral saw "outputs that mixed English, Chinese, and Russian words" and added 0.1 reward when a fastText classifier labels problem, thoughts and answer as one language, after translating 10% of English problems into six languages<a class="cite" href="#ref-5">5</a> (§2.2). DeepSeek-V3.2 found a sampling-side contributor: truncating the action space with top-p at rollout but not in training breaks importance sampling, and top-p with the Keep Sampling Mask "effectively preserves language consistency"<a class="cite" href="#ref-16">16</a> (§3.1; Module 14). A per-step language-ID rate over the chain of thought is a cheap monitor (the writer's suggestion; none of the reports reads one out).</p>
+
+<h2 id="run-health">6. Reading a run</h2>
+
+<h3 id="dashboard">6.1 The signals the reports actually use</h3>
+<p>Every monitor below appears in at least one report or in TRL's logged-metric list: entropy (Cui et al., DAPO, ProRL, Magistral, Qwen3), KL to the reference (Olmo 3, Tulu 3, ProRL), response length and its truncation split (DAPO, R1, Olmo 3, ProRL), the share of prompts with zero reward variance (DAPO Fig. 3b, Olmo 3 Fig. 26), clip fraction (DAPO's mean up-clipped probability, GSPO's clipped-token fraction), the gap between training reward and validation accuracy (DAPO), and the log-probability gap between sampler and trainer (TRL's <code>sampling/sampling_logp_difference/mean</code>)<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-19">19</a>. DAPO's rule for entropy: it "needs to be maintained within an appropriate range", since too low loses exploration and too high brings "gibberish and repetitive generation", and "a slow upward trend in entropy is conducive to the improvement of model performance"; it also notes that training reward "often exhibits little correlation with the accuracy on the validation set"<a class="cite" href="#ref-2">2</a> (§4.3). ProRL monitors a blended validation set (AIME 2024, Codeforces, GPQA-Diamond, IFEval, one Reasoning Gym task) and uses it to trigger reference resets<a class="cite" href="#ref-3">3</a> (App. E). Figure 8 draws the healthy and failing shapes.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f8t"><title id="f8t">Four schematic monitor panels: entropy with slow rise, collapse and late blow-up; KL with plateau versus runaway; response length with healthy growth versus a spike to the cap; zero-advantage share flat versus rising</title>
+    <text x="40" y="20" class="d-bold">a. Entropy</text>
+    <line x1="40" y1="30" x2="40" y2="140" class="d-axis"/><line x1="40" y1="140" x2="380" y2="140" class="d-axis"/>
+    <polyline points="40,100 120,98 200,95 280,92 380,88" class="d-line d-stroke-green" style="stroke-width:2.5"/>
+    <polyline points="40,95 70,122 100,133 140,137 200,138 380,139" class="d-line d-stroke-red" style="stroke-width:2.5"/>
+    <polyline points="40,100 80,124 140,135 250,137 300,137 322,70 336,38 350,62 365,74 380,86" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+    <text x="50" y="78" class="d-small">slow rise: healthy (DAPO Fig. 7c)</text>
+    <text x="150" y="128" class="d-small">collapse (Cui Fig. 1)</text>
+    <text x="50" y="48" class="d-small">late blow-up (DAPO Fig. 5b)</text>
+    <text x="440" y="20" class="d-bold">b. KL to the reference</text>
+    <line x1="440" y1="30" x2="440" y2="140" class="d-axis"/><line x1="440" y1="140" x2="780" y2="140" class="d-axis"/>
+    <polyline points="440,140 480,118 520,102 570,92 630,86 700,83 780,82" class="d-line d-stroke-green" style="stroke-width:2.5"/>
+    <polyline points="440,140 500,120 570,100 640,76 710,54 780,36" class="d-line d-stroke-red" style="stroke-width:2.5"/>
+    <text x="560" y="130" class="d-small">rise, then plateau (Olmo 3 Fig. 41)</text>
+    <text x="450" y="46" class="d-small">no plateau; off-domain evals fall (Tulu 3)</text>
+    <text x="40" y="190" class="d-bold">c. Mean response length</text>
+    <line x1="40" y1="200" x2="40" y2="310" class="d-axis"/><line x1="40" y1="310" x2="380" y2="310" class="d-axis"/>
+    <line x1="40" y1="212" x2="380" y2="212" class="d-line d-dashed d-text-light"/><text x="376" y="207" text-anchor="end" class="d-small d-text-light">max length</text>
+    <polyline points="40,298 100,288 160,278 220,266 280,254 380,240" class="d-line d-stroke-green" style="stroke-width:2.5"/>
+    <polyline points="40,298 100,292 160,286 220,282 262,278 282,250 296,218 312,212 380,212" class="d-line d-stroke-red" style="stroke-width:2.5"/>
+    <text x="120" y="306" class="d-small">grows with validation accuracy</text>
+    <text x="118" y="236" class="d-small">spike, clipped share rises</text>
+    <text x="440" y="190" class="d-bold">d. Zero-advantage share of prompts</text>
+    <line x1="440" y1="200" x2="440" y2="310" class="d-axis"/><line x1="440" y1="310" x2="780" y2="310" class="d-axis"/>
+    <polyline points="440,296 520,294 600,292 700,290 780,288" class="d-line d-stroke-green" style="stroke-width:2.5"/>
+    <polyline points="440,296 520,282 600,262 700,240 780,226" class="d-line d-stroke-red" style="stroke-width:2.5"/>
+    <text x="450" y="222" class="d-small">climbs as entropy falls (DAPO Fig. 3b)</text>
+    <text x="580" y="284" class="d-small">held down by filtering</text>
+    <rect x="40" y="318" width="12" height="8" class="d-fill-green"/><text x="58" y="326" class="d-small">healthy</text>
+    <rect x="124" y="318" width="12" height="8" class="d-fill-red"/><text x="142" y="326" class="d-small">failing</text>
+    <rect x="204" y="318" width="12" height="8" class="d-fill-orange"/><text x="222" y="326" class="d-small">failing, other direction</text>
+    <text x="780" y="326" text-anchor="end" class="d-small d-text-light">horizontal axis: training step</text>
+  </svg>
+  <figcaption><b>Figure 8.</b> Schematic shapes, not data: each curve is drawn from the behavior the cited figure or sentence describes. Panel a combines three reports' entropy shapes<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-1">1</a>; panel b is the shape Olmo 3 plots for a no-leash run and the failure Tulu 3 describes<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-14">14</a>; panel c follows ProRL's Run 3 and the R1 notes on repetition<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-13">13</a>. Panel d follows the rising share of accuracy-1 prompts in DAPO's run.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 6.</b> Symptom, the signal that shows it, and the response a report documented. "Response" is what the cited report did, not a recommendation. Metric names in code font are TRL's<a class="cite" href="#ref-6">6</a>.</caption>
+  <thead><tr><th>Symptom</th><th>Where it shows</th><th>Documented response</th><th>Source and its limit</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Entropy falls toward zero early; accuracy plateaus</td><td><code>entropy</code>; accuracy curve</td><td>Clip-Higher; dynamic or active sampling; Clip-Cov or KL-Cov; KL with resets</td><td>DAPO, Olmo 3, Cui, ProRL (Table 3; mostly Qwen2.5, single runs)</td></tr>
+    <tr><td class="row">Entropy rises sharply with length</td><td><code>entropy</code>, <code>completions/mean_length</code>, <code>completions/clipped_ratio</code></td><td>token-level loss; overlong filtering with soft punishment; end-of-sequence penalty</td><td>DAPO §3.3–3.4, ProRL Run 4–5, Tulu 3 (Qwen2.5-32B, 1.5B)</td></tr>
+    <tr><td class="row">Sudden entropy drop and degradation within a few steps, no algorithm change</td><td><code>entropy</code>, <code>sampling/sampling_logp_difference/mean</code></td><td>check engine determinism: GLM-5's non-deterministic top-k in a sparse-attention indexer; <code>torch.topk</code> fixed it</td><td>GLM-5 §3.2<a class="cite" href="#ref-10">10</a>; Module 14</td></tr>
+    <tr><td class="row">KL keeps rising; off-domain evaluations fall</td><td><code>kl</code> (needs \(\beta\ne0\)); held-out evals</td><td>raise \(\beta\) (Tulu 3); mix reward and data across domains (Olmo 3); reset the anchor (ProRL)</td><td>one DPO-start 8B setup; Olmo 3 reports no matched ablation</td></tr>
+    <tr><td class="row">KL term dominates the loss; updates shrink</td><td><code>kl</code>, update size</td><td>hard reset of reference and optimizer state</td><td>ProRL only; 1.5B</td></tr>
+    <tr><td class="row">Training reward up, validation flat</td><td>reward against held-out accuracy</td><td>watch a validation blend; reset on plateau</td><td>DAPO §4.3, ProRL App. E</td></tr>
+    <tr><td class="row">Zero-advantage share climbs</td><td><code>frac_reward_zero_std</code></td><td>drop dead groups and refill; make prompts harder</td><td>DAPO, Olmo 3 (Module 11 §4)</td></tr>
+    <tr><td class="row">Reasoning mixes languages</td><td>language-ID rate (not logged by default)</td><td>language-consistency reward; keep the sampling mask with top-p</td><td>R1, Magistral, V3.2 (§5.4)</td></tr>
+  </tbody>
+</table>
+
+<h3 id="thresholds">6.2 Absolute values do not transfer</h3>
+<p>The same curve can sit at very different numbers in different setups, so compare a run with its own early trajectory and with a sibling run, not with a published value.</p>
+<ul>
+<li><strong>Entropy.</strong> DAPO's final run on Qwen2.5-32B plots entropy between about 0.3 and 0.7 (axis of Fig. 7c)<a class="cite" href="#ref-2">2</a>; ProRL's 1.5B run sits near 1 on a 0–6 axis<a class="cite" href="#ref-3">3</a>; TRL's docs use an <code>entropy_target</code> of 5.0 in their example and say typical models have 2–10 nats<a class="cite" href="#ref-6">6</a>. Temperature, the tokens included (TRL excludes truncated completions only when asked) and the prompt set all move it (§1.1).</li>
+<li><strong>Clip fraction.</strong> It is not comparable across loss types. GSPO clips whole sequences and reports an average clipped fraction of 0.15 against 0.0013 for GRPO, two orders of magnitude apart, and "adjusting the clipping ranges does not alter the disparity in magnitude"<a class="cite" href="#ref-19">19</a> (§5.2, Fig. 2). A fraction that signals trouble for token-level clipping is routine for the sequence-level kind (Module 12).</li>
+
+</ul>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Two questions are open. First, how to stop entropy collapsing, and whether entropy is what should be protected. Second, whether a long-chain-of-thought run should carry a KL term at all. Most reports decide both by assertion; the tests that exist are short and single-model. Module 6's disagreement section covers the KL estimator and placement; this one covers the long-CoT decision.</p>
+
+<h3 id="disagree-entropy">A. How to prevent entropy collapse</h3>
+<div class="positions">
+  <article class="position">
+    <h4>Reshape the clip and the batch</h4>
+    <p class="who">DAPO, Olmo 3, Magistral, GLM-5; ScaleRL's base loss<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-10">10</a><a class="cite" href="#ref-8">8</a></p>
+    <p>The upper clip throttles rare tokens, so raise it (0.26 to 0.4 across reports) and drop zero-advantage groups so the batch keeps a gradient.</p>
+    <ul class="pros"><li>No new term or model; four independent recipes use it.</li><li>Magistral gives an operational rule: tune \(\epsilon_{\mathrm{high}}\) to hold group entropy stable.</li></ul>
+    <ul class="cons"><li>Modest measured gain (36 to 38 AIME points in DAPO's ladder; +0.2 and +1.4 average points in Cui et al., where it turns unstable late).</li><li>The constant moves the asymptote (ScaleRL) and depends on off-policy reuse (Module 12).</li></ul>
+  </article>
+  <article class="position">
+    <h4>Select tokens by covariance</h4>
+    <p class="who">Cui et al. (Clip-Cov, KL-Cov)<a class="cite" href="#ref-1">1</a>; related token-selective work by Wang et al.<a class="cite" href="#ref-12">12</a></p>
+    <p>A few confident, rewarded tokens carry the covariance that drains entropy; brake those only, and entropy becomes a dial.</p>
+    <ul class="pros"><li>Derived from a mechanism checked against measured covariance.</li><li>Largest reported gains (+6.4 average points at 32B).</li></ul>
+    <ul class="cons"><li>Two Qwen2.5 models, math, 8,192 tokens; unreplicated, and no production recipe read adopts it.</li><li>No relationship found between the controlled entropy and accuracy, so the target is unknown.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Anchor with KL, reset it, and sample hot</h4>
+    <p class="who">ProRL<a class="cite" href="#ref-3">3</a></p>
+    <p>From a distilled start an explicit KL term is the stronger fix; reset the reference when it dominates the loss.</p>
+    <ul class="pros"><li>Entropy held near 1 for over 2,000 steps; large per-domain gains at 1.5B.</li></ul>
+    <ul class="cons"><li>Cui et al. and Magistral found KL hurt accuracy; no isolating ablation; temperature alone "only delays" collapse.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Entropy is a symptom, not the target</h4>
+    <p class="who">ScaleRL (App. A.12)<a class="cite" href="#ref-8">8</a>; Agarwal et al.<a class="cite" href="#ref-20">20</a>; Olmo 3's DPO-start observation<a class="cite" href="#ref-9">9</a></p>
+    <p>Two ScaleRL runs with the same entropy path differed in performance; Agarwal et al. report that rewarding negative entropy alone matches or beats GRPO and RLOO on Qwen-7B (abstract level); Olmo 3's DPO checkpoint had lower entropy and higher pass@k than its SFT checkpoint.</p>
+    <ul class="pros"><li>Explains why Cui et al.'s interventions showed no entropy-accuracy link.</li></ul>
+    <ul class="cons"><li>ScaleRL's own base loss still carries asymmetric clipping "to avoid entropy collapse".</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The positions answer different questions. To stop an early collapse cheaply, Clip-Higher plus dead-group filtering is the only answer with several independent adopters. To steer entropy to a chosen level, covariance-selective control is the only method with a mechanism behind a dial, on two models and a short context. For long runs from a distilled start, resets are the only documented practice and are unablated. The fourth position is the important correction: entropy is a necessary health signal and a poor score, because the same path can carry different accuracy (ScaleRL) and a sharper start can have a better ceiling (Olmo 3). I would log entropy, keep a floor with Clip-Higher, and not optimize toward a number. What would settle it: one recipe at 16k or more context, two base models, {none, Clip-Higher, Clip-Cov or KL-Cov, adaptive bonus} crossed, with held-out entropy and pass@k (Module 20) so sharpening and expansion are separated.</p></div>
+
+<h3 id="disagree-kl">B. Keep or remove the KL-to-reference term in long-CoT RL</h3>
+<div class="positions">
+  <article class="position">
+    <h4>Remove it</h4>
+    <p class="who">DAPO, Olmo 3, GLM-5, Magistral, MiniMax-M1, ScaleRL's base, TRL's default<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-10">10</a><a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-17">17</a><a class="cite" href="#ref-6">6</a></p>
+    <p>A reasoning policy must diverge from its start, a verifier gives no learned proxy to exploit, and the reference copy costs memory and a forward pass.</p>
+    <ul class="pros"><li>Convergent practice across open recipes; TRL does not even load the reference by default.</li><li>Magistral tested a KL term, including an EMA reference, and reports it hindered training.</li></ul>
+    <ul class="cons"><li>Mostly assertion: DAPO's ladder has no KL row, Olmo 3 cites practice.</li><li>Tulu 3 saw off-domain scores fall as KL grew; Olmo 3 avoids that by mixing data, which a narrow run cannot copy.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Keep it, and reset the anchor</h4>
+    <p class="who">ProRL; R1's 400-step replacement; DeepSeekMath's iterative GRPO<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-13">13</a><a class="cite" href="#ref-15">15</a></p>
+    <p>A restoring force protects stability over thousands of steps; resets keep it from freezing progress. "Remove KL" applies to raw base models.</p>
+    <ul class="pros"><li>R1 ran 10,400 steps with this scheme; ProRL ran more than 2,000 on a 1.5B model.</li><li>Cheap to add where the reference is already loaded.</li></ul>
+    <ul class="cons"><li>Resets turn the leash into a trust region (Module 6 §4.2), so it no longer bounds distance from the start.</li><li>Tulu 3 and Olmo 3 share a DPO start yet decide opposite ways (Table 4), which weakens the base-versus-distilled rule.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Keep it small and per domain, with a corrected estimator</h4>
+    <p class="who">DeepSeek-V3.2; Tulu 3's sweep<a class="cite" href="#ref-16">16</a><a class="cite" href="#ref-14">14</a></p>
+    <p>Different domains want different strengths, weak or none for math, and the \(k_3\) gradient must be importance-corrected when kept.</p>
+    <ul class="pros"><li>Matches the evidence that drift hurts off-target evaluations but not the rewarded task.</li><li>V3.2 fixes a known estimator bias instead of dropping the term.</li></ul>
+    <ul class="cons"><li>V3.2 gives no coefficients or ablation; per-domain tuning multiplies hyperparameters.</li><li>Tulu 3's evidence is a sweep at 1,024 to 2,048-token responses, not long chains of thought.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The decision turns on what the reward cannot see, not on the checkpoint. With a rule-based verifier, broad mixed data and held-out evaluations in the loop, removal is convergent and cheap, and the KL curve should still be logged as an instrument (Olmo 3 does). With a narrow single-domain reward, with a learned or generative judge (Modules 16 and 19), or when off-domain scores fall as KL rises, keep a small term or reset the anchor, as Tulu 3 and ProRL did. The sources contain no matched on, off and reset comparison at long context; Magistral's test and Cui et al.'s Figure 10 are the nearest, and both are negative results for a KL penalty used to hold entropy, not controlled studies of drift. That experiment would settle it: one recipe, thousands of steps, {no KL, fixed \(\beta\), \(\beta\) with resets}, with entropy, KL, off-domain accuracy and pass@k logged.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The default recipe has converged faster than the evidence for it: Clip-Higher with an upper bound of 0.26 to 0.4, no KL loss, token-level aggregation and dead-group filtering appear together in DAPO, Olmo 3, Magistral and GLM-5, between March 2025 and February 2026. TRL's defaults lag part of that: <code>loss_type</code> is <code>dapo</code> and <code>beta</code> is 0.0, but <code>epsilon_high</code> is unset, so Clip-Higher is opt-in<a class="cite" href="#ref-6">6</a>; these pages move, so check your version. Entropy control is moving into libraries (an adaptive bonus and a top-entropy-token mask), on evidence that in the sources read is a docstring and an abstract. Open as of 2026-10-27: whether an optimal entropy exists (Cui et al. find none; ScaleRL finds entropy does not predict performance across recipes), whether the entropy-performance law survives off-policy data and mixed rewards, and how much of a "collapse" is numerical rather than algorithmic, since GLM-5's entropy cliff came from a non-deterministic top-k kernel (Module 14). Module 15 reframes the loss-side tweaks as efficiency changes rather than ceiling changes, with the clip bound as the exception. Cui et al. is a v1 preprint (May 2025) and Magistral a v1 (June 2025).</p>
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Cui, G. et al. <em>The Entropy Mechanism of Reinforcement Learning for Reasoning Language Models</em>. arXiv:2505.22617v1, 28 May 2025 (preprint, Shanghai AI Laboratory et al.). <a href="https://arxiv.org/pdf/2505.22617v1">https://arxiv.org/pdf/2505.22617v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: entropy definition (Eq. 5), the law R = -a exp(H) + b (Eq. 6, §2.3-2.6), the covariance lemma and theorems (§3), the entropy-bonus and reference-KL experiments (§4.1, Figs. 9-10), Clip-Cov and KL-Cov (§4.2-4.5, Eqs. 10-14, Table 2, Table 1 covariance percentiles).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Yu, Q. et al. <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv:2503.14476v2, 20 May 2025. <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: entropy collapse and Clip-Higher (§3.1, Figs. 2-3), dynamic sampling (§3.2), token-level loss and its entropy and length effect (§3.3, Fig. 4), overlong filtering (§3.4, Fig. 5), no-KL decision (§2.3), ablation ladder (Table 1), monitoring guidance (§4.3, Fig. 7).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Liu, M. et al. <em>ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models</em>. arXiv:2505.24864v1, 30 May 2025 (NVIDIA). <a href="https://arxiv.org/pdf/2505.24864v1">https://arxiv.org/pdf/2505.24864v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: KL penalty with reference resets and the "remove KL" qualification (§2.3.1), setup including epsilon_high 0.4 and temperature 1.2 (§3.2), training dynamics (§3.3, Fig. 2), results (Tables 1-3, §3.4), the eight-run recipe (App. E).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Kimi Team. <em>Kimi K2: Open Agentic Intelligence</em>. arXiv:2507.20534v2, 3 Feb 2026 (v1 28 Jul 2025). <a href="https://arxiv.org/pdf/2507.20534v2">https://arxiv.org/pdf/2507.20534v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: temperature decay, budget control and the squared-loss objective (§3.2.3).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Mistral AI. <em>Magistral</em>. arXiv:2506.10910v1, 12 Jun 2025. <a href="https://arxiv.org/pdf/2506.10910v1">https://arxiv.org/pdf/2506.10910v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: removal of KL, Clip-Higher values and language-consistency reward (§2.1-2.2), epsilon_high 0.3 and temperature 1.0 (§5.3), the entropy-bonus and KL failures (§7.4.2, Fig. 12), length-reward co-movement (§7.1, Figs. 8-9). Not in the source map; read from the PDF.</span></li>
+  <li id="ref-6"><span class="ref-type">official</span>Hugging Face TRL maintainers. <em>TRL documentation: GRPO Trainer</em>. main branch, fetched 2026-10-27 (no version stated). <a href="https://huggingface.co/docs/trl/main/en/grpo_trainer">https://huggingface.co/docs/trl/main/en/grpo_trainer</a>. Accessed 2026-10-27. <span class="ref-use">Used for: logged metrics (entropy, kl, completions/*, frac_reward_zero_std, sampling_logp_difference), entropy_coef and adaptive entropy, top_entropy_quantile, sync_ref_model, beta, epsilon_high and loss_type defaults.</span></li>
+  <li id="ref-7"><span class="ref-type">repo</span>Hugging Face. <em>trl/trainer/grpo_trainer.py</em>. main branch, same URL as Module 9, fetched 2026-10-27. <a href="https://raw.githubusercontent.com/huggingface/trl/main/trl/trainer/grpo_trainer.py">https://raw.githubusercontent.com/huggingface/trl/main/trl/trainer/grpo_trainer.py</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the fused log-probability and entropy head built with the generation temperature (lines near add_fused_lm_head); the sampler temperature passed to vLLM. Not in the source map; also used by Module 9.</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Khatri, D. et al. <em>The Art of Scaling Reinforcement Learning Compute for LLMs</em>. arXiv:2510.13786v1, 15 Oct 2025. <a href="https://arxiv.org/pdf/2510.13786v1">https://arxiv.org/pdf/2510.13786v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: base algorithm without KL and with asymmetric clipping (§3), entropy on a held-out set and the batch-size finding (App. A.12), epsilon_max effect on the asymptote (App. A.17.1).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Team Olmo. <em>Olmo 3</em>. arXiv:2512.13961v2, 14 Apr 2026 (v1 15 Dec 2025). <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: OlmoRL list including no KL loss and clip-higher (§4.4.1), key findings on length, DPO-start entropy and domain mixing (§4.5), RL-Zero active-sampling ablation (§6.2, Fig. 26), hyperparameters (Table 49) and the 7B Think curves (Fig. 41, App. A.6.3).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>GLM-5 Team. <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. arXiv:2602.15763v2, 24 Feb 2026. <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: KL removed relative to IcePop, epsilon 0.2/0.28 (§3.2), non-deterministic top-k entropy cliff (§3.2, DSA RL insights).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Qwen Team. <em>Qwen3 Technical Report</em>. arXiv:2505.09388v1, 14 May 2025. <a href="https://arxiv.org/pdf/2505.09388v1">https://arxiv.org/pdf/2505.09388v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the stated entropy target in reasoning RL (§4.2).</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Wang, S. et al. <em>Beyond the 80/20 Rule: High-Entropy Minority Tokens Drive Effective Reinforcement Learning for LLM Reasoning</em>. arXiv:2506.01939, 2 Jun 2025; NeurIPS 2025. <a href="https://arxiv.org/abs/2506.01939">https://arxiv.org/abs/2506.01939</a>. Accessed 2026-10-27. <span class="ref-use">Used for: restricting updates to the top-entropy 20% of tokens (abstract level only; page fetched through a summarizing tool). Not in the source map.</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv:2501.12948v2, 4 Jan 2026 (expanded Nature version; v1 22 Jan 2025). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: R1-Zero settings, length curve and 8.2k jump (§2.1, §2.3, Fig. 1), reference replacement every 400 steps (§2.1, §3.2.1), language-mixing and language-consistency reward (§1, §3.2.1, Supp. B.6), small-model repetition (Supp. G.1).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Lambert, N. et al. <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv:2411.15124v5, 14 Apr 2025 (v1 22 Nov 2024). <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-27. <span class="ref-use">Used for: beta sweep and over-optimization as KL grows (§6.2.1, Figs. 21-22), response caps and the -10 end-of-sequence penalty (Table 21).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Shao, Z. et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv:2402.03300v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-27. <span class="ref-use">Used for: KL in the loss, 0.04 coefficient and the iterative-GRPO reference reset (§4.1.4, §4.2).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv:2512.02556v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: domain-dependent KL strength, length penalty and language-consistency reward (§3, §3.1), Keep Sampling Mask and language consistency (§3.1).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>MiniMax. <em>MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention</em>. arXiv:2506.13585v1, 16 Jun 2025. <a href="https://arxiv.org/pdf/2506.13585v1">https://arxiv.org/pdf/2506.13585v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: no KL penalty in CISPO (§3.1).</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Liu, Z. et al. <em>Understanding R1-Zero-Like Training: A Critical Perspective</em>. arXiv:2503.20783v2, 6 Oct 2025; COLM 2025. <a href="https://arxiv.org/pdf/2503.20783v2">https://arxiv.org/pdf/2503.20783v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: response-length growth with and without the length normalizer (§3.1-3.2), R1-Zero correct versus incorrect response length and the harder-prompt hypothesis (Appendix, Table 5).</span></li>
+  <li id="ref-19"><span class="ref-type">paper</span>Zheng, C. et al. (Qwen Team). <em>Group Sequence Policy Optimization</em>. arXiv:2507.18071v2, 28 Jul 2025. <a href="https://arxiv.org/pdf/2507.18071v2">https://arxiv.org/pdf/2507.18071v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: clipped-token fractions of GSPO (0.15) and GRPO (0.0013) (§5.2, Fig. 2).</span></li>
+  <li id="ref-20"><span class="ref-type">paper</span>Agarwal, S., Zhang, Z., Yuan, L., Han, J., Peng, H. <em>The Unreasonable Effectiveness of Entropy Minimization in LLM Reasoning</em>. arXiv:2505.15134, 21 May 2025. <a href="https://arxiv.org/abs/2505.15134">https://arxiv.org/abs/2505.15134</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the claim that rewarding negative entropy alone matches GRPO and RLOO on Qwen-7B (abstract level only; page fetched through a summarizing tool). Not in the source map.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

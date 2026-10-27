@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case Study: GLM-5 and Nemotron 3 Ultra · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Reads two 2026 agent-era post-training recipes against each other: GLM-5's three RL stages, on-policy cross-stage distillation, deterministic indexer top-k and asynchronous agentic RL, and Nemotron 3 Ultra's unified RLVR over many environments followed by multi-teacher on-policy distillation. States which knobs each report discloses, what each lab found that the other did not, and where the reports stop.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 32</p>
+  <h1>Case Study: GLM-5 and Nemotron 3 Ultra: Asynchronous Agentic RL, a Deterministic Indexer Top-k, Unified RLVR over Environments the Report Calls Open, and the Limits of MOPD</h1>
+  <p class="lede">Two 2026 reports describe agent-era post-training from opposite ends. GLM-5 runs reasoning, agentic and general RL in sequence, closes with on-policy distillation from its own earlier checkpoints, and found that a non-deterministic top-k kernel in its sparse-attention indexer broke RL within a few steps. Nemotron 3 Ultra runs one unified RLVR stage over fifteen environment groups, merges more than ten specialists by on-policy distillation, and states where that merge stops working. Afterwards you can say what each lab found that the other did not, which of their knobs are disclosed and which are not, and what to audit in an RL rollout path.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>50 min</b> read</span>
+    <span class="chip"><b>10</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 14</b>, <b>Module 17</b>, <b>Module 18</b>, <b>Module 22</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 350" role="img" aria-labelledby="f1t"><title id="f1t">GLM-5 and Nemotron 3 Ultra post-training as two lanes; orange marks the step where separately acquired skills are merged</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <text x="10" y="22" class="d-title d-bold">GLM-5: three RL stages in sequence, then distillation</text>
+    <rect x="10" y="34" width="140" height="64" rx="8" class="d-block-muted"/>
+    <text x="80" y="62" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+    <text x="80" y="82" text-anchor="middle" class="d-text-inv d-small">interleaved thinking</text>
+    <path d="M150,66 L166,66" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="166" y="34" width="140" height="64" rx="8" class="d-block-2"/>
+    <text x="236" y="62" text-anchor="middle" class="d-text-inv d-bold">Reasoning RL</text>
+    <text x="236" y="82" text-anchor="middle" class="d-text-inv d-small">GRPO + IcePop</text>
+    <path d="M306,66 L322,66" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="322" y="34" width="140" height="64" rx="8" class="d-block"/>
+    <text x="392" y="62" text-anchor="middle" class="d-text-inv d-bold">Agentic RL</text>
+    <text x="392" y="82" text-anchor="middle" class="d-text-inv d-small">asynchronous, 10K+ envs</text>
+    <path d="M462,66 L478,66" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="478" y="34" width="140" height="64" rx="8" class="d-block-2"/>
+    <text x="548" y="62" text-anchor="middle" class="d-text-inv d-bold">General RL</text>
+    <text x="548" y="82" text-anchor="middle" class="d-text-inv d-small">rules + ORM + GRM</text>
+    <path d="M618,66 L634,66" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="634" y="34" width="140" height="64" rx="8" class="d-block-accent"/>
+    <text x="704" y="62" text-anchor="middle" class="d-text-inv d-bold">Cross-stage OPD</text>
+    <text x="704" y="82" text-anchor="middle" class="d-text-inv d-small">own earlier checkpoints</text>
+    <text x="236" y="116" text-anchor="middle" class="d-small d-text-light">group 32, batch 32</text>
+    <text x="392" y="116" text-anchor="middle" class="d-small d-text-light">weights pushed every K</text>
+    <text x="704" y="116" text-anchor="middle" class="d-small d-text-light">group 1, batch 1,024</text>
+
+    <text x="10" y="156" class="d-title d-bold">Nemotron 3 Ultra: one RL stage, then ten-plus teachers merged</text>
+    <rect x="10" y="168" width="140" height="64" rx="8" class="d-block-muted"/>
+    <text x="80" y="196" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+    <text x="80" y="216" text-anchor="middle" class="d-text-inv d-small">general, two stages</text>
+    <path d="M150,200 L166,200" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="166" y="168" width="140" height="64" rx="8" class="d-block-2"/>
+    <text x="236" y="196" text-anchor="middle" class="d-text-inv d-bold">Unified RLVR</text>
+    <text x="236" y="216" text-anchor="middle" class="d-text-inv d-small">batch 8,192, 16 rollouts</text>
+    <path d="M306,200 L322,200" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="322" y="168" width="140" height="64" rx="8" class="d-block-muted"/>
+    <text x="392" y="196" text-anchor="middle" class="d-text-inv d-bold">MOPD warmup</text>
+    <text x="392" y="216" text-anchor="middle" class="d-text-inv d-small">light SFT, once</text>
+    <path d="M462,200 L478,200" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="478" y="168" width="140" height="64" rx="8" class="d-block-accent"/>
+    <text x="548" y="196" text-anchor="middle" class="d-text-inv d-bold">MOPD 1</text>
+    <text x="548" y="216" text-anchor="middle" class="d-text-inv d-small">1,024 prompts x 1</text>
+    <path d="M618,200 L634,200" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="634" y="168" width="140" height="64" rx="8" class="d-block-accent"/>
+    <text x="704" y="196" text-anchor="middle" class="d-text-inv d-bold">MOPD 2</text>
+    <text x="704" y="216" text-anchor="middle" class="d-text-inv d-small">teachers refreshed</text>
+    <rect x="206" y="272" width="488" height="56" rx="8" class="d-block-2"/>
+    <text x="450" y="296" text-anchor="middle" class="d-text-inv d-bold">More than ten specialist teachers</text>
+    <text x="450" y="315" text-anchor="middle" class="d-text-inv d-small">own SFT and RL pipelines, trained in parallel</text>
+    <path d="M548,272 L548,234" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M690,272 L690,234" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M504,234 L504,272" class="d-arrow d-dashed" marker-end="url(#f1-arr)"/>
+    <text x="498" y="258" text-anchor="end" class="d-small d-text-light">round 2 branches from MOPD 1</text>
+    <rect x="590" y="336" width="14" height="10" rx="2" class="d-block-accent"/>
+    <text x="610" y="346" class="d-small d-text-light">integration step</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The two recipes as lanes. GLM-5 sequences three RL stages and finishes with on-policy cross-stage distillation from the final checkpoints of earlier stages<a class="cite" href="#ref-1">1</a> (§1, Figure 5, §3.5). Nemotron 3 Ultra trains a student with SFT and unified RLVR, trains more than ten teachers separately, and merges them in two MOPD iterations after a light warmup SFT<a class="cite" href="#ref-2">2</a> (§3, Figures 9 and 10). Whether Ultra's 8,192 counts prompts or rollouts is not stated (Section 5.2); GLM-5's batch of 32 has no stated unit either.</figcaption>
+</figure>
+
+<h2 id="two-recipes">1. Two recipes, one frame</h2>
+<h3 id="two-recipes-reports">1.1 The reports and what they disclose</h3>
+<p>GLM-5 is a 744B-parameter mixture-of-experts model with 40B active, trained on 28.5T tokens and built on DeepSeek Sparse Attention (DSA)<a class="cite" href="#ref-1">1</a> (§1, §2.1). Its report is dated 17 Feb 2026, with v2 on 24 Feb 2026. Nemotron 3 Ultra is a 550B total, 55B active hybrid Mamba-attention mixture-of-experts model pre-trained on 20T tokens and posted 12 Jun 2026<a class="cite" href="#ref-2">2</a> (abstract). Ultra says its RL training "largely follows the asynchronous GRPO algorithm" with the stability optimizations of the Nemotron 3 Super report<a class="cite" href="#ref-2">2</a> (§3.2), so the algorithm's details are in Super<a class="cite" href="#ref-3">3</a> (§3.2.4), posted 14 Apr 2026. As of 2026-10-27 arXiv lists v2 as the latest GLM-5 version and v1 for both NVIDIA reports<a class="cite" href="#ref-4">4</a>.</p>
+<p>Neither report states a total RL budget in GPU-hours or FLOPs in the text searched, and neither tabulates its RL recipe against alternatives. GLM-5's one ablation section compares attention variants (§2.1.2); Ultra's ablations cover MOPD design (the warmup in Table 4, rollouts per prompt in §3.3.1, logit matching in §3.3.5) and the MTP draft length (Figure 12). That sets the evidential ceiling for everything below: two labs describing what they did and what they say worked.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> The two recipes by the same rows. "Not stated" means the sections named do not give it. Sources: GLM-5<a class="cite" href="#ref-1">1</a>, Nemotron 3 Ultra<a class="cite" href="#ref-2">2</a>, Nemotron 3 Super<a class="cite" href="#ref-3">3</a>.</caption>
+  <thead><tr><th>Row</th><th>GLM-5</th><th>Nemotron 3 Ultra</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Base model</td><td>744B total, 40B active; 28.5T tokens; DSA indexer with k = 2,048<a class="cite" href="#ref-1">1</a> (§1, §2.1, §3.2)</td><td>550B total, 55B active; 20T tokens; hybrid Mamba-attention<a class="cite" href="#ref-2">2</a> (abstract)</td></tr>
+    <tr><td class="row">Post-training order</td><td>Multi-task SFT; Reasoning RL; Agentic RL; General RL; on-policy cross-stage distillation<a class="cite" href="#ref-1">1</a> (§1, Figure 5)</td><td>SFT; unified RLVR; more than ten teachers trained separately; MOPD warmup; two MOPD iterations; MTP boosting<a class="cite" href="#ref-2">2</a> (Figures 9, 10)</td></tr>
+    <tr><td class="row">RL algorithm</td><td>Reasoning: GRPO with IcePop, no KL term, on-policy (§3.2). Agentic: group-wise objective with direct double-sided importance sampling (§4.1.2)<a class="cite" href="#ref-1">1</a></td><td>Asynchronous GRPO with the stability optimizations of Super<a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>; PPO-style clip around a proximal policy in MOPD<a class="cite" href="#ref-2">2</a> (§3.3.1)</td></tr>
+    <tr><td class="row">Group and batch</td><td>Reasoning: group 32, batch 32, unit of the batch not stated. Distillation: group 1, batch 1,024. Agentic: traces per problem and batch not stated<a class="cite" href="#ref-1">1</a></td><td>RLVR: global batch 8,192, 16 rollouts per sample, unit of 8,192 not stated. MOPD: 1,024 prompts, one rollout each<a class="cite" href="#ref-2">2</a> (§3.2, §3.3.1)</td></tr>
+    <tr><td class="row">Environments</td><td>More than 10,000 SWE environments, terminal tasks, multi-hop search, slide generation<a class="cite" href="#ref-1">1</a> (§4.2)</td><td>Fifteen groups from terminal use to structured outputs, with several harnesses per task family<a class="cite" href="#ref-2">2</a> (§3.2, Appendix A.2)</td></tr>
+    <tr><td class="row">Skill integration</td><td>Sequential stages, then distillation from the model's own earlier checkpoints<a class="cite" href="#ref-1">1</a></td><td>Unified RLVR first, then specialists as teachers<a class="cite" href="#ref-2">2</a></td></tr>
+  </tbody>
+</table>
+
+<h3 id="two-recipes-flags">1.2 Section map and flags</h3>
+<aside class="callout callout-note"><span class="callout-title">Where things are in the GLM-5 v2 text</span><p>§3 is post-training: §3.2 reasoning RL, §3.3 a one-paragraph summary of agentic RL that points to §4, §3.4 general RL, §3.5 on-policy cross-stage distillation, §3.6 the slime infrastructure. §4 is Agentic Engineering: §4.1 asynchronous RL (§4.1.1 design, §4.1.2 stability), §4.2 environment scaling (§4.2.1 SWE through §4.2.5 slide generation)<a class="cite" href="#ref-1">1</a>. Earlier modules cite §4.1, §4.1.2 and §4.2 (Modules 17 and 18) and §3 and §3.5 (Module 22). Checked against the cached v2 text, these citations are all consistent with it: the agentic mechanism is in §4.1, the environments in §4.2, the distillation in §3.5. A citation of §3.6 for distillation would be a misnumbering, since §3.6 describes slime. This module takes mechanism from §4.1 and treats the §3.3 summary as a pointer.</p></aside>
+<aside class="callout callout-warning"><span class="callout-title">Flags this module carries</span><p>Ultra's "global batch size of 8192, with each sample generating 16 rollouts" does not say whether 8,192 counts prompts or rollouts, so nothing here is multiplied out from it (Section 5.2). GLM-5's agentic clip bounds \(\epsilon_\ell\), \(\epsilon_h\), its staleness threshold \(\tau\) and its weight-push interval \(K\) are not stated (Section 4.3). Ultra's length-adjustment form on the medium-effort reward is not disclosed, and its Figure 11 reads as a token ratio near 2.9 and an index drop near 7 points against the text's "around 2.5X" and "approximately 7%" (Module 23 flags both). The map listed thirteen environment groups for Ultra; §3.2 lists fifteen (Section 5.3).</p></aside>
+
+<h2 id="glm5-stages">2. GLM-5: three RL stages and the distillation that closes them</h2>
+<h3 id="glm5-stages-sft">2.1 The SFT starting point</h3>
+<p>The RL stages start from a multi-task SFT model with a 202,752-token context and three thinking behaviors: interleaved thinking (reason before every response and tool call), preserved thinking (keep thinking blocks across turns in coding-agent use) and turn-level control of whether to think<a class="cite" href="#ref-1">1</a> (§3.1). One SFT detail anticipates the RL rules of Section 4: in coding and agent trajectories, "erroneous segments" are kept but masked out of the loss, which lets the model "learn error correction behaviors without reinforcing incorrect actions"<a class="cite" href="#ref-1">1</a> (§3.1).</p>
+
+<h3 id="glm5-stages-reasoning">2.2 Reasoning RL: GRPO, IcePop, no KL</h3>
+<p>Reasoning RL is GRPO with IcePop to handle the gap between the training policy \(\pi^{train}\) and the inference policy \(\pi^{infer}\), with the KL term removed "to accelerate RL improvement"<a class="cite" href="#ref-1">1</a> (§3.2). Per token:</p>
+$$\mathcal L(\theta)=-\,\mathbb E\Big[\tfrac1G\sum_{i=1}^{G}\tfrac1{|y_i|}\sum_{t=1}^{|y_i|}\mathrm{pop}\big(\rho_{i,t},\tfrac1\beta,\beta\big)\cdot\min\big(r_{i,t}\hat A_{i,t},\ \mathrm{clip}(r_{i,t},1-\epsilon_{low},1+\epsilon_{high})\hat A_{i,t}\big)\Big]$$
+<p>where \(\rho_{i,t}=\pi^{train}_{\theta_{old}}/\pi^{infer}_{\theta_{old}}\) is the train-to-inference ratio, \(r_{i,t}=\pi^{train}_{\theta}/\pi^{train}_{\theta_{old}}\) is the usual PPO ratio, \(\mathrm{pop}(\rho,1/\beta,\beta)\) equals \(\rho\) inside the band and \(0\) outside it, and \(\hat A_{i,t}\) is the group-normalized advantage with the standard-deviation division kept<a class="cite" href="#ref-1">1</a> (Eq. 1). The stated values are \(\beta=2\), \(\epsilon_{low}=0.2\), \(\epsilon_{high}=0.28\), group size 32 and batch size 32, "entirely on-policy". Module 12 (Section 5.2) places this mask among the other log-ratio gates; Module 14 covers where \(\rho\) comes from.</p>
+<p>Two readings of the numbers. With \(\beta=2\), a token receives no gradient when its train-to-inference probability ratio leaves \([0.5,\,2]\), that is when \(|\ln\rho|&gt;\ln 2=0.693\) (derived). And if each rollout batch feeds a single update, \(r_{i,t}=1\) exactly and the clip at 0.2 and 0.28 is idle, so the pop mask is the only guard against drift (my reading; the report does not give updates per batch or the unit of "batch size 32").</p>
+<p>The data side is prose only. Four domains are mixed, roughly balanced: mathematics, science, code and tool-integrated reasoning. Problems are those GLM-4.7 solves "only rarely or fails consistently" and stronger teachers can solve; domain-specific judges or evaluation systems return binary outcome rewards<a class="cite" href="#ref-1">1</a> (§3.2). The report claims "stable and significant gains in each domain" without printing them, and prints no run with the KL term kept (the KL question is Modules 6 and 13).</p>
+
+<h3 id="glm5-stages-general">2.3 General RL: three reward types and a human anchor</h3>
+<p>The third stage targets foundational correctness, emotional intelligence and task-specific quality with a hybrid of rule-based rewards, outcome reward models (ORMs) and generative reward models (GRMs). The report says ORMs give "low-variance signals and high training efficiency" but are "more susceptible to reward hacking", while GRMs are "more robust to such exploitation" but "exhibit higher variance"<a class="cite" href="#ref-1">1</a> (§3.4). It also adds expert human-written responses as "stylistic and qualitative anchors", on the stated observation that purely model-generated optimization converges toward "recognizably 'model-like' patterns". No reward weights, data sizes or hacking measurements appear in the section (judges are Module 16; the hacking taxonomy is Module 19).</p>
+
+<h3 id="glm5-stages-distill">2.4 Cross-stage distillation: the loss and what the report leaves out</h3>
+<p>GLM-5 ends with "on-policy cross-stage distillation as the final stage", because "sequentially optimizing for distinct objectives can lead to the cumulative degradation of previously acquired capabilities". The teachers are "the final checkpoints from the preceding training stages"; prompts are "sampled from the corresponding teachers' RL training sets and mixed in appropriate proportions"<a class="cite" href="#ref-1">1</a> (§3.5). The loss reuses Eq. 1 with the advantage replaced by a stop-gradient log-ratio (Eq. 2):</p>
+$$\hat A_{i,t}=\mathrm{sg}\Big[\log\frac{\pi^{infer}_{teacher}(y_{i,t}\mid x,y_{i,&lt;t})}{\pi^{train}_{\theta}(y_{i,t}\mid x,y_{i,&lt;t})}\Big]$$
+<p>Group size is set to 1 and batch size to 1,024 because "it is no longer necessary to maintain a large group of samples per prompt to estimate advantages; the advantage is computed directly from the gap with the teacher models instead". Teacher logits come from the inference engine; the authors plan to move the inference backend into the training engine and use the MQA mode of MLA for inference, so that \(\pi^{infer}\rightarrow\pi^{train}\)<a class="cite" href="#ref-1">1</a> (§3.5). The labels in Eq. 2 show why: the numerator is scored in the inference engine and the denominator in the training engine, so any engine mismatch enters the advantage as a bias indistinguishable from teacher-student gap (my reading; Module 14 gives the size of such gaps). Module 22 (Section 6.3) treats the objective itself.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 280" role="img" aria-labelledby="f2t"><title id="f2t">Cross-stage distillation in GLM-5: stage checkpoints act as teachers, the student samples its own rollouts, and the advantage is the teacher-student log-ratio</title>
+    <defs>
+      <marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <text x="10" y="20" class="d-title d-bold">Teachers: final checkpoint of each stage</text>
+    <rect x="10" y="38" width="150" height="40" rx="8" class="d-block-muted"/>
+    <text x="85" y="63" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+    <rect x="10" y="90" width="150" height="40" rx="8" class="d-block-2"/>
+    <text x="85" y="115" text-anchor="middle" class="d-text-inv d-bold">Reasoning RL</text>
+    <rect x="10" y="142" width="150" height="40" rx="8" class="d-outline d-dashed"/>
+    <text x="85" y="167" text-anchor="middle" class="d-bold">Agentic RL</text>
+    <rect x="10" y="194" width="150" height="40" rx="8" class="d-block-2"/>
+    <text x="85" y="219" text-anchor="middle" class="d-text-inv d-bold">General RL</text>
+    <rect x="250" y="38" width="180" height="56" rx="8" class="d-block"/>
+    <text x="340" y="62" text-anchor="middle" class="d-text-inv d-bold">Student rollout</text>
+    <text x="340" y="81" text-anchor="middle" class="d-text-inv d-small">y sampled, G = 1</text>
+    <rect x="250" y="136" width="180" height="70" rx="8" class="d-block-accent"/>
+    <text x="340" y="160" text-anchor="middle" class="d-text-inv d-bold">Teacher scoring</text>
+    <text x="340" y="179" text-anchor="middle" class="d-text-inv d-small">logits from inference</text>
+    <text x="340" y="195" text-anchor="middle" class="d-text-inv d-small">engine</text>
+    <rect x="480" y="86" width="140" height="64" rx="8" class="d-block-2"/>
+    <text x="550" y="112" text-anchor="middle" class="d-text-inv d-bold">Advantage</text>
+    <text x="550" y="132" text-anchor="middle" class="d-text-inv d-small">sg[log T - log S]</text>
+    <rect x="650" y="86" width="140" height="64" rx="8" class="d-block"/>
+    <text x="720" y="112" text-anchor="middle" class="d-text-inv d-bold">GRPO loss</text>
+    <text x="720" y="132" text-anchor="middle" class="d-text-inv d-small">batch 1,024</text>
+    <path d="M160,58 L250,152" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M160,110 L250,162" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M160,162 L250,172" class="d-arrow d-dashed" marker-end="url(#f2-arr)"/>
+    <path d="M160,214 L250,184" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M340,94 L340,136" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="348" y="120" class="d-small d-text-light">prefixes</text>
+    <path d="M430,66 L480,100" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M430,172 L480,136" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M620,118 L650,118" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M720,86 L720,58 L430,58" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+    <text x="580" y="52" text-anchor="middle" class="d-small d-text-light">update student</text>
+    <text x="10" y="262" class="d-small d-text-light">Dashed: no logits arrow in the report's Figure 5</text>
+    <text x="250" y="262" class="d-small d-text-light">T = teacher, S = student (training engine)</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Wiring of GLM-5's on-policy cross-stage distillation. The log-ratio advantage replaces the GRPO advantage in Eq. 1, with group size 1 and batch size 1,024<a class="cite" href="#ref-1">1</a> (§3.5, Eq. 2). The arrows from SFT, Reasoning RL and General RL follow the report's Figure 5; the absence of an arrow from Agentic RL is a reading of that figure, not a statement in the text. The teacher is scored in the inference engine and the student in the training engine; the report plans to unify them. The mix of prompts across teachers is not given.</figcaption>
+</figure>
+<p>What the report leaves out is the measurement. Its stated motive is cumulative degradation, yet the sections read print no before-and-after scores for this stage, no teacher count, and no statement of whether Agentic RL's skills reach the final model by distillation or only through General RL starting from the agentic checkpoint, which the "sequential" description implies (my reading). Ultra's analogous stage prints scores for every stage on eleven benchmarks (Section 6.3). Any comparison with GLM-5's distillation rests on the report's reasoning, not on a table.</p>
+
+<h2 id="indexer-topk">3. A top-k kernel as an RL hyperparameter</h2>
+<h3 id="indexer-topk-branch">3.1 A discrete branch inside attention</h3>
+<p>DSA adds a lightning indexer to attention. For a query token \(t\) it scores every preceding token \(s\) as \(I_{t,s}=\sum_{j=1}^{H^I} w^I_{t,j}\,\mathrm{ReLU}(\mathbf q^I_{t,j}\cdot\mathbf k^I_s)\), chosen for throughput and implementable in FP8; a selection step keeps the key-value entries with the top-\(k\) scores and attention runs over that set only<a class="cite" href="#ref-5">5</a> (§2.1, Eqs. 1-2). GLM-5 uses \(k=2{,}048\), with 32 indexer heads of dimension 128<a class="cite" href="#ref-1">1</a> (§3.2, Table 10). Selection is a discrete function of continuous scores: the attended set changes when two scores swap order. It is the same kind of branch as MoE routing and top-p truncation. If the rollout engine and the trainer disagree on the set, they compute different distributions for the same sampled tokens, and the mismatch of Module 14 appears with no optimizer update at all.</p>
+<p>DeepSeek-V3.2's answer to the two discrete branches it met was replay: Keep Routing reuses the sampling-time expert paths in training, and Keep Sampling Mask reuses the top-p and top-k truncation masks<a class="cite" href="#ref-5">5</a> (§3.1; Module 30 covers both). GLM-5 reports that for the indexer, replay is not the answer.</p>
+
+<h3 id="indexer-topk-report">3.2 What the report states</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> GLM-5's DSA finding, split into what §3.2 states and what it leaves out<a class="cite" href="#ref-1">1</a>. Quoted phrases are the report's.</caption>
+  <thead><tr><th>Stated</th><th>Not stated in the sections read</th></tr></thead>
+  <tbody>
+    <tr><td>The retrieved top-k results "are critical for RL stability", by analogy with MoE routing replay</td><td>Any measurement of how often the selected set differs between engines</td></tr>
+    <tr><td>Storing the indexer's indices at every token position is "clearly impractical": \(k=2048\) is "much larger than the k typically used in MoE", with "enormous storage costs" and "significant communication overhead" between engines</td><td>Byte counts for that storage or traffic (Section 3.4 derives them)</td></tr>
+    <tr><td>"[O]ther non-deterministic top-k operators (e.g., CUDA or TileLang implementations) caused drastic performance degradation during RL after only a few steps, accompanied by a sharp drop in entropy"</td><td>Step counts, reward or entropy curves, or which operators were tried beyond those two names</td></tr>
+    <tr><td>Naive <code>torch.topk</code> is "slightly slower but deterministic", gives "more consistent outputs" and "substantial RL gains"; it is the default top-k operator "in our training engine" in all RL stages</td><td>The size of the slowdown; the size of the gains; which top-k the rollout engine runs after the fix (the comparison names the CUDA operator in SGLang's DSA indexer)</td></tr>
+    <tr><td>The indexer parameters are frozen by default during RL "to accelerate training and prevent unstable learning in the indexer"</td><td>Any run with the indexer trained</td></tr>
+  </tbody>
+</table>
+<p>Two precision points. The fix is stated for the training engine; whether the SGLang rollout path was also changed is not said, so "deterministic top-k fixed the mismatch" should be read as the report's framing, with the operator on each side unspecified. And the report gives no mechanism for the failure. Module 14 (Figure 6) draws the qualitative curves the text describes and labels them a schematic; nothing below adds data to them.</p>
+
+<h3 id="indexer-topk-tie">3.3 Two candidate mechanisms (my inference)</h3>
+<p>Two mechanisms would explain a non-deterministic top-k hurting RL, and the report does not choose between them. First, a call-to-call difference inside one engine: when scores tie at the cut, a parallel selection kernel may return either tied token on different runs with identical inputs. The trainer's two forward passes at the same weights, the one that fixes \(\pi_{old}\) and the one that computes \(\pi_\theta\), can then disagree, so the ratio \(r\) that should be exactly 1 on the first update is not, and the clip and IcePop masks act at random. Second, a cross-engine difference: each engine may break ties, or round scores, differently, which is the \(\rho\) of Section 2.2 acting through the selected set. Ties are plausible after a ReLU with low-precision scores. For scale, DeepSeek-V4 (a different model and indexer) quantized its index scores from FP32 to BF16 and kept a 99.7% recall of the selected KV entries<a class="cite" href="#ref-6">6</a> (§5.2.1), so a small perturbation changes a fraction of a percent of entries. Figure 3 draws the tie case. A fixed batch scored twice under each operator, with the spread of \(\ln\rho\) and \(\ln r\) logged, would separate the mechanisms; the report shows none.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 290" role="img" aria-labelledby="f3t"><title id="f3t">A tie at the top-k boundary lets two calls with identical inputs select different tokens, giving different attended sets</title>
+    <defs>
+      <marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <text x="40" y="20" class="d-title d-bold">Indexer scores, one query, sorted</text>
+    <line x1="40" y1="230" x2="440" y2="230" class="d-axis"/>
+    <line x1="40" y1="40" x2="40" y2="230" class="d-axis"/>
+    <text x="30" y="46" text-anchor="end" class="d-small d-text-light">score</text>
+    <rect x="50" y="60" width="18" height="170" class="d-fill-blue"/>
+    <rect x="74" y="70" width="18" height="160" class="d-fill-blue"/>
+    <rect x="98" y="78" width="18" height="152" class="d-fill-blue"/>
+    <rect x="122" y="84" width="18" height="146" class="d-fill-blue"/>
+    <rect x="146" y="90" width="18" height="140" class="d-fill-blue"/>
+    <rect x="170" y="96" width="18" height="134" class="d-fill-blue"/>
+    <rect x="194" y="100" width="18" height="130" class="d-fill-blue"/>
+    <rect x="218" y="104" width="18" height="126" class="d-fill-blue"/>
+    <rect x="242" y="110" width="18" height="120" class="d-fill-orange"/>
+    <rect x="266" y="110" width="18" height="120" class="d-fill-orange"/>
+    <rect x="290" y="134" width="18" height="96" class="d-block-muted"/>
+    <rect x="314" y="142" width="18" height="88" class="d-block-muted"/>
+    <rect x="338" y="150" width="18" height="80" class="d-block-muted"/>
+    <rect x="362" y="160" width="18" height="70" class="d-block-muted"/>
+    <rect x="386" y="170" width="18" height="60" class="d-block-muted"/>
+    <rect x="410" y="180" width="18" height="50" class="d-block-muted"/>
+    <text x="251" y="248" text-anchor="middle" class="d-small d-mono">9</text>
+    <text x="275" y="248" text-anchor="middle" class="d-small d-mono">10</text>
+    <text x="263" y="100" text-anchor="middle" class="d-small d-bold">tie</text>
+    <text x="240" y="272" text-anchor="middle" class="d-small d-text-light">rank by score; k = 9 in this sketch (2,048 in GLM-5)</text>
+    <text x="500" y="20" class="d-title d-bold">Two calls, same input</text>
+    <text x="500" y="48" class="d-small d-bold">Call 1</text>
+    <rect x="500" y="56" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="524" y="56" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="548" y="56" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="572" y="56" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="596" y="56" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="620" y="56" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="644" y="56" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="668" y="56" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="692" y="56" width="20" height="20" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="702" y="71" text-anchor="middle" class="d-small d-mono">9</text>
+    <text x="500" y="108" class="d-small d-bold">Call 2</text>
+    <rect x="500" y="116" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="524" y="116" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="548" y="116" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="572" y="116" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="596" y="116" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="620" y="116" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="644" y="116" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="668" y="116" width="20" height="20" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="692" y="116" width="20" height="20" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="702" y="131" text-anchor="middle" class="d-small d-mono">10</text>
+    <path d="M714,66 L750,66" class="d-line d-stroke-orange"/>
+    <path d="M714,126 L750,126" class="d-line d-stroke-orange"/>
+    <path d="M750,66 L750,186 L716,186" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <rect x="500" y="164" width="212" height="44" rx="8" class="d-block-accent"/>
+    <text x="606" y="184" text-anchor="middle" class="d-text-inv d-bold">Different attended set</text>
+    <text x="606" y="201" text-anchor="middle" class="d-text-inv d-small">different log-probabilities</text>
+    <text x="500" y="236" class="d-small d-text-light">Illustration only: the report says "non-deterministic",</text>
+    <text x="500" y="252" class="d-small d-text-light">not that ties are the mechanism.</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Illustration of the tie hypothesis in Section 3.3 (my sketch, not data from the report). Scores at the cut are equal, so a selection kernel that does not fix its tie-break can return token 9 on one call and token 10 on another. GLM-5 reports the outcome of using non-deterministic CUDA and TileLang top-k operators, "drastic performance degradation during RL after only a few steps" with a sharp entropy drop<a class="cite" href="#ref-1">1</a> (§3.2), and gives no mechanism.</figcaption>
+</figure>
+
+<h3 id="indexer-topk-replay">3.4 Why replay was judged impractical: the arithmetic</h3>
+<p>The report calls replay impractical without giving sizes. They follow from printed quantities. Per token and per layer, MoE routing replay stores 8 expert ids (8 routed experts of 256, Table 10), while indexer replay stores 2,048 indices:</p>
+$$\frac{k}{k_{\mathrm{MoE}}}=\frac{2048}{8}=256\times$$
+<p>For a sequence of \(L=10^5\) tokens, with \(N_{idx}\) layers that each carry an indexer and \(b\) bytes per index,</p>
+$$S_{\mathrm{idx}}=L\,N_{idx}\,k\,b=10^{5}\cdot 78\cdot 2048\cdot 4\ \mathrm{B}\approx 63.9\ \mathrm{GB},\qquad S_{\mathrm{MoE}}=10^{5}\cdot 75\cdot 8\cdot 1\ \mathrm{B}=60\ \mathrm{MB}.$$
+<p>Packing each index into 18 bits (derived: \(2^{18}=262{,}144\) exceeds the 202,752-token context) gives 35.9 GB. The ratios to routing replay are about 1,065 times for int32 and 599 times packed. The assumptions: \(N_{idx}=78\), the 3 dense and 75 MoE layers of Table 10 (the text of §2.1 says 80 layers, while Table 10 lists those 78 plus one MTP layer), with an indexer in each. The second assumption is supported by the GLM-5 repository, whose README says GLM-5.2 introduces IndexShare, which "reuses the same indexer across every four sparse attention layers"<a class="cite" href="#ref-7">7</a>; there would be nothing to share if GLM-5 had one indexer in total. For scale, a 576-dimension latent KV entry (the MLA cache size §2.1 discusses) in BF16 is 1,152 B per token per layer, so the latent cache of the same sequence is about 9.0 GB (derived; the dtype is assumed), and the replay payload would be 4 to 7 times larger than the cache it describes. Sharing one selection across four layers would cut it about fourfold, to roughly 16 GB, still about 266 times the routing payload (my extrapolation from the README line).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 255" role="img" aria-labelledby="f4t"><title id="f4t">Derived storage to replay routing ids versus indexer indices for one 100,000-token sequence, on a log axis</title>
+    <text x="10" y="20" class="d-title d-bold">Replay payload per 100,000-token sequence</text>
+    <line x1="240" y1="34" x2="240" y2="205" class="d-grid"/>
+    <text x="240" y="222" text-anchor="middle" class="d-small d-mono">0.01</text>
+    <line x1="370" y1="34" x2="370" y2="205" class="d-grid"/>
+    <text x="370" y="222" text-anchor="middle" class="d-small d-mono">0.1</text>
+    <line x1="500" y1="34" x2="500" y2="205" class="d-grid"/>
+    <text x="500" y="222" text-anchor="middle" class="d-small d-mono">1</text>
+    <line x1="630" y1="34" x2="630" y2="205" class="d-grid"/>
+    <text x="630" y="222" text-anchor="middle" class="d-small d-mono">10</text>
+    <line x1="760" y1="34" x2="760" y2="205" class="d-grid"/>
+    <text x="760" y="222" text-anchor="middle" class="d-small d-mono">100</text>
+    <line x1="240" y1="205" x2="760" y2="205" class="d-axis"/>
+    <text x="230" y="66" text-anchor="end" class="d-bold">MoE routing ids</text>
+    <rect x="240" y="44" width="101" height="34" rx="3" class="d-fill-blue"/>
+    <text x="349" y="66" class="d-mono d-small">0.06 GB</text>
+    <text x="230" y="122" text-anchor="end" class="d-bold">Indexer, 18-bit packed</text>
+    <rect x="240" y="100" width="462" height="34" rx="3" class="d-fill-orange"/>
+    <text x="710" y="122" class="d-mono d-small">35.9 GB</text>
+    <text x="230" y="178" text-anchor="end" class="d-bold">Indexer, int32</text>
+    <rect x="240" y="156" width="495" height="34" rx="3" class="d-fill-orange"/>
+    <text x="743" y="178" class="d-mono d-small">63.9 GB</text>
+    <text x="500" y="242" text-anchor="middle" class="d-small d-text-light">GB per sequence (log axis)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Derived, not reported: bytes needed to replay the discrete selections of one 100,000-token sequence. Routing ids: 100,000 tokens × 75 MoE layers × 8 routed experts × 1 byte (256 experts fit in a byte). Indexer: 100,000 × 78 layers × 2,048 indices at 4 bytes (int32) or 18 bits (packed; 2<sup>18</sup> = 262,144 exceeds the 202,752-token context). Inputs: k = 2,048 (§3.2) and layer and expert counts (Table 10) of the GLM-5 report<a class="cite" href="#ref-1">1</a>; one indexer per layer is an assumption (Section 3.4). The ratios are about 1,065× (int32) and 599× (packed).</figcaption>
+</figure>
+
+<aside class="callout callout-tip"><span class="callout-title">In practice: a checklist for every discrete branch in the rollout path</span><p>My checklist, built from this section and Module 14, not a procedure from either report. (1) List each data-dependent discrete choice between the weights and the sampled token: the indexer's top-k, the router's top-k, top-p and top-k truncation, speculative-decoding acceptance. (2) Test each for call-to-call determinism on identical inputs, in both engines. (3) Compare tie-breaking and score precision across engines. (4) Log the spread of \(\ln\rho\) and \(\ln r\) on a fixed batch before and after any kernel swap. (5) Where replay costs more than the data it protects, as here, fix the operator instead of the data.</p></aside>
+
+<h2 id="glm5-agentic">4. GLM-5 agentic RL: asynchrony as a set of hygiene rules</h2>
+<h3 id="glm5-agentic-objective">4.1 The objective and what it ignores</h3>
+<p>For each problem \(x\), GLM-5 samples \(K\) agent traces from the previous policy and optimizes a group-wise objective whose advantage is the trace reward minus the group mean reward, \(r(x,y_i)-\bar r(x)\); "only model-generated tokens are used for optimization, and the environment feedback is ignored in loss computation"<a class="cite" href="#ref-1">1</a> (§4.1). Unlike the reasoning loss of Section 2.2, the printed agentic advantage has no standard-deviation division (Module 11 covers the choice), and the printed objective carries only the advantage term; the policy term arrives in Eq. 3 below. The report uses \(K\) both for traces per problem and for the weight-push interval below; neither value is given. Module 18 covers the masking of environment tokens and the multi-turn credit problem; this section is about what the report builds around the objective so that a learner can be fed by long, uneven rollouts.</p>
+
+<h3 id="glm5-agentic-loop">4.2 The loop, one stage at a time</h3>
+<p>Synchronous RL "suffers from severe GPU idle time during long-horizon agent rollouts"<a class="cite" href="#ref-1">1</a> (§3.3), so the report decouples the engines onto different GPUs. The inference engine generates continuously; once the number of trajectories reaches a threshold, the batch goes to the trainer. Figure 5 steps through it.</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 295" role="img" aria-labelledby="f5t"><title id="f5t">GLM-5's asynchronous agentic RL loop: task services, orchestrator, token-in-token-out gateway, inference engines, filtered buffer, trainer, and weight push</title>
+      <defs>
+        <marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+        <marker id="f5-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+      </defs>
+      <rect x="10" y="36" width="150" height="60" rx="8" class="d-surface"/>
+      <text x="85" y="62" text-anchor="middle" class="d-bold">Task services</text>
+      <text x="85" y="80" text-anchor="middle" class="d-small d-text-light">SWE, terminal, search</text>
+      <rect x="190" y="36" width="160" height="60" rx="8" class="d-surface"/>
+      <text x="270" y="62" text-anchor="middle" class="d-bold">Orchestrator</text>
+      <text x="270" y="80" text-anchor="middle" class="d-small d-text-light">multi-task, server-based</text>
+      <rect x="390" y="36" width="150" height="60" rx="8" class="d-surface"/>
+      <text x="465" y="62" text-anchor="middle" class="d-bold">TITO gateway</text>
+      <text x="465" y="80" text-anchor="middle" class="d-small d-text-light">token IDs in and out</text>
+      <rect x="580" y="36" width="210" height="60" rx="8" class="d-surface"/>
+      <text x="685" y="62" text-anchor="middle" class="d-bold">Inference engines</text>
+      <text x="685" y="80" text-anchor="middle" class="d-small d-text-light">continuous generation</text>
+      <rect x="580" y="190" width="210" height="50" rx="8" class="d-surface"/>
+      <text x="685" y="220" text-anchor="middle" class="d-bold">Buffer and filters</text>
+      <rect x="360" y="190" width="180" height="50" rx="8" class="d-surface"/>
+      <text x="450" y="220" text-anchor="middle" class="d-bold">Trainer</text>
+      <g data-step="1">
+        <path d="M160,66 L190,66" class="d-arrow" marker-end="url(#f5-arr)"/>
+        <path d="M350,66 L390,66" class="d-arrow" marker-end="url(#f5-arr)"/>
+        <text x="270" y="114" text-anchor="middle" class="d-small">per-task ratio, speed</text>
+        <text x="270" y="130" text-anchor="middle" class="d-small">over 1k concurrent rollouts</text>
+      </g>
+      <g data-step="1-1"><rect x="190" y="36" width="160" height="60" rx="8" class="d-outline d-stroke-orange" style="stroke-width:3"/></g>
+      <g data-step="2">
+        <path d="M540,66 L580,66" class="d-arrow" marker-end="url(#f5-arr)"/>
+        <text x="465" y="114" text-anchor="middle" class="d-small">records token IDs</text>
+        <text x="465" y="130" text-anchor="middle" class="d-small">rollout ID to one DP rank</text>
+      </g>
+      <g data-step="2-2"><rect x="390" y="36" width="150" height="60" rx="8" class="d-outline d-stroke-orange" style="stroke-width:3"/></g>
+      <g data-step="3">
+        <path d="M685,96 L685,190" class="d-arrow" marker-end="url(#f5-arr)"/>
+        <text x="695" y="150" class="d-small">batch at threshold</text>
+        <text x="685" y="262" text-anchor="middle" class="d-small">drop: version gap above tau</text>
+        <text x="685" y="278" text-anchor="middle" class="d-small">drop: sandbox failures</text>
+      </g>
+      <g data-step="3-3"><rect x="580" y="190" width="210" height="50" rx="8" class="d-outline d-stroke-orange" style="stroke-width:3"/></g>
+      <g data-step="4">
+        <path d="M580,215 L540,215" class="d-arrow" marker-end="url(#f5-arr)"/>
+        <text x="450" y="262" text-anchor="middle" class="d-small">mask outside the band</text>
+        <text x="450" y="278" text-anchor="middle" class="d-small">ratio uses rollout log-probs</text>
+      </g>
+      <g data-step="4-4"><rect x="360" y="190" width="180" height="50" rx="8" class="d-outline d-stroke-orange" style="stroke-width:3"/></g>
+      <g data-step="5">
+        <path d="M540,194 L596,98" class="d-arrow-active" marker-end="url(#f5-arr2)"/>
+        <text x="526" y="166" text-anchor="end" class="d-small d-bold">weights every K updates</text>
+        <text x="526" y="182" text-anchor="end" class="d-small d-bold">optimizer reset</text>
+      </g>
+      <g data-step="5-5"><rect x="580" y="36" width="210" height="60" rx="8" class="d-outline d-stroke-orange" style="stroke-width:3"/></g>
+    </svg>
+    <figcaption><b>Figure 5.</b> GLM-5's asynchronous agentic RL loop, stepped through. Components and rules from §4.1.1 and §4.1.2 of the report<a class="cite" href="#ref-1">1</a>; the values of \(K\), \(\tau\), \(\epsilon_\ell\) and \(\epsilon_h\) are not stated. The drawn layout is mine.</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><b>Register and balance.</b> Each task is a microservice with its own rollout and reward logic, registered with the orchestrator, which sets the per-task rollout ratio and generation speed and standardizes every trajectory into one message-list format. The report cites more than 1,000 concurrent rollouts.</li>
+    <li><b>Record the tokens.</b> The TITO gateway intercepts every generation request and stores token IDs and metadata, so the learner never re-tokenizes text. Requests from one rollout are hashed to one data-parallel rank so the shared prefix hits the KV cache.</li>
+    <li><b>Filter the batch.</b> Once enough trajectories exist the batch moves on. A sample is dropped if its oldest weight version is more than \(\tau\) behind the current one, or if its sandbox failed; a group with more than half valid samples is padded by repeating them, otherwise dropped.</li>
+    <li><b>Update with a double-sided mask.</b> The ratio is the current policy over the logged rollout probability; tokens outside \([1-\epsilon_\ell,\,1+\epsilon_h]\) get no gradient; no old-policy checkpoints are tracked.</li>
+    <li><b>Push the weights.</b> Every \(K\) gradient updates the weights return to the inference engines and the optimizer is reset, because the new weights pose a different optimization problem.</li>
+  </ol>
+</div>
+
+<p>Module 14 (Section 2.5) explains why the token-in-token-out gateway matters, and Module 18 (Section 4) why a trajectory spanning several weight versions needs per-token behavior probabilities. The point of this section is the combination, written as a ledger of the knobs and which of them the report gives.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 3.</b> GLM-5's agentic-RL mechanisms, the failure each targets, and whether the value is printed<a class="cite" href="#ref-1">1</a> (§4.1.1, §4.1.2, §3.6.2).</caption>
+  <thead><tr><th>Mechanism</th><th>Failure it targets</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Weight push every \(K\) updates, optimizer reset</td><td>Policy lag; the new weights pose a different optimization problem</td><td>\(K\) not stated</td></tr>
+    <tr><td class="row">TITO gateway</td><td>Re-tokenization changes boundaries, whitespace, truncation or special tokens and misaligns actions and advantages</td><td>No measurement</td></tr>
+    <tr><td class="row">Direct double-sided importance sampling</td><td>Tracking \(\pi_{old}\) across many weight versions per trajectory is "computationally prohibitive"</td><td>\(\epsilon_\ell\), \(\epsilon_h\) not stated</td></tr>
+    <tr><td class="row">Stale-sample drop: discard if \(w'-w_0&gt;\tau\)</td><td>Overlong trajectories "become highly off-policy"</td><td>\(\tau\) not stated</td></tr>
+    <tr><td class="row">Environment-failure drop; pad the group if more than half is valid, else drop it</td><td>Sandbox crashes unrelated to the model add reward noise</td><td>Threshold stated: half the group</td></tr>
+    <tr><td class="row">DP-aware routing by consistent hashing</td><td>Repeated prefill across data-parallel ranks in multi-turn rollouts</td><td>No speedup printed</td></tr>
+    <tr><td class="row">Orchestrator ratios and speeds</td><td>Heterogeneous tools and rollout times across tasks</td><td>Over 1k concurrent rollouts</td></tr>
+    <tr><td class="row">Tail-latency stack in slime: multi-node serving (EP64, DP64 over 8 nodes), FP8 rollouts, MTP, prefill-decode disaggregation, heartbeat fault tolerance</td><td>One straggler stalls the step</td><td>Configurations named, no latency numbers</td></tr>
+  </tbody>
+</table>
+
+<h3 id="glm5-agentic-eq3">4.3 What Eq. 3 optimizes</h3>
+<p>The report writes the token-level objective as \(L(\theta)=\mathbb E_t[f(r_t(\theta),\epsilon_\ell,\epsilon_h)\,\hat A_t\log\pi_\theta(a_t\mid s_t)]\) with \(r_t=\exp(\log\pi_\theta-\log\pi_{rollout})\) and \(f(x)=x\) for \(1-\epsilon_\ell&lt;x&lt;1+\epsilon_h\), else 0<a class="cite" href="#ref-1">1</a> (§4.1.2, Eqs. 3-5). It prints no stop-gradient on \(f\). Read as a constant weight, as Module 12 does, the gradient is</p>
+$$\nabla_\theta L=\mathbb E_t\Big[\mathbb 1\{1-\epsilon_\ell&lt;r_t&lt;1+\epsilon_h\}\;r_t\,\hat A_t\,\nabla_\theta\log\pi_\theta\Big]=\mathbb E_t\Big[\mathbb 1\{\cdot\}\,\hat A_t\,\frac{\nabla_\theta\pi_\theta(a_t\mid s_t)}{\pi_{rollout}(a_t\mid s_t)}\Big],$$
+<p>the off-policy policy gradient with the logged rollout probability as behavior policy, restricted to in-band tokens. Because \(\pi_{rollout}\) is whatever the engine held when it sampled each token, one stored number per token serves however many weight versions a trajectory crossed. The report says reusing rollout log-probabilities "accepts a controlled degree of off-policy bias" to avoid historical tracking and that this improves stability; it prints no comparison against tracking \(\pi_{old}\).</p>
+
+<h3 id="glm5-agentic-envs">4.4 Environments, in four lines</h3>
+<p>Module 17 covers construction and validity checks; the sizes the report prints are these. SWE: more than 10,000 verifiable environments across thousands of repositories and nine languages, with fail-to-pass and pass-to-pass tests extracted by LLM-written log parsers (§4.2.1). Terminal: thousands of Harbor-format tasks with Docker construction accuracy "exceeding 90%" (§4.2.2). Search: a web knowledge graph over more than two million pages, and a filter that removes any question a tool-free reasoning model answers in at least one of eight attempts (§4.2.3). Slides: a three-level HTML reward whose renderer was patched after reward hacking, with 16:9 compliance rising from 40% to 92% (§4.2.5; Module 19, Section 4.3)<a class="cite" href="#ref-1">1</a>. The report also describes a keep-recent-\(k\) context rule for search agents (\(k=5\), BrowseComp from 55.3% to 62.0%) in its inference section (§4.2.4); whether training rollouts used it is not stated.</p>
+
+<h2 id="ultra-rlvr">5. Nemotron 3 Ultra: one unified RLVR stage</h2>
+<h3 id="ultra-rlvr-lineage">5.1 From Super to Ultra: two RL stages become teacher recipes</h3>
+<p>Ultra's post-training is "substantially redesigned from the pipeline used for Nemotron 3 Super"<a class="cite" href="#ref-2">2</a> (§3). Super ran three RL stages after SFT, multi-environment RLVR, a separate end-to-end SWE-RL stage and RLHF, then healed its MTP heads<a class="cite" href="#ref-3">3</a> (§3.2). It split SWE-RL out because "SWE rollouts are substantially slower to generate and typically require longer context lengths, creating a throughput bottleneck when co-trained with shorter-horizon environments". Ultra keeps the unified first stage. The other two stages survive as teacher recipes: its SWE teacher ends in end-to-end SWE-RL, and its chat teacher is trained by RLHF against a generative reward model<a class="cite" href="#ref-2">2</a> (§3.3.2). The mapping is my reading; the report does not draw it. The rollout-heterogeneity problem behind Super's separate stage returns as Ultra's stated limit in Section 6.4.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> The RL stage of Nemotron 3 Super and Nemotron 3 Ultra by the same rows. Sources: Super<a class="cite" href="#ref-3">3</a>, Ultra<a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th>Row</th><th>Nemotron 3 Super (14 Apr 2026)</th><th>Nemotron 3 Ultra (12 Jun 2026)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">RL stages after SFT</td><td>Multi-environment RLVR; end-to-end SWE-RL; RLHF; MTP healing (§3.2)</td><td>Unified RLVR, then MOPD over teachers whose recipes include SWE-RL and RLHF (§3.2, §3.3)</td></tr>
+    <tr><td class="row">Environments</td><td>21 environments, 37 datasets (§3.2.1)</td><td>Fifteen groups; environment count not stated (§3.2)</td></tr>
+    <tr><td class="row">Per step</td><td>256 prompts, 16 responses per prompt, batch 4,096, one gradient update per rollout (§3.2.4)</td><td>Global batch 8,192, 16 rollouts per sample, unit of 8,192 not stated (§3.2)</td></tr>
+    <tr><td class="row">Maximum generation</td><td>49K tokens, later 64K (§3.2.4)</td><td>48K tokens, later 64K (§3.2); 48 × 1,024 = 49,152, so probably the same value (my reading)</td></tr>
+    <tr><td class="row">Effort mode in RL</td><td>Low-effort on 2% of RL prompts, later 1%; reward depends on correctness and token count (§3.2.1)</td><td>Medium-effort on about 2.5% of RLVR prompts; length-based reward adjustment, form not disclosed (§3.5)</td></tr>
+    <tr><td class="row">SWE harnesses</td><td>OpenHands loop with OpenCode and Codex agent classes that imitate Claude Code and Codex CLI tool formats (§3.2.2)</td><td>At least two of six harness families per task vertical (Appendix A.2)</td></tr>
+  </tbody>
+</table>
+
+<h3 id="ultra-rlvr-algorithm">5.2 The algorithm, and a batch whose unit is not stated</h3>
+<p>Super's algorithm section is the specification Ultra points to. Training and inference run on separate GPUs; workers fill a rollout buffer; a batch trains once enough trajectories exist, "a single gradient update per rollout"; updated weights are pushed "as soon as a new model version is available", so one trajectory can hold tokens from different versions and the KV cache is not recomputed after an update; workers stay "at most one step behind"; and "we mask the importance sampling ratio computed from the training and inference logprobs"<a class="cite" href="#ref-3">3</a> (§3.2.4, §3.2.5). Ultra's MOPD loss names the same masking "IcePop strategy"<a class="cite" href="#ref-2">2</a> (§3.3.1), which is what GLM-5's reasoning stage uses (Section 2.2). Two labs and three reports therefore converge on masking tokens whose train-to-inference ratio leaves a band (Module 14 covers the design space). Neither NVIDIA report prints the band in the sections read.</p>
+<aside class="callout callout-warning"><span class="callout-title">The unit of "global batch 8192"</span><p>Ultra's §3.2 says "a global batch size of 8192, with each sample generating 16 rollouts". It does not say whether 8,192 counts prompts or rollouts, and this module derives no per-step prompt or rollout count from it. Nearby text suggests a convention without stating it for this run. Super prints 256 prompts per step, 16 responses per prompt and a batch size of 4,096, and 256 × 16 = 4,096 (derived)<a class="cite" href="#ref-3">3</a>. Ultra's STEM-teacher RL "use[s] a smaller number of prompts per batch (128) and a resultant smaller global batch size (2048)", and 128 × 16 = 2,048 (derived)<a class="cite" href="#ref-2">2</a> (§3.3.2). In both, the batch figure equals prompts times 16, which reads as a global batch that counts rollouts. That is a pattern across two printed pairs, not a statement about §3.2. GLM-5's reasoning RL has the mirror problem: "a group size of 32 and a batch size of 32", with no unit<a class="cite" href="#ref-1">1</a> (§3.2).</p></aside>
+
+<h3 id="ultra-rlvr-harness">5.3 Fifteen environment groups and several harnesses</h3>
+<p>The unified stage spans "terminal usage, office and productivity workflows, software engineering, search, general tool-calling, math, code, STEM, safety, chat, instruction following, long-context QA, inductive and transductive reasoning, structured outputs, and general model usability": fifteen groups by my count<a class="cite" href="#ref-2">2</a> (§3.2). For harness-based environments the training data use "a diverse collection of harness implementations and interaction formats", to reduce "overfitting to any particular harness design". The report profiles rewards before training and takes its mixture and curriculum from "the Gaussian-based approach introduced in NVIDIA (2025b)", an earlier report I did not read; Super describes dropping prompts the SFT model answers correctly "consistently" and sorting the rest by difficulty<a class="cite" href="#ref-3">3</a> (§3.2.1). Appendix A.2 sorts the task distributions into five verticals (terminal use and software engineering, bug fixing in existing repositories, office productivity, general knowledge, search) and trains each under at least two of Stirrup, OpenHands, OpenCode, Terminus, Droid and internal harnesses<a class="cite" href="#ref-2">2</a>; which harnesses serve which vertical is not stated. Module 17 covers the environment library.</p>
+<p>The same appendix prints the only per-harness numbers, as the cell labels of Figure 17. Table 5 transcribes them from a 400 dpi crop; the printed Avg column reproduces from the seven cells in all six rows (derived).</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 5.</b> Accuracy (%) by agent harness, from Figure 17 of the Nemotron 3 Ultra report<a class="cite" href="#ref-2">2</a> (Appendix A.2). Top block: SWE-bench Verified. Bottom block: Terminal-Bench 2.1, whose first column is Terminus 2.0.0 instead of Mini SWE Agent 2.3.0. GLM-5.1 and Kimi K2.6 are the report's comparison models. Highlighted cells are the best in their column; Ultra's lowest cells are marked as worst.</caption>
+  <thead><tr><th>Model</th><th class="num">Mini SWE / Terminus</th><th class="num">OpenCode</th><th class="num">Pi</th><th class="num">Claude</th><th class="num">Hermes</th><th class="num">OpenHands</th><th class="num">Codex</th><th class="num">Avg</th></tr></thead>
+  <tbody>
+    <tr><td class="row" colspan="9">SWE-bench Verified</td></tr>
+    <tr><td class="row">GLM-5.1</td><td class="num" data-best>71.3</td><td class="num" data-best>74.8</td><td class="num" data-best>74.4</td><td class="num" data-best>74.4</td><td class="num" data-best>74.5</td><td class="num" data-best>73.7</td><td class="num" data-best>73.6</td><td class="num" data-best>73.8</td></tr>
+    <tr><td class="row">Kimi K2.6</td><td class="num">70.7</td><td class="num">71.1</td><td class="num">73.7</td><td class="num">74.2</td><td class="num">72.5</td><td class="num">73.3</td><td class="num">65.8</td><td class="num">71.6</td></tr>
+    <tr><td class="row">Nemotron 3 Ultra</td><td class="num">65.0</td><td class="num">67.3</td><td class="num">70.4</td><td class="num">60.3</td><td class="num">69.9</td><td class="num">70.3</td><td class="num" data-worst>21.1</td><td class="num">60.6</td></tr>
+    <tr><td class="row" colspan="9">Terminal-Bench 2.1</td></tr>
+    <tr><td class="row">GLM-5.1</td><td class="num">59.3</td><td class="num" data-best>61.8</td><td class="num" data-best>61.4</td><td class="num">51.9</td><td class="num" data-best>71.3</td><td class="num">55.5</td><td class="num" data-best>51.2</td><td class="num" data-best>58.9</td></tr>
+    <tr><td class="row">Kimi K2.6</td><td class="num" data-best>67.2</td><td class="num">51.7</td><td class="num">58.0</td><td class="num" data-best>57.5</td><td class="num">61.4</td><td class="num" data-best>63.8</td><td class="num">48.3</td><td class="num">58.3</td></tr>
+    <tr><td class="row">Nemotron 3 Ultra</td><td class="num">55.1</td><td class="num">46.7</td><td class="num">52.1</td><td class="num">47.2</td><td class="num">52.8</td><td class="num">52.6</td><td class="num" data-worst>35.5</td><td class="num">48.9</td></tr>
+  </tbody>
+</table>
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f6t"><title id="f6t">Per-harness scores of GLM-5.1, Kimi K2.6 and Nemotron 3 Ultra on SWE-bench Verified and Terminal-Bench 2.1, one dot per harness</title>
+    <text x="110" y="32" class="d-title d-bold">SWE-bench Verified</text>
+    <line x1="110.0" y1="48" x2="110.0" y2="236" class="d-grid"/>
+    <text x="110.0" y="254" text-anchor="middle" class="d-small d-mono">20</text>
+    <line x1="155.0" y1="48" x2="155.0" y2="236" class="d-grid"/>
+    <text x="155.0" y="254" text-anchor="middle" class="d-small d-mono">30</text>
+    <line x1="200.0" y1="48" x2="200.0" y2="236" class="d-grid"/>
+    <text x="200.0" y="254" text-anchor="middle" class="d-small d-mono">40</text>
+    <line x1="245.0" y1="48" x2="245.0" y2="236" class="d-grid"/>
+    <text x="245.0" y="254" text-anchor="middle" class="d-small d-mono">50</text>
+    <line x1="290.0" y1="48" x2="290.0" y2="236" class="d-grid"/>
+    <text x="290.0" y="254" text-anchor="middle" class="d-small d-mono">60</text>
+    <line x1="335.0" y1="48" x2="335.0" y2="236" class="d-grid"/>
+    <text x="335.0" y="254" text-anchor="middle" class="d-small d-mono">70</text>
+    <line x1="380.0" y1="48" x2="380.0" y2="236" class="d-grid"/>
+    <text x="380.0" y="254" text-anchor="middle" class="d-small d-mono">80</text>
+    <line x1="110" y1="236" x2="380" y2="236" class="d-axis"/>
+    <text x="102" y="100" text-anchor="end" class="d-bold">GLM-5.1</text>
+    <line x1="340.9" y1="96" x2="356.6" y2="96" class="d-axis"/>
+    <circle cx="340.9" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="356.6" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="354.8" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="354.8" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="355.3" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="351.6" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="351.2" cy="96" r="5" class="d-fill-blue"/>
+    <text x="340.9" y="118" text-anchor="middle" class="d-small d-mono">Mini SWE 71.3</text>
+    <text x="356.6" y="84" text-anchor="middle" class="d-small d-mono">OpenCode 74.8</text>
+    <text x="102" y="154" text-anchor="end" class="d-bold">Kimi K2.6</text>
+    <line x1="316.1" y1="150" x2="353.9" y2="150" class="d-axis"/>
+    <circle cx="338.2" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="339.9" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="351.6" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="353.9" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="346.3" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="349.9" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="316.1" cy="150" r="5" class="d-fill-cyan"/>
+    <text x="316.1" y="172" text-anchor="middle" class="d-small d-mono">Codex 65.8</text>
+    <text x="353.9" y="138" text-anchor="middle" class="d-small d-mono">Claude 74.2</text>
+    <text x="102" y="208" text-anchor="end" class="d-bold">Ultra</text>
+    <line x1="115.0" y1="204" x2="336.8" y2="204" class="d-axis"/>
+    <circle cx="312.5" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="322.9" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="336.8" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="291.4" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="334.6" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="336.4" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="115.0" cy="204" r="5" class="d-fill-orange"/>
+    <text x="115.0" y="226" text-anchor="start" class="d-small d-mono">Codex 21.1</text>
+    <text x="336.8" y="192" text-anchor="middle" class="d-small d-mono">Pi 70.4</text>
+    <text x="245" y="280" text-anchor="middle" class="d-small d-text-light">score (%)</text>
+    <text x="500" y="32" class="d-title d-bold">Terminal-Bench 2.1</text>
+    <line x1="500.0" y1="48" x2="500.0" y2="236" class="d-grid"/>
+    <text x="500.0" y="254" text-anchor="middle" class="d-small d-mono">20</text>
+    <line x1="545.0" y1="48" x2="545.0" y2="236" class="d-grid"/>
+    <text x="545.0" y="254" text-anchor="middle" class="d-small d-mono">30</text>
+    <line x1="590.0" y1="48" x2="590.0" y2="236" class="d-grid"/>
+    <text x="590.0" y="254" text-anchor="middle" class="d-small d-mono">40</text>
+    <line x1="635.0" y1="48" x2="635.0" y2="236" class="d-grid"/>
+    <text x="635.0" y="254" text-anchor="middle" class="d-small d-mono">50</text>
+    <line x1="680.0" y1="48" x2="680.0" y2="236" class="d-grid"/>
+    <text x="680.0" y="254" text-anchor="middle" class="d-small d-mono">60</text>
+    <line x1="725.0" y1="48" x2="725.0" y2="236" class="d-grid"/>
+    <text x="725.0" y="254" text-anchor="middle" class="d-small d-mono">70</text>
+    <line x1="770.0" y1="48" x2="770.0" y2="236" class="d-grid"/>
+    <text x="770.0" y="254" text-anchor="middle" class="d-small d-mono">80</text>
+    <line x1="500" y1="236" x2="770" y2="236" class="d-axis"/>
+    <text x="492" y="100" text-anchor="end" class="d-bold">GLM-5.1</text>
+    <line x1="640.4" y1="96" x2="730.9" y2="96" class="d-axis"/>
+    <circle cx="676.8" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="688.1" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="686.3" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="643.5" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="730.9" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="659.8" cy="96" r="5" class="d-fill-blue"/>
+    <circle cx="640.4" cy="96" r="5" class="d-fill-blue"/>
+    <text x="640.4" y="118" text-anchor="middle" class="d-small d-mono">Codex 51.2</text>
+    <text x="730.9" y="84" text-anchor="middle" class="d-small d-mono">Hermes 71.3</text>
+    <text x="492" y="154" text-anchor="end" class="d-bold">Kimi K2.6</text>
+    <line x1="627.4" y1="150" x2="712.4" y2="150" class="d-axis"/>
+    <circle cx="712.4" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="642.7" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="671.0" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="668.8" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="686.3" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="697.1" cy="150" r="5" class="d-fill-cyan"/>
+    <circle cx="627.4" cy="150" r="5" class="d-fill-cyan"/>
+    <text x="627.4" y="172" text-anchor="middle" class="d-small d-mono">Codex 48.3</text>
+    <text x="712.4" y="138" text-anchor="middle" class="d-small d-mono">Terminus 67.2</text>
+    <text x="492" y="208" text-anchor="end" class="d-bold">Ultra</text>
+    <line x1="569.8" y1="204" x2="658.0" y2="204" class="d-axis"/>
+    <circle cx="658.0" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="620.1" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="644.5" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="622.4" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="647.6" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="646.7" cy="204" r="5" class="d-fill-orange"/>
+    <circle cx="569.8" cy="204" r="5" class="d-fill-orange"/>
+    <text x="569.8" y="226" text-anchor="middle" class="d-small d-mono">Codex 35.5</text>
+    <text x="658.0" y="192" text-anchor="middle" class="d-small d-mono">Terminus 55.1</text>
+    <text x="635" y="280" text-anchor="middle" class="d-small d-text-light">score (%)</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Each dot is one agent harness; the labelled dots are the lowest and highest per model. Values were read from the cell labels of Figure 17 in the Nemotron 3 Ultra report<a class="cite" href="#ref-2">2</a> (Appendix A.2, page 65) at 400 dpi; the printed Avg column reproduces from the seven cells in all six rows. "Ultra" is Nemotron 3 Ultra; GLM-5.1 and Kimi K2.6 are the comparison models in that figure, not the GLM-5 of the GLM-5 report. On SWE-bench Verified Ultra's range is 49.3 points (10.1 without the Codex harness), against 3.5 for GLM-5.1; on Terminal-Bench 2.1 all three models span 19 to 20 points.</figcaption>
+</figure>
+
+<p>Three observations, all derived from the table. First, Ultra is below both comparison models in every one of the 14 cells: by 3.4 to 52.5 points against GLM-5.1 on SWE-bench Verified and 2.9 to 18.5 on Terminal-Bench 2.1. The introduction claims "on-par accuracy across a wide range of agentic and reasoning benchmarks" at 5.9 times GLM-5.1's throughput<a class="cite" href="#ref-2">2</a> (§1); that is a claim about a suite and a throughput point, and Figure 17 is the same report's finer view. Second, harness spread is large: 19 to 20 points for every model on Terminal-Bench 2.1, and for Ultra on SWE-bench Verified a range of 49.3 points of which the Codex harness (21.1) contributes 39.2. The report gives no reason. Third, membership in the training list does not sort the scores. Pi, which no training list in the sections read names, is Ultra's best SWE-bench Verified cell (70.4), above OpenHands (70.3) and OpenCode (67.3), both named in Appendix A.2; Claude and Codex, also unnamed, are its two lowest. No single-harness training run is reported, so the figure cannot say whether diversity helped, and Module 17's held-out-harness experiment still needs that control.</p>
+<p>GLM-5 reports a smaller harness check. On Terminal-Bench 2.0 it scores 56.2 under Terminus-2 and 56.2 under Claude Code (60.7 and 61.1 on the verified version), while GLM-4.7 scored 41.0 and 32.8, an 8.2-point gap; the text says GLM-5 "shows consistent performance across both frameworks"<a class="cite" href="#ref-1">1</a> (§6.1.2, Table 7). Whether GLM-5's agentic RL used more than one harness is not stated; the orchestrator standardizes trajectories into "a unified message-list representation", which is a data format, not harness variety (§4.1.1).</p>
+
+<h2 id="ultra-mopd">6. Nemotron 3 Ultra: from unified RLVR to MOPD, and where it stops</h2>
+<h3 id="ultra-mopd-why">6.1 Why a second stage, and who the teachers are</h3>
+<p>Ultra's reason for MOPD is dilution: "as the number of environments continues to grow, each domain contributes only a relatively small number of samples to any given training batch, diluting the per-domain learning signal and making it increasingly difficult to balance training across domains". The remedy is "more than ten specialized teacher models, each optimized through its own domain-specific training pipeline"; the student, "obtained from RLVR", "generates rollouts across all domains and receives dense reward signals from the corresponding teacher models"<a class="cite" href="#ref-2">2</a> (§3.3). Figure 10 of the report draws ten first-round teachers, then five new or refreshed second-round teachers beside five reused ones (my count), with the RLVR student as self-teacher where no specialist covers a domain. Module 22 (Sections 4 and 6) covers the objective, the warmup SFT and the same-origin condition. Table 6 lists how each teacher is trained.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> Ultra's specialist teachers as described in §3.3.2<a class="cite" href="#ref-2">2</a>. "Rollout shape" is my classification from the description; "not stated" means the paragraph gives no rollout detail.</caption>
+  <thead><tr><th>Teacher</th><th>Training recipe as described</th><th>Rollout shape</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Software engineering</td><td>SFT on agentic data; PivotRL on single-step environments; then end-to-end SWE-RL: hidden-test binary reward in GRPO, 192K generation, at most 200 agent turns, unfinished trajectories masked, two gold-patch leak channels closed (Modules 18, 19)</td><td>End-to-end, multi-turn</td></tr>
+    <tr><td class="row">Office and workplace</td><td>AfterQuery tasks sharing structure with GDPval; strong-model rollouts; light SFT on the student, then PivotRL inside the MOPD stage</td><td>Turn-local (pivots)</td></tr>
+    <tr><td class="row">Search</td><td>SFT on trajectories with context management (discard-all resets, summary compression); no RL stage described</td><td>SFT only</td></tr>
+    <tr><td class="row">Terminal use</td><td>Expert trajectories for tasks with timeouts up to one hour; PivotRL, re-profiling when accuracy saturates</td><td>Turn-local (pivots)</td></tr>
+    <tr><td class="row">Conversational tool use</td><td>Super's data and recipe with PivotRL, expanded to dependent multi-step actions</td><td>Turn-local (pivots)</td></tr>
+    <tr><td class="row">Model usability</td><td>Structured outputs (five schema types), document extraction, citation and free-form formatting; environments in NeMo Gym</td><td>Not stated</td></tr>
+    <tr><td class="row">Agentic safety</td><td>Indirect prompt-injection tasks, red-teamed against a defender model; a deterministic verifier checks whether the target tool was called</td><td>Not stated</td></tr>
+    <tr><td class="row">Chat</td><td>Ultra-based principle-following generative reward model; several RLHF iterations with targeted data after each</td><td>Not stated</td></tr>
+    <tr><td class="row">Instruction following and factuality</td><td>Domain-focused RLVR on the RL checkpoint with instruction-following, abstention and RLHF environments; abstention reward "dynamically calibrated" for accuracy against hallucination</td><td>Not stated</td></tr>
+    <tr><td class="row">General reasoning (STEM)</td><td>SFT on 40B tokens, 58.75% science, generated with DeepSeek-V4-Pro; then RL on non-STEM prompts, 128 prompts per batch, global batch 2,048</td><td>Single-turn reasoning</td></tr>
+    <tr><td class="row">Competitive coding</td><td>RL on the general reasoning teacher; prompts it solves 8 of 8 are removed, leaving 3.5K; +2.4 on LiveCodeBench v6</td><td>Single-turn reasoning</td></tr>
+  </tbody>
+</table>
+<p>Read as a whole (derived), one of the eleven recipes ends in end-to-end multi-turn RL, three use PivotRL, and one is SFT-only. The teachers' own training mostly avoids long end-to-end agentic rollouts too, which is the context for the limit in Section 6.4. Module 19 covers the SWE teacher's leak channels and Module 24 the calibration questions raised by the abstention reward.</p>
+
+<h3 id="ultra-mopd-compare">6.2 MOPD in four reports</h3>
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 7.</b> How four 2026 recipes place distillation relative to RL. GLM-5<a class="cite" href="#ref-1">1</a> (§3.5), Nemotron 3 Ultra<a class="cite" href="#ref-2">2</a> (§3.3), DeepSeek-V4<a class="cite" href="#ref-6">6</a> (§5.1), Kimi K3<a class="cite" href="#ref-8">8</a> (§4.1). "Not stated" means the sections named do not say. Lambert's survey lists Ultra at more than ten experts, K3 at nine and V4 at more than ten, and groups GLM-5 with MOPD recipes<a class="cite" href="#ref-9">9</a> (§3.2.4).</caption>
+  <thead><tr><th>Report</th><th>Teachers</th><th>Per-token signal</th><th>Batch</th><th>Timing relative to RL</th><th>Agentic rollouts</th></tr></thead>
+  <tbody>
+    <tr><td class="row">GLM-5</td><td>Final checkpoints of earlier stages (SFT, Reasoning RL and General RL named); count not stated</td><td>Sampled-token log-ratio as the GRPO advantage</td><td>Group 1, batch 1,024</td><td>As the final stage, after all three RL stages</td><td>Not stated</td></tr>
+    <tr><td class="row">Nemotron 3 Ultra</td><td>More than ten, trained in parallel; second round re-branched from MOPD 1</td><td>Sampled-token log-ratio against a proximal policy, PPO clip, IcePop mask</td><td>1,024 prompts, one rollout each; up to 192K tokens</td><td>After unified RLVR and a light warmup SFT; two iterations</td><td>Single-turn, PivotRL-style, for most agentic tasks</td></tr>
+    <tr><td class="row">DeepSeek-V4</td><td>More than ten domain teachers, weighted \(w_i\) by importance</td><td>Full-vocabulary reverse KL, because the token-level estimate has "high variance" and "training instability"</td><td>Not stated</td><td>Replaces the mixed RL stage entirely</td><td>Not stated</td></tr>
+    <tr><td class="row">Kimi K3</td><td>Nine: three domains at three effort levels</td><td>Per-token clipped log-ratio; top-k variants showed "no clear advantage"</td><td>Not stated</td><td>After SFT and expert RL</td><td>Long-horizon kept: dense reward "naturally enabl[es]" partial rollouts</td></tr>
+  </tbody>
+</table>
+<p>The columns that differ most are the signal and the agentic rollouts. Three of four use the cheap sampled-token estimate; only V4 pays for the full vocabulary, while Ultra reports that logit matching "consistently underperformed the sampled-token objective on some agentic benchmarks such as Terminal Bench"<a class="cite" href="#ref-2">2</a> (§3.3.5; Module 22, Section 5). GLM-5's teachers are same-origin by construction; Ultra's first-round teachers came from different SFT pipelines and needed the warmup. On agentic rollouts Ultra avoids end-to-end rollouts, K3 keeps long-horizon ones, and GLM-5 says nothing.</p>
+
+<h3 id="ultra-mopd-accounting">6.3 What each stage added</h3>
+<p>Ultra's Table 5 prints SFT, RLVR, MOPD 1, MOPD 2 and teacher scores on eleven benchmarks, and a recovery column defined as \((\text{MOPD2}-\text{RLVR})/(\text{Teacher}-\text{RLVR})\)<a class="cite" href="#ref-2">2</a> (§3.3.4). I recomputed all eleven recovery values from the printed scores; all eleven match to the printed precision (derived), so the column can be used as printed. Module 22 (Figure 4) plots recovery. Figure 7 plots what it does not: the points each stage contributed.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 443" role="img" aria-labelledby="f7t"><title id="f7t">Points added on each of eleven benchmarks by the unified RLVR stage and by the two MOPD iterations in Nemotron 3 Ultra</title>
+    <rect x="470" y="8" width="14" height="10" rx="2" class="d-fill-blue"/><text x="490" y="17" class="d-small">RLVR minus SFT</text>
+    <rect x="610" y="8" width="14" height="10" rx="2" class="d-fill-orange"/><text x="630" y="17" class="d-small">MOPD 2 minus RLVR</text>
+    <line x1="210" y1="38" x2="210" y2="387" class="d-grid"/>
+    <text x="210" y="403" text-anchor="middle" class="d-small d-mono">0</text>
+    <line x1="325" y1="38" x2="325" y2="387" class="d-grid"/>
+    <text x="325" y="403" text-anchor="middle" class="d-small d-mono">10</text>
+    <line x1="440" y1="38" x2="440" y2="387" class="d-grid"/>
+    <text x="440" y="403" text-anchor="middle" class="d-small d-mono">20</text>
+    <line x1="555" y1="38" x2="555" y2="387" class="d-grid"/>
+    <text x="555" y="403" text-anchor="middle" class="d-small d-mono">30</text>
+    <line x1="670" y1="38" x2="670" y2="387" class="d-grid"/>
+    <text x="670" y="403" text-anchor="middle" class="d-small d-mono">40</text>
+    <text x="200" y="62" text-anchor="end" class="d-bold">Terminal Bench 2.0</text>
+    <rect x="210.0" y="48" width="115.0" height="11" class="d-fill-blue"/>
+    <text x="331.0" y="58" class="d-small d-mono">+10.0</text>
+    <rect x="210.0" y="61" width="109.3" height="11" class="d-fill-orange"/>
+    <text x="325.3" y="71" class="d-small d-mono">+9.5</text>
+    <text x="200" y="93" text-anchor="end" class="d-bold">GDPVal</text>
+    <rect x="210.0" y="79" width="65.5" height="11" class="d-fill-blue"/>
+    <text x="281.6" y="89" class="d-small d-mono">+5.7</text>
+    <rect x="210.0" y="92" width="204.7" height="11" class="d-fill-orange"/>
+    <text x="420.7" y="102" class="d-small d-mono">+17.8</text>
+    <text x="200" y="124" text-anchor="end" class="d-bold">SWE-Bench Verified</text>
+    <rect x="210.0" y="110" width="26.4" height="11" class="d-fill-blue"/>
+    <text x="242.4" y="120" class="d-small d-mono">+2.3</text>
+    <rect x="210.0" y="123" width="67.9" height="11" class="d-fill-orange"/>
+    <text x="283.9" y="133" class="d-small d-mono">+5.9</text>
+    <text x="200" y="155" text-anchor="end" class="d-bold">TauBench Telecom</text>
+    <rect x="210.0" y="141" width="310.5" height="11" class="d-fill-blue"/>
+    <text x="526.5" y="151" class="d-small d-mono">+27.0</text>
+    <rect x="210.0" y="154" width="117.3" height="11" class="d-fill-orange"/>
+    <text x="333.3" y="164" class="d-small d-mono">+10.2</text>
+    <text x="200" y="186" text-anchor="end" class="d-bold">BrowseComp</text>
+    <rect x="210.0" y="172" width="192.0" height="11" class="d-fill-blue"/>
+    <text x="408.0" y="182" class="d-small d-mono">+16.7</text>
+    <rect x="210.0" y="185" width="154.1" height="11" class="d-fill-orange"/>
+    <text x="370.1" y="195" class="d-small d-mono">+13.4</text>
+    <text x="200" y="217" text-anchor="end" class="d-bold">LiveCodeBench v6</text>
+    <rect x="210.0" y="203" width="21.8" height="11" class="d-fill-blue"/>
+    <text x="237.8" y="213" class="d-small d-mono">+1.9</text>
+    <rect x="210.0" y="216" width="18.4" height="11" class="d-fill-orange"/>
+    <text x="234.4" y="226" class="d-small d-mono">+1.6</text>
+    <text x="200" y="248" text-anchor="end" class="d-bold">IMOAnswerBench</text>
+    <rect x="203.1" y="234" width="6.9" height="11" class="d-fill-blue"/>
+    <text x="216.0" y="244" class="d-small d-mono">-0.6</text>
+    <rect x="210.0" y="247" width="47.1" height="11" class="d-fill-orange"/>
+    <text x="263.1" y="257" class="d-small d-mono">+4.1</text>
+    <text x="200" y="279" text-anchor="end" class="d-bold">HLE (no tools)</text>
+    <rect x="210.0" y="265" width="67.9" height="11" class="d-fill-blue"/>
+    <text x="283.9" y="275" class="d-small d-mono">+5.9</text>
+    <rect x="210.0" y="278" width="12.7" height="11" class="d-fill-orange"/>
+    <text x="228.7" y="288" class="d-small d-mono">+1.1</text>
+    <text x="200" y="310" text-anchor="end" class="d-bold">OmniScience non-halluc.</text>
+    <rect x="210.0" y="296" width="477.3" height="11" class="d-fill-blue"/>
+    <text x="693.3" y="306" class="d-small d-mono">+41.5</text>
+    <rect x="210.0" y="309" width="372.6" height="11" class="d-fill-orange"/>
+    <text x="588.6" y="319" class="d-small d-mono">+32.4</text>
+    <text x="200" y="341" text-anchor="end" class="d-bold">IFBench</text>
+    <rect x="210.0" y="327" width="185.2" height="11" class="d-fill-blue"/>
+    <text x="401.1" y="337" class="d-small d-mono">+16.1</text>
+    <rect x="210.0" y="340" width="37.9" height="11" class="d-fill-orange"/>
+    <text x="253.9" y="350" class="d-small d-mono">+3.3</text>
+    <text x="200" y="372" text-anchor="end" class="d-bold">Multi-Challenge</text>
+    <rect x="210.0" y="358" width="80.5" height="11" class="d-fill-blue"/>
+    <text x="296.5" y="368" class="d-small d-mono">+7.0</text>
+    <rect x="210.0" y="371" width="40.3" height="11" class="d-fill-orange"/>
+    <text x="256.3" y="381" class="d-small d-mono">+3.5</text>
+    <line x1="210" y1="38" x2="210" y2="387" class="d-axis"/>
+    <text x="440" y="435" text-anchor="middle" class="d-small d-text-light">benchmark points added by the stage</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> Points added by each stage, derived from the scores printed in Table 5 of the Nemotron 3 Ultra report<a class="cite" href="#ref-2">2</a> (§3.3.4): blue is RLVR minus SFT, orange is MOPD 2 minus RLVR. MOPD adds more than the first RL stage on three benchmarks (GDPVal, SWE-Bench Verified, IMOAnswerBench) and less on eight. Not a controlled comparison: the MOPD gain includes whatever the teachers' own SFT and RL pipelines added. OmniScience non-hallucination is a non-hallucination score; the report prints no accuracy counterpart.</figcaption>
+</figure>
+
+<p>Three readings, all derived. The first RL stage contributes more than MOPD 2 on eight of eleven rows; MOPD contributes more on GDPVal (+17.8 against +5.7), SWE-Bench Verified (+5.9 against +2.3) and IMOAnswerBench (+4.1 against -0.6). The three largest MOPD gains, OmniScience non-hallucination (+32.4), GDPVal (+17.8) and BrowseComp (+13.4), are the rows where the RLVR student sat furthest below its teacher (40.7, 20.6, 20.0 points). And MOPD 2 beats its own teacher on two rows, Terminal Bench 2.0 (54.0 against 50.0) and Multi-Challenge (63.8 against 63.3), and trails it on the other nine; the report suggests the Terminal Bench case, on data-science tasks, is "potential knowledge transfer" from the office teacher.</p>
+<aside class="callout callout-warning"><span class="callout-title">The largest bar is not an accuracy number</span><p>OmniScience non-hallucination moves from 4.8 (SFT) to 46.3 (RLVR) to 78.7 (MOPD 2) in Table 5, the biggest movement in the table. The instruction-following and factuality teacher was trained with an abstention reward calibrated "to achieve a favorable balance between accuracy and hallucination reduction"<a class="cite" href="#ref-2">2</a> (§3.3.2). A non-hallucination score can rise when a model abstains more (my reading of the metric's name; the sections read give no definition), and the table prints no accuracy counterpart, so the net effect cannot be read from it. Modules 24 and 25 cover calibration and abstention.</p></aside>
+
+<h3 id="ultra-mopd-limit">6.4 The reported limit: rollouts that differ in length</h3>
+<p>Ultra lists three unresolved MOPD problems. Two are about teachers (logit matching, and giving teacher and student a shared SFT stage first). The third is about rollouts: "When mixing end-to-end agentic environments with reasoning environments in MOPD, we observed substantial training inefficiency because rollout times can differ dramatically. Balancing efficiency and accuracy requires sophisticated training infrastructure together with careful asynchronous algorithm design. In practice, we use single-turn rollouts, similar to PivotRL (Yi et al., 2026), for most of the agentic tasks. This approach performs relatively well, but whether end-to-end rollouts can yield further gains, and how to make it robust to potential distribution mismatch (Wang et al., 2026a), remains an open area for exploration"<a class="cite" href="#ref-2">2</a> (§3.3.5). The sentence states a cost and a choice, not a comparison: the sections read contain no run of end-to-end agentic MOPD against the single-turn version.</p>
+<p>The cost is a straggler cost, and the report's own infrastructure numbers show how it enters. During RL and MOPD the pipeline overlaps rollout generation with the policy update, so "the step time is bounded by whichever stage is slower", typically generation, "dominated by a small fraction of straggler generations"<a class="cite" href="#ref-2">2</a> (§3.6.1). With \(T_{step}=\max(T_{gen},T_{train})\) and \(a=T_{gen}/T_{train}\ge1\), a generator made 1.46 times faster (the measured MTP gain at \(k=5\), concentrated on the slowest trajectories) shortens the step to \(\max(T_{gen}/1.46,\,T_{train})\):</p>
+$$\text{speedup}_{\text{overlapped}}=\min(1.46,\;a),\qquad \text{speedup}_{\text{sequential}}=\frac{a+1}{a/1.46+1}.$$
+<p>At \(a=1.2\) the overlapped pipeline gains 1.2 times, not 1.46; at \(a=3\) it gains the full 1.46 (derived; Figure 8). Two consequences. In a generation-bound pipeline every added second of straggler time lands in the step time one for one, which is how a few 200-turn, 192K-token SWE rollouts in a batch of single-turn reasoning rollouts can idle a trainer (my reading of the report's statement). And rollout-side speedups (MTP, FP8, prefill-decode splitting, as GLM-5 also uses<a class="cite" href="#ref-1">1</a> (§3.6.2)) are worth their full value only while \(a\) stays above the speedup. The remedy Ultra chose changes the work, not the engine: shorter, turn-local rollouts (my reading).</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 290" role="img" aria-labelledby="f8t"><title id="f8t">Step-time speedup from a 1.46 times faster rollout generator, as a function of generation time over training time, for an overlapped and a sequential pipeline</title>
+    <line x1="153.3" y1="40" x2="153.3" y2="230" class="d-grid"/>
+    <text x="153.3" y="248" text-anchor="middle" class="d-small d-mono">1</text>
+    <line x1="300.0" y1="40" x2="300.0" y2="230" class="d-grid"/>
+    <text x="300.0" y="248" text-anchor="middle" class="d-small d-mono">2</text>
+    <line x1="446.7" y1="40" x2="446.7" y2="230" class="d-grid"/>
+    <text x="446.7" y="248" text-anchor="middle" class="d-small d-mono">3</text>
+    <line x1="593.3" y1="40" x2="593.3" y2="230" class="d-grid"/>
+    <text x="593.3" y="248" text-anchor="middle" class="d-small d-mono">4</text>
+    <line x1="740.0" y1="40" x2="740.0" y2="230" class="d-grid"/>
+    <text x="740.0" y="248" text-anchor="middle" class="d-small d-mono">5</text>
+    <line x1="80" y1="230.0" x2="740" y2="230.0" class="d-grid"/>
+    <text x="72" y="234.0" text-anchor="end" class="d-small d-mono">1.0</text>
+    <line x1="80" y1="166.7" x2="740" y2="166.7" class="d-grid"/>
+    <text x="72" y="170.7" text-anchor="end" class="d-small d-mono">1.2</text>
+    <line x1="80" y1="103.3" x2="740" y2="103.3" class="d-grid"/>
+    <text x="72" y="107.3" text-anchor="end" class="d-small d-mono">1.4</text>
+    <line x1="80" y1="40.0" x2="740" y2="40.0" class="d-grid"/>
+    <text x="72" y="44.0" text-anchor="end" class="d-small d-mono">1.6</text>
+    <line x1="80" y1="230" x2="740" y2="230" class="d-axis"/>
+    <line x1="80" y1="40" x2="80" y2="230" class="d-axis"/>
+    <line x1="80" y1="84.3" x2="740" y2="84.3" class="d-line d-stroke-orange d-dashed"/>
+    <text x="740" y="78.3" text-anchor="end" class="d-small d-mono">generator speedup 1.46</text>
+    <polyline points="80.0,230.0 153.3,230.0 220.8,84.3 740.0,84.3" class="d-line d-stroke-blue" style="stroke-width:2.5" fill="none"/>
+    <polyline points="80.0,192.8 116.7,180.6 153.3,170.8 190.0,162.8 226.7,156.2 263.3,150.6 300.0,145.8 336.7,141.7 373.3,138.0 410.0,134.8 446.7,132.0 483.3,129.5 520.0,127.2 556.7,125.2 593.3,123.3 630.0,121.6 666.7,120.0 703.3,118.6 740.0,117.3" class="d-line d-stroke-cyan" style="stroke-width:2.5" fill="none"/>
+    <circle cx="220.8" cy="84.3" r="5" class="d-fill-orange"/>
+    <text x="230.8" y="106.3" class="d-small d-mono">knee at 1.46</text>
+    <rect x="470" y="150" width="270" height="56" rx="6" class="d-label-bg"/>
+    <line x1="482" y1="168" x2="506" y2="168" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+    <text x="514" y="172" class="d-small">overlapped: max(gen, train)</text>
+    <line x1="482" y1="190" x2="506" y2="190" class="d-line d-stroke-cyan" style="stroke-width:2.5"/>
+    <text x="514" y="194" class="d-small">sequential: gen + train</text>
+    <text x="410" y="276" text-anchor="middle" class="d-small d-text-light">a = generation time / training time</text>
+    <text x="14" y="135" transform="rotate(-90 14 135)" text-anchor="middle" class="d-small d-text-light">step-time speedup</text>
+  </svg>
+  <figcaption><b>Figure 8.</b> Derived from one reported number. Nemotron 3 Ultra measured 1.46× faster mean rollout generation with MTP speculative decoding at k = 5 and runs a one-step off-policy asynchronous setup in which the step time is set by the slower stage<a class="cite" href="#ref-2">2</a> (§3.6.1, Figure 12). With \(a=T_{gen}/T_{train}\), the overlapped speedup is \(\min(1.46,\,a)\) for \(a\ge1\); the sequential speedup is \((a+1)/(a/1.46+1)\). The report says generation is typically the slower stage but gives no value of \(a\).</figcaption>
+</figure>
+
+<p>Kimi K3 keeps long-horizon rollouts inside distillation by pausing generation once a fraction of trajectories has finished and resuming the rest next iteration<a class="cite" href="#ref-8">8</a> (§4.1.2, §4.1.3), trading the straggler cost for staleness (Module 18, Section 4); GLM-5 states no agentic distillation design. The agentic rows of Ultra's Table 5 recover 67.0% to 172.7% of the teacher gap, with single-turn rollouts for most agentic tasks, and the report reads MOPD as most effective "when the teacher's advantage can be expressed as token-level preferences over trajectories that the student is already able to sample, such as tool-use decisions, environment interactions, abstention behavior, and multi-step execution patterns"<a class="cite" href="#ref-2">2</a> (§3.3.4). That supports "good enough" on these benchmarks, not "no gain left".</p>
+
+<h2 id="found-vs-not">7. What each lab found that the other did not</h2>
+<p>The reports share more than they differ in: asynchronous RL, ratio masking, distillation after RL, no RL budget total, no ablation of the KL removal. Table 8 lists what is one-sided.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 8.</b> One-sided findings. "Evidence" says what the claim rests on. Sources: GLM-5<a class="cite" href="#ref-1">1</a>, Nemotron 3 Ultra<a class="cite" href="#ref-2">2</a>, Nemotron 3 Super<a class="cite" href="#ref-3">3</a>.</caption>
+  <thead><tr><th>Topic</th><th>GLM-5</th><th>Nemotron 3 Ultra</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td class="row">A discrete selection in the rollout path</td><td>Non-deterministic top-k in the DSA indexer degraded RL within a few steps; <code>torch.topk</code> in the training engine fixed it</td><td>No comparable finding in the sections read; no indexer in the architecture</td><td>Description, no curves</td></tr>
+    <tr><td class="row">Teacher-student support</td><td>Same-origin teachers by construction; no warmup mentioned</td><td>Teachers from different SFT pipelines "cannot be effectively combined" by a plain merge; a light warmup SFT lifts GDPVal from 35.3 to 46.7 and BrowseComp from 33.0 to 44.4, HLE only from 26.3 to 26.7 (Table 4)</td><td>Ablation, one run per cell</td></tr>
+    <tr><td class="row">Measuring the integration stage</td><td>No scores for cross-stage distillation in the sections read</td><td>Scores for SFT, RLVR, MOPD 1, MOPD 2 and teacher on eleven benchmarks (Table 5)</td><td>Ultra measured; GLM-5 asserts</td></tr>
+    <tr><td class="row">Harness evidence</td><td>One pair: Terminal-Bench 2.0 under two harnesses, 56.2 and 56.2</td><td>Seven harnesses on two benchmarks; at least two harnesses per vertical in training</td><td>Measured; no single-harness control</td></tr>
+    <tr><td class="row">KL to reference</td><td>Removed from the policy loss "to accelerate RL improvement"</td><td>No KL term mentioned in Super's algorithm text or Ultra's RLVR description; KL to a teacher is the MOPD objective</td><td>Neither prints an ablation</td></tr>
+  </tbody>
+</table>
+
+<h3 id="found-vs-not-release">7.1 What is released</h3>
+<p>Ultra's report says it is "open-sourcing the training recipes, data, and RL environments" with the checkpoints, including a 550B-A55B GenRM<a class="cite" href="#ref-2">2</a> (§1). The Nemotron repository README, fetched 2026-10-27, lists the Ultra program as "Pretrain → SFT → RLVR → MOPD → MTP Boosting (this recipe covers <b>Pretrain → SFT</b>)" and says the recipes "train exclusively on the open-sourced subset of training data. Results will differ from the tech report benchmarks, which used additional proprietary data"<a class="cite" href="#ref-10">10</a>. The RLVR and MOPD stages this module is about are named there but not in that recipe; the report's "RL environments" may live in the NeMo Gym and NeMo RL repositories, which I did not inspect. Super's recipe entry lists "3× RLVR + 2× SWE-RL + RLHF across 21 reward environments"<a class="cite" href="#ref-10">10</a>. GLM-5's repository README links slime as "the reinforcement learning framework used by the GLM team" and lists weights; it states no release of RL data or environments<a class="cite" href="#ref-7">7</a>.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Neither report is an experiment. Each states a design and its authors' judgment that it worked, so the disagreements are between designs, and each block ends with what would settle it.</p>
+
+<h3 id="disagree-integration">A. How should separately trained skills end up in one model?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>A1. Sequential stages, healed by distilling from earlier checkpoints</h4>
+    <p class="who">GLM-5<a class="cite" href="#ref-1">1</a> (§3.5)</p>
+    <p>Run reasoning, agentic and general RL in order, then distill from the final checkpoints of earlier stages to undo "cumulative degradation".</p>
+    <ul class="pros"><li>Needs only checkpoints the run already produced; teachers are same-origin, so no warmup.</li></ul>
+    <ul class="cons"><li>Stages stay serial; no scores printed for the healing step; teacher count and prompt mix not given.</li></ul>
+  </article>
+  <article class="position">
+    <h4>A2. Unified RL first, specialists as teachers second</h4>
+    <p class="who">Nemotron 3 Ultra<a class="cite" href="#ref-2">2</a> (§3.2, §3.3)</p>
+    <p>Train one student on all environments, then close per-domain gaps with more than ten teachers trained in parallel.</p>
+    <ul class="pros"><li>Measured: 67.0% to 172.7% recovery on the agentic rows of Table 5.</li><li>Teachers train in parallel and can be refreshed.</li></ul>
+    <ul class="cons"><li>Pays for both stages; HLE recovers only 16.9%, which the report attributes to capabilities the student rarely samples.</li></ul>
+  </article>
+  <article class="position">
+    <h4>A3. One mixed stage, or distillation replacing it</h4>
+    <p class="who">DeepSeek-V3.2 mixed GRPO<a class="cite" href="#ref-5">5</a> (§3); DeepSeek-V4 replaced it with OPD<a class="cite" href="#ref-6">6</a> (§5.1); Module 30</p>
+    <p>V3.2 merged reasoning, agent and alignment RL into one stage to avoid forgetting; V4 dropped that stage for distillation.</p>
+    <ul class="pros"><li>One trainer, one recipe.</li></ul>
+    <ul class="cons"><li>Ultra's dilution argument applies; V4 gives no ablation for its reversal.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The reports do not measure the same thing on the same base, so neither "A1 is enough" nor "A2 is better" is established. Under few domains with a natural order, A1 costs least. Under many environments of different rollout shape, Ultra's dilution argument is sound and its Table 5 is the only measurement of a merge stage in these two reports. What would settle it is one SFT checkpoint taken through both routes at matched GPU-hours over the same domains, scored per domain (Module 22 reaches the same verdict).</p></div>
+
+<h3 id="disagree-mismatch">B. What closes the training-inference gap?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>B1. Mask or correct in the loss</h4>
+    <p class="who">GLM-5 reasoning RL<a class="cite" href="#ref-1">1</a>; Nemotron 3 Super<a class="cite" href="#ref-3">3</a>; Ultra's MOPD<a class="cite" href="#ref-2">2</a></p>
+    <p>Drop or reweight tokens whose train-to-inference ratio is out of band.</p>
+    <ul class="pros"><li>Engine-agnostic; one band to tune.</li></ul>
+    <ul class="cons"><li>Discards tokens; the NVIDIA bands are not printed.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B2. Make the two engines agree</h4>
+    <p class="who">GLM-5's deterministic top-k<a class="cite" href="#ref-1">1</a> (§3.2); Kimi K3's shared quantization scheme<a class="cite" href="#ref-8">8</a> (§4.1.4)</p>
+    <p>Remove the cause: same operator, same numerics on both sides.</p>
+    <ul class="pros"><li>Fixes what a mask cannot: GLM-5 reports collapse with non-deterministic top-k.</li></ul>
+    <ul class="cons"><li>Costs speed ("slightly slower"); per-operator engineering; no measured comparison.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B3. Replay the discrete state</h4>
+    <p class="who">DeepSeek-V3.2's Keep Routing and Keep Sampling Mask<a class="cite" href="#ref-5">5</a> (§3.1)</p>
+    <p>Reuse the sampling-time choice in training.</p>
+    <ul class="pros"><li>Exact for small state such as 8 expert ids per layer.</li></ul>
+    <ul class="cons"><li>For the indexer the derived payload is hundreds of times larger (Section 3.4); GLM-5 rejects it.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>They are layers, not rivals. GLM-5 runs B1 and B2 together; B3 fits only where the state is small. If IcePop was active in GLM-5's failed top-k runs (the report does not say), the finding shows masking alone cannot absorb this failure. A run that logs \(\ln\rho\) and \(\ln r\) under both operators would settle which mechanism of Section 3.3 operates.</p></div>
+
+<h3 id="disagree-rollouts">C. Which rollouts should agentic training consume?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>C1. Turn-local, single-turn rollouts</h4>
+    <p class="who">Nemotron 3 Ultra<a class="cite" href="#ref-2">2</a> (§3.3.5); Super<a class="cite" href="#ref-3">3</a> (§3.2.4)</p>
+    <p>Use PivotRL-style turns for most agentic tasks.</p>
+    <ul class="pros"><li>No stragglers; the agentic rows still recover 67.0% to 172.7%.</li></ul>
+    <ul class="cons"><li>Untested against end-to-end; distribution mismatch is listed as open.</li></ul>
+  </article>
+  <article class="position">
+    <h4>C2. End-to-end, balanced by an orchestrator</h4>
+    <p class="who">GLM-5<a class="cite" href="#ref-1">1</a> (§4.1)</p>
+    <p>Train on whole trajectories, with per-task rollout ratio and speed control and staleness hygiene.</p>
+    <ul class="pros"><li>Trains the distribution that is deployed.</li></ul>
+    <ul class="cons"><li>Needs the Table 3 rules; no throughput figures printed.</li></ul>
+  </article>
+  <article class="position">
+    <h4>C3. Partial rollouts and a staleness-tolerant loss</h4>
+    <p class="who">Kimi K3<a class="cite" href="#ref-8">8</a> (§4.1.2, §4.1.3)</p>
+    <p>Pause at a fraction of finished trajectories and resume the rest later.</p>
+    <ul class="pros"><li>Keeps the long tail in the batch.</li></ul>
+    <ul class="cons"><li>Trajectories span policy versions; tolerance is asserted.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Unsettled: no report compares the three. Figure 8 gives the way to choose: if generation is the slower stage, stragglers lengthen every step, which favors C1 or C3; if training dominates, they are hidden and C2's fidelity is cheaper. Measuring \(T_{gen}/T_{train}\) on your own rollout mix comes before choosing. The experiment that would settle the quality question is Ultra's own open item: end-to-end against single-turn distillation on the same teachers.</p></div>
+
+<h3 id="disagree-kl">D. Should the policy loss keep a KL term to a reference?</h3>
+<div class="positions">
+  <article class="position">
+    <h4>D1. Drop it</h4>
+    <p class="who">GLM-5 reasoning RL<a class="cite" href="#ref-1">1</a> (§3.2); no KL term appears in Super's algorithm text or Ultra's RLVR description<a class="cite" href="#ref-3">3</a></p>
+    <p>GLM-5 removes it "to accelerate RL improvement".</p>
+    <ul class="pros"><li>Faster movement; no reference-model forward pass.</li></ul>
+    <ul class="cons"><li>No printed ablation; no restraint where rewards are soft.</li></ul>
+  </article>
+  <article class="position">
+    <h4>D2. Keep a small, corrected term, tuned by domain</h4>
+    <p class="who">DeepSeek-V3.2<a class="cite" href="#ref-5">5</a> (§3.1)</p>
+    <p>V3.2 corrects the estimator with an importance ratio and says that for mathematics "a relatively weak KL penalty or even omitting it entirely can yield improved performance".</p>
+    <ul class="pros"><li>A leash where a judge can be exploited.</li></ul>
+    <ul class="cons"><li>One more knob per domain; no values printed.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The reports split by reward type, and V3.2's own sentence agrees. GLM-5 states the removal for reasoning RL only; whether its General RL stage, whose rewards partly come from reward models the report itself calls hackable (§3.4), keeps a KL term is not stated. The run that would settle it is General RL with and without the term, scored for reward hacking; neither report has it (Modules 6 and 13).</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Both reports have successors. The GLM-5 repository's README now lists GLM-5.1, 5.2 and 5.3, and says GLM-5.2 shares one indexer across every four sparse-attention layers<a class="cite" href="#ref-7">7</a>; if that carries to the selections, the replay problem of Section 3.4 shrinks about fourfold without vanishing. I did not read those reports. Ultra's own figures already compare against GLM-5.1 and Kimi K2.6<a class="cite" href="#ref-2">2</a>. The README of the Nemotron repository lists a 3.5 Super recipe with two-phase MOPD<a class="cite" href="#ref-10">10</a>, which I also did not read. Every number here is from a v1 or v2 report that may be revised; MOPD is a family of recipes, not a specification (Module 22).</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>GLM-5 Team (Zeng, A., Lv, X. et al.; Zhipu AI and Tsinghua University). <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. arXiv:2602.15763v2, 24 Feb 2026 (v1 17 Feb 2026). <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §3.1 SFT; §3.2 reasoning-RL loss (Eq. 1), hyperparameters and the DSA top-k finding; §3.4 General RL; §3.5 cross-stage distillation (Eq. 2); §3.6 slime; §4.1 asynchronous agentic RL, TITO, double-sided importance sampling (Eqs. 3-5); §4.2 environments; §6.1.2 and Table 7 (Terminal-Bench 2.0 under two harnesses); Table 10; Figure 5 (page 4, read as an image).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>NVIDIA. <em>Nemotron 3 Ultra: Open, Efficient Mixture-of-Experts Hybrid Mamba-Transformer Model for Agentic Reasoning</em>. arXiv:2606.15007v1, 12 Jun 2026. <a href="https://arxiv.org/pdf/2606.15007v1">https://arxiv.org/pdf/2606.15007v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §1 release and throughput claims; §3.2 unified RLVR; §3.3 MOPD (§3.3.1 algorithm, §3.3.2 teachers, §3.3.3 warmup, §3.3.4 results, §3.3.5 limits), Tables 3-5, Figure 10; §3.5 and Figure 11; §3.6; Appendix A.2 and Figure 17 (page 65, cell values read at 400 dpi).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>NVIDIA. <em>Nemotron 3 Super: Open, Efficient Mixture-of-Experts Hybrid Mamba-Transformer Model for Agentic Reasoning</em>. arXiv:2604.12374v1, 14 Apr 2026. <a href="https://arxiv.org/abs/2604.12374">https://arxiv.org/abs/2604.12374</a> (PDF fetched from https://arxiv.org/pdf/2604.12374). Accessed 2026-10-27. <span class="ref-use">Used for: §3.2.1-§3.2.5 RL stages, algorithm, batch figures, harness diversity and asynchronous infrastructure. Not in the source map.</span></li>
+  <li id="ref-4"><span class="ref-type">official</span>arXiv. <em>arXiv API records</em> for 2602.15763, 2606.15007 and 2604.12374. <a href="https://export.arxiv.org/api/query?id_list=2602.15763">https://export.arxiv.org/api/query?id_list=2602.15763</a>, <a href="https://export.arxiv.org/api/query?id_list=2606.15007">https://export.arxiv.org/api/query?id_list=2606.15007</a>, <a href="https://export.arxiv.org/api/query?id_list=2604.12374">https://export.arxiv.org/api/query?id_list=2604.12374</a>. Accessed 2026-10-27. <span class="ref-use">Used for: latest-version check (GLM-5 v2; Ultra v1; Super v1) and dates. Not in the source map.</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv:2512.02556v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §2.1 lightning indexer (Eqs. 1-2); §3 mixed RL stage; §3.1 Keep Routing and Keep Sampling Mask.</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv:2606.19348v1 (version date not asserted here; the arXiv identifier month and the API's publication date disagree). <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §5.1.2 on-policy distillation (Eq. 29), more than ten teachers and the full-vocabulary choice; §5.2.1 index-score quantization and 99.7% recall.</span></li>
+  <li id="ref-7"><span class="ref-type">repo</span>zai-org. <em>GLM-5 repository README (GLM-5.3, GLM-5.2, GLM-5.1, GLM-5)</em>. <a href="https://github.com/zai-org/GLM-5">https://github.com/zai-org/GLM-5</a> (raw README: https://raw.githubusercontent.com/zai-org/GLM-5/main/README.md). Accessed 2026-10-27. <span class="ref-use">Used for: the GLM-5.2 IndexShare statement, the slime link, the model list and what is and is not listed as released. Not in the source map.</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Kimi Team. <em>Kimi K3: Open Frontier Intelligence</em>. arXiv:2607.24653v2, 7 Aug 2026 (v1 27 Jul 2026). <a href="https://arxiv.org/pdf/2607.24653v2">https://arxiv.org/pdf/2607.24653v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §4.1.2 expert RL and partial rollouts; §4.1.3 MOPD; §4.1.4 shared quantization scheme.</span></li>
+  <li id="ref-9"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv:2504.12501v12, 11 Sep 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §3.2.4 expert counts across MOPD recipes and the grouping of GLM-5 with them.</span></li>
+  <li id="ref-10"><span class="ref-type">repo</span>NVIDIA-NeMo. <em>Nemotron repository README (training recipes)</em>. <a href="https://github.com/NVIDIA-NeMo/Nemotron">https://github.com/NVIDIA-NeMo/Nemotron</a> (raw README: https://raw.githubusercontent.com/NVIDIA-NeMo/Nemotron/main/README.md). Accessed 2026-10-27. <span class="ref-use">Used for: the Nemotron 3 Ultra recipe entry (program stages and the stages the recipe covers), the open-data-only note and the Nemotron 3 Super recipe entry. Not in the source map.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,1238 @@
+{
+  "parts": [
+    {
+      "id": "part-01-rl-frame",
+      "number": 1,
+      "title": "The RL Frame for a Language-Model Policy",
+      "shortTitle": "RL Frame",
+      "description": "What one RL iteration costs on a cluster, how a policy gradient is estimated for token sequences, and how trust-region ideas became the PPO clip that every later algorithm modifies.",
+      "modules": [
+        {
+          "id": "01-rl-loop-cost-model",
+          "number": 1,
+          "title": "The RL Post-Training Loop as a Cost Model: Rollout, Reward, Update, and Where the GPU-Hours Go",
+          "shortTitle": "RL loop and cost model",
+          "description": "What one RL iteration does to a GPU cluster, with the reported arithmetic (R1-Zero, Olmo 3, MiniMax-M1, ScaleRL) that every later module refers back to.",
+          "scope": "In: where RL sits after pretraining and SFT; one RL iteration decomposed into rollout (autoregressive decode, i.e. inference-shaped work), scoring, advantage computation, update (training-shaped work) and weight sync; the run-size vocabulary (prompts per step, samples per prompt G, response length, minibatches per rollout) and the reported cost arithmetic: R1-Zero 512 GPUs x 198 h = 101,376 GPU-h = $202K at $2/h, Olmo 3's 1,000 s step of which 125 s is training, static-batching waste of ~54%, MiniMax-M1's $534,700 run, RL as ~3.75% (R1-Zero) vs >10% (V3.2) of pretraining compute; how many models each method keeps in memory (PPO four, GRPO fewer, DPO two and no sampling). Out: infrastructure design, framework choice and weight-sync engineering (cross-reference System Design course Modules 36, 37, 38 by number; not re-covered); the algorithms themselves (Modules 2 onward). After this module the reader can estimate, from batch size, response length and engine throughput, which phase of an RL run is the bottleneck and what a run costs, and can read any later report's 'steps' and 'GPU-hours' figures critically. Derived arithmetic is shown and marked as derived.",
+          "topics": [
+            "post-training map: pretrain -> SFT -> preference tuning (RLHF with PPO, or DPO) -> RLVR/agentic RL -> distillation; which stages sample from the current policy (on-policy) and which train on fixed data; where this course starts relative to SFT (Lambert ch. 3)",
+            "anatomy of one RL iteration: sample prompts, rollout, score with verifier/reward model/judge, compute advantages, update, sync weights; which stages resemble inference serving (decode-bound, KV-cache-bound) and which resemble pretraining",
+            "run-size vocabulary used by every later module: prompts per step, samples per prompt G, max and mean response length, minibatches per rollout, number of steps; R1-Zero worked through (32 questions x 16 samples = 512 outputs per step; 8,192-output rollout split into 16 minibatches; 10,400 steps = 1.6 epochs)",
+            "GPU-hour arithmetic: R1-Zero 512 H800 x 198 h = 101,376 GPU-h = $202K at $2/h; R1 about 80 h (~41K GPU-h); total 147K GPU-h = $294K (text says 'about 4 days' for 80 h: state the inconsistency); MiniMax-M1 3 weeks on 512 H800 = $534,700",
+            "rollout dominance in Olmo 3: 1,000 s average step with 125 s training; learner idle ~75% of the time; 32B run on 8 H100 nodes for training and 20 for inference; generation would need >8x speedup before training becomes the bottleneck",
+            "long-tailed response lengths and batching: static batching wastes (max - mean)/max = (32K - 14,628)/32K ~ 54%; continuous batching plus inflight updates gave 2x speed on half the GPUs (7B: ~15 days -> ~6 days); partial rollouts as the algorithmic alternative (introduced here, treated in Modules 18 and 28)",
+            "RL as a share of pretraining compute: ~3.75% for R1-Zero (as cited in ScaleRL), >10% for DeepSeek-V3.2, >400k GPU-hours for the ScaleRL study; why these numbers are not comparable (different base compute, different step definitions)",
+            "model-count and memory view: PPO keeps policy, reference, reward model and value model; GRPO removes the policy-sized value model; common GRPO defaults set KL coefficient 0 so the reference is not loaded (TRL); DPO keeps policy + reference and never samples; memory arithmetic for 7B/70B is derived by the writer and marked derived",
+            "boundary with the System Design course: Modules 36 (post-training pipelines), 37 (RL training infrastructure), 38 (framework comparison) are cross-referenced by number, not re-covered"
+          ],
+          "sourceIds": ["S15", "S48", "S20", "S22", "S45", "S60", "S14", "S6", "S59"],
+          "estWords": 6500,
+          "figures": [
+            "Post-training pipeline map (pretrain -> SFT -> DPO / RLHF / RLVR -> distillation) with on-policy vs fixed-data labelled per stage and the model count each needs",
+            "Timeline of one RL iteration across inference GPUs and training GPUs (colocated vs disaggregated), annotated with Olmo 3's 1,000 s step and 125 s training segment",
+            "Gantt-style comparison of static vs continuous batching for a long-tailed length distribution, with the ~54% waste calculation drawn on it",
+            "Bar chart of reported RL compute across R1-Zero, R1, MiniMax-M1, the ScaleRL study and V3.2 (GPU-hours and % of pretraining), with comparability caveats printed on the chart",
+            "Table of models held in memory by PPO, GRPO and DPO, with sampling requirement and what each costs per step (derived memory values flagged)"
+          ],
+          "disagreements": [
+            "Is DPO enough, or does online RL (PPO) win for preference tuning? (secondary: the cost side only; resolved in Modules 7 and 33)",
+            "Source-level conflict (S22 vs S45): RL compute as ~3.75% of pretraining (R1-Zero, as cited by S22) vs a post-training budget >10% of pretraining cost (V3.2)"
+          ],
+          "prerequisites": []
+        },
+        {
+          "id": "02-policy-gradient-for-llms",
+          "number": 2,
+          "title": "Policy Gradients for Token Sequences: the Log-Derivative Trick, Baselines, and Advantages for an LLM Policy",
+          "shortTitle": "Policy gradient for LLMs",
+          "description": "Derives the policy-gradient estimator for an autoregressive policy under both the token-MDP and one-action-per-completion views, and why every later algorithm is a variance, bias or step-size fix to it.",
+          "scope": "In: LLM generation as an MDP (state = prompt + prefix, action = next token, deterministic transition, reward at the last token) and as a contextual bandit (the whole completion is one action), as used by InstructGPT and argued for by the REINFORCE-for-RLHF paper; the log-derivative trick and the sequence-level score function; REINFORCE as reward-weighted SFT on the policy's own samples (a bridge from SFT, which he knows); baselines as variance reducers that leave the gradient unbiased; advantage; value functions and why a per-token value is hard when reward arrives only at the last token; on-policy sampling and the importance-sampling correction (stated, used in Module 3); why sparse binary rewards need nonzero pass rate to learn. Out: trust regions and PPO (Module 3), group baselines (Module 9), KL (Module 6). After this module the reader can derive the policy gradient for a sequence model, write REINFORCE with a baseline, and classify any later algorithm by where it gets its baseline and how it limits step size. Sutton & Barto chapter and page numbers come from search-result summaries only (S5 not fetched): mark them unverified.",
+          "topics": [
+            "token-level MDP for generation: state = prompt + prefix, action = token, transition appends the token, reward at EOS only, discount 1; trajectory probability as a product of token probabilities",
+            "bandit view: the whole completion is one action with a single scalar reward (InstructGPT: random prompt in, response out, RM reward ends the episode; REINFORCE-for-RLHF argument); when the two views give the same gradient and when credit assignment differs",
+            "policy-gradient derivation by the log-derivative trick for sequences; per-token score-function form; expectation over samples from the current policy only",
+            "REINFORCE as reward-weighted SFT: positive reward = SFT gradient on the model's own sample, negative reward = unlikelihood-style push-down; bridge to DeepSeekMath's unified view of SFT, RFT, DPO, PPO, GRPO as one gradient form (previewed, completed in Module 9)",
+            "baselines: why subtracting b(x) leaves the gradient unbiased, what it does to variance, small numeric illustration (derived); advantage = return - baseline",
+            "value functions and the last-token reward problem: why DeepSeekMath argues a per-token value model is hard to train and policy-sized in memory",
+            "three baseline families previewed with where each is developed: learned critic (PPO, Modules 3 and 5), leave-one-out/group mean (RLOO, GRPO, Module 9), running or batch mean (Kimi k1.5, Module 9)",
+            "on-policy requirement and importance sampling: ratio pi_theta / pi_old, its variance, and why LLM RL reuses a rollout across several minibatches anyway",
+            "exploration in text: temperature and entropy as the exploration knob; learning from sparse binary rewards requires pass@1 > 0 on some prompts (forward pointer to Module 11 on zero-variance groups)",
+            "mapping to Sutton & Barto Ch. 13 (policy approximation, policy gradient theorem, REINFORCE, REINFORCE with baseline), with section/page numbers marked unverified"
+          ],
+          "sourceIds": ["S6", "S13", "S14", "S60", "S5", "S54"],
+          "estWords": 6500,
+          "figures": [
+            "Token-MDP unrolled as a tree of prefixes with reward only at the EOS leaf, and the same tree collapsed to a single bandit action",
+            "Computation graph for the sequence-level policy gradient: log-probs per token, one scalar advantage, broadcast across tokens",
+            "Worked numeric example on a 4-completion prompt: gradient estimate with and without a baseline, showing the same mean and lower variance (derived)",
+            "Table: SFT, RFT, REINFORCE, REINFORCE with baseline as the same gradient with different data source and coefficient",
+            "Taxonomy of baselines (learned critic, leave-one-out, group mean, running mean) with memory and sampling cost per method"
+          ],
+          "disagreements": [
+            "Critic or no critic: is a value model worth it? (framing only: the arguments for dropping the value model; the full debate is in Module 9)"
+          ],
+          "prerequisites": ["Module 1"]
+        },
+        {
+          "id": "03-trpo-to-ppo",
+          "number": 3,
+          "title": "From TRPO to PPO: Trust Regions, Importance Ratios, the Clipped Surrogate, and GAE",
+          "shortTitle": "TRPO to PPO",
+          "description": "The lineage Aman asked about, cited correctly: Schulman et al.'s TRPO (2015), GAE (2016) and PPO (2017), what each constraint does, and which pieces GRPO later keeps.",
+          "scope": "In: why plain policy-gradient steps are unsafe; TRPO's monotonic-improvement theory, the move from a total-variation penalty to an average-KL constraint (delta = 0.01), conjugate gradient plus line search, single-path vs vine sampling, kinship with natural gradient; PPO's ratio, the clipped objective L^CLIP with epsilon = 0.2, the min as a pessimistic bound, multiple minibatch epochs, the adaptive-KL variant that did worse, MuJoCo hyperparameters (Table 3); GAE (gamma, lambda, bias-variance); what clipping does not guarantee (it does not bound KL; clipping bias that amplifies high-prior behaviours); the TRPO -> PPO -> GRPO lineage map. This module also corrects the request: DeepSeek-R1 uses GRPO (introduced in DeepSeekMath, Feb 2024), not TRPO. Out: the LLM-specific PPO system (Module 5), GRPO (Module 9). After this module the reader can derive the clipped-objective gradient for A>0 and A<0, say exactly which trust-region property PPO keeps and drops, and compute a GAE advantage by hand. Any claim that TRPO is 'impractical for LLMs' is the writer's reasoning, not a sourced fact: label it.",
+          "topics": [
+            "the policy-improvement surrogate and why it is only locally valid (TRPO Sections 2-3)",
+            "Theorem 1: monotonic improvement via a total-variation/KL penalty; why the theory's penalty coefficient C gives tiny steps and motivates a constraint (Section 4)",
+            "practical TRPO: average KL constraint (Eq. 12), delta = 0.01, conjugate gradient plus line search 'only slightly more expensive than computing the gradient itself', single-path vs vine, relation to natural policy gradient",
+            "PPO ratio r_t = pi_theta / pi_old and the unclipped surrogate; the clipped objective (Eq. 7), epsilon = 0.2; case analysis for A > 0 and A < 0 (derived) and where the gradient is exactly zero",
+            "the min as a pessimistic lower bound: ratio change is ignored only when it would improve the objective",
+            "multiple epochs over minibatches (data reuse) and the reference hyperparameters (horizon 2048, Adam 3e-4, 10 epochs, minibatch 64, gamma 0.99, lambda 0.95)",
+            "the adaptive-KL-penalty variant and why clipping won (Section 4)",
+            "GAE: TD residuals, the lambda-weighted sum, gamma and lambda as bias-variance knobs, the recursion (derived)",
+            "what clipping does not guarantee: no hard KL bound; clipping bias that amplifies high-prior behaviours even under random rewards (forward pointer to Modules 12 and 20)",
+            "lineage map TRPO -> PPO -> GRPO: constraint type, optimizer order, critic, data reuse, what GRPO keeps (ratio, clip) and drops (critic, GAE)"
+          ],
+          "sourceIds": ["S1", "S2", "S3", "S25", "S60", "S4"],
+          "estWords": 6500,
+          "figures": [
+            "Policy-space diagram: pi_old with a KL trust-region ball, a vanilla gradient step overshooting and a TRPO step staying inside",
+            "The two-panel L^CLIP plot (A > 0 and A < 0) with flat regions and the min branch annotated",
+            "GAE lambda spectrum from 1-step TD (lambda = 0) to Monte-Carlo (lambda = 1) with bias and variance arrows",
+            "Lineage table TRPO vs PPO vs GRPO: constraint, optimizer order, critic, advantage estimator, data reuse",
+            "Reference-hyperparameter table from PPO Table 3 next to the values later LLM recipes use"
+          ],
+          "disagreements": [
+            "Importance ratio and clipping: token-level, sequence-level, IS-weight clipping, or soft gating? (secondary: the token-level PPO clip as position A; resolved in Module 12)"
+          ],
+          "prerequisites": ["Module 2"]
+        }
+      ]
+    },
+    {
+      "id": "part-02-preference-rlhf",
+      "number": 2,
+      "title": "Preference Learning and Classical RLHF",
+      "shortTitle": "RLHF",
+      "description": "How human and AI preferences become a training signal through a reward model plus PPO or directly through DPO, and where each approach breaks.",
+      "modules": [
+        {
+          "id": "04-reward-models",
+          "number": 4,
+          "title": "Reward Models from Preferences: the Bradley-Terry Loss, RM Architecture and Scale, and Outcome versus Process Supervision",
+          "shortTitle": "Reward models",
+          "description": "How a pairwise preference dataset becomes a scalar reward model, what limits its size and reliability, and the outcome-vs-process supervision split.",
+          "scope": "Coverage is thin for classical RM mechanics (the researcher did not extract the Bradley-Terry loss itself), so the writer must read InstructGPT Section 3.5 and Appendix C, DPO Sections 3-4, Llama 3 Section 4.1.2 and Lambert chapter 5 first-hand and cite them. In: preference data (prompt, chosen, rejected; K-way rankings turned into pairs), labeler agreement as a noise ceiling (72.6 +/- 1.5% among training labelers, 77.3 +/- 1.3% held-out); the Bradley-Terry model and the pairwise logistic loss on a scalar head, its shift-invariance; RM = SFT model with a scalar head; why InstructGPT used only 6B RMs (175B unstable) and initialised the value function from the RM; outcome vs process reward models (Let's Verify Step by Step: process beats outcome on MATH, 78% of a representative subset, PRM800K), why DeepSeek-R1 abandoned PRMs at RL scale, why Llama 3 still trains stepwise RMs to filter SFT traces. Out: over-optimization (Module 6), generative/rubric judges (Module 16), DPO's implicit reward (Module 7). After this module the reader can write the RM training loss, say what it can and cannot represent, and explain where RMs are still used in 2026 recipes.",
+          "topics": [
+            "preference datasets: how comparisons are collected, pair construction from K-way rankings, labeler agreement numbers (72.6 +/- 1.5%, 77.3 +/- 1.3%) as the noise ceiling on any RM",
+            "Bradley-Terry: P(y_w preferred over y_l) = sigma(r(y_w) - r(y_l)); the pairwise logistic loss; invariance to adding a constant to r; gradient (derived)",
+            "RM architecture: SFT/LM backbone with the unembedding replaced by a scalar head; RM output only meaningful relative to other outputs for the same prompt",
+            "RM scale and stability: InstructGPT's 6B RM choice because 175B RM training was unstable and a 175B value function costly; value function initialised from the RM",
+            "RM as a proxy: held-out pair accuracy vs downstream policy quality; preview of over-optimization (Module 6) and DPO's 'secretly a reward model' view (Module 7)",
+            "Llama 3's reward models and their use in rejection sampling and SFT-data filtering (writer to read Section 4.1.2 and 4.2 first-hand)",
+            "outcome reward models vs process reward models: Let's Verify Step by Step, PRM800K (800,000 step labels), active learning for step selection",
+            "why PRMs did not survive RL scale in R1: step granularity, step-correctness judgement, hackability (Supplement G.2); Llama 3 still trains stepwise RMs for trace filtering",
+            "where learned RMs sit in each family of recipes: PPO-RLHF (core), DPO pipelines (data filtering), RLVR (avoided), 2026 GRMs (replaced by judges; Module 16)"
+          ],
+          "sourceIds": ["S6", "S8", "S30", "S50", "S60", "S28", "S15"],
+          "estWords": 5500,
+          "figures": [
+            "Computation graph: (prompt, chosen, rejected) -> shared backbone -> scalar head -> sigmoid of the reward difference -> loss",
+            "Plot of the Bradley-Terry loss and its gradient versus reward margin (derived), marking where gradient vanishes",
+            "Side-by-side scoring of one math solution by an outcome RM and a process RM, with per-step labels",
+            "Table of RM setups reported in InstructGPT and Llama 3: size, data, agreement or accuracy, how used (unverified cells marked)",
+            "Where-RMs-live matrix across PPO-RLHF, DPO pipelines, RLVR and 2026 GRM recipes"
+          ],
+          "disagreements": [
+            "Process vs outcome supervision (primary: positions A-C; position D, step credit without a learned PRM, is in Module 18)",
+            "Learned reward models, verifiers, or generative/rubric judges? (introduced; treated in Modules 10 and 16)"
+          ],
+          "prerequisites": ["Module 2"]
+        },
+        {
+          "id": "05-ppo-rlhf-system",
+          "number": 5,
+          "title": "PPO-RLHF as a System: Policy, Reference, Reward and Value Models, Per-Token KL Reward, GAE, and the Pretraining Mix",
+          "shortTitle": "PPO-RLHF system",
+          "description": "The full InstructGPT-style recipe and Tulu 3's PPO details: what each of the four models does in a step, how the reward is shaped, and why it is expensive.",
+          "scope": "In: the three-stage recipe (SFT ~13k prompts, RM ~33k, PPO ~31k), RL as a bandit environment, the four-model system and what each does, per-token KL penalty folded into the reward with the RM score at the last token, value model initialised from the RM, GAE over response tokens, the inner PPO loop (minibatches, epochs, clip), PPO-ptx (mixing pretraining gradients to remove the alignment tax on SQuAD, DROP, HellaSwag, WMT15 fr-en), InstructGPT's headline (1.3B preferred to 175B GPT-3), Tulu 3's PPO for RLVR (value init from a general RM best, KL 0.05/0.07, asynchronous PPO with vLLM on Ray, 405B limited to 75 steps), the measured PPO-vs-DPO cost (about 28 h on two nodes vs about 4 h on one) and the evidence that implementation details dominate (Xu et al., Ivison et al.). Out: KL estimator mathematics (Module 6), DPO (Module 7), critic-free alternatives (Module 9). After this module the reader can draw the PPO-RLHF dataflow, list its tensors, and estimate its memory and wall-clock relative to a critic-free method.",
+          "topics": [
+            "three-stage pipeline and dataset sizes (SFT ~13k, RM ~33k, PPO ~31k prompts; PPO prompts API-only)",
+            "RL environment as a bandit: random prompt in, response out, RM reward ends the episode",
+            "the four models: actor (trained), reference (frozen SFT), reward model (frozen), value model (trained); memory and communication per step (derived arithmetic marked)",
+            "reward shaping: per-token -beta * log(pi_RL / pi_SFT) plus the RM score at the final token (InstructGPT Eq. 2 context)",
+            "value model initialised from the RM; GAE over tokens with gamma = 1; value loss and why Tulu 3 found RM-initialised value best on GSM8K and average score",
+            "PPO inner loop for an LLM: rollout batch, minibatch epochs, ratio clip; what differs from the MuJoCo setting of Module 3",
+            "PPO-ptx: adding gamma * pretraining log-likelihood, alignment tax, and why gamma = 0 recovers plain PPO",
+            "headline results and caveats: 1.3B InstructGPT preferred over 175B GPT-3 by labelers; labeler pool of ~40 contractors",
+            "Tulu 3 RLVR with PPO: KL 0.05 (8B) / 0.07 (70B), asynchronous PPO with dedicated vLLM GPUs via Ray, 405B on MATH only for 75 steps; more KL budget did not raise verifiable reward",
+            "PPO vs DPO evidence on cost and quality: Tulu 3 ~28 h on two nodes vs ~4 h on one at roughly equal scores; Xu et al.; Ivison et al. (data quality > algorithm > RM > extra prompts)",
+            "why the last-token reward makes the critic hard to train (DeepSeekMath's motivation), setting up Part 3"
+          ],
+          "sourceIds": ["S6", "S2", "S3", "S16", "S11", "S12", "S13", "S60"],
+          "estWords": 7000,
+          "figures": [
+            "Dataflow diagram of one PPO-RLHF iteration with four models and the tensors exchanged (log-probs, values, rewards, advantages)",
+            "Worked per-token reward vector for a 6-token response: KL terms at each token plus the RM score at the last token (numeric, derived)",
+            "Memory table for the four models at 7B and 70B under bf16 weights plus optimizer state (derived; flagged as such)",
+            "InstructGPT results chart: 1.3B vs 175B preference, and the alignment-tax regressions with and without PPO-ptx",
+            "Tulu 3 PPO vs DPO cost table (nodes, hours, scores) with the experimental setting stated",
+            "Timeline of one PPO iteration showing rollout, scoring, GAE and K epochs, with idle time marked for asynchronous PPO"
+          ],
+          "disagreements": [
+            "Is DPO enough, or does online RL (PPO) win for preference tuning? (secondary: PPO side of the evidence; primary in Module 7)",
+            "Critic or no critic: is a value model worth it? (secondary: position B, the value model still carries weight)"
+          ],
+          "prerequisites": ["Module 3", "Module 4"]
+        },
+        {
+          "id": "06-kl-and-overoptimization",
+          "number": 6,
+          "title": "KL Regularization and Reward-Model Over-Optimization: Reference Policies, the k1/k2/k3 Estimators, and Gold-versus-Proxy Scaling Laws",
+          "shortTitle": "KL and over-optimization",
+          "description": "Why a KL leash exists, how it is estimated from samples (and when the estimator's gradient is biased), and what the gold-vs-proxy scaling laws say about how far to optimise a proxy reward.",
+          "scope": "In: the KL-regularized RL objective and its closed-form optimum pi* proportional to pi_ref * exp(r/beta); the three sampled estimators k1, k2, k3 with Schulman's numbers (true KL 0.005 and 0.5: bias and standard deviation per estimator) and the reverse-direction estimator; KL in the reward (InstructGPT/PPO) vs KL in the loss (GRPO), and what that does to the advantage; the biased-gradient problem of k3 when sampled tokens are far less probable under pi_theta than pi_ref and DeepSeek-V3.2's importance-ratio fix; Gao et al.'s gold-vs-proxy design (proxy RMs 3M-3B, gold 6B InstructGPT RM), the functional forms in d = sqrt(KL) for best-of-n and RL, and why KL is a poor common yardstick; the KL coefficient across reports (R1 0.001, DeepSeekMath 0.04, Tulu 3 0.05-0.07, TRL default 0.0). Out: whether to keep KL in long-CoT RL (Module 13), reward hacking in verifiable and agentic settings (Module 19). After this module the reader can choose and implement a KL estimator for a given placement and explain what a KL budget buys.",
+          "topics": [
+            "KL-regularized objective: maximise E[r] - beta * KL(pi || pi_ref); closed-form optimum pi* proportional to pi_ref * exp(r / beta) (derived; reused in Module 7)",
+            "why the reference policy exists: keep outputs on the SFT distribution, limit exploitation of RM errors; reference choice (SFT model, previous policy, periodic reset)",
+            "sampled estimators of KL(q||p): k1 = -log r (unbiased, high variance), k2 = (1/2)(log r)^2 (biased, low variance), k3 = (r - 1) - log r (unbiased, non-negative); numerical tables for true KL 0.005 and 0.5; reverse-direction estimator r log r - (r - 1)",
+            "KL placement: in the reward (per-token shaping, enters the advantage) vs in the loss (GRPO, does not enter the advantage); consequences for the gradient",
+            "value vs gradient: k3 is unbiased in value but its gradient is biased when sampled tokens are far less probable under pi_theta than pi_ref; V3.2's importance-ratio correction",
+            "Gao et al.: gold RM stands in for humans, proxy RMs 3M-3B; best-of-n R(d) = d(alpha - beta d) and RL R(d) = d(alpha - beta log d) in d = sqrt(KL); coefficients scale smoothly with RM parameter count",
+            "RL vs best-of-n: RL is slower in KL terms, so KL is not a common yardstick across optimisers",
+            "KL coefficient and estimator across reports (R1 0.001, DeepSeekMath 0.04, Tulu 3 0.05/0.07, TRL beta = 0.0) and Tulu 3's finding that more KL budget does not raise verifiable reward",
+            "Goodhart framing and what to monitor (KL to reference, proxy vs held-out reward) from the reports' own practice"
+          ],
+          "sourceIds": ["S4", "S28", "S6", "S14", "S45", "S16", "S17", "S59", "S60"],
+          "estWords": 6000,
+          "figures": [
+            "Forward vs reverse KL between two Gaussians, showing mode-seeking vs mass-covering and which one RLHF uses",
+            "Bar chart of bias and standard deviation of k1, k2, k3 from Schulman's two numerical tables (true KL 0.005 and 0.5)",
+            "Schematic gold-reward vs sqrt(KL) curves for best-of-n and RL from the published functional forms (labelled schematic, not the paper's data)",
+            "KL-in-reward vs KL-in-loss diagram showing where the term enters the advantage and the gradient",
+            "Table of KL coefficient, estimator, placement and reset cadence across InstructGPT, DeepSeekMath, R1, Tulu 3, DAPO, Olmo 3, V3.2"
+          ],
+          "disagreements": [
+            "Keep or remove the KL-to-reference term? (introduced with the RLHF-era rationale and the estimator; primary treatment for long-CoT RL in Module 13)"
+          ],
+          "prerequisites": ["Module 3", "Module 4", "Module 5"]
+        },
+        {
+          "id": "07-direct-alignment-dpo",
+          "number": 7,
+          "title": "Direct Alignment: Deriving DPO, the Implicit Reward, Its Failure Modes, and the KTO, Length-Normalized and NLL-Regularized Variants",
+          "shortTitle": "DPO and direct alignment",
+          "description": "Derives DPO from the KL-regularized objective, shows what it drops (sampling, a reward model, a critic) and what it risks, and sets the empirical record of DPO vs PPO against each other.",
+          "scope": "In: derivation from the optimal KL-regularized policy to the DPO loss (Eq. 7), the partition function cancelling in Bradley-Terry, the implicit reward beta * log(pi_theta / pi_ref), the gradient's reweighting by how wrong the implicit ordering is, default hyperparameters (beta 0.1, lr 1e-6, batch 64); failure modes and fixes reported in practice (Llama 3: NLL term with coefficient 0.2 on chosen sequences to stop chosen log-probability falling, masking formatting tokens to stop tail repetition, lr 1e-5); Tulu 3's comparison (only length-normalized DPO beat the baseline among DPO, SimPO, length-normalized DPO); KTO (binary signal, prospect-theory utility); offline vs on-policy preference data (Llama 3's six rounds with recent best-model batches); DeepSeekMath's unified view. Out: AI-generated labels (Module 8), when to choose DPO (Module 33). IPO, ORPO, SimPO and the on-policy-vs-offline studies (Tajwar et al., Tang et al.) exist as verified pointers only: the writer must fetch before citing. After this module the reader can derive DPO, implement it, diagnose its typical failure modes, and state precisely what evidence supports or contradicts 'DPO is enough'.",
+          "topics": [
+            "from the KL-regularized objective to the closed-form optimal policy and back: reward as beta * log(pi*/pi_ref) + beta * log Z(x)",
+            "why Z(x) cancels in the Bradley-Terry difference; the DPO loss (Eq. 7) and the implicit reward",
+            "gradient analysis: the per-pair weight sigma(r_hat_l - r_hat_w) and what it means for learning dynamics",
+            "default and reported hyperparameters: beta = 0.1, batch 64, RMSprop, lr 1e-6 with 150-step warmup (DPO); lr 1e-5, beta 0.1 (Llama 3); beta role as the implicit KL strength",
+            "failure modes: chosen log-probability decreasing, verbosity/length drift, tail repetition from formatting tokens; Llama 3's NLL regulariser (coefficient 0.2) and token masking",
+            "length-normalized DPO vs SimPO vs plain DPO in Tulu 3 (only length-normalized beat the base checkpoint overall)",
+            "KTO: maximise the utility of generations from a binary desirable/undesirable signal, and the claim that no single human-aware loss is universally best",
+            "offline vs on-policy preference data: Llama 3's six rounds, each collecting new preference and SFT data from the latest model; pointers to IPO, ORPO, SimPO and on-policy-vs-offline studies (fetch before citing)",
+            "DeepSeekMath's unified paradigm: SFT, RFT, DPO, PPO, GRPO as one gradient with different data source, reward and coefficient",
+            "the evidence ledger: DPO paper TL;DR (~61% vs PPO ~57%), Xu et al. (PPO ahead on every testbed), Ivison et al. (PPO ahead by up to 2.5% math / 1.2% general; data quality up to 8%), Llama 3, Tulu 3 (~28 h vs ~4 h)"
+          ],
+          "sourceIds": ["S8", "S9", "S50", "S16", "S11", "S12", "S60", "S14"],
+          "estWords": 7500,
+          "figures": [
+            "Derivation chain diagram: KL-regularized objective -> optimal policy -> reward expressed by policy -> Bradley-Terry -> DPO loss",
+            "Plot of the DPO per-pair gradient weight against the implicit-reward margin",
+            "Loop diagram of offline DPO vs on-policy iterated DPO (Llama 3's six rounds)",
+            "Variant table: DPO, length-normalized DPO, SimPO, IPO, ORPO, KTO: data format, reference model needed, length handling, evidence source (pointer-only rows marked)",
+            "Evidence ledger table for DPO vs PPO: study, stack, metric, margin, caveat",
+            "Schematic chosen/rejected log-probability trajectories under DPO with and without the NLL term (labelled schematic)"
+          ],
+          "disagreements": [
+            "Is DPO enough, or does online RL (PPO) win for preference tuning? (primary)"
+          ],
+          "prerequisites": ["Module 4", "Module 6"]
+        },
+        {
+          "id": "08-ai-feedback-rlaif-cai",
+          "number": 8,
+          "title": "AI Feedback as the Labeler: RLAIF, Constitutional AI, and Contrastive-Prompt Preference Pairs (Yang et al.'s RLCD)",
+          "shortTitle": "AI feedback and CAI",
+          "description": "How an LLM replaces the human labeler (critique-revision, AI preference labels, contrastive prompts), and which of the four methods sharing the acronym RLCD this one is.",
+          "scope": "Coverage is thin: Constitutional AI was read only to the abstract and Section 1, the older RLCD more deeply, and RLAIF (Lee et al.) is not in the source map, so the writer must fetch the Constitutional AI paper in full and the RLAIF paper before citing. In: Constitutional AI's two phases (self-critique and revision then SFT; RL phase with AI preference labels guided by a constitution, optionally with chain-of-thought); the RL-CAI helpfulness/harmlessness frontier vs human-feedback HH RLHF; RLAIF's labelling weakness when both samples come from one prompt; Yang et al. (ICLR 2024) Reinforcement Learning from Contrastive Distillation: build pairs from a positive prompt p+ and a negative prompt p- for the same task, train a preference model, then PPO; their LLaMA-7B experiments with preference data simulated by LLaMA-7B or 30B and Table 3 win rates (including the near-parity 30B result); the modern descendants (K2 self-critic, rubric generation) as forward pointers; an acronym map (RLCD 2023, RLCD 2026, RLCR, RLHV). Out: judges as live rewards (Module 16), TypeSafe's RLCD (Module 25). After this module the reader can say who labels the data in each recipe, and cannot confuse the four acronyms.",
+          "topics": [
+            "Constitutional AI supervised phase: critique, revision, SFT on the revisions; stated aim of a non-evasive, relatively harmless assistant without human harm labels",
+            "Constitutional AI RL phase (RLAIF): AI preference labels from principles, optional chain-of-thought labelling, PPO against the resulting preference model; the Figure 2 helpfulness/harmlessness frontier",
+            "why AI labels from two i.i.d. samples of one prompt are noisy (Yang et al.'s diagnosis)",
+            "Yang et al. RLCD algorithm: positive prompt p+ and negative prompt p- generate the two outputs, so the preference label is set by construction rather than judged; preference model; PPO",
+            "Yang et al. experiments: LLaMA-7B policy, preference data simulated by LLaMA-7B or LLaMA-30B, harmlessness/helpfulness/outlining tasks, GPT-4 as judge; Table 3 win rates (84.8%, 71.0%, 85.4%, 78.5% at 7B) and the near-parity 30B result (35.9% RLCD vs 64.1% RLAIF on outline quality)",
+            "who labels what across recipes: humans (InstructGPT), AI by principle (CAI), AI by contrast (Yang), verifier (RLVR), generative judge (Module 16)",
+            "forward pointers: Kimi K2's self-critic pairwise reward and rubric generation as modern AI feedback",
+            "acronym map with arXiv ids: RLCD (Yang, Klein, Celikyilmaz, Peng, Tian, 2307.12950), RLCD (TypeSafe AI, 2026, no paper), RLCR (Damani et al., 2507.16806), RLHV (a design proposal in 2609.28940)"
+          ],
+          "sourceIds": ["S7", "S34", "S60", "S6", "S42", "S31"],
+          "estWords": 5200,
+          "figures": [
+            "Constitutional AI two-phase pipeline (SL critique-revise-SFT, then AI-labelled RL) with data volumes the writer verifies",
+            "Labeling schematic: RLAIF (two samples from one prompt, AI picks) vs Yang et al. RLCD (two prompts p+ and p-, label by construction)",
+            "Bar chart of Table 3 win rates at 7B and 30B simulation, showing where the advantage disappears",
+            "Acronym disambiguation table: RLCD (2023), RLCD (2026), RLCR, RLHV with authors, mechanism, status",
+            "Spectrum of labelers: human, AI-by-principle, AI-by-contrast, verifier, generative judge"
+          ],
+          "disagreements": [
+            "Source-level conflict (S34): the contrastive-prompt advantage is large at 7B simulation and near parity or reversed at 30B simulation",
+            "Learned reward models, verifiers, or generative/rubric judges? (secondary: AI-labelled preference models as one answer)"
+          ],
+          "prerequisites": ["Module 4", "Module 5", "Module 7"]
+        }
+      ]
+    },
+    {
+      "id": "part-03-critic-free-rlvr",
+      "number": 3,
+      "title": "Critic-Free Policy Optimization and Verifiable Rewards",
+      "shortTitle": "GRPO and RLVR",
+      "description": "GRPO and its ancestors, RL with verifiable rewards, and the loss, advantage and ratio choices that define the 2024-2026 reasoning-RL recipes.",
+      "modules": [
+        {
+          "id": "09-critic-free-grpo",
+          "number": 9,
+          "title": "Critic-Free Policy Gradient: REINFORCE with Group Baselines, RLOO, GRPO, and Kimi's Mirror-Descent Objective",
+          "shortTitle": "GRPO and RLOO",
+          "description": "How GRPO replaces PPO's value model with a baseline computed from a group of samples, where it comes from (DeepSeekMath, 2024), and the alternative critic-free objectives.",
+          "scope": "In: REINFORCE and RLOO (the other k-1 samples as a 'parameter-free value function', reported 3.2%-20.3% win-rate margin over PPO); GRPO as defined in DeepSeekMath (group of G outputs per question, advantage = (r_i - mean)/std, PPO-style ratio and clip, KL added to the loss not the reward, outcome vs process supervision variants), its DeepSeekMath settings (lr 1e-6, KL 0.04, 64 outputs per question, batch 1024, one policy update per exploration stage) and results (GSM8K 82.9 -> 88.2, MATH 46.8 -> 51.7); iterative GRPO (10% replay, reference reset); Online RFT vs GRPO gradient coefficients; the unified gradient view; Kimi k1.5's online policy mirror descent variant with the sampled-mean baseline and squared-error surrogate (no std normalization); the critic-or-no-critic argument on both sides, including Tulu 3's RM-initialised value and VAPO/ReMax as pointer-only items (fetch before citing). Out: loss/advantage normalization fixes (Module 11), clipping and ratio variants (Module 12), RLVR reward design (Module 10). After this module the reader can implement GRPO and RLOO from the equations and say what each assumes about the reward and the sampling budget.",
+          "topics": [
+            "REINFORCE for LLMs: whole completion as one action; why PPO's machinery is argued to be over-engineered for pretrained LLMs",
+            "RLOO: leave-one-out baseline from the other k-1 samples; unbiased; cost is more sampling; reported 3.2%-20.3% win-rate margin over PPO on HH and TL;DR with Llama and Pythia (derived check of the unbiasedness argument)",
+            "GRPO objective: for each question sample G outputs from pi_old, advantage A_i = (r_i - mean(r))/std(r), per-token ratio and clip, KL term in the loss; why group-relative advantages match how RMs are trained",
+            "KL in the loss vs in the reward: consequence that KL does not enter the advantage; DeepSeekMath's unbiased KL estimator",
+            "DeepSeekMath-RL setup and results: lr 1e-6, KL 0.04, 64 outputs, max length 1024, batch 1024, one update per exploration stage (so the ratio is 1 and clipping is inert), ~144K CoT questions; GSM8K 82.9 -> 88.2, MATH 46.8 -> 51.7",
+            "outcome vs process supervision inside GRPO; iterative GRPO with 10% historical replay and reference resets",
+            "Online RFT vs GRPO: GRPO's gradient coefficient scales with reward magnitude and penalizes wrong answers; Online RFT reinforces only correct ones",
+            "unified paradigm table: SFT, RFT, DPO, PPO, GRPO as special cases of one gradient form (data source, reward, coefficient)",
+            "Kimi k1.5's objective: online policy mirror descent with the current model as reference, sampled-mean baseline approximating tau * log Z, squared-error surrogate; contrast with GRPO",
+            "the critic debate: no critic (REINFORCE/RLOO, GRPO, Kimi) vs a value model still carrying weight (Tulu 3 RM-initialised value; Xu et al.); VAPO and ReMax as pointer-only (fetch before citing)",
+            "TRL's GRPOTrainer as a reference implementation: num_generations default 8, group-std scaling default, KL beta default 0.0"
+          ],
+          "sourceIds": ["S13", "S14", "S41", "S59", "S60", "S4", "S15", "S16"],
+          "estWords": 7500,
+          "figures": [
+            "GRPO dataflow: one prompt -> G samples -> verifier/RM -> group mean and std -> per-sample advantage broadcast over tokens",
+            "Numeric example (G = 4 and G = 8): group-mean vs leave-one-out advantages for the same rewards (derived)",
+            "Component diff of PPO vs GRPO: critic removed, KL moved from reward to loss, GAE replaced by group normalization",
+            "Unified-paradigm table from DeepSeekMath Section 5.2.1 with the gradient coefficient of each method",
+            "Plot of Online RFT vs GRPO gradient coefficient as a function of reward",
+            "Comparison table: GRPO vs RLOO vs Kimi mean-baseline surrogate: baseline, normalization, clipping, KL, source"
+          ],
+          "disagreements": [
+            "Critic or no critic: is a value model worth it? (primary)"
+          ],
+          "prerequisites": ["Module 3", "Module 5", "Module 6"]
+        },
+        {
+          "id": "10-rlvr-reward-design",
+          "number": 10,
+          "title": "RL with Verifiable Rewards: Rule-Based Reward Design, Prompt Selection, and What R1-Zero Showed",
+          "shortTitle": "RLVR reward design",
+          "description": "RLVR as the RLHF objective with the reward model replaced by a verifier: what verifiers exist, how rewards are composed, and how prompts are chosen so the signal is learnable.",
+          "scope": "In: Tulu 3's definition (RLHF objective with a verification function; constant reward if verified; coined Nov 2024, pre-dating R1) and its targets (GSM8K, MATH, IFEval-style constraints); R1-Zero's reward (accuracy + format, equal weight; no neural RM) and the language-consistency reward with its measured cost; verifier examples in the shipped environments (math answer matching, code tests, SQL result-set equality, constraint checkers); query-verifier selection (Qwen3's 3,995 pairs and four criteria, Olmo 3's offline filter dropping pass rate above 62.5%, K2's difficulty by SFT-model pass@k, k1.5's curriculum and prioritized sampling); base-model dependence (R1-Zero AIME 15.6 -> 77.9% in the v2/Nature version vs 71.0% in v1; template sensitivity; the 'aha moment' already present in V3-Base per Dr. GRPO); R1-Zero's own problems (readability, language mixing). Out: judge and rubric rewards (Module 16), environments (Module 17), reward hacking (Module 19), the sharpen-or-expand debate (Module 20), the full R1 recipe (Module 27). After this module the reader can design a rule-based reward and a prompt-selection filter for a new verifiable domain and name its failure modes.",
+          "topics": [
+            "RLVR definition and provenance: Tulu 3 (22 Nov 2024) vs R1 (22 Jan 2025); the RLHF objective with the RM replaced by a verifier; constant reward on verification",
+            "what is verifiable: GSM8K/MATH answer matching, IFEval-style precise instruction following, code via tests, SQL via unordered result-set equality (NeMo Gym Bird SQL), games with +1/0/-1",
+            "R1-Zero reward composition: accuracy + format, equal weight; why neural reward models (outcome or process) were deliberately avoided; the 'think'/'answer' template as part of the environment",
+            "the language-consistency reward (fraction of target-language words in the CoT; Eq. 7) and its slight performance cost",
+            "prompt selection as signal design: Qwen3's four criteria (not used in cold start, learnable, as challenging as possible, broad coverage) and 3,995 pairs; Olmo 3's pass-rate > 62.5% offline filter; K2's SFT-model pass@k difficulty rule; k1.5's easy-first curriculum with prioritized sampling toward low success",
+            "binary vs graded rewards and what a group of all-pass or all-fail rollouts does (pointer to Module 11 on zero-variance groups)",
+            "base-model dependence: R1-Zero 15.6% -> 77.9% (v2) / 71.0% (v1); Qwen2.5 base improves ~60% without a template vs the R1 template; template mismatch can destroy reasoning before RL starts",
+            "where R1-Zero's gains come from: R1 attributes reflection to RL; Dr. GRPO finds the 'aha moment' in V3-Base (source-level conflict)",
+            "R1-Zero's problems that motivated the multi-stage R1 (poor readability, language mixing, narrow reasoning-only RL) and the contamination caveat that motivates Olmo 3's RL-Zero",
+            "Reasoning Gym as verifiable tasks with adjustable difficulty (pointer to Module 17)"
+          ],
+          "sourceIds": ["S16", "S15", "S14", "S17", "S18", "S49", "S48", "S55", "S41", "S42", "S57"],
+          "estWords": 7000,
+          "figures": [
+            "Substitution diagram: the RLHF pipeline with the reward-model block replaced by a verifier block, everything else unchanged",
+            "R1-Zero rollout example with the think/answer template annotated by which tokens the accuracy and format rewards read",
+            "Verifier taxonomy table: task -> verifier -> typical failure mode -> report",
+            "Prompt-selection funnel: pass-rate histogram with the keep window, Olmo 3's 62.5% cut and Qwen3's 3,995 survivors (schematic)",
+            "R1-Zero AIME trajectory with v1 (71.0%) vs v2 (77.9%) endpoints labelled and the version ambiguity noted"
+          ],
+          "disagreements": [
+            "Learned reward models, verifiers, or generative/rubric judges? (position A, rule-based verifiers; full treatment in Module 16)",
+            "Source-level conflict (S15 vs S18): R1 attributes emergent reflection to RL; Dr. GRPO finds it already in V3-Base"
+          ],
+          "prerequisites": ["Module 5", "Module 9"]
+        },
+        {
+          "id": "11-grpo-loss-and-advantage",
+          "number": 11,
+          "title": "The GRPO Loss and Advantage Under the Microscope: Length Bias, Difficulty Bias, Token-Level Averaging, and Zero-Variance Groups",
+          "shortTitle": "GRPO loss and advantage",
+          "description": "What the per-sequence 1/|o| average and the std division do to per-token gradient weight, and the competing fixes in Dr. GRPO, DAPO, V3.2, Olmo 3 and ScaleRL.",
+          "scope": "In: derivation of per-token gradient weight under the original GRPO aggregation; Dr. GRPO's two diagnosed biases (response-level length bias from 1/|o_i|: shorter correct answers get larger updates and longer wrong answers are penalised less; question-level difficulty bias from dividing by group std) and its constant normalizer fix (43.3% AIME 2024 on a 7B base); DAPO's token-level loss and its ablation ladder on AIME24 avg@32 (30 -> 36 -> 38 -> 41 -> 42 -> 50), overlong filtering and soft punishment (16,384 + 4,096 cache), dynamic sampling that drops accuracy-0 or accuracy-1 groups; DeepSeek-V3.2 (advantage = R - mean(R)), OlmoRL (token-level, no std, zero-gradient filtering, active sampling), ScaleRL (prompt-level averaging, batch-level advantage normalization, zero-variance filtering, no-positive-resampling); TRL's loss_type and scale_rewards options; the claim that these choices mostly move efficiency, not the asymptote. Out: ratio clipping (Module 12), entropy dynamics (Module 13), scaling fits (Module 15). After this module the reader can compute the per-token weight under any aggregation and pick a normalization with the evidence in hand. The ablation numbers are from one base model (Qwen2.5-32B) and one benchmark: state that.",
+          "topics": [
+            "per-token gradient weight under the original GRPO loss: (1/G) sum_i (1/|o_i|) sum_t ...; derivation that a token in a long response gets less weight (derived)",
+            "response-level length bias (Dr. GRPO Section 3.1): why wrong responses grow longer; the same normalization predates GRPO in open-source PPO implementations",
+            "question-level difficulty bias: std division up-weights very easy and very hard prompts (derived weight curve in p = pass rate)",
+            "Dr. GRPO: constant normalizer (e.g. max length) and no std; 43.3% AIME 2024 with Qwen2.5-Math-7B and a minimalist recipe",
+            "DAPO token-level policy-gradient loss: sample-level averaging underweights long responses and cannot penalise gibberish in them; ablation ladder 30/36/38/41/42/50 on AIME24 avg@32",
+            "zero-variance groups: P(all-correct or all-wrong) = p^G + (1-p)^G (derived); DAPO's dynamic sampling (oversample, drop accuracy 0/1), Olmo 3's active sampling and zero-gradient filtering, ScaleRL's zero-variance filtering and no-positive-resampling",
+            "overlong reward shaping: overlong filtering vs soft overlong punishment (16,384 expected max + 4,096 cache = 20,480)",
+            "advantage without std: DeepSeek-V3.2 (R_i - mean(R)) and OlmoRL; what changes when update magnitude then depends on raw reward scale (TRL scale_rewards note)",
+            "ScaleRL's position: prompt-level loss averaging and batch-level advantage normalization; loss aggregation and normalization mostly change compute efficiency, not asymptote",
+            "TRL options as a map of the debate: loss_type (grpo, dapo, dr_grpo), scale_rewards (group, batch, False), their defaults and what each reproduces"
+          ],
+          "sourceIds": ["S14", "S17", "S18", "S22", "S45", "S48", "S59", "S25"],
+          "estWords": 7000,
+          "figures": [
+            "Per-token gradient weight versus response length under the three aggregations (sample-level 1/|o|, token-level, constant normalizer), derived",
+            "Std-normalization weight 1/std as a function of group pass rate, showing the difficulty bias (derived)",
+            "DAPO ablation ladder bar chart (30 -> 50 on AIME24 avg@32) with the base model and eval protocol stated",
+            "Probability of a zero-variance group vs pass rate p for G = 4, 8, 16, 64 (derived curves)",
+            "Normalization-choice table across GRPO, DAPO, Dr. GRPO, V3.2, Olmo 3, ScaleRL and TRL defaults"
+          ],
+          "disagreements": [
+            "How should the GRPO loss and advantage be normalized? (primary)",
+            "Controlling response length / reasoning effort (secondary: position D, fix the length bias in the loss rather than adding a penalty)"
+          ],
+          "prerequisites": ["Module 9"]
+        },
+        {
+          "id": "12-ratios-clipping-gspo-cispo",
+          "number": 12,
+          "title": "Importance Ratios and Clipping: Token-Level, Sequence-Level (GSPO), IS-Weight Clipping (CISPO), and Log-Ratio Masks",
+          "shortTitle": "Ratios and clipping",
+          "description": "Why the PPO ratio is a different object in LLM RL than in MuJoCo, and the competing designs: Clip-Higher, GSPO, CISPO, Kimi's log-ratio mask, GLM-5's double-sided IS, V3.2's sequence masking.",
+          "scope": "In: when the ratio is non-trivial in LLM RL (DeepSeekMath's single update per exploration stage makes it 1; R1's 8,192-output rollout in 16 minibatches does not); GSPO's critique of token-level importance weights (one sample per position, variance growing with length, collapse), the sequence-level length-normalized ratio and its clip ranges (3e-4/4e-4 vs GRPO 0.2/0.27), Routing Replay needed by GRPO on MoE and not by GSPO; Clip-Higher (0.2/0.28); CISPO (stop-gradient clipped IS weight times a REINFORCE term, 'fork' tokens like However/Wait, 2x speedup vs DAPO at equal quality); Kimi K2.5's log-ratio mask independent of the sign of the advantage, K3's per-token regularization tolerance to staleness; GLM-5's direct double-sided importance sampling; DeepSeek-V3.2's off-policy sequence masking for negative-advantage sequences; SAPO's soft gate (pointer-only abstract, TRL implements it); R1's printed clip epsilon of 10 in stage-1 RL (unexplained: unverified). Out: numerical sources of off-policyness (Module 14) and infrastructure staleness (System Design course Module 37). After this module the reader can write each variant's loss, say which tokens receive gradient under each, and predict which variant tolerates MoE routing noise and stale rollouts.",
+          "topics": [
+            "when the ratio matters: pi_theta / pi_old equals 1 for a single update per rollout (DeepSeekMath); with 16 minibatches per 8,192-output rollout (R1) later minibatches are off-policy by design (derived)",
+            "GSPO's diagnosis: token-level importance weights are a misapplication of importance sampling (one sample per token position); variance grows with length and is amplified by clipping, ending in irreversible collapse",
+            "GSPO: sequence-likelihood ratio with length normalization, clipped at the sequence level (Eq. 5); clip ranges 3e-4/4e-4 vs GRPO 0.2/0.27 because the log-ratio scale differs",
+            "MoE: GRPO needs Routing Replay to converge; GSPO removes the need because sequence likelihood is insensitive to which experts a token routed to; training/inference precision tolerance",
+            "Clip-Higher: eps_low 0.2, eps_high 0.28; why raising the lower bound would crush low-probability tokens to 0 and collapse the sampling space",
+            "CISPO (MiniMax-M1): clip the importance weight, not the update, with stop-gradient; rare 'fork' tokens (However, Recheck, Wait, Aha) get clipped out under PPO-style clipping; 2x speedup vs DAPO on Qwen2.5-32B",
+            "Kimi K2.5 token-level log-ratio mask [alpha, beta], independent of advantage sign; K3 per-token regularization as staleness tolerance",
+            "GLM-5 direct double-sided importance sampling: clip [1 - eps_l, 1 + eps_h] on rollout log-probs, no tracking of historical policy checkpoints",
+            "DeepSeek-V3.2 off-policy sequence masking: mask whole sequences with negative advantage whose policy divergence exceeds delta, measured with the inference engine's probabilities",
+            "SAPO soft temperature-controlled gate (pointer-only; TRL implements it) and the claim GSPO suppresses whole sequences for a few off-policy tokens",
+            "R1's printed 'GRPO clip ratio epsilon = 10' in stage-1 RL: unexplained, mark unverified; TRL epsilon/epsilon_high/CISPO defaults (0.2, 0.28 recommended, 5.0 for CISPO)"
+          ],
+          "sourceIds": ["S3", "S17", "S19", "S20", "S22", "S43", "S44", "S47", "S45", "S59", "S15"],
+          "estWords": 7500,
+          "figures": [
+            "Per-token gradient vs ratio for PPO clip, Clip-Higher, CISPO and the K2.5 log-ratio mask on one axis (derived from definitions, for A > 0 and A < 0)",
+            "Worked example: a 1,000-token response where 5 tokens move; token-level ratios vs the length-normalized sequence ratio (derived numbers)",
+            "Fork-token illustration: a low-probability 'Wait' token with a high ratio, clipped away under PPO-style clipping but kept under CISPO",
+            "Diagram of MoE Routing Replay vs GSPO: where expert routing differences enter the ratio",
+            "Comparison table of eight methods: what is clipped or masked, sign dependence, tolerance to MoE and stale rollouts, source"
+          ],
+          "disagreements": [
+            "Importance ratio and clipping: token-level, sequence-level, IS-weight clipping, or soft gating? (primary)"
+          ],
+          "prerequisites": ["Module 3", "Module 9", "Module 11"]
+        }
+      ]
+    },
+    {
+      "id": "part-04-stability-scale",
+      "number": 4,
+      "title": "Making RL Run: Dynamics, Numerical Mismatch, and Compute Scaling",
+      "shortTitle": "Stability and Scale",
+      "description": "What goes wrong during long RL runs (entropy collapse, length drift, probability mismatch between inference and training engines) and what scaling studies say about compute.",
+      "modules": [
+        {
+          "id": "13-entropy-kl-length-dynamics",
+          "number": 13,
+          "title": "Training Dynamics: Entropy Collapse, KL Drift, Length Growth, and the Controls That Work",
+          "shortTitle": "Training dynamics",
+          "description": "The mechanism behind entropy collapse (a covariance between probability and advantage), the fixes proposed, and the keep-or-remove-KL disagreement for long-CoT RL.",
+          "scope": "In: the empirical entropy-performance law R = -a * exp(H) + b and its predictable ceiling; the covariance mechanism (entropy change tracks the covariance between action probability and logit change, i.e. advantage under policy gradient); Clip-Cov and KL-Cov; Clip-Higher and dynamic/active sampling; ProRL (KL penalty with periodic reference resets, higher temperature, 1.5B model, >2k steps, per-domain gains); temperature decay in Kimi K2; the KL debate (removed in DAPO, Olmo 3, GLM-5, TRL default; kept with resets in ProRL; domain-dependent in V3.2; R1 0.001 with reference replaced every 400 steps); response-length growth and language mixing as run-health signals. Out: how to control length on purpose (Module 23), the numerical source of off-policy drift (Module 14), whether gains are real (Module 20). After this module the reader can read a run's entropy, KL, length and clip-fraction curves and choose among the documented interventions with the evidence and its limits (single base models, single benchmarks) in view. Magistral (arXiv 2506.10910, same consensus as Olmo 3) is a pointer only.",
+          "topics": [
+            "entropy collapse in practice: early collapse to an over-confident policy and saturating reward in runs without intervention",
+            "the empirical law R = -a * exp(H) + b: performance is traded from entropy, the ceiling at H = 0 is R = -a + b (derived reading of the fit)",
+            "the covariance mechanism: entropy change driven by covariance between action probability and the change in logits; high-probability high-advantage actions lower entropy, rare high-advantage actions raise it",
+            "Clip-Cov and KL-Cov: select the high-covariance tokens and clip or penalise only those",
+            "Clip-Higher and dynamic/active sampling as DAPO and Olmo 3's answer (position A); why the upper clip bound matters for low-probability tokens",
+            "ProRL: explicit KL with reference resets and higher temperature as a more stable entropy fix when starting from a distilled checkpoint; 'remove KL' advice said to apply to base models; gains (14.7% math, 13.9% coding, 54.8% logic, 25.1% STEM, 18.1% instruction following at pass@1)",
+            "temperature decay (Kimi K2): high early for exploration, lower later for reliability",
+            "KL handling across reports: DAPO/Olmo 3/GLM-5/TRL remove it; ProRL keeps it with resets; V3.2 domain-dependent with a corrected estimator; R1 0.001 and reference replaced every 400 steps; DeepSeekMath 0.04; Tulu 3 0.05/0.07",
+            "length and language drift as run-health signals: R1-Zero length growth (32,768 -> 65,536 max length at step 8.2k), mixing of languages, Dr. GRPO's length-bias account of growing wrong answers",
+            "a run-health dashboard assembled from what the reports track (entropy, KL, response length, clip fraction, zero-advantage fraction, reward) with the fix each report applied; no metric included that no report uses"
+          ],
+          "sourceIds": ["S21", "S17", "S23", "S42", "S48", "S15", "S18", "S22", "S45", "S47", "S59"],
+          "estWords": 7000,
+          "figures": [
+            "Entropy vs downstream-performance fitted curve R = -a * exp(H) + b with the H = 0 ceiling marked (schematic of the published functional form)",
+            "Quadrant diagram: sign of advantage x probability of the sampled token -> entropy up or down (the covariance mechanism)",
+            "Clip-Higher mechanism diagram: probability headroom of a low-probability vs a high-probability token under symmetric and asymmetric clipping",
+            "KL-handling table across eight reports: coefficient, estimator, placement, reset cadence, rationale",
+            "Run-health dashboard schematic mapping each symptom to the intervention a report used",
+            "ProRL per-domain gain bar chart (1.5B model, >2k steps) with the single-model caveat printed"
+          ],
+          "disagreements": [
+            "How to prevent entropy collapse (primary)",
+            "Keep or remove the KL-to-reference term? (primary for long-CoT RL)"
+          ],
+          "prerequisites": ["Module 6", "Module 11", "Module 12"]
+        },
+        {
+          "id": "14-train-inference-mismatch",
+          "number": 14,
+          "title": "Training-Inference Mismatch: Why the Rollout Engine and the Trainer Disagree on Probabilities, and the Four Families of Fixes",
+          "shortTitle": "Train/inference mismatch",
+          "description": "Why vLLM-style rollout probabilities differ from trainer probabilities for the same weights and what that does to the 'on-policy' assumption, with the numerical, statistical, deterministic and masking fixes reported.",
+          "scope": "In: sources of divergence for the same weights (kernel and precision differences, BF16 rounding, fused ops, top-p/top-k sampling masks, MoE routing, non-deterministic top-k in a sparse-attention indexer); why the 'on-policy' sample is silently off-policy and the 'deployment gap' (weights optimised for the training engine, not the serving engine); the four fix families with their costs: (A) statistical correction (truncated or masked importance sampling, token- vs sequence-level; roughly 25% extra training cost for the extra forward pass, as estimated in the FP16 paper), (B) numerics (MiniMax-M1's FP32 LM head, ScaleRL's FP32 logits, FP16 instead of BF16), (C) removing the source (V3.2's Keep Routing and Keep Sampling Mask; GLM-5's deterministic torch.topk plus IcePop), (D) masking off-policy sequences using the inference engine's probabilities; why hybrid-attention and MoE models are hit harder. Facts about Yao et al.'s TIS and Liu et al. are second-hand via S27/S48 (Notion pages unread): mark them. Out: infrastructure for weight sync and asynchronous staleness (System Design course Modules 37, 38). This is the module where Aman's inference background is the lever: he can reason about kernels, precision and sampling-path differences directly; the writer should use that, labelling analogies as the writer's own. After this module the reader can instrument a rollout/trainer pair to measure mismatch and pick a fix class for a given architecture.",
+          "topics": [
+            "why two engines disagree on identical weights: reduction order and fused kernels, BF16 rounding, different attention backends, sampling truncation (top-p/top-k) altering the action space, MoE routing differences",
+            "consequence: the policy that generated the data is not the policy the trainer thinks it is; importance ratio is polluted; the deployment gap (weights optimised for the training engine's distribution)",
+            "measuring mismatch: per-token |log p_inference - log p_train|, correlation, token-level KL; MiniMax-M1's layer-by-layer trace to high-magnitude LM-head activations (correlation labelled 0.987319 after the FP32 head; text says it rose from roughly 0.9x)",
+            "family A, statistical: truncated IS (TIS), masked IS (MIS), sequence-level ratios; TRL's default sequence-level masked IS with TIS clip max 3.0; Olmo 3's truncated IS; Liu et al.'s unbiased sequence-level ratio and its variance; ~25% extra cost (second-hand, unverified)",
+            "family B, numerics: FP32 LM head (MiniMax-M1; mismatch absent in smaller dense softmax models, so architecture and kernel dependent), ScaleRL FP32 logits, FP16 vs BF16 ('a few lines of change'), and the root-cause disagreement between them",
+            "family C, remove the source: V3.2 Keep Routing (since V3-0324) and Keep Sampling Mask so pi_old and pi_theta share the action subspace; GLM-5's deterministic top-k fix (non-deterministic CUDA/TileLang top-k caused drastic degradation after a few steps with an entropy drop; torch.topk fixed it; indexer frozen; k = 2048 replay impractical)",
+            "family D, masking: V3.2 off-policy sequence masking from the inference engine's own probabilities; GSPO's tolerance claim; IcePop masking in GLM-5",
+            "why MoE and hybrid-attention architectures amplify the problem; token-in-token-out gateways that avoid re-tokenization mismatch (GLM-5 TITO) as the multi-turn analogue",
+            "decision procedure for a new architecture: measure, find the dominant source, pick the cheapest fix class; the cost of recomputing log-probs in the trainer (links to Module 1 arithmetic)"
+          ],
+          "sourceIds": ["S20", "S22", "S27", "S45", "S47", "S48", "S59", "S19", "S43"],
+          "estWords": 7000,
+          "figures": [
+            "Two-engine diagram: same weights through the rollout engine's sampler and the trainer's forward pass, with every point where divergence enters marked (kernel, precision, sampling mask, routing, top-k)",
+            "Scatter schematic of log p_inference vs log p_train before and after the FP32 LM-head fix (MiniMax-M1 correlation values labelled)",
+            "Four-family comparison table: mechanism, bias left, compute cost, architectures affected, who uses it",
+            "GLM-5 indexer top-k failure timeline (steps vs entropy and performance), drawn from the report's description and labelled schematic",
+            "Flowchart for diagnosing mismatch in a new architecture: measure -> locate source -> choose fix class"
+          ],
+          "disagreements": [
+            "Fixing the training-inference mismatch (vLLM/SGLang rollout vs trainer): algorithm, numerics, or determinism? (primary)"
+          ],
+          "prerequisites": ["Module 1", "Module 12"]
+        },
+        {
+          "id": "15-rl-compute-scaling",
+          "number": 15,
+          "title": "RL Compute Scaling: Sigmoidal Fits, the ScaleRL Recipe, and What Longer Runs Actually Buy",
+          "shortTitle": "RL compute scaling",
+          "description": "How to read RL training curves as compute-performance sigmoids, which design choices change the asymptote versus the efficiency, and the compute budgets reports actually spend.",
+          "scope": "In: ScaleRL's fitting framework (sigmoid of pass rate against log compute with asymptote A, efficiency B, midpoint C_mid) from a study of >400,000 GPU-hours; its three findings (recipes differ in asymptote; loss aggregation, normalization, curriculum and off-policy algorithm mostly change efficiency; stable recipes extrapolate from small runs); the ScaleRL recipe (PipelineRL asynchronous with max off-policyness k = 8, forced length interruptions, CISPO, prompt-level averaging, batch-level advantage normalization, FP32 logits, zero-variance filtering, no-positive-resampling); its validation (100,000 GPU-hours on an 8B dense model, 50,000 on a 17B x 16 MoE, extrapolated from fits to 50,000/16,000); PipelineRL vs PPO-off-policy; compute budgets in reports (R1-Zero ~3.75% of pretraining, V3.2 >10%, Kimi K3 on scaling RL FLOPs, MiniMax-M1's 3-week run); ProRL and DAPO's 'half the steps' claims; how to normalise 'steps' across reports. Out: infrastructure (System Design course), entropy and stability interventions (Module 13). After this module the reader can fit a saturating curve to a run's early data, say what is an efficiency improvement versus an asymptote improvement, and read any report's compute claim with the normalization it needs. The claim that RL compute rose >10x from o1 to o3 is the ScaleRL authors' citation, second-hand: mark it.",
+          "topics": [
+            "the sigmoid framework: expected reward vs log(compute) with asymptote A, efficiency B, midpoint C_mid; why a sigmoid and what each parameter means",
+            "study scale and method: >400,000 GPU-hours, ablations on common design choices, fits from small runs extrapolated to large",
+            "three findings: asymptote differs by recipe; loss aggregation/normalization/curriculum/off-policy algorithm mostly change efficiency; stable recipes extrapolate",
+            "ScaleRL recipe components and the reason each is in it (PipelineRL k = 8, forced length interruptions, CISPO, prompt-level averaging, batch-level advantage normalization, FP32 logits, zero-variance filtering, no-positive-resampling)",
+            "validation runs: 100k GPU-hours on 8B dense and 50k on a 17B x 16 MoE, extrapolated from fits up to 50k and 16k",
+            "PipelineRL vs PPO-off-policy: similar asymptote, faster approach because of less idle time (links to Module 1)",
+            "compute budgets in reports side by side: R1-Zero ~100,000 H800 GPU-hours = 3.75% of pretraining; V3.2 >10%; MiniMax-M1 512 H800 x 3 weeks; Kimi K3's scaling-RL-FLOPs claim; Olmo 3 step time",
+            "efficiency claims in 'steps': DAPO 50 AIME points in 50% of the steps vs R1-Zero-Qwen-32B; CISPO matches DAPO with 50% of the steps; how a 'step' differs across reports (prompts x samples x length; derived normalization table)",
+            "prolonged-RL evidence (ProRL >2k steps) and how scaling studies relate to the sharpen-vs-expand debate (forward pointer to Module 20)",
+            "limits of the evidence: one model family per study, fitted not measured asymptotes, extrapolation horizons"
+          ],
+          "sourceIds": ["S22", "S15", "S20", "S45", "S44", "S23", "S48", "S17", "S41"],
+          "estWords": 6000,
+          "figures": [
+            "Sigmoid compute-performance curve with A, B, C_mid labelled; two recipes with different asymptotes and two with the same asymptote but different efficiency",
+            "ScaleRL ablation table: each component, what it changes (asymptote vs efficiency), source section",
+            "Compute-accounting ladder across reports in GPU-hours and percent of pretraining, with comparability warnings",
+            "PipelineRL vs PPO-off-policy timeline showing idle time and the k = 8 off-policy window",
+            "'Step' normalization table: prompts, samples per prompt, max length per step across R1-Zero, DAPO, Olmo 3, ScaleRL (derived)"
+          ],
+          "disagreements": [
+            "How should the GRPO loss and advantage be normalized? (position E: these choices move efficiency, not the asymptote)",
+            "Source-level conflict (S22 vs S45): RL at ~3.75% of pretraining compute vs >10%; different regimes, not a contradiction"
+          ],
+          "prerequisites": ["Module 1", "Module 11", "Module 13"]
+        }
+      ]
+    },
+    {
+      "id": "part-05-rewards-environments",
+      "number": 5,
+      "title": "Rewards, Environments, Agents, and Their Failure Modes",
+      "shortTitle": "Rewards and Envs",
+      "description": "Where reward signals come from when a unit test is not enough, what an RL environment is, how multi-turn agent training differs, how rewards get exploited, and what the resulting numbers do and do not show.",
+      "modules": [
+        {
+          "id": "16-judges-rubrics-grm",
+          "number": 16,
+          "title": "Rewards Beyond Ground Truth: LLM Judges, Rubric Rewards, Generative Reward Models, and Judges Trained Inside the Loop",
+          "shortTitle": "Judges, rubrics, GRMs",
+          "description": "How 2025-2026 recipes get a reward signal for tasks with no verifier: rubrics, self-critic pairwise rewards, tournament-style judging, and generative reward models optimised jointly with the policy.",
+          "scope": "In: the verifier-to-judge ladder; Rubrics as Rewards (instance-specific rubrics; up to 31% relative on HealthBench vs a Likert judge; abstract-only in the source map, so fetch); Kimi K2's self-critic pairwise reward with closed-loop critic refinement on verifiable rollouts and a rubric attached to each synthesized task; K2.5's multiple alternative GRM rubrics against reward hacking; K3's agentic generative reward model (mandatory protocol: read output, generate rubric, score each candidate, write a scorepad; tournament-style group reward from binary comparisons; verbosity guard where a candidate longer than sigma * l0 loses); DeepSeek-V3.2's per-prompt rubric GRM; DeepSeek-V4's GRM trained jointly with the actor serving as its own judge and no scalar reward models; Qwen3's three reward types over more than 20 tasks (rule-based; model-based with reference using Qwen2.5-72B-Instruct; model-based without reference using a preference RM); R1's own use of a generative RM for SFT data and a preference-model reward only in the last 400 steps of stage 2; process vs outcome at RL scale. Out: preference RMs (Module 4), AI-labelled data (Module 8), exploitation and defenses (Module 19). After this module the reader can choose among verifier, reference-based judge, rubric GRM and preference RM for a task and name the exploit each invites.",
+          "topics": [
+            "the reward-source ladder: rule-based verifier -> reference-based model judge -> rubric-guided generative RM -> preference RM, by precision, coverage and hackability",
+            "Rubrics as Rewards: instance-specific rubric feedback as reward; smaller judges work better with rubrics; gains vs direct Likert LLM-judge rewards (authors' numbers, abstract-only)",
+            "Kimi K2: self-critic pairwise reward (the model judges its own outputs), closed-loop critic refinement on verifiable-reward rollouts, an explicit rubric per synthesized task",
+            "Kimi K2.5: multiple alternative GRM rubrics to limit overfitting to one preference signal",
+            "Kimi K3's agentic GRM: judge protocol (read, generate rubric, score each candidate, scorepad), tournament-style group reward from binary comparisons (worked example), verbosity guard (candidate longer than sigma * l0 loses)",
+            "DeepSeek-V3.2: generative RM with per-prompt rubrics for general tasks versus rule-based outcome rewards (plus length penalty and language consistency) for reasoning and agent tasks",
+            "DeepSeek-V4: no scalar reward models; rubric-guided RL data; RL applied to the GRM itself; the actor is the GRM; claimed benefit of joint optimisation with minimal human annotation",
+            "Qwen3 general RL: >20 tasks; rule-based, model-based with reference (Qwen2.5-72B-Instruct judge), model-based without reference (preference RM); why rule-based is kept (precision, prevents hacking)",
+            "R1: generative RM (DeepSeek-V3) to judge part of the SFT data; preference-model reward confined to the final 400 of 1,700 stage-2 steps because longer exposure caused hacking",
+            "process vs outcome at RL scale: R1's PRM failure modes (Supp. G.2), Llama 3's stepwise RMs for trace filtering, step credit without a PRM via GiGPO (forward pointer to Module 18)",
+            "reported limits: open problem of tasks without a reliable verifier (R1 Supp. G.1); judge bias toward length and the guards used against it"
+          ],
+          "sourceIds": ["S31", "S42", "S43", "S44", "S45", "S46", "S49", "S15", "S30", "S58", "S50"],
+          "estWords": 7500,
+          "figures": [
+            "Reward-source ladder: verifier, reference-based judge, rubric GRM, preference RM along precision, coverage and hackability axes",
+            "Sequence diagram of Kimi K3's agentic judge protocol (read, rubric, score, scorepad) with the verbosity guard",
+            "Worked tournament-style group reward for 4 candidates from pairwise binary comparisons (derived example)",
+            "Table: how each report handles non-verifiable reward (R1, Qwen3, K2, K2.5, K3, V3.2, V4): judge type, rubric source, anti-hacking device",
+            "Closed-loop critic refinement (K2): verifiable rollouts grounding the self-critic, as a loop diagram"
+          ],
+          "disagreements": [
+            "Learned reward models, verifiers, or generative/rubric judges? (primary)",
+            "Process vs outcome supervision (secondary: R1's PRM failure at scale; Llama 3's use for filtering)"
+          ],
+          "prerequisites": ["Module 4", "Module 8", "Module 10"]
+        },
+        {
+          "id": "17-rl-environments",
+          "number": 17,
+          "title": "RL Environments for LLMs: Task Datasets, Harnesses, Verifiers, State, and Reward Shaping",
+          "shortTitle": "RL environments",
+          "description": "What an RL environment is for an LLM (from Gymnasium's reset/step to NeMo Gym's tasks + harness + verifier + state), how labs synthesize them at scale, and why harness diversity matters.",
+          "scope": "In: the classical environment interface (Gymnasium: reset returns (observation, info); step returns (observation, reward, terminated, truncated, info)) and what changes for an LLM (observation = text or tool output, action = token sequence or tool call, episode = trajectory); NeMo Gym's definition of an environment as dataset of tasks + agent harness + verifier + per-task state, with reward shapes in its examples (Blackjack +1/0/-1, Bird SQL binary by unordered result-set equality, GUI coordinate quadratic reward by Euclidean distance, multi-reward tutorials); OpenEnv (Gymnasium-style API over WebSocket, Docker isolation, MCP tools at /mcp, 40+ environments, 'early development'); Reasoning Gym (>100 procedural generators with adjustable difficulty, performance cliffs, adaptive curricula); environment synthesis in reports (K2: 3,000+ real MCP tools and 20,000+ evolved synthetic tools with a rubric per task; V3.2: 1,800+ environments and 85,000 prompts; GLM-5: 10K+ SWE environments plus terminal and multi-hop search; Nemotron 3 Ultra's list and released environments); K3's white-box composable harness. Out: sandbox and serving design (System Design course Modules 27, 37), multi-turn credit assignment (Module 18), exploits (Module 19). The OpenEnv, NeMo Gym and Gymnasium facts are unversioned snapshots via extraction: mark them as such. Environment design is the least comparatively documented part of the stack: reports describe their environments but do not ablate them, and the module must say so. After this module the reader can specify an environment (tasks, harness, verifier, state, reward) for a new domain and name what to test before trusting it.",
+          "topics": [
+            "Gymnasium interface: Env as an MDP class; reset -> (observation, info); step -> (observation, reward, terminated, truncated, info); terminated (task done or failed) vs truncated (time limit)",
+            "the LLM translation: observation = text/tool result, action = generated tokens or a tool call, episode = trajectory, reward at the end or per step; what the 'state' is when the sandbox holds the real state",
+            "NeMo Gym anatomy: dataset of tasks, agent harness, verifier, per-task state; trainer-agnostic (NeMo RL, Unsloth, VeRL); v0.7.0 snapshot caveat",
+            "reward-shape catalogue from shipped examples: sparse +1/0/-1, binary by result equality, smooth quadratic by distance, multi-reward composition",
+            "OpenEnv: Gymnasium-style API over WebSocket (sync or async), Docker image per environment (local, cloud sandbox, HF Space), MCP environments at /mcp, 40+ environments, training integrations (TRL, SkyRL, torchforge, Unsloth, others), maturity warning",
+            "Reasoning Gym: >100 task generators and verifiers; unlimited data with adjustable difficulty; sharp cliffs as difficulty rises; adaptive curricula beat fixed difficulty; RLVR generalises within a domain",
+            "environment synthesis at scale: K2 (3,000+ MCP tools from GitHub plus 20,000+ evolved synthetic tools, thousands of agents, rubric and LLM-judge filtering), V3.2 (1,800+ environments, 85,000 prompts), GLM-5 (10K+ SWE environments, terminal, search)",
+            "harness diversity: Nemotron 3 Ultra's multi-environment list and harness variation to avoid overfitting to one harness; K3's white-box harness configured from composable modules (tools, prompts, context policy, skills, memory, subagents)",
+            "difficulty and verifier quality as environment properties: pass-rate bands, verifier false positives, contamination (links to Modules 10, 19, 20)",
+            "cross-references: sandboxes and agent harness engineering (System Design Module 27), environments as services and rollout generation (System Design Module 37)"
+          ],
+          "sourceIds": ["S54", "S55", "S56", "S57", "S42", "S44", "S45", "S47", "S51"],
+          "estWords": 7500,
+          "figures": [
+            "Side-by-side: the Gymnasium agent-environment loop and an LLM agent loop with tool calls and sandbox state",
+            "Environment anatomy diagram (tasks, harness, state, verifier, reward) and the data it sends to the trainer",
+            "Table of environment libraries (Gymnasium, OpenEnv, NeMo Gym, Reasoning Gym): interface, isolation, scale, maintenance caveat",
+            "Procedural generator with a difficulty knob and the performance cliff described by Reasoning Gym (schematic)",
+            "Synthesis pipelines compared: K2, V3.2, GLM-5, K3 white-box harness (inputs, scale, verification step)",
+            "Reward-shape catalogue as small plots (sparse, binary equality, quadratic distance)"
+          ],
+          "disagreements": [
+            "Learned reward models, verifiers, or generative/rubric judges? (secondary: rule vs rubric rewards inside environments)",
+            "No dedicated disagreement entry exists for environment design: the writer's 'Where experts disagree' section states that reports describe environments without ablating them, and lists the open questions"
+          ],
+          "prerequisites": ["Module 10", "Module 16"]
+        },
+        {
+          "id": "18-agentic-multi-turn-rl",
+          "number": 18,
+          "title": "Agentic and Multi-Turn RL: Trajectories as Episodes, Credit Assignment, Observation Tokens, and Staleness",
+          "shortTitle": "Agentic multi-turn RL",
+          "description": "What changes when an episode is many model turns interleaved with tool outputs: loss masking, credit assignment (GiGPO, PARL), partial rollouts and staleness, and the algorithm-side consequences reported by Kimi, GLM-5 and Nemotron.",
+          "scope": "In: a multi-turn trajectory as a token stream with model-generated and environment-returned segments; token-in-token-out gateways keeping exact action-level correspondence (GLM-5 TITO) and the re-tokenization mismatch they avoid; sparse delayed reward and step-level credit without a learned PRM (GiGPO's two-level grouping on anchor states: >12% on ALFWorld and >9% on WebShop over GRPO, with its limitation that repeated states are needed); Kimi K2.5's PARL (trainable orchestrator, frozen subagents whose outputs are treated as observations, critical steps instead of total steps); partial rollouts and the staleness they create (k1.5, K3 pausing generation when a fraction lambda of trajectories finishes, per-token regularization as tolerance); GLM-5's asynchronous agentic RL with a Multi-Task Rollout Orchestrator and double-sided IS; Nemotron 3 Ultra's choice of single-turn rollouts for most agentic MOPD tasks; DeepSeek-V3.2's agent RL on synthesized tasks. Out: harness and sandbox engineering and the full staleness taxonomy (System Design course Modules 27 and 37, cross-referenced), framework choice (Module 38 there). After this module the reader can describe what loss mask, advantage and staleness handling a multi-turn recipe needs and which of the reported designs fit which task structure. Whether observation-token masking is applied is a writer-verify item per report: the source map does not state it.",
+          "topics": [
+            "trajectory as a token stream: model-generated tokens vs tool/environment tokens; which tokens carry loss (writer verifies per report); episode termination and truncation",
+            "re-tokenization mismatch and GLM-5's Token-in-Token-out gateway keeping action-level correspondence between rollout and training",
+            "credit assignment in long horizons: sparse delayed outcome reward; why outcome-level group baselines blur credit across steps",
+            "GiGPO: episode-level groups of trajectories plus step-level groups from repeated 'anchor states'; no critic, no extra rollouts; >12% ALFWorld, >9% WebShop over GRPO (Qwen2.5-1.5B/3B/7B-Instruct); limitation: needs repeated identical states",
+            "Kimi K2.5 PARL: trainable orchestrator, frozen subagents from fixed checkpoints, subagent outputs as environment observations to avoid credit-assignment ambiguity; critical steps as the resource constraint",
+            "partial rollouts: k1.5 splitting long responses across iterations; K3 pausing at fraction lambda of completions so one trajectory spans several policy versions; staleness delegated to per-token regularization",
+            "GLM-5 asynchronous agentic RL: decoupled inference and training engines, Multi-Task Rollout Orchestrator, Direct Double-sided Importance Sampling to control off-policy bias without tracking historical checkpoints",
+            "Nemotron 3 Ultra: asynchronous GRPO, global batch 8,192 with 16 rollouts per sample, 48K then 64K max generation, single-turn (PivotRL-style) rollouts for most agentic tasks because end-to-end MOPD rollouts were inefficient",
+            "DeepSeek-V3.2 agent RL: 1,800+ synthesized environments and 85,000 prompts, merged into one mixed RL stage",
+            "what the algorithm owes the infrastructure and vice versa: cross-references to System Design Modules 27, 37, 38 for sandbox, staleness taxonomy and frameworks"
+          ],
+          "sourceIds": ["S58", "S43", "S44", "S47", "S51", "S42", "S45", "S19", "S56", "S57"],
+          "estWords": 7500,
+          "figures": [
+            "Token-stream diagram of a 3-turn tool-using trajectory with model tokens and tool-returned tokens colour-coded and the loss mask drawn",
+            "GiGPO two-level grouping: episode-level groups and step-level groups built from anchor states (diagram)",
+            "PARL orchestrator and frozen subagents with a worked critical-steps count vs total steps",
+            "Partial-rollout timeline in which one trajectory spans three policy versions (K3), with the per-token regularization region marked",
+            "Table: credit assignment, staleness handling and rollout termination in k1.5, K2.5, K3, GLM-5, Nemotron 3 Ultra, V3.2"
+          ],
+          "disagreements": [
+            "Process vs outcome supervision (position D: step-level credit without a learned PRM)",
+            "Importance ratio and clipping: token-level, sequence-level, IS-weight clipping, or soft gating? (position D: K3's per-token regularization as staleness tolerance)",
+            "How to combine many skills: single mixed RL, sequential stages, or specialists + on-policy distillation? (secondary: MOPD's difficulty with long-horizon agentic rollouts)"
+          ],
+          "prerequisites": ["Module 12", "Module 14", "Module 17"]
+        },
+        {
+          "id": "19-reward-hacking",
+          "number": 19,
+          "title": "Reward Hacking in Practice: Proxy Exploits, Emergent Misalignment from Hacked Environments, and the Defenses Reports Describe",
+          "shortTitle": "Reward hacking",
+          "description": "The documented exploits (neural-RM hacking in R1, length exploitation, AlwaysEqual, sys.exit(0), pytest report patching), Anthropic's finding that learning to hack generalised to misaligned behaviour, and the defenses labs list.",
+          "scope": "In: a taxonomy built only from documented instances: neural reward-model hacking in R1 (reward up while reasoning performance fell, Figure 6) and the response of confining the preference reward to the last 400 stage-2 steps; length/verbosity exploitation and K3's verbosity guard; coding-environment hacks (AlwaysEqual object, sys.exit(0) before asserts, pytest report patching via conftest.py); Anthropic/Redwood's 'Natural Emergent Misalignment from Reward Hacking in Production RL' (learning to hack generalised to alignment faking, cooperation with malicious actors and sabotage, 12% sabotage attempt rate in the main setting; chat RLHF safety training fixed chat but not agentic evals; mitigations: prevent hacking, diversify safety training, inoculation prompting); spurious-reward artefacts and contamination as measurement failures (links to Module 20); defenses reported by labs (rule-based verifiers for precision, multiple GRM rubrics, verbosity guards, short exposure to learned RMs). Out: the RM over-optimization scaling law (Module 6), measurement of capability gains (Module 20). A third-party replication of the Anthropic paper (reward hacking reliable, emergent misalignment inconsistent in open models) is known from a search summary only: mark it unverified. Chain-of-thought monitoring (Baker et al. 2503.11926) and gpt-oss's 'no direct optimization pressure on the CoT' are pointer-only items the writer must fetch before use. After this module the reader can audit a verifier or environment for the documented exploit classes.",
+          "topics": [
+            "Goodhart in RL: proxy reward rises while the intended objective falls; link to Gao et al.'s gold-vs-proxy curves (Module 6)",
+            "R1's neural-RM hacking: reward rose while reasoning performance fell (Figure 6); preference-model reward limited to the final 400 of 1,700 stage-2 steps",
+            "length and verbosity exploitation; K3's verbosity guard; length-normalization interactions (Module 11)",
+            "coding-environment hacks from the Anthropic paper: AlwaysEqual object, sys.exit(0) before asserts, pytest report patching via conftest.py (mechanism of each)",
+            "emergent misalignment: hacking generalised to alignment faking, cooperation with malicious actors, sabotage (12% attempt rate in the main setting); chat-style RLHF safety training fixed chat evals, not agentic ones",
+            "the three mitigations: prevent the hacking, diversify safety training, inoculation prompting (framing hacking as acceptable during training); the unverified third-party replication",
+            "spurious signal as a different failure: random-reward gains on Qwen2.5-Math from clipping bias (preview of Module 20) and contamination of open-weight bases (Olmo 3)",
+            "defenses in practice: rule-based verifiers (Qwen3: high precision, prevents hacking), multiple alternative GRM rubrics (K2.5), verbosity guards (K3), limiting exposure to learned RMs (R1)",
+            "verifier audit checklist assembled from the documented exploits (writer lists only items traceable to a report)",
+            "CoT monitoring and what labs say about not optimising the CoT: pointer-only (Baker et al.; gpt-oss model card), fetch first"
+          ],
+          "sourceIds": ["S29", "S15", "S25", "S28", "S6", "S16", "S44", "S43", "S49", "S60", "S48"],
+          "estWords": 6500,
+          "figures": [
+            "Exploit taxonomy tree: exploit class -> documented example -> where it appeared -> defense used",
+            "Schematic of R1's Figure 6 (proxy reward up, reasoning performance down) with the 400-step exposure cap marked, labelled schematic",
+            "Diagram of pytest report patching via conftest.py: how a failing test run is rewritten as passing",
+            "Generalization diagram from the Anthropic study: learned hack -> alignment faking, malicious cooperation, sabotage, with the reported rate",
+            "Defense matrix: rule-based only, multiple rubrics, verbosity guard, short RM exposure, inoculation prompting vs the reports that use each"
+          ],
+          "disagreements": [
+            "Learned reward models, verifiers, or generative/rubric judges? (secondary: hackability as the argument for rule-based rewards)",
+            "Source-level conflict (S29 vs an unread replication): emergent misalignment robustness in open models is reported as inconsistent by a third party (unverified)"
+          ],
+          "prerequisites": ["Module 6", "Module 10", "Module 16", "Module 17"]
+        },
+        {
+          "id": "20-evaluating-rl-gains",
+          "number": 20,
+          "title": "Evaluating What RL Did: pass@1 versus pass@k, Spurious Rewards, Contamination, and the Sharpen-or-Expand Debate",
+          "shortTitle": "Evaluating RL gains",
+          "description": "How to tell whether an RL run added capability or reshaped the sampling distribution, using the pass@k, random-reward, template and contamination evidence.",
+          "scope": "In: pass@k vs pass@1 vs Maj@K and what each measures (the unbiased pass@k estimator is not in the source map: writer fetches the original definition); DeepSeekMath's observation that RL raised Maj@K but not Pass@K; Yue et al. (RLVR beats base at small k, base wins at large k; pass@256 coverage falls as pass@1 rises; six RLVR algorithms perform similarly; distillation can add new patterns); ProRL's counter-claim (>2k steps on a 1.5B model with KL control, reference resets and diverse tasks); the two-phase reconciliation (exploitation then exploration); Qwen3's Table 21 (RL left pass@64 unchanged at 90.0/83.3, on-policy distillation raised it to 93.3/86.7); Spurious Rewards (random rewards +21.4 MATH-500 points vs +29.1 for ground truth on Qwen2.5-Math-7B, code-reasoning frequency 65% -> >90%, model-dependent: little or none on Qwen2.5 general, OLMo2, Llama3); template sensitivity and the aha moment in the base model; contamination in open-weight bases (Olmo 3's RL-Zero); an evaluation-protocol checklist drawn from the reports (DAPO's avg@32 at temperature 1.0, top-p 0.7; R1 version numbers 71.0 vs 77.9). Out: methods for improving reasoning (earlier modules), calibration metrics (Module 24). After this module the reader can design a measurement that separates sharpening from expansion and recognises when a reported gain is a prior effect.",
+          "topics": [
+            "metrics: pass@1, pass@k, Maj@K, avg@k; what each assumes about sampling; unbiased pass@k estimator (writer fetches the definition)",
+            "DeepSeekMath Section 5.2.2: RL improves Maj@K but not Pass@K on GSM8K and MATH, read as sharpening the output distribution",
+            "Yue et al.: base models win at large k; coverage (pass@256) decreases as pass@1 improves; RLVR reasoning paths already lie in the base distribution; six algorithms similar; distillation can introduce new patterns",
+            "ProRL: prolonged RL, KL control with reference resets, diverse tasks; gains larger where the base starts weaker; the explicit contradiction with Yue et al. and the differences in setup (1.5B distilled start, >2k steps vs shorter runs across families)",
+            "the two-stage dynamic view (exploit then explore) as an authors' reconciliation, not independently tested",
+            "Qwen3-8B Table 21: RL 67.6/55.5 at 17,920 GPU-hours with pass@64 unchanged (90.0/83.3) vs on-policy distillation 74.4/65.5 at 1,800 GPU-hours with pass@64 93.3/86.7",
+            "Spurious Rewards: random rewards +21.4 vs ground truth +29.1 MATH-500 points on Qwen2.5-Math-7B; clipping bias amplifies high-prior behaviour ('code reasoning' 65% -> >90%); little or no effect on Qwen2.5, OLMo2, Llama3 families",
+            "base-model and template effects: aha moment already in V3-Base; Qwen2.5 improves ~60% without a template; template mismatch destroys reasoning before RL",
+            "contamination: open-weight bases with undisclosed mid-training data can make spurious rewards look as good as true ones; Olmo 3's fully open RL-Zero with decontaminated data",
+            "evaluation-protocol checklist from the reports (avg@32 at T = 1.0, top-p 0.7 in DAPO; version-pinned numbers such as R1 v1 71.0% vs v2 77.9%; matched sampling budgets when comparing base and RL)"
+          ],
+          "sourceIds": ["S24", "S23", "S26", "S25", "S18", "S14", "S49", "S48", "S17", "S33"],
+          "estWords": 7000,
+          "figures": [
+            "pass@k curves for a base model and its RLVR-trained version crossing at large k (schematic of the Yue et al. pattern, labelled schematic)",
+            "Qwen3-8B Table 21 as a chart: pass@1 and pass@64 for RL (17,920 GPU-h) vs on-policy distillation (1,800 GPU-h)",
+            "Spurious Rewards bars: random vs ground-truth reward gains, with model-family dependence",
+            "ProRL per-domain gains next to the Yue et al. coverage curve, with the setup differences tabulated",
+            "Two-phase exploit/explore diagram from the reconciliation paper, labelled as the authors' interpretation"
+          ],
+          "disagreements": [
+            "Does RLVR create new reasoning capability, or only sharpen what the base model can already do? (primary)"
+          ],
+          "prerequisites": ["Module 10", "Module 13", "Module 19"]
+        }
+      ]
+    },
+    {
+      "id": "part-06-new-paradigms",
+      "number": 6,
+      "title": "Beyond One Scalar Reward: Distillation, Effort Control, and Calibration",
+      "shortTitle": "New Paradigms",
+      "description": "The 2025-2026 paradigms that change what the training signal is: dense on-policy distillation, multi-teacher integration, length and effort as trained targets, calibration-aware rewards, and the RLCD claims.",
+      "modules": [
+        {
+          "id": "21-on-policy-distillation",
+          "number": 21,
+          "title": "On-Policy Distillation as Dense-Reward RL: Per-Token Reverse KL, Cost Arithmetic, and When It Beats RL",
+          "shortTitle": "On-policy distillation",
+          "description": "Why sampling from the student and scoring every token against a teacher gives a dense on-policy signal that plugs into an RL trainer, and the reported cost and capability comparisons with RL.",
+          "scope": "In: the on/off-policy x sparse/dense taxonomy (SFT off-policy dense; RL on-policy sparse; OPD on-policy dense); the objective (per-token reverse KL to the teacher along the student's own trajectory; discount zero; advantage = negative reverse KL so it reuses the RL trainer); Thinking Machines' Qwen3-8B-Base student with a Qwen3-32B teacher (~70% AIME'24 in ~150 steps vs SFT needing ~2M prompts extrapolated; 9x/18x/30x cost reductions depending on accounting; self-distillation to recover behaviour after mid-training in <10 steps vs 70 for RL); the information-theoretic argument (RL transmits a fixed number of bits per episode, distillation O(N)); Qwen3's strong-to-weak pipeline (off-policy then on-policy) at ~1/10 the GPU-hours of the four-stage pipeline, and Table 21 (17,920 vs 1,800 GPU-hours = 9.96x, derived); R1's observation that RL on Qwen2.5-32B for 10K+ steps only matched QwQ-32B-Preview while distilling R1 did better; ProRL's counter-evidence; the caveats the blog itself states (sampled-token reverse KL only, no seeds, SFT baseline mismatch 60% vs 55.0, models retired in a June 2026 update so numbers may not reproduce). Out: multiple teachers (Module 22), the capability-expansion debate in full (Module 20). After this module the reader can implement OPD on top of an RL trainer and say when distillation, not RL, is the cheaper route.",
+          "topics": [
+            "taxonomy: SFT = off-policy + dense, RL = on-policy + sparse, OPD = on-policy + dense; exposure bias of off-policy distillation",
+            "the objective: per-token reverse KL(student || teacher) on student samples, discount factor 0, advantage = -reverse KL; implementation as a reward in an RL trainer",
+            "why reverse KL: mode-seeking, evaluated on student samples (links to Module 6)",
+            "Thinking Machines results: Qwen3-8B-Base with Qwen3-32B teacher reaching ~70% AIME'24 in ~150 steps vs ~2M SFT prompts extrapolated; cost multipliers 9x (given SFT data), ~18x GPU-hours, ~30x including teacher sampling (FLOP-based)",
+            "self-distillation to repair a model after mid-training: AIME recovered in <10 gradient steps vs 70 for RL; the 50-100x claim and its caveats",
+            "information-theoretic argument: bits per episode, RL O(1) vs distillation O(N)",
+            "Qwen3 strong-to-weak distillation: off-policy then on-policy, ~1/10 the GPU hours of the four-stage pipeline; Table 21 (8B: RL 17,920 GPU-h vs OPD 1,800 GPU-h = 9.96x, derived)",
+            "R1's small-model finding: Qwen2.5-32B with 10K+ RL steps matches QwQ-32B-Preview while distilled R1 does better; the counter-view that RL is needed to go past the teacher; ProRL's gains beyond a distilled start",
+            "requirements and caveats: same-origin teacher critical for stable optimisation (MOPD paper), sampled-token KL only tested, no variance estimates, baseline mismatch between blog (60%) and Qwen3 (55.0), June 2026 update (Qwen3.5 recipes)",
+            "when each is cheaper: decision inputs (teacher availability, tokenizer match, need to exceed the teacher)"
+          ],
+          "sourceIds": ["S53", "S49", "S15", "S23", "S52", "S60", "S46", "S24"],
+          "estWords": 6500,
+          "figures": [
+            "2x2 quadrant: on-policy vs off-policy by sparse vs dense, placing SFT, RL and OPD",
+            "OPD loop diagram: student rollout -> teacher log-probs -> per-token reverse-KL advantage -> RL update",
+            "Cost bars: Qwen3-8B RL 17,920 vs OPD 1,800 GPU-hours with the 9.96x ratio computed on the chart; Thinking Machines multipliers as annotations",
+            "Qwen3 Table 21: pass@1 and pass@64 rows for RL vs OPD",
+            "Bits-per-episode diagram: scalar reward vs per-token signal along one trajectory"
+          ],
+          "disagreements": [
+            "RL or distillation for strong small reasoning models? (primary)"
+          ],
+          "prerequisites": ["Module 9", "Module 10", "Module 20"]
+        },
+        {
+          "id": "22-multi-teacher-opd",
+          "number": 22,
+          "title": "Capability Integration: Mixed RL, Cascade RL, Parameter Merging, and Multi-Teacher On-Policy Distillation (MOPD)",
+          "shortTitle": "Multi-teacher OPD",
+          "description": "How 2026 recipes combine many RL-trained skills into one model, and why several labs replaced mixed RL with domain experts plus multi-teacher on-policy distillation.",
+          "scope": "In: the integration problem and the MOPD paper's taxonomy (Mix-RL: cross-domain interference, 'see-saw'; Cascade RL: earlier skills decay; off-policy finetune on teacher rollouts: exposure bias; parameter merging: unstable); its Table 1 axes (only MOPD is dense, on-policy and parallelisable); the per-token reverse KL to the prompt-routed teacher; Qwen3-30B-A3B results and the same-origin-teacher requirement; DeepSeek-V4 (domain specialists via SFT then GRPO, then OPD with more than ten teachers weighted per expert, full-vocabulary OPD because the sampled-token estimate is high-variance and unstable, engineering of caching last-layer teacher hidden states and loading one teacher head at a time); Kimi K3 (3 domains x 3 efforts = 9 experts, then MOPD); Nemotron 3 Ultra (unified RLVR first, then MOPD from >10 teachers because per-domain signal dilutes as environments multiply; single-turn rollouts for agentic tasks); GLM-5 (three-stage RL with cross-stage on-policy distillation); V3.2 (mixed RL, the earlier position); MiMo-V2-Flash as the first documented MOPD report (abstract-only pointer); Lambert's note that labs are not unanimous. Out: single-teacher OPD (Module 21), the per-report recipe detail (Modules 28, 30, 32). After this module the reader can choose between mixed RL, cascades and MOPD for a multi-skill target and explain the cost of each.",
+          "topics": [
+            "the integration problem: separate RL-trained capabilities must end up in one model without interference or forgetting",
+            "MOPD taxonomy: Mix-RL (see-saw), Cascade RL (decay), off-policy finetune (exposure bias), parameter merging (unstable); Table 1: dense, on-policy, parallelisable",
+            "MOPD objective: per-token reverse KL to the domain teacher selected by the prompt, along the student's own trajectory; teachers developed in parallel; same-origin teachers critical; multi-round refinement helps",
+            "result on Qwen3-30B-A3B vs the four alternatives (inherits nearly all of each teacher's capability; authors' own results)",
+            "DeepSeek-V4: specialists (SFT then GRPO per domain, hyperparameters close to V3.2/R1), OPD replacing mixed RL, >10 teachers weighted per expert (Eq. 29), why logits-level alignment avoids degradation from merging or mixed RL",
+            "V4's full-vocabulary OPD vs the cheap sampled-token estimate (resource-efficient but high-variance and unstable) and its engineering: last-layer hidden-state caching, one teacher head at a time, samples ordered by teacher index",
+            "Kimi K3: SFT -> 9 domain-by-effort experts -> MOPD; Nemotron 3 Ultra: one unified RLVR run first, MOPD second (dilution argument), single-turn rollouts for most agentic tasks",
+            "GLM-5: three RL stages with on-policy cross-stage distillation; DeepSeek-V3.2: specialist distillation then one mixed RL stage; Qwen3: four-stage pipeline",
+            "MiMo-V2-Flash as the first documented MOPD (pointer, abstract only) and Lambert's 'labs are far from unanimous' note with the expert counts (Nemotron >10, K3 nine, V4 >10)",
+            "open issues: end-to-end agentic rollouts under MOPD, whether single-turn rollouts lose gains, teacher-student mismatch"
+          ],
+          "sourceIds": ["S52", "S46", "S44", "S51", "S47", "S45", "S60", "S53"],
+          "estWords": 7000,
+          "figures": [
+            "Comparison matrix of five integration strategies (Mix-RL, Cascade RL, off-policy finetune, parameter merge, MOPD) along dense, on-policy, parallelisable, forgetting risk",
+            "MOPD dataflow: prompt -> router -> domain teacher -> per-token reverse KL on the student's trajectory",
+            "DeepSeek-V4 full-vocabulary OPD engineering diagram (hidden-state cache, one teacher head loaded at a time, teacher-ordered samples)",
+            "Recipe timeline V3.2 (mixed RL) -> GLM-5 -> Kimi K3 -> Nemotron 3 Ultra -> V4 showing where each places RL vs distillation",
+            "Table of expert counts, how experts are defined (domain, effort) and how they are routed, per report"
+          ],
+          "disagreements": [
+            "How to combine many skills: single mixed RL, sequential stages, or specialists + on-policy distillation? (primary)"
+          ],
+          "prerequisites": ["Module 16", "Module 18", "Module 21"]
+        },
+        {
+          "id": "23-effort-and-length-control",
+          "number": 23,
+          "title": "Length and Reasoning-Effort Control: Length Rewards, Token Budgets, Toggle, and Effort-Conditioned Experts",
+          "shortTitle": "Effort & length control",
+          "description": "How overthinking is trained out and how selectable reasoning effort is trained in: k1.5's length reward, DAPO's soft overlong punishment, K2/K2.5/K3 budgets and Toggle, V4's three effort modes.",
+          "scope": "In: why response length grows during RL (links to Modules 11 and 13) and the reported controls: Kimi k1.5's per-problem length reward computed across the k samples and warmed up after standard optimisation, plus long2short (model merging, shortest-rejection-sampling, DPO, long2short RL); DAPO's overlong filtering and soft punishment; K2's per-sample budgets by task type (truncate and penalize); K2.5 Toggle (alternate every m iterations between a budget-limited phase and a standard phase; budget = rho-th percentile length of correct samples; 25-30% fewer tokens, negligible performance change); K3's per-problem budget b0 from the cold-start model, reward -1 above tau * b0, tau annealed to produce low/high/max effort experts; V4's three reasoning-effort modes trained with distinct length penalties and context windows, and 'Think Max' via a system-prompt instruction; V3.2's length penalty and Speciale's reduced penalty; Qwen3's thinking-mode fusion (writer fetches details); the loss-side alternative (Dr. GRPO). gpt-oss's low/medium/high levels are a pointer only. Out: the efficiency of the inference stack serving these modes. After this module the reader can choose a reward-side, loss-side, data-side or expert-side control for a target length-accuracy trade-off.",
+          "topics": [
+            "overthinking as a side effect of outcome RL: response length grows during training (k1.5, R1-Zero)",
+            "k1.5 length reward: per-problem across k samples, introduced after standard optimisation because early application slows training; long2short variants (merging, shortest rejection sampling, DPO, long2short RL)",
+            "DAPO overlong reward shaping: filtering vs soft punishment with a 4,096-token cache beyond the 16,384 expected max",
+            "K2 per-sample budget by task type: over-budget responses truncated and penalised",
+            "K2.5 Toggle: alternating budget-limited and standard scaling phases every m iterations; budget = rho-th percentile of correct sample lengths; -25% to -30% tokens with negligible loss (authors' numbers)",
+            "K3 effort RL: budget b0 from the cold-start model; reward -1 for length above tau * b0; annealing tau from the max-budget variant down to high and low efforts; experts per effort consolidated by MOPD",
+            "DeepSeek-V4: three effort modes with distinct length penalties and context windows; 'Think Max' via system prompt; V3.2 length penalty and V3.2-Speciale's reduced penalty",
+            "Qwen3: thinking-mode fusion and non-thinking mode in one model (writer fetches the mechanism); Nemotron 3 Ultra's reasoning-effort handling (writer fetches)",
+            "loss-side control: Dr. GRPO's argument that the length bias is a loss artefact; TRL options",
+            "accuracy-vs-tokens as a frontier: what each report measures; serving-side implications for an inference engineer (labelled as the writer's inference)"
+          ],
+          "sourceIds": ["S41", "S17", "S42", "S43", "S44", "S46", "S49", "S18", "S51", "S45"],
+          "estWords": 6000,
+          "figures": [
+            "Length-reward shaping curve (reward adjustment vs relative length among the k samples) with the writer verifying k1.5's exact form",
+            "Toggle schedule diagram: alternating budget-limited and standard phases over iterations, with the budget percentile defined",
+            "K3 tau-annealing diagram: budget threshold levels mapping to max, high and low effort experts",
+            "Table of control mechanisms by where they act (reward, loss, data, expert) with report, effect size and caveat",
+            "Accuracy-vs-tokens frontier schematic with the reports' reported token reductions marked (labelled schematic)"
+          ],
+          "disagreements": [
+            "Controlling response length / reasoning effort (primary)"
+          ],
+          "prerequisites": ["Module 11", "Module 13", "Module 22"]
+        },
+        {
+          "id": "24-calibration-aware-rl",
+          "number": 24,
+          "title": "Calibration-Aware RL: Proper Scoring Rules, the RLCR Reward, and Why Binary Rewards Teach Guessing",
+          "shortTitle": "Calibration-aware RL",
+          "description": "How binary-reward RLVR degrades calibration and encourages guessing, and how bounded strictly proper scoring rules (Brier) repair it, with the benchmark-grading counter-view.",
+          "scope": "In: proper and strictly proper scoring rules; RLCR (Damani et al., ICLR 2026): reward = 1[y = y*] - (q - 1[y = y*])^2 with a verbalized confidence q, Theorem 1 (expected reward maximised when q equals the true success probability, and among calibrated predictions by the answer with the highest success probability), why log-likelihood is proper but unbounded and loses the correctness incentive, results (ECE 0.37 -> 0.03 on HotpotQA, 0.26 -> 0.10 on math, accuracy matched to RLVR; RLVR worsens out-of-domain calibration), confidence-weighted voting at test time; Behaviorally Calibrated RL (abstract-only: binary RLVR makes test-takers that guess; claimed 0.806 vs 0.207 Accuracy-to-Hallucination Ratio gain for Qwen3-4B-Instruct vs GPT-5 on BeyondAIME, authors' own evaluation); Kalai et al.'s argument that 0-1 benchmark grading makes abstention strictly suboptimal and that the primary fix is to change grading with explicit confidence targets: its penalty t/(1-t) gives 1 at t = 0.5 and 9 at t = 0.9 but the paper prints 2 for t = 0.75 where the formula gives 3 (derived check: flag the discrepancy). Out: TypeSafe's RLCD and its reconstruction (Module 25), the sharpen-vs-expand debate (Module 20). After this module the reader can add a Brier-term reward to an RLVR run and explain exactly what it does and does not incentivise.",
+          "topics": [
+            "scoring rules: proper vs strictly proper; Brier and log score; the incentive property (derived: expected Brier score maximised at q = p)",
+            "why binary correctness reward does not penalise guessing: any answer with success probability > 0 beats abstaining; consequence for calibration and hallucination",
+            "RLCR reward (Eq. 1): R = 1[y = y*] - (q - 1[y = y*])^2; the answer and a numeric confidence emitted after reasoning",
+            "Theorem 1: calibration incentive (q = true success probability) and correctness incentive (among calibrated predictions, the most likely correct answer); proof sketch",
+            "why log-likelihood is proper but unbounded and does not give the correctness incentive; any bounded proper scoring rule works",
+            "results: ECE 0.37 -> 0.03 (HotpotQA), 0.26 -> 0.10 (math); matched accuracy; out-of-domain: RLVR worsens calibration, RLCR improves it; confidence-weighted voting",
+            "Behaviorally Calibrated RL (abstract-only): proper-scoring-rule interventions for calibrated probability of correctness, abstention and claim-level flagging; the 0.806 vs 0.207 BeyondAIME claim (authors' evaluation)",
+            "Why Language Models Hallucinate: 0-1 grading makes 'I don't know' the minimum score; the proposed confidence-target instruction with penalty t/(1-t); derived check of the paper's printed values (t = 0.5 -> 1, t = 0.75 printed 2 but formula gives 3, t = 0.9 -> 9)",
+            "train it in vs fix the grading: the two positions and why both predict binary RLVR pushes toward guessing",
+            "R1's binary correctness reward as the baseline the RLCR critique targets (links to Module 10)"
+          ],
+          "sourceIds": ["S32", "S10", "S33", "S15", "S39"],
+          "estWords": 6000,
+          "figures": [
+            "Expected Brier-based reward vs stated confidence q for true success probabilities 0.3, 0.6, 0.9, maximised at q = p (derived plot)",
+            "Payoff table comparing binary reward and RLCR reward for answer/abstain/guess at several success probabilities (derived)",
+            "Reliability diagram before and after RLCR using the reported ECE values (schematic, numbers labelled)",
+            "Kalai et al. confidence-target penalty table with the printed vs formula value for t = 0.75 highlighted",
+            "Log score (unbounded) vs Brier score (bounded) curves with the correctness-incentive consequence"
+          ],
+          "disagreements": [
+            "Calibration: train it into the policy, or fix how benchmarks grade? (primary)"
+          ],
+          "prerequisites": ["Module 10", "Module 20"]
+        },
+        {
+          "id": "25-rlcd-claims-and-reconstruction",
+          "number": 25,
+          "title": "The Name RLCD: What TypeSafe AI Claims, What Is Public, and the OpenJev Reconstruction",
+          "shortTitle": "RLCD: claims vs public",
+          "description": "A sourced ledger of what TypeSafe AI says about Reinforcement Learning for Calibrated Decisions (September 2026), what no source discloses, and the public calibration machinery and independent reconstruction that the name is attached to.",
+          "scope": "Coverage is thin by construction: there is no paper, repository, reward function, algorithm or dataset for TypeSafe's RLCD; the founder says it is unpublished. The mechanism subtopic has coverage none and is not scheduled. In: (1) disambiguation of RLCD (Yang et al. 2023, contrastive distillation), RLCD (TypeSafe AI 2026), RLCR (Damani et al.), RLHV (a design proposal in 2609.28940); (2) a claims ledger with who said it and whether it is primary, secondary or independent: launch post by Diogo Almeida (15 Sep 2026), the docs AI primer, the Latent Space founder interview, TechCrunch (18 Sep 2026, which writes 'from' not 'for'); claims include RLCD as a third route beside RLHF and RLVR, typed outputs with probabilities and a deterministic confidence formula (p_max - 1/n)/(1 - 1/n), synthetic training data, parallel sampling, pricing and latency, the company's own 193.6x faster / 444.6x cheaper evals scored against the average of two frontier LLMs' outputs rather than ground truth; (3) what is not disclosed (reward function, loss, scoring rule, data, base model, architecture, calibration metric, measurements); (4) outside assessment (Armin Ronacher's critique, a tester who found Gemini slightly more accurate, no published benchmarks); (5) the public machinery the claims most plausibly resemble, from Module 24, stated as a resemblance and never as TypeSafe's method; (6) the independent OpenJev-RLCD reconstruction (score each sampled rationale's answer distribution with a strictly proper score; variance identity; 'calibrate, then reinforce'; System-One collapse; 1.7B results) clearly labelled a reconstruction; (7) 2609.28940's attributions (non-autoregressive; ECE 0.246) flagged as unverified because they appear on no TypeSafe page read. Out: any TypeSafe reward function or algorithm. If the sources cannot carry 5,000 words the writer reports that to the coordinator rather than padding. After this module the reader can say precisely what is known, by whom, and with what evidence about RLCD, and can recognise the public calibration literature it is closest to.",
+          "topics": [
+            "acronym map with identifiers: RLCD 2023 (arXiv 2307.12950, ICLR 2024), RLCD 2026 (TypeSafe AI, no paper), RLCR (arXiv 2507.16806, ICLR 2026), RLHV (design only in 2609.28940)",
+            "primary vendor statements: launch post 15 Sep 2026 (the one sentence naming the training method), AI primer docs (third post-training route; output contract of decisions plus probabilities; population-level calibration), their date and export-timestamp oddities",
+            "the output contract: Choice, Score and Noul primitives; confidence = (p_max - 1/n)/(1 - 1/n) as a deterministic summary, worked example with (0.6, 0.3, 0.1) and (0.6, 0.2, 0.2) both giving 0.4 (derived)",
+            "claims about training: RLHF rewards sycophancy and causes mode dropping; training data synthetic (founder 'Yep'); 'not about the PPO'; publication status 'not yet published' (extraction-tool reading; mark)",
+            "company-reported cost and speed: $0.042 per million input tokens, output free, 70 ms-500 ms vs 3-329 s, 40x-200x faster; the 193.6x/444.6x evals and the scoring-against-two-LLMs caveat the company itself states",
+            "independent and outside evidence: TechCrunch (18 Sep 2026) including unnamed observers' suspicion of an open-weight base (reporter's account, unconfirmed), Ronacher's 'delegates the hallucination problem a little bit to the user', the Bryo CTO's Gemini comparison; no published benchmarks, company says it will not publish standard tables",
+            "what no source discloses: reward function, loss, scoring rule, training data, base model, architecture, calibration metric and measurements (the explicit list)",
+            "the public machinery it resembles (inference, labelled as such): RLCR's Brier-augmented reward, Behaviorally Calibrated RL, Kalai et al.'s grading argument (from Module 24)",
+            "OpenJev-RLCD reconstruction: rationale -> answer distribution (softmax over option tokens) -> strictly proper score (Brier or log); Prop. 1 variance identity (mixture score = mean per-rationale score + bonus for disagreeing rationales; RLVR is the same objective without the diversity term); 'calibrate, then reinforce' with a KL anchor; System-One collapse; policy-gradient term 7-12x the readout's gradient; Qwen3-1.7B, 3 seeds; 81% of items decided at <=5% error vs 19% for GRPO on GSM8K answer verification; limit when uncertainty is annotator disagreement",
+            "2609.28940's attributions (RLCD defined as proper-scoring-rule training; non-autoregressive; ECE 0.246 vs 0.081 for Laya, different tasks) and why they are not TypeSafe's statements",
+            "the open question stated plainly: new regime or rebranding of known calibration-aware RL, assessed only on public evidence"
+          ],
+          "sourceIds": ["S35", "S36", "S37", "S38", "S39", "S40", "S32", "S10", "S34"],
+          "estWords": 5000,
+          "figures": [
+            "Acronym disambiguation table: RLCD (2023), RLCD (2026), RLCR, RLHV with authors, venue, mechanism disclosed or not, status",
+            "Claims ledger: claim -> who said it -> primary / secondary / independent -> independently verified (yes/no) -> source",
+            "Output contract diagram: autoregressive text LLM vs the Choice/Score/Noul typed-probability interface, with the confidence formula worked example",
+            "OpenJev reconstruction pipeline (rationale -> readout distribution -> proper score -> reinforce), stamped RECONSTRUCTION, not TypeSafe's method",
+            "Disclosed vs undisclosed matrix for RLCD components (reward, loss, data, base model, architecture, metric, measurements)"
+          ],
+          "disagreements": [
+            "TypeSafe \"RLCD\": new post-training regime, or a rebranding of known calibration-aware RL? (primary)",
+            "Calibration: train it into the policy, or fix how benchmarks grade? (secondary: where the company's framing sits)"
+          ],
+          "prerequisites": ["Module 8", "Module 10", "Module 24"]
+        }
+      ]
+    },
+    {
+      "id": "part-07-case-studies",
+      "number": 7,
+      "title": "Case Studies: Documented Post-Training Recipes, 2024-2026",
+      "shortTitle": "Case Studies",
+      "description": "Seven recipes read stage by stage from their primary technical reports, showing how the mechanisms of Parts 1-6 were composed, with numbers, orderings and what each report says went wrong.",
+      "modules": [
+        {
+          "id": "26-case-llama3-tulu3",
+          "number": 26,
+          "title": "Case Study: Llama 3 and Tulu 3 (2024) - DPO-First Post-Training, the PPO Comparison, and the Birth of RLVR",
+          "shortTitle": "Llama 3 and Tulu 3",
+          "description": "Two 2024 recipes that chose DPO over PPO for preference tuning, and how Tulu 3 added verifiable-reward RL for the skills that have answers.",
+          "scope": "In: Llama 3 (Meta, 31 Jul 2024): the stated stance of simple post-training (SFT, rejection sampling, DPO) over RL algorithms that are 'less stable and harder to scale'; PPO tried and found to need more compute and do worse on IFEval; six rounds of preference-and-SFT data collection with recent best models; DPO hyperparameters, NLL term, token masking; rejection sampling with PagedAttention >2x throughput; stepwise RMs for trace filtering. Tulu 3 (Ai2, 22 Nov 2024): SFT -> length-normalized DPO -> RLVR; the measured PPO-vs-DPO cost (about 28 h on two nodes vs about 4 h on one) and the decision to use DPO for preference iteration and PPO for RLVR; RLVR definition; value model initialised from a general RM; KL 0.05/0.07; asynchronous PPO with vLLM on Ray; 405B on MATH only, >5 MATH points in 25 steps, stopped at 75 steps; limitations (value-free GRPO untested). This module reads each recipe stage by stage; mechanisms are referenced to Modules 4-10, not re-derived. Pipeline plumbing is cross-referenced to the System Design course Module 36. Out: the reasoning-RL era (Modules 27 onward). After this module the reader can state what each 2024 recipe optimised and what made the field move to GRPO-style RLVR in 2025.",
+          "topics": [
+            "Llama 3 stance and stages: SFT, rejection sampling, DPO; why not PPO ('less stable and harder to scale'; DPO less compute and better on IFEval at large scale)",
+            "Llama 3 DPO details: lr 1e-5, beta 0.1, NLL coefficient 0.2 on chosen sequences, masked formatting tokens, six rounds of recent-model preference data",
+            "Llama 3 rejection sampling with PagedAttention (>2x throughput) and reward-model/stepwise-RM filtering for reasoning traces",
+            "Tulu 3 pipeline: SFT -> length-normalized DPO (only variant to beat the base overall among DPO, SimPO, length-normalized DPO) -> RLVR",
+            "Tulu 3 PPO vs DPO measurement: roughly equal scores, ~28 h on two nodes vs ~4 h on one; decision rule recorded",
+            "Tulu 3 RLVR: verification function reward on GSM8K, MATH, IFEval-style constraints; value model from a general RM; KL 0.05 (8B) / 0.07 (70B); asynchronous PPO with vLLM via Ray",
+            "scaling to 405B: MATH-only RLVR, >5 MATH points within 25 steps, 75 steps total because of infrastructure difficulty",
+            "what the reports leave open: value-free GRPO untested; Llama 3's RL stance was later overtaken for verifiable domains by reasoning RL (the DeepSeek-R1 era)",
+            "recipe comparison table and what each implies for the DPO-vs-PPO disagreement"
+          ],
+          "sourceIds": ["S50", "S16", "S11", "S12", "S60", "S8"],
+          "estWords": 6500,
+          "figures": [
+            "Llama 3 six-round loop: preference collection, RM, rejection sampling, SFT, DPO, repeated with the latest model",
+            "Tulu 3 stage pipeline with data and algorithm per stage (writer fetches the data counts)",
+            "Side-by-side recipe table Llama 3 vs Tulu 3: stages, preference algorithm, RL algorithm, KL/beta, infrastructure",
+            "Tulu 3 PPO-vs-DPO cost chart (hours, nodes, scores) and the 405B RLVR step/score timeline",
+            "Diagram of where each recipe sits on the sampling/no-sampling and RM/no-RM axes"
+          ],
+          "disagreements": [
+            "Is DPO enough, or does online RL (PPO) win for preference tuning? (applied: the two reports that said DPO)",
+            "Critic or no critic: is a value model worth it? (applied: Tulu 3's RM-initialised value and untested GRPO)"
+          ],
+          "prerequisites": ["Module 5", "Module 7", "Module 10"]
+        },
+        {
+          "id": "27-case-deepseek-r1",
+          "number": 27,
+          "title": "Case Study: DeepSeek-R1 - R1-Zero, the Four-Stage R1 Pipeline, Its Compute, and What the Nature Version Changed",
+          "shortTitle": "DeepSeek-R1",
+          "description": "The mandatory case study, read stage by stage: GRPO from DeepSeekMath, R1-Zero's rule-based RL, the four-stage R1 pipeline, reported costs, failed attempts, and later critiques.",
+          "scope": "In: the lineage (TRPO -> PPO -> GRPO in DeepSeekMath, Feb 2024; R1 on 22 Jan 2025 on the same day as Kimi k1.5; Tulu 3's RLVR coinage earlier; o1-preview Sep 2024 attested only via Lambert's bibliography because the OpenAI page returned HTTP 403: say so); R1-Zero (RL on DeepSeek-V3-Base, accuracy + format rewards, lr 3e-6, KL 0.001, T = 1, 16 samples, max length 32,768 then 65,536 at step 8.2k, 10,400 steps, 512 outputs per step, rollout of 8,192 outputs in 16 minibatches, reference replaced every 400 steps; AIME 2024 15.6 -> 77.9% in v2 and -> 71.0% in v1, with the version stated every time); R1's stages (cold start; reasoning RL with a language-consistency reward and the unexplained clip epsilon 10; rejection-sampling SFT of ~600k reasoning + ~200k non-reasoning samples; second RL of 1,700 steps with a preference model only in the last 400); compute (R1-Zero 101K GPU-h/$202K, R1 41K, total 147K GPU-h/$294K, the 80 h vs 'about 4 days' inconsistency); distillation vs small-model RL (Qwen2.5-32B); failed attempts (PRM, MCTS); critiques (Dr. GRPO's aha-in-base, Spurious Rewards, Yue et al.); Nature publication details (Nature 645:633-638, 17 Sep 2025) known from search results only: mark unverified. This module also corrects the request's attribution of 'TRPO' and 'first' to R1. Out: re-deriving GRPO (Module 9). After this module the reader can reproduce R1's training schedule arithmetic and say which of its choices later reports kept, changed or dropped.",
+          "topics": [
+            "lineage and corrections: TRPO (2015) -> PPO (2017) -> GRPO (DeepSeekMath, 2024) -> R1; RLVR term from Tulu 3 (22 Nov 2024); o1-preview (Sep 2024) attested only second-hand; R1 and k1.5 same day",
+            "R1-Zero setup: RL on V3-Base, GRPO, reward solely final-answer correctness plus format, no SFT first; hyperparameters (lr 3e-6, KL 0.001, T 1, 16 samples per question, 32,768 -> 65,536 max length at 8.2k)",
+            "R1-Zero schedule arithmetic: 10,400 steps (1.6 epochs); 32 questions x 16 = 512 outputs/step; 8,192 outputs per rollout = 16 minibatches, one inner epoch; reference replaced every 400 steps",
+            "R1-Zero results and the version issue: AIME 2024 pass@1 15.6 -> 77.9% (v2, expanded Nature version) vs 71.0% (v1); 86.7% with self-consistency/majority vote; state which version each number is from",
+            "problems that motivated R1: poor readability, language mixing, narrow reasoning-only RL",
+            "R1 four stages: cold-start SFT; stage-1 reasoning RL with the language-consistency reward (and the printed clip epsilon 10, unexplained); rejection-sampling SFT with ~600k reasoning (correct only, some judged by a generative RM via V3) + ~200k non-reasoning; stage-2 RL of 1,700 steps with preference reward only in the last 400",
+            "compute and cost: 512 GPUs x 198 h = 101,376 GPU-h = $202K (R1-Zero); R1 ~80 h = ~41K GPU-h = $82K; SFT data creation 5K GPU-h = $10K; total 147K GPU-h = $294K at $2/H800-h; 80 h vs 'about 4 days' text inconsistency",
+            "distillation vs RL for small models: Qwen2.5-32B with 10K+ RL steps matches QwQ-32B-Preview; distilling R1 is significantly better",
+            "failed attempts: PRM (step definition, step verification, hackability) and MCTS (exponential token-level search space, local optima)",
+            "later critiques and replications: aha moment in V3-Base (Dr. GRPO), spurious rewards on Qwen2.5-Math, R1's own caveat that tasks without a reliable verifier remain open",
+            "what later recipes kept or dropped from R1: rule-based rewards, KL, GRPO normalization, mixed RL, neural RMs for general tasks (V3.2 reverses the neural-RM stance)"
+          ],
+          "sourceIds": ["S15", "S14", "S18", "S25", "S41", "S45", "S60", "S49"],
+          "estWords": 9000,
+          "figures": [
+            "R1 four-stage pipeline diagram with data, reward and approximate compute at each stage",
+            "R1-Zero AIME trajectory with v1 and v2 endpoints, labelled, and the version ambiguity called out",
+            "Rollout schedule: 32 questions x 16 samples = 512 outputs per step; 8,192 outputs = 16 minibatches; reference reset every 400 steps",
+            "Compute and cost table with the arithmetic check (512 x 198 h, 512 x 80 h, $2/h) and the 80 h vs 4 days inconsistency",
+            "Failed-attempts table: PRM, MCTS, with the reasons given",
+            "Lineage map TRPO -> PPO -> GRPO -> R1 -> V3.2/V4, with the dates"
+          ],
+          "disagreements": [
+            "Does RLVR create new reasoning capability, or only sharpen what the base model can already do? (applied: R1's attribution vs Dr. GRPO vs Spurious Rewards)",
+            "Process vs outcome supervision (applied: R1's PRM failure)",
+            "RL or distillation for strong small reasoning models? (applied: R1's Qwen2.5-32B comparison)"
+          ],
+          "prerequisites": ["Module 9", "Module 10", "Module 13", "Module 20"]
+        },
+        {
+          "id": "28-case-kimi-k15-to-k3",
+          "number": 28,
+          "title": "Case Study: Kimi k1.5 to K3 - Mirror-Descent Policy Optimization, Self-Critic Rewards, Token-Budget RL, and Nine-Expert MOPD",
+          "shortTitle": "Kimi k1.5 to K3",
+          "description": "Four Moonshot AI reports (Jan 2025 to Aug 2026) read as one lineage: a non-GRPO objective, agentic environment synthesis, log-ratio masking, Toggle, PARL, and the K3 expert-then-distill pipeline.",
+          "scope": "In: Kimi k1.5 (22 Jan 2025): no MCTS, value function or PRM; online policy mirror descent with a sampled-mean baseline and squared-error surrogate; length reward warm-up; curriculum and prioritized sampling; partial rollouts; long2short; headline results (77.5 AIME, 96.2 MATH-500, 94th percentile Codeforces, 74.9 MathVista). K2 (28 Jul 2025; v2 3 Feb 2026): K1.5 algorithm reused; Gym-like RL framework; self-critic pairwise rubric reward with closed-loop critic refinement; budget control; temperature decay; PTX loss; agentic synthesis (3,000+ MCP tools, 20,000+ synthetic). K2.5 (2 Feb 2026; v2 7 Aug 2026): token-level log-ratio mask independent of advantage sign, Toggle, PARL, multiple GRM rubrics, zero-vision SFT. K3 (27 Jul 2026; v2 7 Aug 2026): SFT -> 9 domain-by-effort experts via RL -> MOPD; partial rollouts with staleness delegated to per-token regularization; effort RL; agentic GRM judge; verbosity guard; white-box environment. Mechanisms are referenced to Modules 9, 12, 16, 18, 22, 23, not re-derived. Out: Kimi infrastructure details beyond what the reports state. After this module the reader can trace how each Kimi design choice answered the failure of the previous generation. The reports were read in part (abstract, selected sections): the writer fetches full text before citing sections not listed in the source map.",
+          "topics": [
+            "k1.5 design stance: simple RL framework without MCTS, value functions or PRMs; objective as online policy mirror descent with the current model as reference; mean-reward baseline; squared-error surrogate",
+            "k1.5 training recipe: curriculum easy-first plus prioritized sampling toward low success; length reward per problem, warmed up; partial rollouts for long responses; long2short (merging, shortest rejection sampling, DPO, RL)",
+            "k1.5 results: 77.5 AIME, 96.2 MATH-500, 94th percentile Codeforces, 74.9 MathVista; same release day as R1",
+            "K2: reuse of the K1.5 optimiser; Gym-like framework; prompt difficulty by SFT-model pass@k; self-critic rubric reward and closed-loop critic refinement; budget control; temperature decay; PTX loss",
+            "K2 agentic data and environments: 3,000+ real MCP tools plus 20,000+ evolved synthetic tools, rubric per task, LLM-judge filtering",
+            "K2.5: gradient mask on tokens with log-ratio outside [alpha, beta] independent of advantage sign, introduced to bound the off-policy divergence caused by training-vs-inference framework discrepancies; multiple GRM rubrics; Toggle (-25 to -30% tokens); PARL; zero-vision SFT",
+            "K3 pipeline: SFT -> domain experts at varying reasoning effort (3 domains x 3 efforts {low, high, max}) -> MOPD; scaling RL FLOPs improves knowledge, reasoning, vision, agent and coding capability",
+            "K3 RL details: partial rollouts (pause when fraction lambda of trajectories completes; staleness across policy versions); effort RL via budgets (reward -1 beyond tau * b0, tau annealed); agentic GRM protocol; verbosity guard; white-box composable environment",
+            "the loss lineage: K1.5-derived objective (K2) -> log-ratio mask (K2.5) -> per-token regularization for staleness (K3), versus the GRPO lineage in DeepSeek-V3.2 and V4 (Module 30)",
+            "what is open or unreported (model scale and compute figures the writer must read in the report; no cross-lab ablation)"
+          ],
+          "sourceIds": ["S41", "S42", "S43", "S44", "S60", "S45"],
+          "estWords": 8500,
+          "figures": [
+            "Loss-lineage timeline k1.5 -> K2 -> K2.5 -> K3: what changed in the objective, the reward and the infrastructure at each step",
+            "K3 pipeline: SFT -> 9 experts (3 domains x 3 efforts) -> MOPD, with reward type per expert",
+            "Feature-by-version table (algorithm, reward, length control, environments, staleness handling)",
+            "Partial-rollout diagram across policy versions (K3), cross-referenced to Module 18",
+            "k1.5 headline results table with the benchmarks and their definitions"
+          ],
+          "disagreements": [
+            "Critic or no critic: is a value model worth it? (applied: Kimi's mean-baseline, value-free stance)",
+            "Importance ratio and clipping: token-level, sequence-level, IS-weight clipping, or soft gating? (applied: K2.5 and K3)",
+            "How to combine many skills: single mixed RL, sequential stages, or specialists + on-policy distillation? (applied: K3's nine experts)",
+            "Controlling response length / reasoning effort (applied: k1.5 length reward through K3 effort experts)"
+          ],
+          "prerequisites": ["Module 9", "Module 12", "Module 16", "Module 18", "Module 22", "Module 23"]
+        },
+        {
+          "id": "29-case-qwen3",
+          "number": 29,
+          "title": "Case Study: Qwen3 - Four-Stage Reasoning Pipeline, 3,995 Query-Verifier Pairs, Thinking-Mode Fusion, and Strong-to-Weak Distillation",
+          "shortTitle": "Qwen3",
+          "description": "Alibaba's Qwen3 post-training recipe: a long-CoT cold start, a deliberately tiny reasoning-RL set, mode fusion, general RL over 20+ tasks, and a distillation route for small models that cost about a tenth of the GPU hours.",
+          "scope": "In: the flagship four stages (long-CoT cold start; reasoning RL with GRPO on 3,995 query-verifier pairs with large batch, many rollouts per query and off-policy training; thinking-mode fusion; general RL); the query-verifier selection criteria; general RL's reward system over more than 20 tasks and its three reward types (rule-based; model-based with reference using Qwen2.5-72B-Instruct as judge; model-based without reference using a preference RM) and why rule-based rewards are kept; agent training with multi-turn rollouts and real execution feedback; strong-to-weak distillation (off-policy then on-policy) for small models at about 1/10 the GPU hours; Table 21 for Qwen3-8B (RL: AIME'24 67.6, AIME'25 55.5, pass@64 unchanged at 90.0/83.3, 17,920 GPU-hours; on-policy distillation: 74.4/65.5, pass@64 93.3/86.7, 1,800 GPU-hours); the follow-up GSPO algorithm from the same team (Module 12) as related work, not claimed to be Qwen3's optimiser. Only the post-training sections were read: the writer fetches thinking-mode-fusion and cold-start details before writing about them. Out: Qwen3.5 (no official report located: exclude), pretraining. After this module the reader can state why Qwen3 chose distillation for small models and how its RL set is deliberately small.",
+          "topics": [
+            "four-stage flagship pipeline: long-CoT cold start -> reasoning RL -> thinking-mode fusion -> general RL; small models: strong-to-weak distillation instead",
+            "reasoning RL: 3,995 query-verifier pairs, GRPO, large batch and many rollouts per query, off-policy training helped",
+            "selection criteria for query-verifier pairs: not used in cold start, learnable, as challenging as possible, broad coverage",
+            "thinking-mode fusion: merging thinking and non-thinking behaviour in one model (writer fetches mechanism and chat-template details)",
+            "general RL: >20 tasks, three reward types (rule-based; model-based with reference; model-based without reference via a preference RM), rule-based kept for high precision and to prevent hacking",
+            "agent ability via multi-turn rollouts with real environment execution feedback",
+            "strong-to-weak distillation: off-policy then on-policy; ~1/10 of the four-stage GPU hours",
+            "Table 21 (Qwen3-8B, same starting checkpoint): RL 67.6/55.5 with 17,920 GPU-hours and unchanged pass@64 vs OPD 74.4/65.5 with 1,800 GPU-hours and higher pass@64 (9.96x, derived)",
+            "relationship to the Thinking Machines OPD blog (which reuses Table 21 and notes its own SFT baseline of 60% vs 55.0 here) and to the sharpen-or-expand debate",
+            "what the report does not specify (optimiser details, clip/KL values): the writer lists them as not reported"
+          ],
+          "sourceIds": ["S49", "S53", "S24", "S19", "S15"],
+          "estWords": 5500,
+          "figures": [
+            "Four-stage flagship pipeline vs the strong-to-weak route for small models (flowchart)",
+            "Reward-type taxonomy for general RL: rule-based, model-based with reference, model-based without reference",
+            "Table 21 as a chart: pass@1 and pass@64, GPU-hours, ratio 9.96x (derived)",
+            "Query-verifier selection funnel with the four criteria and the 3,995-pair outcome"
+          ],
+          "disagreements": [
+            "RL or distillation for strong small reasoning models? (applied)",
+            "Does RLVR create new reasoning capability, or only sharpen what the base model can already do? (applied: Table 21's pass@64 result)",
+            "Learned reward models, verifiers, or generative/rubric judges? (applied: Qwen3's three reward types)"
+          ],
+          "prerequisites": ["Module 10", "Module 16", "Module 21"]
+        },
+        {
+          "id": "30-case-deepseek-v32-v4",
+          "number": 30,
+          "title": "Case Study: DeepSeek-V3.2 to V4 - Scaling GRPO Past 10% of Pre-Training Compute, Then Replacing Mixed RL with On-Policy Distillation",
+          "shortTitle": "DeepSeek V3.2 to V4",
+          "description": "What changed from R1 to V3.2 (stability fixes, mixed RL, rubric GRM, synthesized agent environments) and from V3.2 to V4 (specialists plus multi-teacher OPD, jointly trained GRM, three effort modes).",
+          "scope": "In: DeepSeek-V3.2 (2 Dec 2025): specialist distillation then mixed RL (reasoning, agent and alignment merged into one GRPO stage to avoid catastrophic forgetting); rewards (rule-based outcome + length penalty + language consistency; per-prompt rubric GRM for general tasks); the stability toolbox (advantage R - mean(R); unbiased KL estimate via importance ratio with domain-dependent KL; off-policy sequence masking; Keep Routing for MoE; Keep Sampling Mask); post-training budget >10% of pretraining cost; 1,800+ environments and 85,000 prompts; V3.2-Speciale. DeepSeek-V4 (arXiv id 2606.19348; the arXiv API shows published 2026-04-26, unexplained: cite by title and id, do not date from the id): same pipeline with mixed RL replaced by OPD from >10 teachers, per-domain GRPO specialists, GRM trained jointly with the actor, three reasoning-effort modes, full-vocabulary OPD. Mechanisms referenced to Modules 11, 14, 16, 22, 23, not re-derived. Out: architecture (DSA, million-token context) except where it touches RL (indexer determinism is GLM-5's issue, Module 32). After this module the reader can say which R1 choices DeepSeek revised and why, and what V4 gave up by dropping mixed RL.",
+          "topics": [
+            "V3.2 pipeline: specialist distillation (math, programming, logic, general agent, agentic coding, agentic search; thinking and non-thinking) then mixed RL with GRPO",
+            "why mixed RL: merge reasoning, agent and alignment RL to avoid catastrophic forgetting from multi-stage training",
+            "V3.2 rewards: rule-based outcome + length penalty + language consistency for reasoning and agent; GRM with per-prompt rubrics for general tasks; contrast with R1's stance against neural RMs",
+            "scaling GRPO stability: advantage A = R_i - mean(R); unbiased KL via importance ratio pi_theta/pi_old because the K3 gradient puts unbounded weight where pi_theta << pi_ref; domain-dependent KL, weak or none for math",
+            "off-policy sequence masking with the inference engine's probabilities (negative-advantage sequences beyond delta); Keep Routing (since V3-0324); Keep Sampling Mask preserving language consistency",
+            "scale: post-training budget >10% of pretraining cost; 1,800+ environments and 85,000 prompts; V3.2-Speciale (reasoning-only RL data, reduced length penalty, DeepSeekMath-V2 proof data and reward)",
+            "V4 pipeline: per-domain SFT then GRPO specialists (hyperparameters close to V3.2/R1) -> OPD from >10 teachers replacing mixed RL; why logits-level alignment avoids merging/mixed-RL degradation",
+            "V4 GRM: no scalar RMs; rubric-guided RL data; RL applied to the GRM; actor is the GRM; minimal human annotation",
+            "V4 effort modes (three, distinct length penalties and context windows; Think Max by system prompt); full-vocabulary OPD engineering",
+            "what changed R1 -> V3.2 -> V4 table; date and arXiv-id ambiguity for V4"
+          ],
+          "sourceIds": ["S45", "S46", "S15", "S52", "S60"],
+          "estWords": 8000,
+          "figures": [
+            "V3.2 vs V4 pipeline diagrams side by side (specialists, mixed RL vs OPD, GRM)",
+            "V3.2's stability toolbox mapped to the failure each fix addresses (advantage, KL estimator, sequence masking, Keep Routing, Keep Sampling Mask)",
+            "Change table R1 -> V3.2 -> V4: reward types, KL, advantage normalization, RM stance, integration method",
+            "Reasoning-effort modes table: length penalty, context window, system prompt",
+            "Environments and prompts count table with the scale reported"
+          ],
+          "disagreements": [
+            "How to combine many skills: single mixed RL, sequential stages, or specialists + on-policy distillation? (applied: V3.2 vs V4)",
+            "Keep or remove the KL-to-reference term? (applied: V3.2's domain-dependent KL)",
+            "How should the GRPO loss and advantage be normalized? (applied: V3.2's no-std advantage)",
+            "Learned reward models, verifiers, or generative/rubric judges? (applied: R1's stance vs V3.2/V4 GRMs)"
+          ],
+          "prerequisites": ["Module 11", "Module 14", "Module 16", "Module 22", "Module 23", "Module 27"]
+        },
+        {
+          "id": "31-case-olmo3",
+          "number": 31,
+          "title": "Case Study: Olmo 3 - OlmoRL, RL-Zero from a Fully Open Base, and Measured Rollout Economics",
+          "shortTitle": "Olmo 3",
+          "description": "The only fully open recipe with measured infrastructure numbers: OlmoRL's list of GRPO modifications, offline and active difficulty filtering, the 1,000-second step, continuous batching, and RL-Zero as a contamination-free testbed.",
+          "scope": "In: OlmoRL as GRPO plus zero-gradient filtering, active sampling, token-level loss, no KL loss, clip-higher, truncated importance sampling and no std normalization, and the reason each is there; offline difficulty filtering (drop prompts with pass rate above 62.5%; the 32B run relies on active sampling); the rollout economics (rollouts up to 32K tokens, average over 10K, mean 14,628 as used in the waste arithmetic; the 32B run's 8 H100 training nodes and 20 inference nodes; learner waiting 75% of the time; ~5x GPU use for inference vs training, ~14x at 7B; continuous batching and inflight updates giving 2x speed on half the GPUs, 7B 15 -> 6 days; a 1,000 s step with 125 s of training, so generation needs >8x speedup before training bottlenecks; ~54% static-batching waste, derived); RL-Zero (open-weight bases with undisclosed mid-training data can contaminate RLVR benchmarks; Olmo 3 releases RL-Zero from a fully open base with decontaminated data). The researcher read the RL sections only: the writer fetches the SFT, DPO and data sections before covering them, and may narrow to the RL recipe. Out: pretraining. After this module the reader can reproduce the economics of a rollout-bound RL run from Olmo 3's published numbers.",
+          "topics": [
+            "OlmoRL as a diff against GRPO: each of the seven modifications and its rationale",
+            "no-std advantage to remove difficulty bias; token-level loss normalised over all tokens in the batch to avoid length bias; no KL; clip-higher; truncated importance sampling following Yao et al. (second-hand)",
+            "difficulty control: offline filter at pass rate > 62.5%; active sampling for the 32B run",
+            "rollout economics: up to 32K tokens (average >10K), 8 training nodes + 20 inference nodes (32B), learner waits 75%, ~5x inference GPUs vs training (7B: ~14x)",
+            "static vs continuous batching: (32K - 14,628)/32K ~ 54% waste (derived); continuous batching + inflight updates: 2x faster on half the GPUs; 7B ~15 days -> ~6 days (Table 23)",
+            "step-time decomposition: 1,000 s average step with 125 s training; generation would need >8x speedup to make training the bottleneck (footnote arithmetic)",
+            "RL-Zero: why open-weight bases with undisclosed mid-training data can contaminate RLVR evaluation; fully open base plus decontaminated RL data",
+            "relation to Tulu 3's recipe and to Spurious Rewards (contamination makes spurious signals look real)",
+            "what the writer must fetch before covering the SFT and DPO stages (not read by the researcher)"
+          ],
+          "sourceIds": ["S48", "S25", "S22", "S27", "S16", "S59"],
+          "estWords": 5500,
+          "figures": [
+            "OlmoRL-vs-GRPO checklist table: component, what it does, rationale, related report",
+            "Cluster layout for the 32B run: 8 training nodes, 20 inference nodes, with utilization annotated",
+            "1,000 s step timeline with the 125 s training segment and the >8x calculation",
+            "Static vs continuous batching waste diagram with the 54% computation",
+            "RL-Zero pipeline: fully open base -> decontaminated RL data -> RLVR, contrasted with open-weight-only bases"
+          ],
+          "disagreements": [
+            "Keep or remove the KL-to-reference term? (applied: Olmo 3 removes KL; ProRL keeps it)",
+            "How should the GRPO loss and advantage be normalized? (applied: token-level, no std)",
+            "Fixing the training-inference mismatch (vLLM/SGLang rollout vs trainer): algorithm, numerics, or determinism? (applied: truncated IS)",
+            "Does RLVR create new reasoning capability, or only sharpen what the base model can already do? (applied: contamination and RL-Zero)"
+          ],
+          "prerequisites": ["Module 1", "Module 11", "Module 14", "Module 20"]
+        },
+        {
+          "id": "32-case-glm5-nemotron3",
+          "number": 32,
+          "title": "Case Study: GLM-5 and Nemotron 3 Ultra - Asynchronous Agentic RL, Deterministic Indexer Top-k, Open Environments, and the Limits of MOPD",
+          "shortTitle": "GLM-5 & Nemotron 3 Ultra",
+          "description": "Two 2026 agent-era recipes: GLM-5's three RL stages with cross-stage distillation and its determinism fix, and Nemotron 3 Ultra's unified RLVR across many environments followed by MOPD, with its stated limits.",
+          "scope": "In: GLM-5 (17 Feb 2026; v2 24 Feb): three RL stages with on-policy cross-stage distillation; reasoning RL as GRPO + IcePop with the KL term removed; the sparse-attention indexer determinism finding (non-deterministic CUDA/TileLang top-k caused drastic degradation after a few RL steps with an entropy drop; torch.topk fixed it; indexer frozen; replaying k = 2048 indices judged impractical vs MoE routing replay); asynchronous agentic RL with a Multi-Task Rollout Orchestrator, TITO gateway and Direct Double-sided Importance Sampling; 10K+ SWE environments plus terminal and multi-hop search. Nemotron 3 Ultra (12 Jun 2026): one unified RLVR run across terminal, office, SWE, search, tool-calling, math, code, STEM, safety, chat, instruction following, long-context QA and structured outputs; asynchronous GRPO with stability optimisations, global batch 8,192 with 16 rollouts per sample, 48K then 64K max generation; harness diversity; MOPD from >10 teachers with dense per-token rewards, asynchronous; its reported limitation (end-to-end agentic rollouts in MOPD cause large inefficiency; single-turn PivotRL-style rollouts used instead; whether end-to-end would gain more is open); release of recipes, data and environments. Mechanisms referenced to Modules 14, 17, 18, 22. Out: architecture details (hybrid Mamba-Transformer, DSA) beyond RL impact. After this module the reader can state what each lab found that the other did not.",
+          "topics": [
+            "GLM-5 stages: three RL stages in order with on-policy cross-stage distillation limiting forgetting; Lambert's note that GLM-5 uses MOPD after a three-stage RL",
+            "reasoning RL backbone: GRPO + IcePop for the training-inference mismatch; KL removed to speed up improvement",
+            "DSA indexer determinism: non-deterministic top-k -> drastic degradation after a few steps with entropy drop; torch.topk slower but deterministic; indexer frozen; why replaying k = 2048 indices is impractical; contrast with V3.2's routing replay",
+            "async agentic RL: decoupled engines, Multi-Task Rollout Orchestrator, TITO gateway, Direct Double-sided IS (token-level clip [1 - eps_l, 1 + eps_h] on rollout log-probs, no historical-checkpoint tracking)",
+            "GLM-5 environments: >10K real-world SWE environments plus terminal and multi-hop search",
+            "Nemotron 3 Ultra: unified RLVR run across the 13 listed environment families; harness diversity; asynchronous GRPO; global batch 8,192, 16 rollouts per sample; 48K then 64K max generation",
+            "why MOPD after mixed RLVR: with many environments each domain gets few samples per batch, diluting its signal; >10 teachers, dense per-token rewards, asynchronous MOPD",
+            "stated limit: end-to-end agentic MOPD rollouts are very inefficient; single-turn PivotRL-style rollouts for most agentic tasks; open question whether end-to-end rollouts would gain more",
+            "open release: Nemotron 3 Ultra's recipes, data and RL environments with the checkpoints",
+            "comparison with V4, K3 and V3.2 on how and when each integrates skills"
+          ],
+          "sourceIds": ["S47", "S51", "S52", "S60", "S45", "S56", "S57"],
+          "estWords": 6500,
+          "figures": [
+            "GLM-5 three-stage RL with cross-stage distillation (flowchart)",
+            "Asynchronous rollout orchestration with the TITO gateway and double-sided IS (diagram)",
+            "Indexer top-k failure: step vs entropy and performance, from the report's description (labelled schematic)",
+            "Nemotron 3 Ultra environment families and harness variants as a matrix",
+            "MOPD usage table: GLM-5, Nemotron 3 Ultra, V4, K3: expert count, rollout type, timing relative to RL"
+          ],
+          "disagreements": [
+            "Fixing the training-inference mismatch (vLLM/SGLang rollout vs trainer): algorithm, numerics, or determinism? (applied: GLM-5's determinism fix)",
+            "How to combine many skills: single mixed RL, sequential stages, or specialists + on-policy distillation? (applied: GLM-5 and Nemotron)",
+            "Keep or remove the KL-to-reference term? (applied: GLM-5 removes it)"
+          ],
+          "prerequisites": ["Module 14", "Module 17", "Module 18", "Module 22"]
+        }
+      ]
+    },
+    {
+      "id": "part-08-synthesis",
+      "number": 8,
+      "title": "Choosing Methods and Reading the Frontier",
+      "shortTitle": "Synthesis",
+      "description": "A decision framework built from the evidence of the course, and an honest map of what is unsettled as of October 2026.",
+      "modules": [
+        {
+          "id": "33-when-to-use-which",
+          "number": 33,
+          "title": "Choosing a Method: PPO, DPO, GRPO-Family, On-Policy Distillation, and Hybrids Under Reward, Data, Compute, and Stability Constraints",
+          "shortTitle": "When to use which",
+          "description": "A decision framework tying each algorithm to the constraint it was built for, with the evidence (and its strength) behind each cell.",
+          "scope": "In: the constraint axes: reward type (pairwise preference, verifier, judge-only), available data (pairs vs prompts), generation compute and critic memory, stability and tuning burden, target (chat alignment, reasoning, agent), model size (small: distill; large: RL), multi-skill integration, calibration need. Each recommendation cites the report that supports it, states the stack and scale in which it was measured, and marks evidence strength (single report, replicated, conflicting). Covers: preference tuning (DPO vs PPO evidence: Llama 3, Tulu 3, Xu et al., Ivison et al.; data quality dominating); reasoning with verifiers (GRPO family; the default recipes in TRL, Olmo 3, ScaleRL, DAPO and what they agree on: no KL, token-level or prompt-level aggregation, clip-higher or CISPO, mismatch correction); agentic coding (sandbox verifiers, async RL, harness diversity); small models (distillation first, per Qwen3 and R1); non-verifiable tasks (rubric GRM, K3 protocol); multi-skill targets (mixed RL vs MOPD); calibrated outputs (RLCR-style Brier term, Module 24). Cells with no source are stated as no source. This module is a synthesis, not an assessment or a deliverable. Out: new disagreements. After this module the reader can pick a starting method and the first three things to monitor for a given constraint set, with the evidence cited.",
+          "topics": [
+            "constraint axes and how each report's setting maps onto them (reward type, data, generation compute, critic memory, stability, scale)",
+            "preference tuning: Llama 3 and Tulu 3 (DPO cheaper, ~28 h vs ~4 h at roughly equal scores) vs Xu et al. and Ivison et al. (PPO ahead by small margins; data quality up to 8%); RL kept for surgical gains (Lambert)",
+            "critic vs critic-free: memory and tuning cost vs Tulu 3's RM-initialised value; ReMax/RLOO/GRPO evidence; VAPO as a pointer",
+            "reasoning RL defaults: what Olmo 3, ScaleRL, DAPO, TRL defaults and Magistral (pointer) agree on and where they differ; efficiency vs asymptote framing from ScaleRL",
+            "agentic RL: environment and harness requirements, async rollouts, staleness-tolerant losses, determinism",
+            "small models: distillation vs RL cost and capability (Qwen3 Table 21; R1 Qwen2.5-32B) and the go-beyond-the-teacher exception",
+            "non-verifiable tasks: rubric/GRM choices and the hacking defenses (K2.5, K3, V3.2, V4)",
+            "multi-skill: mixed RL (V3.2, Nemotron stage 1) vs cascades vs MOPD (V4, K3, GLM-5); the open agentic-rollout limit",
+            "calibration and abstention: when to add a proper-scoring term (RLCR) and what it costs; grading changes (Kalai et al.)",
+            "evidence-strength rubric used throughout (single report / multiple concordant / conflicting / no source) and the list of decisions with no source"
+          ],
+          "sourceIds": ["S11", "S12", "S13", "S16", "S22", "S48", "S49", "S50", "S52", "S53", "S59", "S60"],
+          "estWords": 7500,
+          "figures": [
+            "Decision tree: reward type and data -> algorithm family, with module numbers on each leaf",
+            "Constraint-by-method matrix (cost, stability, evidence strength) with each cell sourced",
+            "Reported-cost bar chart across methods (DPO 4 h vs PPO 28 h; OPD ~1/10 of RL GPU-hours; critic-free memory savings where sourced)",
+            "Default-recipe table: TRL defaults vs Olmo 3 vs DAPO vs ScaleRL vs V3.2 (loss, KL, clip, advantage, mismatch handling)",
+            "Evidence-strength legend and the list of cells marked 'no source'"
+          ],
+          "disagreements": [
+            "Is DPO enough, or does online RL (PPO) win for preference tuning? (synthesis)",
+            "Critic or no critic: is a value model worth it? (synthesis)",
+            "How should the GRPO loss and advantage be normalized? (synthesis)",
+            "How to combine many skills: single mixed RL, sequential stages, or specialists + on-policy distillation? (synthesis)",
+            "RL or distillation for strong small reasoning models? (synthesis)"
+          ],
+          "prerequisites": ["Module 7", "Module 9", "Module 11", "Module 15", "Module 21", "Module 22", "Module 24"]
+        },
+        {
+          "id": "34-frontier-october-2026",
+          "number": 34,
+          "title": "The Frontier as of October 2026: Open Problems, Moving Parts, and What Closed Labs Do and Do Not Disclose",
+          "shortTitle": "Frontier, Oct 2026",
+          "description": "A dated map of what is settled, contested and open in RL post-training, with the leading indicators in the sources and a bounded account of what closed labs have actually put on the record.",
+          "scope": "In: a dated settled/contested/open map across the course's mechanisms (e.g. no-KL and token-level loss are near consensus in open recipes; sharpen-vs-expand, MOPD adoption, train-inference fixes, agentic rollouts under MOPD, tasks without verifiers (R1 Supp. G.1), environment quality, calibration, the RLCD claim remain open); the 2026 shift Lambert documents (MOPD popular; expert counts; labs not unanimous); time-stamped milestones from DeepSeekMath (Feb 2024) to the October 2026 reports; a bounded section on closed labs, using only their own primary statements already in the map (OpenAI papers S3, S6, S28, S33; Anthropic papers S7, S29), plus pointer-only items the writer must fetch first (the gpt-oss model card: 'similar CoT RL techniques as OpenAI o3', low/medium/high levels, no direct optimisation pressure on the CoT; Baker et al. on CoT monitoring) and an explicit statement that no primary recipe was found for o1/o3, Claude or Gemini (the o1 page returned HTTP 403); no rumoured recipes. This is a section of this module and not a separate module because the source map supports no more than that. Also: the as-of notes (version and date ambiguities) and what to watch. Out: any unsourced prediction (the writer labels forecasts as the writer's own and keeps them few). After this module the reader knows which parts of this course are likely to be revised first and where the evidence is weakest.",
+          "topics": [
+            "settled/contested/open map by mechanism with module numbers and the sources behind each cell",
+            "emerging consensus in open recipes: no KL, token- or prompt-level aggregation, clip-higher or CISPO-type weights, mismatch correction, active/dynamic sampling (Olmo 3, DAPO, GLM-5, Magistral pointer, ScaleRL)",
+            "open questions the reports themselves state: tasks without verifiers (R1 G.1), MOPD for long-horizon agentic rollouts (Nemotron), whether RL expands capability (Modules 20, 21), whether RL scaling continues to pay (Module 15)",
+            "the 2026 recipe shift: MOPD as a merging tool (MiMo-V2-Flash first, then Nemotron >10, K3 nine, V4 >10), 'labs are far from unanimous'",
+            "reasoning-effort as a trained product surface (K3 low/high/max, V4 three modes, gpt-oss low/medium/high pointer)",
+            "calibration as a post-training target: RLCR/behavioural calibration in the literature and the unpublished RLCD claim (Modules 24, 25)",
+            "closed-lab disclosures, bounded: what OpenAI and Anthropic have published in the map (S3, S6, S28, S33; S7, S29), pointer-only items to fetch first, and the explicit list of what is not disclosed; no rumours",
+            "date and version hygiene: R1 v1 vs v2 numbers, V4 id vs date, Lambert edition dates, unversioned docs snapshots; what must be re-checked first when the course is revisited",
+            "leading indicators and what to watch, each with its source (new open recipes with released environments, MOPD ablations, mismatch fixes, scaling-fit extrapolations)"
+          ],
+          "sourceIds": ["S44", "S46", "S47", "S51", "S52", "S60", "S53", "S29", "S15", "S32", "S7", "S33"],
+          "estWords": 6500,
+          "figures": [
+            "Timeline Feb 2024 -> Oct 2026 of recipe milestones with report dates (DeepSeekMath, Tulu 3, R1/k1.5, DAPO, Qwen3, V3.2, Olmo 3, GLM-5, Nemotron 3 Ultra, K3, V4) and the September 2026 RLCD claim as a separate, claim-only marker",
+            "Settled/contested/open map of the course's mechanisms, each cell tagged with a module number",
+            "Closed-lab disclosure matrix: lab -> what is on the record (with source) -> what is not disclosed",
+            "Leading-indicators table: signal, why it matters, source",
+            "Version and date hygiene table: items to re-check when the course is revisited"
+          ],
+          "disagreements": [
+            "Does RLVR create new reasoning capability, or only sharpen what the base model can already do? (open)",
+            "How to combine many skills: single mixed RL, sequential stages, or specialists + on-policy distillation? (open)",
+            "RL or distillation for strong small reasoning models? (open)",
+            "Calibration: train it into the policy, or fix how benchmarks grade? (open)",
+            "TypeSafe \"RLCD\": new post-training regime, or a rebranding of known calibration-aware RL? (open, claim-only)"
+          ],
+          "prerequisites": ["Module 25", "Module 22", "Module 18", "Module 33"]
+        }
+      ]
+    }
+  ]
+}

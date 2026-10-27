@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentic and Multi-Turn RL: Trajectories as Episodes, Credit Assignment, Observation Tokens, and Staleness · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="What changes when an RL episode is many model turns interleaved with tool output: the loss mask, step-level credit without a learned process reward (GiGPO), frozen subagents and critical steps (Kimi K2.5 PARL), partial rollouts and policy staleness (Kimi k1.5 and K3, GLM-5, MiMo-V2-Flash), and turn-local training (PivotRL, Nemotron 3 Ultra).">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 18</p>
+  <h1>Agentic and Multi-Turn RL: Trajectories as Episodes, Credit Assignment, Observation Tokens, and Staleness</h1>
+  <p class="lede">An episode is no longer one response: it is several model turns interleaved with tool output, and that changes four things in the objective. This module covers which tokens carry loss, how one trajectory-level reward is split across turns (GiGPO, PARL's critical steps), what partial rollouts do to the policy version behind each token, and why Nemotron 3 Ultra's distillation stage uses single-turn rollouts for most agentic tasks. Afterwards you can specify the loss mask, the advantage and the staleness rule for a multi-turn recipe, and say which reported design fits which task structure.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>40 min</b> read</span>
+    <span class="chip"><b>17</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 12</b>, <b>Module 14</b>, <b>Module 17</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 350" role="img" aria-labelledby="f1t"><title id="f1t">A single-turn episode (one response, one reward) next to a multi-turn episode (model turns a1 to a3 interleaved with environment outputs o1 and o2, one reward), with four numbered places where multi-turn training differs</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="10" y="10" width="780" height="92" rx="10" class="d-panel"/>
+    <text x="24" y="32" class="d-title">Single-turn: one response, one reward</text>
+    <rect x="24" y="44" width="96" height="44" rx="6" class="d-block-muted"/><text x="72" y="71" text-anchor="middle" class="d-text-inv d-bold">prompt</text>
+    <rect x="124" y="44" width="360" height="44" rx="6" class="d-block"/><text x="304" y="71" text-anchor="middle" class="d-text-inv d-bold">sampled response: every token has a loss</text>
+    <path d="M484,66 L520,66" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="522" y="44" width="68" height="44" rx="6" class="d-hl"/><text x="556" y="71" text-anchor="middle" class="d-bold">r</text>
+    <text x="610" y="62" class="d-small d-text-light">one scalar</text><text x="610" y="78" class="d-small d-text-light">per sequence</text>
+
+    <rect x="10" y="112" width="780" height="124" rx="10" class="d-panel"/>
+    <text x="24" y="134" class="d-title">Multi-turn: T model turns interleaved with environment output</text>
+    <rect x="24" y="148" width="70" height="44" rx="6" class="d-block-muted"/><text x="59" y="175" text-anchor="middle" class="d-text-inv d-bold">prompt</text>
+    <rect x="98" y="148" width="70" height="44" rx="6" class="d-block"/><text x="133" y="175" text-anchor="middle" class="d-text-inv d-bold">a1</text>
+    <rect x="172" y="148" width="86" height="44" rx="6" class="d-block-muted"/><text x="215" y="175" text-anchor="middle" class="d-text-inv d-bold">o1</text>
+    <rect x="262" y="148" width="62" height="44" rx="6" class="d-block"/><text x="293" y="175" text-anchor="middle" class="d-text-inv d-bold">a2</text>
+    <rect x="328" y="148" width="98" height="44" rx="6" class="d-block-muted"/><text x="377" y="175" text-anchor="middle" class="d-text-inv d-bold">o2</text>
+    <rect x="430" y="148" width="70" height="44" rx="6" class="d-block"/><text x="465" y="175" text-anchor="middle" class="d-text-inv d-bold">a3</text>
+    <path d="M500,170 L530,170" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="532" y="148" width="58" height="44" rx="6" class="d-hl"/><text x="561" y="175" text-anchor="middle" class="d-bold">R</text>
+    <text x="24" y="218" class="d-mono d-small d-text-light">mask m</text>
+    <text x="59" y="218" text-anchor="middle" class="d-mono d-small">0</text><text x="133" y="218" text-anchor="middle" class="d-mono d-small">1</text><text x="215" y="218" text-anchor="middle" class="d-mono d-small">0</text><text x="293" y="218" text-anchor="middle" class="d-mono d-small">1</text><text x="377" y="218" text-anchor="middle" class="d-mono d-small">0</text><text x="465" y="218" text-anchor="middle" class="d-mono d-small">1</text>
+    <text x="610" y="166" class="d-small d-text-light">T = 3 turns,</text><text x="610" y="182" class="d-small d-text-light">one scalar R</text>
+    <circle cx="256" cy="150" r="10" class="d-fill-orange"/><text x="256" y="154" text-anchor="middle" class="d-text-inv d-bold d-small">1</text>
+    <circle cx="590" cy="150" r="10" class="d-fill-orange"/><text x="590" y="154" text-anchor="middle" class="d-text-inv d-bold d-small">2</text>
+    <circle cx="515" cy="196" r="10" class="d-fill-orange"/><text x="515" y="200" text-anchor="middle" class="d-text-inv d-bold d-small">3</text>
+    <circle cx="26" cy="150" r="10" class="d-fill-orange"/><text x="26" y="154" text-anchor="middle" class="d-text-inv d-bold d-small">4</text>
+
+    <circle cx="34" cy="268" r="11" class="d-fill-orange"/><text x="34" y="272" text-anchor="middle" class="d-text-inv d-bold d-small">1</text>
+    <text x="54" y="265">Loss mask: only the model's own</text><text x="54" y="283">tokens may carry gradient (Section 1)</text>
+    <circle cx="414" cy="268" r="11" class="d-fill-orange"/><text x="414" y="272" text-anchor="middle" class="d-text-inv d-bold d-small">2</text>
+    <text x="434" y="265">Credit: one reward must be split</text><text x="434" y="283">across T decisions (Sections 2, 3)</text>
+    <circle cx="34" cy="316" r="11" class="d-fill-orange"/><text x="34" y="320" text-anchor="middle" class="d-text-inv d-bold d-small">3</text>
+    <text x="54" y="313">Tails: duration is turns plus tool waits;</text><text x="54" y="331">stale tokens follow (Section 4)</text>
+    <circle cx="414" cy="316" r="11" class="d-fill-orange"/><text x="414" y="320" text-anchor="middle" class="d-text-inv d-bold d-small">4</text>
+    <text x="434" y="313">Unit: train on the whole trajectory</text><text x="434" y="331">or on one turn at a time (Sections 5, 6)</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The four places where a multi-turn episode changes the training recipe. Blue segments are tokens the model sampled (<code>a</code>), grey segments are environment output the model only reads (<code>o</code>). GLM-5 states that only model-generated tokens are used for optimization<a class="cite" href="#ref-1">1</a>; Kimi K3 pauses generation once a fraction of trajectories has finished, so tails cross policy versions<a class="cite" href="#ref-2">2</a>; PivotRL and Nemotron 3 Ultra train on single turns instead of whole trajectories<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+
+<h2 id="token-stream">1. The trajectory is a token stream</h2>
+
+<h3 id="token-stream-mask">1.1 What the trainer receives, and the mask</h3>
+<p>A single-turn RLVR sample is a prompt and one sampled response, and the sequence the trainer scores is the sequence the engine sampled. A multi-turn sample is a message list that grows during rollout: the model emits a turn (reasoning plus a tool call), the harness executes the call and appends the result, and the model continues until it answers, hits a turn or token limit, or the environment ends the episode. NeMo Gym describes the environment in these terms: a dataset of tasks, an agent harness that decides how the model interacts with the world, a verifier, and per-task state<a class="cite" href="#ref-4">4</a> (an unversioned README snapshot, release v0.7.0). Gymnasium's <code>step</code> returns separate <code>terminated</code> (task completed or failed) and <code>truncated</code> (time limit) flags<a class="cite" href="#ref-5">5</a>. For an LLM the difference matters: a truncated trajectory has no outcome yet, and Section 5.3 shows Nemotron masking exactly those.</p>
+<p>Write the rollout as tokens \(y_1,\dots,y_L\) and let \(I(y_t)=1\) for tokens the policy sampled and \(0\) for tokens the environment returned. The policy-gradient estimator differentiates the probability of the actions the policy chose (Module 2). Observation tokens are drawn from the environment's dynamics, not from \(\pi_\theta\), so neither \(\nabla\log\pi_\theta\) nor the ratio \(\rho=\pi_\theta/\pi_{old}\) means anything for them. Search-R1 puts this into the GRPO objective, and applies the same mask inside the KL term<a class="cite" href="#ref-6">6</a> (§3.1, Eq. 3):</p>
+$$ \mathcal J(\theta)=\mathbb E\Big[\frac1G\sum_{i=1}^{G}\frac{1}{\sum_t I(y_{i,t})}\sum_{t:\,I(y_{i,t})=1}\min\big(\rho_{i,t}\hat A_{i,t},\ \mathrm{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)\hat A_{i,t}\big)\Big]-\beta D_{KL}. $$
+<p>Two things differ from the single-turn loss of Module 11. The normalizer counts sampled tokens only, so a long tool output does not dilute the gradient of the model's own tokens. And in outcome-reward GRPO the advantage \(\hat A_{i,t}=\hat A_i\) is the same for every unmasked token of trajectory \(i\), however many turns it contains (Section 2 is about that).</p>
+<p>The ids in this sequence must be the ids the engine sampled. The gateway that guarantees it (GLM-5's token-in-token-out) is Module 14, Section 2.5, and is not repeated here. Kimi K2.5 states the same design choice: its framework "strictly follows a Token-in-Token-out paradigm" and records the log-probabilities of every engine output for mismatch correction<a class="cite" href="#ref-7">7</a> (Appendix D). What multi-turn adds is that observation segments travel through the same id stream and need a mask, not a probability.</p>
+
+<h3 id="token-stream-reports">1.2 What each report says about masking</h3>
+<p>The source map did not record whether the reports mask environment tokens, so I searched the full text of each. The result is thin: only GLM-5 states the rule for tool output in the passages searched, and Search-R1 is the only paper that measures it.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> Statements about loss on non-model tokens, by source. "Not stated" means a keyword search of the full report text found no such statement; it does not mean the lab does not mask.</caption>
+  <thead><tr><th>Source</th><th>What it says</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Search-R1</td><td>Loss masked on retrieved tokens in PPO, GRPO and the KL term; normalizer counts sampled tokens<a class="cite" href="#ref-6">6</a></td><td>§3.1, Table 4</td></tr>
+    <tr><td class="row">RAGEN (StarPO)</td><td>Response masking enabled vs disabled on Sokoban with a 0.5B model; enabling it gave higher success (figure only)<a class="cite" href="#ref-8">8</a></td><td>Appendix D, Fig. 12</td></tr>
+    <tr><td class="row">GLM-5</td><td>"only model-generated tokens are used for optimization, and the environment feedback is ignored in loss computation"<a class="cite" href="#ref-1">1</a></td><td>§4.1</td></tr>
+    <tr><td class="row">Kimi K2.5</td><td>Frozen subagents' trajectories "excluded from the optimization objective"; the orchestrator's own tool results: not stated<a class="cite" href="#ref-7">7</a></td><td>Abstract, §3</td></tr>
+    <tr><td class="row">Kimi K3</td><td>A pure-JSON fallback block that occurs only in input tokens has its loss masked; tool results: not stated<a class="cite" href="#ref-2">2</a></td><td>Chat-template appendix</td></tr>
+    <tr><td class="row">Nemotron 3 Ultra</td><td>Loss masked on unfinished trajectories; negative advantage on tokens of malformed reasoning or tool calls; tool results: not stated<a class="cite" href="#ref-9">9</a></td><td>§3.3.2 (SWE teacher)</td></tr>
+    <tr><td class="row">Kimi k1.5</td><td>Under partial rollouts "certain segments can be excluded from loss computation"<a class="cite" href="#ref-10">10</a></td><td>§2.6.2</td></tr>
+    <tr><td class="row">Kimi K2, DeepSeek-V3.2, DeepSeek-V4</td><td>Not stated<a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-13">13</a></td><td>-</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f2t"><title id="f2t">Grouped bar chart of exact-match scores on seven question-answering sets and their mean, with and without loss masking of retrieved tokens, Qwen2.5-7B-Base trained with PPO</title>
+    <line x1="70" y1="20" x2="70" y2="270" class="d-axis"/><line x1="70" y1="270" x2="780" y2="270" class="d-axis"/>
+    <line x1="70" y1="181" x2="780" y2="181" class="d-grid"/><line x1="70" y1="92" x2="780" y2="92" class="d-grid"/>
+    <text x="64" y="274" text-anchor="end" class="d-small d-text-light">0</text><text x="64" y="185" text-anchor="end" class="d-small d-text-light">0.25</text><text x="64" y="96" text-anchor="end" class="d-small d-text-light">0.50</text>
+    <text x="14" y="146" class="d-small d-text-light" transform="rotate(-90 14 146)" text-anchor="middle">exact match</text>
+
+    <rect x="92" y="98.6" width="28" height="171.4" class="d-fill-blue"/><rect x="122" y="131.4" width="28" height="138.6" class="d-fill-red"/>
+    <text x="106" y="92" text-anchor="middle" class="d-mono d-small">.480</text><text x="136" y="125" text-anchor="middle" class="d-mono d-small">.388</text>
+    <rect x="192" y="42.2" width="28" height="227.8" class="d-fill-blue"/><rect x="222" y="67.5" width="28" height="202.5" class="d-fill-red"/>
+    <text x="206" y="36" text-anchor="middle" class="d-mono d-small">.638</text><text x="236" y="61" text-anchor="middle" class="d-mono d-small">.567</text>
+    <rect x="292" y="106.9" width="28" height="163.1" class="d-fill-blue"/><rect x="322" y="130.4" width="28" height="139.6" class="d-fill-red"/>
+    <text x="306" y="100" text-anchor="middle" class="d-mono d-small">.457</text><text x="336" y="124" text-anchor="middle" class="d-mono d-small">.391</text>
+    <rect x="392" y="115.4" width="28" height="154.6" class="d-fill-blue"/><rect x="422" y="154" width="28" height="116" class="d-fill-red"/>
+    <text x="406" y="109" text-anchor="middle" class="d-mono d-small">.433</text><text x="436" y="148" text-anchor="middle" class="d-mono d-small">.325</text>
+    <rect x="492" y="133.6" width="28" height="136.4" class="d-fill-blue"/><rect x="522" y="155.4" width="28" height="114.6" class="d-fill-red"/>
+    <text x="506" y="127" text-anchor="middle" class="d-mono d-small">.382</text><text x="536" y="149" text-anchor="middle" class="d-mono d-small">.321</text>
+    <rect x="592" y="200" width="28" height="70" class="d-fill-blue"/><rect x="622" y="231.4" width="28" height="38.6" class="d-fill-red"/>
+    <text x="606" y="194" text-anchor="middle" class="d-mono d-small">.196</text><text x="636" y="225" text-anchor="middle" class="d-mono d-small">.108</text>
+    <rect x="692" y="115.8" width="28" height="154.2" class="d-fill-blue"/><rect x="722" y="161.5" width="28" height="108.5" class="d-fill-red"/>
+    <text x="706" y="109" text-anchor="middle" class="d-mono d-small">.432</text><text x="736" y="155" text-anchor="middle" class="d-mono d-small">.304</text>
+
+    <text x="121" y="288" text-anchor="middle" class="d-small">NQ</text><text x="221" y="288" text-anchor="middle" class="d-small">TriviaQA</text><text x="321" y="288" text-anchor="middle" class="d-small">PopQA</text><text x="421" y="288" text-anchor="middle" class="d-small">HotpotQA</text><text x="521" y="288" text-anchor="middle" class="d-small">2Wiki</text><text x="621" y="288" text-anchor="middle" class="d-small">MuSiQue</text><text x="721" y="288" text-anchor="middle" class="d-small">Bamboogle</text>
+
+    <rect x="400" y="302" width="14" height="14" class="d-fill-blue"/><text x="420" y="314" class="d-small">with loss mask (mean .431)</text>
+    <rect x="590" y="302" width="14" height="14" class="d-fill-red"/><text x="610" y="314" class="d-small">without (mean .343)</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Masking retrieved tokens out of the loss, Qwen2.5-7B-Base trained with PPO, exact match on seven QA sets. The mean is 0.431 with the mask and 0.343 without, +0.088 absolute (derived; +26% relative). On Qwen2.5-3B-Base the mean is 0.303 against 0.262, but MuSiQue (0.049 vs 0.053) and Bamboogle (0.088 vs 0.104) go the other way. Data: Search-R1 Tables 4 and 6<a class="cite" href="#ref-6">6</a>.</figcaption>
+</figure>
+<p>RAGEN's version of the same ablation ran at 0.5B on Sokoban and reports the direction only<a class="cite" href="#ref-8">8</a>. Both are small-model results on short-horizon tasks with PPO, so they show that the mask is not cosmetic, not how large the effect is at frontier scale.</p>
+
+<h3 id="token-stream-history">1.3 History is part of the policy</h3>
+<p>The policy at turn \(t\) conditions on whatever the harness shows it, and the harness can rewrite history. DeepSeek-V3.2 found that R1's rule of discarding reasoning when the next round arrives "forces the model to redundantly re-reason" through the problem at every tool call. Its rule drops reasoning only when a new user message arrives, keeps it while only tool outputs are appended, and always keeps the tool-call history<a class="cite" href="#ref-12">12</a> (§3.2.1). DeepSeek-V4 keeps the complete reasoning history across all rounds in tool-calling scenarios, including across user messages<a class="cite" href="#ref-13">13</a>. Kimi K3 "supports only preserved thinking": the think channel stays in history even when empty<a class="cite" href="#ref-2">2</a>. Other rules shrink history instead: DeepSeek-V3.2's search agent applies Summary, Discard-75% or Discard-all once usage passes 80% of the context window<a class="cite" href="#ref-12">12</a> (§4.4), Nemotron 3 Ultra's search teacher is fine-tuned on trajectories with discard-all and summary behavior<a class="cite" href="#ref-9">9</a>, and K3 lists context-management strategies among the composable modules of its training harness<a class="cite" href="#ref-2">2</a> (§4.2.1).</p>
+<p>This decides how a trajectory becomes training samples (derived; none of the reports describes its packing). If every turn appends to the previous context, the trajectory is one sequence: the engine's log-probability for each token was computed given exactly the prefix that the trainer sees, and one forward pass reproduces all conditionals (Figure 3). If a rule deletes or rewrites earlier tokens, the final sequence is not an extension of the context at turn 2, so the trainer must rebuild each segment's own context and one trajectory becomes several sequences that share one reward. verl-agent, the code base behind GiGPO, takes the second route by design: a "step-wise multi-turn" paradigm that avoids concatenating full histories, with a configurable memory module and a history length of 2 for ALFWorld and WebShop<a class="cite" href="#ref-14">14</a> (Appendix A, E.2).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f3t"><title id="f3t">Token stream of a three-turn tool-using trajectory with segment widths proportional to illustrative token counts, the loss mask, and the context window the policy saw at each turn</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="20" y="24" class="d-title">One trajectory as the trainer sees it</text>
+    <rect x="20" y="40" width="110" height="52" rx="4" class="d-block-muted"/><text x="75" y="62" text-anchor="middle" class="d-text-inv d-bold">task prompt</text><text x="75" y="80" text-anchor="middle" class="d-text-inv d-small">2,000 tok</text>
+    <rect x="132" y="40" width="72" height="52" rx="4" class="d-block"/><text x="168" y="62" text-anchor="middle" class="d-text-inv d-bold">a1</text><text x="168" y="80" text-anchor="middle" class="d-text-inv d-small">600</text>
+    <rect x="206" y="40" width="130" height="52" rx="4" class="d-block-muted"/><text x="271" y="62" text-anchor="middle" class="d-text-inv d-bold">o1 tool result</text><text x="271" y="80" text-anchor="middle" class="d-text-inv d-small">1,500</text>
+    <rect x="338" y="40" width="72" height="52" rx="4" class="d-block"/><text x="374" y="62" text-anchor="middle" class="d-text-inv d-bold">a2</text><text x="374" y="80" text-anchor="middle" class="d-text-inv d-small">600</text>
+    <rect x="412" y="40" width="130" height="52" rx="4" class="d-block-muted"/><text x="477" y="62" text-anchor="middle" class="d-text-inv d-bold">o2 tool result</text><text x="477" y="80" text-anchor="middle" class="d-text-inv d-small">1,500</text>
+    <rect x="544" y="40" width="72" height="52" rx="4" class="d-block"/><text x="580" y="62" text-anchor="middle" class="d-text-inv d-bold">a3</text><text x="580" y="80" text-anchor="middle" class="d-text-inv d-small">600</text>
+    <path d="M618,66 L650,66" class="d-arrow" marker-end="url(#f3-arr)"/><rect x="652" y="40" width="50" height="52" rx="4" class="d-hl"/><text x="677" y="71" text-anchor="middle" class="d-bold">R</text>
+
+    <text x="20" y="116" class="d-small d-text-light">loss mask m</text>
+    <text x="75" y="134" text-anchor="middle" class="d-mono">0</text><text x="168" y="134" text-anchor="middle" class="d-mono d-bold">1</text><text x="271" y="134" text-anchor="middle" class="d-mono">0</text><text x="374" y="134" text-anchor="middle" class="d-mono d-bold">1</text><text x="477" y="134" text-anchor="middle" class="d-mono">0</text><text x="580" y="134" text-anchor="middle" class="d-mono d-bold">1</text>
+    <text x="20" y="160" class="d-small d-text-light">advantage on masked-in tokens</text>
+    <rect x="132" y="168" width="72" height="22" rx="3" class="d-fill-orange-soft"/><text x="168" y="184" text-anchor="middle" class="d-mono d-small">A</text>
+    <rect x="338" y="168" width="72" height="22" rx="3" class="d-fill-orange-soft"/><text x="374" y="184" text-anchor="middle" class="d-mono d-small">A</text>
+    <rect x="544" y="168" width="72" height="22" rx="3" class="d-fill-orange-soft"/><text x="580" y="184" text-anchor="middle" class="d-mono d-small">A</text>
+    <text x="640" y="184" class="d-small d-text-light">same scalar A</text>
+
+    <text x="20" y="222" class="d-small d-text-light">context the policy conditioned on</text>
+    <path d="M22,240 L130,240" class="d-line d-stroke-blue"/><text x="76" y="256" text-anchor="middle" class="d-small">for a1</text>
+    <path d="M22,266 L336,266" class="d-line d-stroke-blue"/><text x="180" y="282" text-anchor="middle" class="d-small">for a2: prompt, a1, o1</text>
+    <path d="M22,292 L542,292" class="d-line d-stroke-blue"/><text x="282" y="308" text-anchor="middle" class="d-small">for a3: prompt, a1, o1, a2, o2</text>
+    <circle cx="130" cy="240" r="4" class="d-fill-blue"/><circle cx="336" cy="266" r="4" class="d-fill-blue"/><circle cx="542" cy="292" r="4" class="d-fill-blue"/>
+    <text x="560" y="266" class="d-small d-text-light">append-only: one sequence</text>
+    <text x="560" y="292" class="d-small d-text-light">rewritten history: one per turn</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> A three-turn trajectory with illustrative token counts (chosen for drawing, not measured; the same values feed Table 2). Blue segments carry loss (<code>m=1</code>), grey segments are environment output. Every blue token receives the same trajectory-level advantage in outcome-reward GRPO. If the harness appends only, the context for each turn is a prefix of the final sequence; if it drops or summarizes earlier tokens, that prefix property fails (Section 1.3).</figcaption>
+</figure>
+
+<p>The cost of the choice is plain arithmetic. Let \(p\) be the initial prompt, \(g\) the sampled tokens per turn, \(o\) the observation tokens per turn, \(T\) the turns and \(h\) a history window. One concatenated sequence has \(p+Tg+(T-1)o\) tokens. Per-turn samples with full history sum to \(T(p+g)+(g+o)T(T-1)/2\), quadratic in \(T\). A window of \(h\) previous turns costs \(T(p+g)+(g+o)\sum_{t=1}^{T}\min(t-1,h)\). For scale, GiGPO notes that an ALFWorld episode can run to 50 steps and over 20k tokens<a class="cite" href="#ref-14">14</a>.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Tokens the trainer processes for one trajectory under three layouts. Parameters are illustrative (\(p=2{,}000\), \(g=600\), \(o=1{,}500\), \(T=30\), \(h=2\)); all columns are derived from the formulas above.</caption>
+  <thead><tr><th>Layout</th><th class="num">Samples</th><th class="num">Tokens (k)</th><th class="num">vs concatenated</th><th class="num">Loss-token share (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Concatenated, append-only</td><td class="num">1</td><td class="num" data-best>63.5</td><td class="num">1.0x</td><td class="num" data-best>28.3</td></tr>
+    <tr><td class="row">Per-turn, full history</td><td class="num">30</td><td class="num" data-worst>991.5</td><td class="num">15.6x</td><td class="num" data-worst>1.8</td></tr>
+    <tr><td class="row">Per-turn, window \(h=2\)</td><td class="num">30</td><td class="num">197.7</td><td class="num">3.1x</td><td class="num">9.1</td></tr>
+  </tbody>
+</table>
+<div class="calc">
+  <p class="calc-title">Trainer tokens for one trajectory under each layout</p>
+  <div class="calc-row"><label for="c1p">Prompt p (tokens)</label><input type="range" id="c1p" name="p" min="500" max="8000" step="500" value="2000"></div>
+  <div class="calc-row"><label for="c1g">Sampled per turn g</label><input type="range" id="c1g" name="g" min="100" max="2000" step="100" value="600"></div>
+  <div class="calc-row"><label for="c1o">Observation per turn o</label><input type="range" id="c1o" name="o" min="100" max="5000" step="100" value="1500"></div>
+  <div class="calc-row"><label for="c1T">Turns T</label><input type="range" id="c1T" name="T" min="2" max="100" step="1" value="30"></div>
+  <div class="calc-row"><label for="c1h">History window h</label><input type="range" id="c1h" name="h" min="1" max="10" step="1" value="2"></div>
+  <div class="calc-out">
+    <div>Concatenated<output data-expr="p + T*g + (T-1)*o" data-format="int"></output></div>
+    <div>Per-turn, full history<output data-expr="T*(p+g) + (g+o)*T*(T-1)/2" data-format="int"></output></div>
+    <div>Per-turn, window h<output data-expr="T*(p+g) + (g+o)*(min(T-1,h)*(min(T-1,h)+1)/2 + max(T-1-h,0)*h)" data-format="int"></output></div>
+    <div>Full / concatenated<output data-expr="(T*(p+g) + (g+o)*T*(T-1)/2) / (p + T*g + (T-1)*o)" data-format="fixed:1" data-unit="x"></output></div>
+    <div>Loss tokens in concatenated<output data-expr="100*T*g/(p + T*g + (T-1)*o)" data-format="fixed:1" data-unit="%"></output></div>
+  </div>
+  <p class="calc-note">Formulas as above; token counts, not FLOPs. Attention cost inside a sequence is superlinear in its length, so the concatenated layout is cheaper per token than the token count alone suggests only when the sequence still fits the trainer's context and activation budget.</p>
+</div>
+<p>Rollout-side prefill has the same shape. GLM-5 routes every request of one rollout to the same data-parallel rank by consistent hashing so the shared prefix hits the KV cache; with that, "prefill cost remains proportional to incremental tokens rather than total context length"<a class="cite" href="#ref-1">1</a> (§4.1.2). The infrastructure is System Design Modules 27 and 37; the algorithmic point is only that the trainer pays the quadratic bill unless history is append-only or windowed.</p>
+
+<h2 id="credit">2. Splitting credit across turns</h2>
+
+<h3 id="credit-outcome">2.1 What a trajectory-level baseline does</h3>
+<p>Group-relative advantage compares trajectory \(i\)'s reward with its group and hands the result to every sampled token (Modules 9 and 11). Every agentic recipe in this module's source set does exactly that. GLM-5's objective is \(r(x,y_i)-\bar r(x)\) over agent traces<a class="cite" href="#ref-1">1</a> (§4.1). Kimi K2.5's loss uses the same mean-reward baseline inside a token-level objective<a class="cite" href="#ref-7">7</a> (Eq. 1). DeepSeek-V3.2 uses \(A=R-\operatorname{mean}(R)\) in GRPO<a class="cite" href="#ref-12">12</a> (§3.1), and Nemotron 3 Ultra's end-to-end SWE stage feeds a binary hidden-test reward to GRPO<a class="cite" href="#ref-9">9</a>. A full-text search of K2, K2.5, K3, V3.2, V4, GLM-5, Nemotron 3 Ultra, MiMo-V2-Flash and Olmo 3 finds no mention of GiGPO, anchor states or step-level advantages.</p>
+<p>The consequence is that a wrong turn inside a successful trajectory is reinforced, and a correct turn inside a failed one is punished. On average the signal points the right way, because good turns co-occur with success more often, but the estimator's variance grows with the number of turns that share one scalar (Module 2). What the frontier reports show in response is more samples per task and difficulty filtering of tasks (DeepSeek-V3.2 keeps tasks with non-zero pass@100, Section 6.2), not finer credit.</p>
+
+<h3 id="credit-gigpo">2.2 GiGPO: step-level groups from repeated states</h3>
+<p>GiGPO keeps the critic-free group structure and adds a second grouping. Sample \(N\) trajectories of one task from identical initial conditions. The episode-level advantage is GRPO's, with \(F_{norm}\) either the standard deviation or 1 (a rescaled leave-one-out estimator). Collect the set of distinct states \(\tilde s\) that occur anywhere in the group, including repeat visits inside one trajectory, and for each build a step group of the actions taken there and the discounted return that followed<a class="cite" href="#ref-14">14</a> (§4.1-4.3, Eqs. 3-8):</p>
+$$ A^E(\tau_i)=\frac{R(\tau_i)-\operatorname{mean}_j R(\tau_j)}{F_{norm}},\quad A^S(a^{(i)}_t)=\frac{R^{(i)}_t-\operatorname{mean}_{G^S(\tilde s)}R}{F_{norm}},\quad R^{(i)}_t=\sum_{k=t}^{T}\gamma^{k-t}r^{(i)}_k,\quad A=A^E+\omega A^S. $$
+<p>The clipped objective with a KL term is then applied per step with \(A\) (Eq. 9). Grouping is a hash-map lookup on the state, so it needs no extra rollouts and no value model; the paper uses \(\omega=1\) without tuning, \(\gamma=0.95\) and \(N=8\) on ALFWorld and WebShop, with a reward of 10 for success, 0 for failure and -0.1 for an invalid action (Appendix E.1). The comparison group for an action is "what else happened from this same state", which is the closest a critic-free method gets to a baseline \(V(s)\).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 440" role="img" aria-labelledby="f4t"><title id="f4t">Six trajectories visiting the same anchor state, the step group built from them with discounted returns and step-level advantages, and the resulting credit for the two clicks in trajectory 3 under GRPO and under GiGPO</title>
+    <text x="14" y="26" class="d-title">Trajectories reaching the anchor state</text>
+    <text x="14" y="46" class="d-small d-text-light">steps t = 1, 2, ... left to right</text>
+    <text x="22" y="82" class="d-mono">τ1</text><rect x="50" y="64" width="40" height="30" rx="4" class="d-block-muted"/><rect x="94" y="64" width="40" height="30" rx="4" class="d-fill-orange"/><text x="114" y="84" text-anchor="middle" class="d-text-inv d-small d-bold">item1</text><rect x="138" y="64" width="40" height="30" rx="4" class="d-block-muted"/><rect x="182" y="64" width="40" height="30" rx="4" class="d-block-muted"/><text x="330" y="84" class="d-mono d-small">R=1</text>
+    <text x="22" y="122" class="d-mono">τ2</text><rect x="50" y="104" width="40" height="30" rx="4" class="d-block-muted"/><rect x="94" y="104" width="40" height="30" rx="4" class="d-fill-orange"/><text x="114" y="124" text-anchor="middle" class="d-text-inv d-small d-bold">item1</text><rect x="138" y="104" width="40" height="30" rx="4" class="d-block-muted"/><rect x="182" y="104" width="40" height="30" rx="4" class="d-block-muted"/><text x="330" y="124" class="d-mono d-small">R=1</text>
+    <text x="22" y="162" class="d-mono">τ3</text><rect x="50" y="144" width="40" height="30" rx="4" class="d-block-muted"/><rect x="94" y="144" width="40" height="30" rx="4" class="d-fill-orange"/><text x="114" y="164" text-anchor="middle" class="d-text-inv d-small d-bold">item2</text><rect x="138" y="144" width="40" height="30" rx="4" class="d-block-muted"/><rect x="182" y="144" width="40" height="30" rx="4" class="d-fill-orange"/><text x="202" y="164" text-anchor="middle" class="d-text-inv d-small d-bold">item1</text><rect x="226" y="144" width="40" height="30" rx="4" class="d-block-muted"/><rect x="270" y="144" width="40" height="30" rx="4" class="d-block-muted"/><text x="330" y="164" class="d-mono d-small">R=1</text>
+    <text x="22" y="202" class="d-mono">τ4</text><rect x="50" y="184" width="40" height="30" rx="4" class="d-block-muted"/><rect x="94" y="184" width="40" height="30" rx="4" class="d-fill-orange"/><text x="114" y="204" text-anchor="middle" class="d-text-inv d-small d-bold">next</text><rect x="138" y="184" width="40" height="30" rx="4" class="d-block-muted"/><rect x="182" y="184" width="40" height="30" rx="4" class="d-block-muted"/><text x="330" y="204" class="d-mono d-small">R=0</text>
+    <text x="22" y="242" class="d-mono">τ5</text><rect x="50" y="224" width="40" height="30" rx="4" class="d-block-muted"/><rect x="94" y="224" width="40" height="30" rx="4" class="d-fill-orange"/><text x="114" y="244" text-anchor="middle" class="d-text-inv d-small d-bold">next</text><rect x="138" y="224" width="40" height="30" rx="4" class="d-block-muted"/><rect x="182" y="224" width="40" height="30" rx="4" class="d-block-muted"/><text x="330" y="244" class="d-mono d-small">R=0</text>
+    <text x="22" y="282" class="d-mono">τ6</text><rect x="50" y="264" width="40" height="30" rx="4" class="d-block-muted"/><rect x="94" y="264" width="40" height="30" rx="4" class="d-fill-orange"/><text x="114" y="284" text-anchor="middle" class="d-text-inv d-small d-bold">item2</text><rect x="138" y="264" width="40" height="30" rx="4" class="d-block-muted"/><rect x="182" y="264" width="40" height="30" rx="4" class="d-block-muted"/><text x="330" y="284" class="d-mono d-small">R=0</text>
+    <text x="14" y="314" class="d-small d-text-light">τ7, τ8 fail without reaching this state: 3 of 8 succeed</text>
+    <rect x="14" y="326" width="16" height="14" rx="3" class="d-fill-orange"/><text x="36" y="338" class="d-small">anchor state: search-results page</text>
+
+    <rect x="392" y="40" width="400" height="168" rx="8" class="d-panel"/>
+    <text x="404" y="60" class="d-title">Step group at the anchor (7 entries)</text>
+    <text x="404" y="82" class="d-small d-text-light">action</text><text x="580" y="82" text-anchor="end" class="d-small d-text-light">R_t</text><text x="650" y="82" text-anchor="end" class="d-small d-text-light">A^S</text><text x="720" y="82" text-anchor="end" class="d-small d-text-light">A^E</text><text x="784" y="82" text-anchor="end" class="d-small d-text-light">A</text>
+    <text x="404" y="106" class="d-mono d-small">item1 (τ1, τ2, τ3@4)</text><text x="580" y="106" text-anchor="end" class="d-mono d-small">0.810</text><text x="650" y="106" text-anchor="end" class="d-mono d-small">+0.369</text><text x="720" y="106" text-anchor="end" class="d-mono d-small">+0.625</text><text x="784" y="106" text-anchor="end" class="d-mono d-small d-bold">+0.994</text>
+    <text x="404" y="130" class="d-mono d-small">item2 (τ3@2)</text><text x="580" y="130" text-anchor="end" class="d-mono d-small">0.656</text><text x="650" y="130" text-anchor="end" class="d-mono d-small">+0.215</text><text x="720" y="130" text-anchor="end" class="d-mono d-small">+0.625</text><text x="784" y="130" text-anchor="end" class="d-mono d-small d-bold">+0.840</text>
+    <text x="404" y="154" class="d-mono d-small">item2 (τ6)</text><text x="580" y="154" text-anchor="end" class="d-mono d-small">0.000</text><text x="650" y="154" text-anchor="end" class="d-mono d-small">-0.441</text><text x="720" y="154" text-anchor="end" class="d-mono d-small">-0.375</text><text x="784" y="154" text-anchor="end" class="d-mono d-small d-bold">-0.816</text>
+    <text x="404" y="178" class="d-mono d-small">next (τ4, τ5)</text><text x="580" y="178" text-anchor="end" class="d-mono d-small">0.000</text><text x="650" y="178" text-anchor="end" class="d-mono d-small">-0.441</text><text x="720" y="178" text-anchor="end" class="d-mono d-small">-0.375</text><text x="784" y="178" text-anchor="end" class="d-mono d-small d-bold">-0.816</text>
+    <text x="404" y="200" class="d-small d-text-light">γ = 0.9, F_norm = 1, ω = 1; group mean of R_t = 0.441</text>
+
+    <text x="392" y="244" class="d-title">Credit given to the two clicks inside τ3</text>
+    <text x="392" y="272" class="d-small">GRPO: item2 click (wrong)</text><rect x="590" y="260" width="100" height="16" class="d-fill-blue"/><text x="696" y="273" class="d-mono d-small">+0.625</text>
+    <text x="392" y="298" class="d-small">GRPO: item1 click (right)</text><rect x="590" y="286" width="100" height="16" class="d-fill-blue"/><text x="696" y="299" class="d-mono d-small">+0.625</text>
+    <text x="392" y="324" class="d-small">GiGPO: item2 click (wrong)</text><rect x="590" y="312" width="134" height="16" class="d-fill-orange"/><text x="730" y="325" class="d-mono d-small">+0.840</text>
+    <text x="392" y="350" class="d-small">GiGPO: item1 click (right)</text><rect x="590" y="338" width="159" height="16" class="d-fill-orange"/><text x="755" y="351" class="d-mono d-small">+0.994</text>
+    <text x="392" y="384" class="d-small d-text-light">bar length is proportional to advantage; the right click</text>
+    <text x="392" y="400" class="d-small d-text-light">now outranks the wrong one inside the same trajectory</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> A constructed example of GiGPO's two-level advantage; the mechanism is from the paper's Eqs. 3-8, the numbers are mine. The toy uses \(\gamma=0.9\) and reward 1 at the end of a successful trajectory (the paper's experiments use \(\gamma=0.95\) and reward 10), so a click at step \(t\) in a trajectory that succeeds at step \(T\) has return \(0.9^{T-t}\): 0.81 for the first click in \(\tau_1\) (\(T=4\), \(t=2\)) and 0.656 for \(\tau_3\)'s wrong click (\(T=6\)). The paper's own Figure 3 gives only the ordering \(A^S(\text{1st item})&gt;A^S(\text{2nd item})&gt;A^S(\text{next page})\)<a class="cite" href="#ref-14">14</a>.</figcaption>
+</figure>
+
+<h3 id="credit-evidence">2.3 Evidence and limits</h3>
+<p>The evidence is two text-environment benchmarks at 1.5B and 7B, three seeds, and a search-QA set. With \(F_{norm}=1\) GiGPO beats GRPO by 13.3 and 10.6 points (ALFWorld success, WebShop success) at 1.5B and by 12.6 and 9.1 points at 7B, which are the abstract's "> 12%" and "> 9%" in absolute points<a class="cite" href="#ref-14">14</a> (§5.2, Table 1).</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 3.</b> GiGPO against its baselines (Qwen2.5-Instruct, mean of 3 seeds, % success unless marked). "w/ std" uses \(F_{norm}=\) std, "w/o std" uses 1. Source: Table 1 of the GiGPO paper<a class="cite" href="#ref-14">14</a>.</caption>
+  <thead><tr><th>Model</th><th>Method</th><th class="num">ALFWorld success</th><th class="num">WebShop score</th><th class="num">WebShop success</th></tr></thead>
+  <tbody>
+    <tr><td class="row">1.5B</td><td>PPO (with critic)</td><td class="num">54.4</td><td class="num">73.8</td><td class="num">51.5</td></tr>
+    <tr><td class="row">1.5B</td><td>RLOO</td><td class="num">69.7</td><td class="num">73.9</td><td class="num">52.1</td></tr>
+    <tr><td class="row">1.5B</td><td>GRPO</td><td class="num">72.8</td><td class="num">75.8</td><td class="num">56.8</td></tr>
+    <tr><td class="row">1.5B</td><td>GiGPO w/ std</td><td class="num" data-best>86.7</td><td class="num">83.1</td><td class="num">65.0</td></tr>
+    <tr><td class="row">1.5B</td><td>GiGPO w/o std</td><td class="num">86.1</td><td class="num" data-best>83.5</td><td class="num" data-best>67.4</td></tr>
+    <tr><td class="row">7B</td><td>PPO (with critic)</td><td class="num">80.4</td><td class="num">81.4</td><td class="num">68.7</td></tr>
+    <tr><td class="row">7B</td><td>RLOO</td><td class="num">75.5</td><td class="num">80.3</td><td class="num">65.7</td></tr>
+    <tr><td class="row">7B</td><td>GRPO</td><td class="num">77.6</td><td class="num">79.3</td><td class="num">66.1</td></tr>
+    <tr><td class="row">7B</td><td>GiGPO w/ std</td><td class="num" data-best>90.8</td><td class="num">84.4</td><td class="num">72.8</td></tr>
+    <tr><td class="row">7B</td><td>GiGPO w/o std</td><td class="num">90.2</td><td class="num" data-best>86.2</td><td class="num" data-best>75.2</td></tr>
+  </tbody>
+</table>
+<p>Three details bound the claim. First, the overhead: anchor grouping takes 0.01 s and the step-advantage arithmetic 0.53 s per iteration, against 362.83 s for the whole iteration (1.5B, ALFWorld). That is \(0.54/362.83=0.15\%\); the paper prints "&lt; 0.002%", which matches a fraction (0.0015) and not a percentage, so I read the unit as a slip. Either way grouping is free next to rollout. For scale, the 1.5B runs used 2 H100 GPUs for 150 iterations (Appendix E.1), which at 362.83 s per iteration is about 15 hours, or 30 GPU-hours (derived). Second, recurrence is empirical: singleton step groups stay under 35% of groups through training, so over 65% of states recur in ALFWorld, and the authors read the early large groups (10 or more members, over 20% of groups at iteration 10) as looping by an immature policy<a class="cite" href="#ref-14">14</a> (§5.5). Third, when no state repeats \(A^S=0\) and the method reduces to GRPO. The search-QA runs used similarity-based grouping instead: two states match when their longest-matching-subsequence similarity exceeds 0.9. For coding and terminal agents, where each command changes file and process state, exact repeats are plausibly rare after the first few steps<mark class="unverified" title="Inference from GiGPO's stated limitation (reliance on state matching); no source measures state recurrence in SWE or terminal tasks">, so the approach may degrade towards GRPO there</mark>.</p>
+
+<h3 id="credit-beyond">2.4 Critics, process rewards and shaping</h3>
+<p>DeepSeek-R1's supplement gives three reasons it dropped a process reward model: a fine-grained step is hard to define, whether a step is correct is hard to determine, and a model-based PRM "inevitably leads to reward hacking"<a class="cite" href="#ref-15">15</a> (§G.2). In an agent loop the first reason disappears, because the harness delimits turns, but the second remains. GiGPO sidesteps both by using the environment's own returns, grouped by state (my reading).</p>
+<p>The critic is not dead at small scale. At 7B, PPO with a critic beats GRPO and RLOO on ALFWorld (80.4 against 77.6 and 75.5, Table 3). Search-R1 finds GRPO converges faster but "may exhibit instability after trained for a number of steps", PPO is more stable but slower<a class="cite" href="#ref-6">6</a> (Fig. 2a). RAGEN sees "reward variability cliffs and gradient spikes" in multi-turn training, calls the collapse mode the Echo Trap, notes that declining reward standard deviation often precedes it, and stabilizes by training only on the top \(p\%\) of prompts by reward standard deviation (default 25%): under PPO, keeping 75% extends FrozenLake stability from 100 to 140 steps and keeping 50% avoids collapse<a class="cite" href="#ref-8">8</a> (§4.2). This is Module 11's dynamic sampling, applied because a multi-turn group has more ways to go uniform.</p>
+<p>Shaping lives outside the advantage. Nemotron's SWE teacher says the final reward "does not always help with trajectory-level behaviors", so it masks unfinished trajectories and gives malformed reasoning or tool calls a negative advantage on the offending tokens<a class="cite" href="#ref-9">9</a> (§3.3.2). Kimi K3 overrides the reward with \(-1\) when a trajectory's budgeted tokens, counting reasoning and tool-call arguments for agentic tasks, exceed \(\tau\) times a per-problem budget<a class="cite" href="#ref-2">2</a> (§4.1.2). Its personal-assistant environments attach an evaluation criterion to each event, which makes the environment's signal denser than a final pass/fail; the report does not say how event scores enter the advantage (§4.2.5).</p>
+
+<h2 id="parl">3. Orchestrators and frozen subagents: PARL</h2>
+
+<h3 id="parl-what">3.1 What is trained, and the reward</h3>
+<p>Kimi K2.5's Agent Swarm splits one task across subagents that an orchestrator creates and schedules. Parallel-Agent RL (PARL) trains the orchestrator only. The subagents are "instantiated from fixed intermediate policy checkpoints", their execution trajectories are "excluded from the optimization objective", and their outputs are treated "as environmental observations rather than differentiable decision points"<a class="cite" href="#ref-7">7</a> (§3). In token-stream terms from Section 1, a subagent's return is an observation segment with mask 0. The stated reason is credit ambiguity: "a correct final answer does not guarantee flawless subagent execution, just as a failure does not imply universal subagent error".</p>
+<p>The reward adds two auxiliary terms to the task outcome<a class="cite" href="#ref-7">7</a> (§3):</p>
+$$ r_{\text{PARL}}(x,y)=\lambda_1\,r_{\text{parallel}}+\lambda_2\,r_{\text{finish}}+r_{\text{perf}}(x,y). $$
+<p>\(r_{\text{perf}}\) is the task-level outcome. \(r_{\text{parallel}}\), an instantiation reward, fights "serial collapse", the local optimum in which the orchestrator never spawns anything. \(r_{\text{finish}}\), the sub-agent finish rate, fights "spurious parallelism", where the orchestrator inflates a parallelism metric by spawning many subagents without a real decomposition. Both \(\lambda\) are annealed to zero during training, so the final policy is optimized for \(r_{\text{perf}}\) alone. The passages I read give no values for \(\lambda_1,\lambda_2\) or the annealing schedule. The pair is a small instance of the pattern Module 19 treats: an auxiliary reward to get past a bad optimum, removed before it becomes the thing the policy exploits.</p>
+
+<h3 id="parl-critical">3.2 Critical steps: a resource constraint that rewards parallelism</h3>
+<p>Counting total steps would charge the orchestrator for every parallel step. K2.5 instead measures cost by analogy to a critical path. With stages \(t=1,\dots,T\), where \(S^{(t)}_{main}\) is the main agent's steps in stage \(t\) (typically 1) and \(S^{(t)}_{sub,i}\) the steps of the \(i\)-th subagent in a parallel group<a class="cite" href="#ref-7">7</a> (§3):</p>
+$$ \text{CriticalSteps}=\sum_{t=1}^{T}\Big(S^{(t)}_{main}+\max_i S^{(t)}_{sub,i}\Big). $$
+<p>Training and evaluation are constrained by this quantity, so creating subtasks that do not shorten the longest parallel branch gains nothing under it. Figure 5 counts a toy episode (numbers mine). Stage 1 spawns four subagents that take 5, 3, 8 and 2 steps; stage 2 spawns six that take 4, 4, 9, 2, 3 and 5; stage 3 is the orchestrator's final answer. Critical steps are \((1+8)+(1+9)+1=20\), total steps are \(3+18+27=48\), so the swarm is 2.4 times shorter than one agent doing the same 48 steps in sequence. A perfectly balanced split of the same subagent work (\(\lceil 18/4\rceil=5\), \(\lceil 27/6\rceil=5\)) would give \(6+6+1=13\) critical steps, 3.7 times shorter. The gap between 20 and 13 is the value of decomposing evenly, which is what the metric pays for.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f5t"><title id="f5t">Critical-steps count for a toy parallel-agent episode: three stages, with the longest subagent in each stage setting the stage length, next to a diagram of which tokens the orchestrator is trained on</title>
+    <defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="14" y="24" class="d-title">Toy episode, 1 step = 22 px</text>
+
+    <text x="14" y="76" class="d-small d-text-light">stage 1</text>
+    <rect x="80" y="58" width="22" height="14" class="d-block"/>
+    <rect x="102" y="58" width="110" height="14" class="d-block-muted"/><text x="217" y="70" class="d-mono d-small">5</text>
+    <rect x="102" y="76" width="66" height="14" class="d-block-muted"/><text x="173" y="88" class="d-mono d-small">3</text>
+    <rect x="102" y="94" width="176" height="14" class="d-hl"/><text x="283" y="106" class="d-mono d-small d-bold">8</text>
+    <rect x="102" y="112" width="44" height="14" class="d-block-muted"/><text x="151" y="124" class="d-mono d-small">2</text>
+    <text x="330" y="98" class="d-mono d-small">1 + 8 = 9</text>
+
+    <text x="14" y="168" class="d-small d-text-light">stage 2</text>
+    <rect x="80" y="146" width="22" height="14" class="d-block"/>
+    <rect x="102" y="146" width="88" height="14" class="d-block-muted"/><text x="195" y="158" class="d-mono d-small">4</text>
+    <rect x="102" y="164" width="88" height="14" class="d-block-muted"/><text x="195" y="176" class="d-mono d-small">4</text>
+    <rect x="102" y="182" width="198" height="14" class="d-hl"/><text x="305" y="194" class="d-mono d-small d-bold">9</text>
+    <rect x="102" y="200" width="44" height="14" class="d-block-muted"/><text x="151" y="212" class="d-mono d-small">2</text>
+    <rect x="102" y="218" width="66" height="14" class="d-block-muted"/><text x="173" y="230" class="d-mono d-small">3</text>
+    <rect x="102" y="236" width="110" height="14" class="d-block-muted"/><text x="217" y="248" class="d-mono d-small">5</text>
+    <text x="340" y="198" class="d-mono d-small">1 + 9 = 10</text>
+
+    <text x="14" y="278" class="d-small d-text-light">stage 3</text>
+    <rect x="80" y="266" width="22" height="14" class="d-block"/><text x="112" y="278" class="d-mono d-small">1</text>
+    <text x="340" y="278" class="d-mono d-small">1 + 0 = 1</text>
+
+    <rect x="14" y="304" width="400" height="84" rx="8" class="d-surface"/>
+    <text x="26" y="326" class="d-bold">critical steps = 9 + 10 + 1 = 20</text>
+    <text x="26" y="346" class="d-bold">total steps = 3 + 18 + 27 = 48 (2.4x longer)</text>
+    <text x="26" y="368" class="d-small d-text-light">balanced split of the same work: 6 + 6 + 1 = 13 (3.7x)</text>
+
+    <rect x="14" y="40" width="10" height="10" class="d-block"/><text x="30" y="49" class="d-small">orchestrator step</text>
+    <rect x="150" y="40" width="10" height="10" class="d-block-muted"/><text x="166" y="49" class="d-small">frozen subagent</text>
+    <rect x="276" y="40" width="10" height="10" class="d-hl"/><text x="292" y="49" class="d-small">longest in stage</text>
+
+    <rect x="470" y="40" width="316" height="130" rx="10" class="d-panel"/>
+    <text x="628" y="62" text-anchor="middle" class="d-title">Orchestrator (trainable)</text>
+    <rect x="490" y="76" width="130" height="34" rx="6" class="d-block"/><text x="555" y="98" text-anchor="middle" class="d-text-inv d-bold">own tokens: m = 1</text>
+    <rect x="636" y="76" width="130" height="34" rx="6" class="d-block-muted"/><text x="701" y="98" text-anchor="middle" class="d-text-inv d-bold">returns: m = 0</text>
+    <text x="628" y="136" text-anchor="middle" class="d-small d-text-light">subagent outputs are observations</text>
+    <text x="628" y="154" text-anchor="middle" class="d-small d-text-light">gradient flows through m = 1 tokens only</text>
+
+    <rect x="470" y="200" width="316" height="110" rx="10" class="d-panel d-dashed"/>
+    <text x="628" y="222" text-anchor="middle" class="d-title">Subagents (frozen checkpoints)</text>
+    <rect x="490" y="238" width="86" height="34" rx="6" class="d-block-muted"/><text x="533" y="260" text-anchor="middle" class="d-text-inv d-bold">sub 1</text>
+    <rect x="590" y="238" width="86" height="34" rx="6" class="d-block-muted"/><text x="633" y="260" text-anchor="middle" class="d-text-inv d-bold">sub 2</text>
+    <rect x="690" y="238" width="76" height="34" rx="6" class="d-block-muted"/><text x="728" y="260" text-anchor="middle" class="d-text-inv d-bold">sub 3</text>
+    <text x="628" y="296" text-anchor="middle" class="d-small d-text-light">trajectories excluded from the loss</text>
+    <path d="M628,170 L628,200" class="d-arrow-active" marker-end="url(#f5-arr)"/><text x="640" y="190" class="d-small">task text</text>
+    <path d="M560,200 L560,172" class="d-arrow" marker-end="url(#f5-arr)"/><text x="480" y="190" class="d-small">result</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Left: the critical-steps count for a toy episode (the numbers are constructed to exercise the formula; each band is one stage, bars within a band start together, stages run in sequence). The longest subagent sets each stage's length. Right: which tokens the orchestrator is optimized on. Formula and the freezing/exclusion rule: Kimi K2.5 §3<a class="cite" href="#ref-7">7</a>.</figcaption>
+</figure>
+
+<h3 id="parl-why">3.3 Why freeze, what it costs, and what is reported</h3>
+<p>Freezing makes the orchestrator's problem an ordinary single-policy RL problem with a stochastic environment (the subagents), which is what Sections 1 and 2 already handle. The costs are visible in the recipe. The orchestrator is first trained against small subagents and then larger ones, the cluster's inference-instance ratio between subagents and orchestrator is adjusted dynamically, and subagents never improve from the swarm's reward during that stage<a class="cite" href="#ref-7">7</a> (§3). The report contains no co-training baseline in the passages I read, so "frozen is more stable" is the authors' stated reason and not a measured comparison.</p>
+<p>Reported outcomes are for inference, on wide-search tasks: latency "up to 4.5x" lower with item-level F1 up from 72.8% to 79.0% against single-agent baselines (the introduction prints 72.8%, the evaluation text 72.7%), and a swarm that stays at 0.6-1.6 times a baseline latency as the target F1 rises from 30% to 70%, where the single agent grows from about 1.8 to over 7.0 times it (evaluation section, Fig. 8). The report also argues the swarm is "proactive context management": subagents keep bounded local contexts and "only task-relevant outputs" return, which shards context instead of truncating it and, per the authors, beat Discard-all on BrowseComp with fewer critical steps<a class="cite" href="#ref-7">7</a> (Fig. 7). For training, that has a plain consequence: the orchestrator's trained sequence stays short because subagent traces never enter it. K2.5's rollout manager runs every task as an asynchronous coroutine, lets a task recursively trigger sub-task rollouts, and handles up to 100,000 concurrent agent tasks (Appendix D). Module 28 reads the K1.5-to-K3 line stage by stage.</p>
+
+<h2 id="staleness">4. Partial rollouts and staleness</h2>
+
+<h3 id="staleness-mechanisms">4.1 Three ways to stop waiting for the slowest trajectory</h3>
+<p>Agentic training lengthens the tail as it succeeds: Kimi K3 reports that average tool-call steps rise consistently as RL FLOPs scale<a class="cite" href="#ref-2">2</a> (Fig. 8). Module 1 (Section 6) has the long-tail arithmetic and System Design Module 37 the infrastructure taxonomy; this section covers what the algorithm must absorb.</p>
+<p><strong>Kimi k1.5</strong> gives each iteration a fixed output-token budget. A trajectory that exceeds it has its unfinished portion saved to a replay buffer and continued in the next iteration. Only the current iteration (iter n) "requires on-policy computation", while segments from iterations \(n-m\) to \(n-1\) "can be efficiently reused from the buffer", and "certain segments can be excluded from loss computation"<a class="cite" href="#ref-10">10</a> (§2.6.2). Kimi K2 applies the same technique to multi-turn agentic rollouts: long-tail unfinished tasks "paused, and resumed in the next RL iteration"<a class="cite" href="#ref-11">11</a> (§3.3.4, Agentic Rollout).</p>
+<p><strong>Kimi K3</strong> replaces the token budget with a completion fraction. Each iteration keeps \(N\times K\) trajectories in flight, and "the generation phase pauses as soon as a fraction \(\lambda\in(0,1)\) of trajectories completes (i.e., \(\lambda NK\))". Paused rollouts are enqueued and resumed first in the next iteration; once all \(K\) responses of a prompt are done they go straight to policy optimization<a class="cite" href="#ref-2">2</a> (§4.1.2). A trajectory "naturally spans multiple iterations", and the report's answer to the resulting staleness is that the objective "inherently tolerates such an extreme off-policy regime through a per-token regularization"<a class="cite" href="#ref-2">2</a>. Pausing an agent mid-episode needs the environment to survive the pause, which is why K3 pairs it with a microVM sandbox whose incremental checkpoint and resume take as little as 133 ms and 49 ms (§5.3.2; sandbox design is System Design Module 27). <strong>MiMo-V2-Flash</strong> also partitions overlong trajectories across steps, "while limiting staleness and the proportion of partial samples in each batch", with "staleness-aware truncated importance sampling"<a class="cite" href="#ref-16">16</a> (§4.6.2).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f6t"><title id="f6t">Timeline of four iterations with five trajectories; trajectories C, D and E cross policy-version boundaries, D spans three versions, and its older tokens are enclosed in a dashed region where the importance ratio departs from one</title>
+    <defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="190" y="24" text-anchor="middle" class="d-title">iteration n</text><text x="370" y="24" text-anchor="middle" class="d-title">iteration n+1</text><text x="550" y="24" text-anchor="middle" class="d-title">iteration n+2</text>
+    <text x="190" y="42" text-anchor="middle" class="d-mono d-small">engine at v_n</text><text x="370" y="42" text-anchor="middle" class="d-mono d-small">engine at v_n+1</text><text x="550" y="42" text-anchor="middle" class="d-mono d-small">engine at v_n+2</text>
+    <path d="M100,52 L100,256" class="d-axis"/>
+    <path d="M280,52 L280,256" class="d-line d-dashed"/><path d="M460,52 L460,256" class="d-line d-dashed"/><path d="M640,52 L640,256" class="d-line d-dashed"/>
+    <text x="284" y="272" class="d-small d-text-light">pause at λNK done; update</text>
+
+    <text x="24" y="82" class="d-mono">A</text><rect x="100" y="68" width="130" height="22" class="d-fill-blue"/><text x="236" y="84" class="d-small">done</text>
+    <text x="24" y="118" class="d-mono">B</text><rect x="100" y="104" width="170" height="22" class="d-fill-blue"/><text x="276" y="120" class="d-small">done</text>
+    <text x="24" y="154" class="d-mono">C</text><rect x="100" y="140" width="180" height="22" class="d-fill-blue"/><rect x="280" y="140" width="110" height="22" class="d-fill-cyan"/><text x="396" y="156" class="d-small">done</text>
+    <text x="24" y="190" class="d-mono d-bold">D</text><rect x="100" y="176" width="180" height="22" class="d-fill-blue"/><rect x="280" y="176" width="180" height="22" class="d-fill-cyan"/><rect x="460" y="176" width="100" height="22" class="d-fill-orange"/><text x="566" y="192" class="d-small">done</text>
+    <text x="24" y="226" class="d-mono">E</text><rect x="100" y="212" width="180" height="22" class="d-fill-blue"/><rect x="280" y="212" width="150" height="22" class="d-fill-cyan"/><text x="436" y="228" class="d-small">done</text>
+
+    <rect x="96" y="170" width="368" height="34" rx="6" class="d-outline d-dashed d-stroke-red"/>
+    <text x="472" y="78" class="d-small">stale tokens of D (dashed):</text><text x="472" y="94" class="d-small">ratio departs from 1</text>
+    <path d="M472,100 L446,168" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <path d="M560,200 L560,236 L600,236" class="d-arrow-active" marker-end="url(#f6-arr)"/>
+    <text x="606" y="240" class="d-small">K=all done: to the optimizer</text>
+
+    <rect x="14" y="296" width="12" height="12" class="d-fill-blue"/><text x="32" y="307" class="d-small">sampled by v_n</text>
+    <rect x="164" y="296" width="12" height="12" class="d-fill-cyan"/><text x="182" y="307" class="d-small">sampled by v_n+1</text>
+    <rect x="334" y="296" width="12" height="12" class="d-fill-orange"/><text x="352" y="307" class="d-small">sampled by v_n+2</text>
+    <text x="14" y="338" class="d-small">If D is consumed by the update after iteration n+2, token lag is 2, 1 and 0 for the three segments.</text>
+    <text x="14" y="358" class="d-small d-text-light">Schematic of the scheme described in Kimi K3 §4.1.2; lengths and counts are drawn, not measured.</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Partial rollouts with a completion fraction: generation pauses when \(\lambda NK\) trajectories have finished, unfinished ones resume next iteration under newer weights, and a trajectory can end up with tokens from several policy versions. Schematic of the scheme in Kimi K3<a class="cite" href="#ref-2">2</a>; the dashed region is where K3 relies on its per-token regularization.</figcaption>
+</figure>
+
+<h3 id="staleness-pause">4.2 What pausing at a fraction does</h3>
+<p>Model trajectory durations as i.i.d. exponential with mean \(\mu\), an assumption chosen for a closed form and not taken from any report. Waiting for all \(n=NK\) costs the expected maximum \(\mu H_n\approx\mu(\ln n+0.577)\). Pausing at fraction \(\lambda\) costs the \(\lambda\)-quantile \(t_\lambda=-\mu\ln(1-\lambda)\). For \(n=8{,}192\) and \(\lambda=0.9\): \(H_n=9.59\), \(t_\lambda=2.30\,\mu\), a 4.2-fold shorter iteration; to first order the longest trajectory then spans about \(9.59/2.30\approx4.2\) iterations, so it touches five policy versions. The same model prices the selection effect: the first \(\lambda\) fraction to finish has mean length \(\mu\,[1-(1+q)(1-\lambda)]/\lambda\) with \(q=-\ln(1-\lambda)\), which is \(0.744\,\mu\) at \(\lambda=0.9\), 26% shorter than the population.</p>
+<div class="calc">
+  <p class="calc-title">Pause-at-fraction under exponential durations (illustrative model)</p>
+  <div class="calc-row"><label for="c2n">Trajectories in flight n = N x K</label><input type="range" id="c2n" name="n" min="256" max="65536" step="256" value="8192" data-format="si"></div>
+  <div class="calc-row"><label for="c2l">Pause fraction λ</label><input type="range" id="c2l" name="lam" min="0.5" max="0.99" step="0.01" value="0.9" data-format="fixed:2"></div>
+  <div class="calc-out">
+    <div>Wait-for-all iteration time (units of mean duration)<output data-expr="log(n) + 0.5772" data-format="fixed:2"></output></div>
+    <div>Pause-at-λ iteration time (same units)<output data-expr="-log(1-lam)" data-format="fixed:2"></output></div>
+    <div>Iteration speed-up<output data-expr="(log(n)+0.5772)/(-log(1-lam))" data-format="fixed:1" data-unit="x"></output></div>
+    <div>Iterations spanned by the longest trajectory (approx.)<output data-expr="ceil((log(n)+0.5772)/(-log(1-lam)))" data-format="int"></output></div>
+    <div>Mean length of first-λ finishers vs population<output data-expr="100*(1-(1-log(1-lam))*(1-lam))/lam" data-format="fixed:0" data-unit="%"></output></div>
+  </div>
+  <p class="calc-note">Formulas: \(E[\max]\approx\ln n+0.577\), \(t_\lambda=-\ln(1-\lambda)\), kept-set mean \(=[1-(1+q)(1-\lambda)]/\lambda\). Agent trajectories with variable turn counts and tool latency are plausibly heavier-tailed than the exponential; if so the real speed-up and span are larger. Use the shape, not the values.</p>
+</div>
+<p>The selection effect is why resuming matters. DeepSeek-V4 states the failure for preempted generation: "it is mathematically incorrect to regenerate unfinished requests from scratch, as this introduces length bias", because "shorter responses are more likely to survive interruption"; its fix is a token-granular write-ahead log plus saved KV cache, so decoding continues instead of restarting<a class="cite" href="#ref-13">13</a> (§5.2.3). The same logic covers pausing: if the unfinished 10% were dropped, the optimizer would see a batch biased to short trajectories. K3's scheme avoids that by resuming, and pays in staleness. The staleness is also not random. It concentrates on the longest trajectories, and GLM-5 notes that "overly long trajectories can become highly off-policy, which may destabilize training"<a class="cite" href="#ref-1">1</a> (§4.1.2).</p>
+
+<h3 id="staleness-loss">4.3 What the loss sees across versions</h3>
+<p>Give each token a behavior version \(b_t\), the weights that sampled it. The ratio the learner needs is \(\pi_\theta(y_t\mid s_t)/\pi_{b_t}(y_t\mid s_t)\). If the engine returns \(\log\pi_{b_t}\) with every token, as K2.5's framework does<a class="cite" href="#ref-7">7</a> (Appendix D), that is one stored number per token however many versions the trajectory crossed. This is why GLM-5 can drop \(\pi_{old}\) and use the rollout log-probabilities as "a direct behavior proxy" when "rollout engines may undergo multiple updates during a single trajectory generation"<a class="cite" href="#ref-1">1</a> (§4.1.2), and why token-level objectives carry over unchanged to partial rollouts. GLM-5 names the result Direct Double-sided Importance Sampling: the ratio is \(\pi_\theta/\pi_{rollout}\) and tokens outside \([1-\epsilon_\ell,1+\epsilon_h]\) are masked from the gradient, controlling off-policy bias "without tracking historical policy checkpoints". The objectives themselves (K2.5's log-ratio band, K3's per-token regularization, GLM-5's double-sided mask) are Module 12, Sections 5.1 and 5.2; the mismatch between engines that produces a second, version-independent ratio is Module 14.</p>
+<p>Two derived cautions. A sequence-level ratio, as in GSPO, can still be assembled from per-token recorded log-probabilities, but its clip range (3e-4 and 4e-4 in GSPO's experiments<a class="cite" href="#ref-17">17</a>, §4) was set for one-version sequences, and none of the reports in this set tests it on multi-version ones. And importance weights correct the probability of each action given its context, not the distribution of contexts: a stale action's context holds observations produced by older actions the current policy may not take. PPO-style methods ignore that term, and so does every report here.</p>
+
+<h3 id="staleness-bound">4.4 Bounding the lag</h3>
+<p>GLM-5 treats staleness as something to cap. It logs for each response the sequence of weight versions \(w_0&lt;\dots&lt;w_k\) that generated it and discards a sample when \(w'-w_0&gt;\tau\), with \(w'\) the current version; the report does not state \(\tau\). The training engine pushes weights to the rollout engine every \(K\) gradient updates, and GLM-5 also resets the optimizer after each such push<a class="cite" href="#ref-1">1</a> (§4.1.1-4.1.2). Nemotron 3 Ultra runs "a one-step off-policy asynchronous RL setup" in which rollout generation overlaps the previous update, so lag is at most one step by construction; for MOPD it separates the behavior policy from a proximal policy used as the trust-region center<a class="cite" href="#ref-9">9</a> (§3.3.1, §3.6.1). K3 states a tolerance and no bound, and publishes no staleness histogram or comparison with synchronous rollouts in the passages I read. Section 7 lines the designs up.</p>
+
+<h2 id="turn-local">5. Turn-local RL: PivotRL and Nemotron 3 Ultra</h2>
+
+<h3 id="turn-local-mechanism">5.1 Train on the turns that carry signal</h3>
+<p>The cheapest way to avoid long, stale, uneven trajectories is not to roll them out. PivotRL, from NVIDIA, starts from existing SFT trajectories and decomposes each at assistant boundaries into state-action pairs \((s_t,a^*_t)\), where \(s_t\) is the full history before the \(t\)-th assistant turn. Offline, it samples \(K\) local rollouts from the reference policy at each candidate state, scores them with a verifier, and keeps only turns with nonzero reward variance and a low reward mean (\(\hat\sigma^2(s)&gt;0\), \(\hat\mu(s)&lt;\lambda_{\text{diff}}\)); these are the pivots. Online, it samples \(G\) actions at a pivot, runs only the short rollout needed to score each, and applies a GRPO-style update with a verifier reward \(r_{\text{func}}(s,a)=\mathbb{1}[a\in\mathcal M(s)]\), where \(\mathcal M(s)\) is the set of locally acceptable actions<a class="cite" href="#ref-3">3</a> (§3.1, Eqs. 4-8). The verifier may be a normalized string or schema check, a task-specific equivalence rule, or a lightweight LLM judge.</p>
+<p>Both design choices answer a measured problem. First, a group whose rewards are all equal has zero advantage (Module 11, Section 4); in turn space the paper measures that 71% of randomly sampled turns on \(\tau^2\)-Bench and SWE-Bench give no learning signal. Second, rewarding only an exact match with the demonstrated action is too strict in a generative action space, where many tool calls are valid.</p>
+
+<h3 id="turn-local-numbers">5.2 What the numbers show, and what they do not</h3>
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f7t"><title id="f7t">Left: tau-squared-Bench accuracy for the base model, same-data SFT, and three PivotRL variants. Right: cumulative rollout turns each method needed to reach 32.67 percent on SWE-Bench Verified, PivotRL about 133 thousand against about 542 thousand for end-to-end RL</title>
+    <text x="14" y="22" class="d-title">τ²-Bench accuracy (%)</text>
+    <line x1="60" y1="36" x2="60" y2="250" class="d-axis"/><line x1="60" y1="250" x2="420" y2="250" class="d-axis"/>
+    <line x1="60" y1="107" x2="420" y2="107" class="d-grid"/><line x1="60" y1="178" x2="420" y2="178" class="d-grid"/>
+    <text x="54" y="254" text-anchor="end" class="d-small d-text-light">0</text><text x="54" y="182" text-anchor="end" class="d-small d-text-light">25</text><text x="54" y="111" text-anchor="end" class="d-small d-text-light">50</text>
+    <rect x="76" y="123.3" width="46" height="126.7" class="d-block-muted"/><text x="99" y="117" text-anchor="middle" class="d-mono d-small">44.35</text>
+    <rect x="146" y="83" width="46" height="167" class="d-block-muted"/><text x="169" y="77" text-anchor="middle" class="d-mono d-small">58.44</text>
+    <rect x="216" y="86.2" width="46" height="163.8" class="d-fill-red"/><text x="239" y="80" text-anchor="middle" class="d-mono d-small">57.34</text>
+    <rect x="286" y="79.5" width="46" height="170.5" class="d-fill-blue"/><text x="309" y="73" text-anchor="middle" class="d-mono d-small">59.68</text>
+    <rect x="356" y="67.7" width="46" height="182.3" class="d-fill-orange"/><text x="379" y="61" text-anchor="middle" class="d-mono d-small">63.81</text>
+    <text x="99" y="268" text-anchor="middle" class="d-small">Base</text>
+    <text x="169" y="268" text-anchor="middle" class="d-small">SFT</text><text x="169" y="282" text-anchor="middle" class="d-small">same data</text>
+    <text x="239" y="268" text-anchor="middle" class="d-small">strict</text><text x="239" y="282" text-anchor="middle" class="d-small">reward</text>
+    <text x="309" y="268" text-anchor="middle" class="d-small">no pivot</text><text x="309" y="282" text-anchor="middle" class="d-small">filter</text>
+    <text x="379" y="268" text-anchor="middle" class="d-small">full</text><text x="379" y="282" text-anchor="middle" class="d-small">PivotRL</text>
+
+    <text x="450" y="22" class="d-title">Turns to reach 32.67% on SWE-Bench</text>
+    <text x="450" y="74" class="d-small">PivotRL</text>
+    <rect x="450" y="82" width="49" height="30" class="d-fill-orange"/><text x="506" y="102" class="d-mono d-small">~133K (130 x 1,024)</text>
+    <text x="450" y="158" class="d-small">End-to-end RL</text>
+    <rect x="450" y="166" width="200" height="30" class="d-fill-blue"/><text x="656" y="186" class="d-mono d-small">~542K</text>
+    <text x="450" y="226" class="d-small">72 steps x 512 trajectories x ~14.7 turns (derived)</text>
+    <text x="450" y="246" class="d-small">4.1x in turns; ~5.5x in wall-clock (reported)</text>
+    <text x="450" y="270" class="d-small d-text-light">Qwen3-30B-A3B-Thinking, OpenHands, same nodes</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> Left: ablation on τ²-Bench (best checkpoint over training): both removing the pivot filter and replacing the functional reward with exact match lose accuracy, and strict-reward local RL ends below same-data SFT. Right: rollout turns to a matched 32.67% SWE-Bench accuracy. Data: PivotRL Tables 4 and 6, Section 4.2 and Appendix A.2<a class="cite" href="#ref-3">3</a>; the 14.7 turns per trajectory is derived from the reported 542K turns.</figcaption>
+</figure>
+<p>The turn count in Figure 7 checks out. PivotRL trains with a batch of 1,024 (64 prompts times 16 generations) at one turn per sample and reaches 32.67% at step 130, so \(130\times1{,}024=133{,}120\) rollout turns. End-to-end RL uses 512 trajectories per step (16 prompts times 32 generations), reaches the same accuracy at about step 72 and about 542K cumulative turns, which implies \(542{,}000/(72\times512)\approx14.7\) turns per trajectory, inside the reported 12-25. The ratio is 4.1 in turns and the report gives about 5.5 in wall-clock, so an end-to-end turn costs roughly 1.35 times a single-turn one in time (derived; long contexts and tool latency are the likely cause, which the report does not break out)<a class="cite" href="#ref-3">3</a> (§4.2, App. A.2).</p>
+<p>Four limits sit around the headline. The count is training samples; the \(K\) offline profiling rollouts per candidate turn are not part of that total in the text I read. The 32.67% is below same-data SFT on the same benchmark (37.40%, Table 1), so on SWE-Bench PivotRL's case is cost against end-to-end RL and retention outside the domain, not in-domain accuracy. The SWE-Bench local verifier "matches tool-call names only", so what is learned turn by turn there is which kind of operation to run next, with final success judged only by the full harness. And the out-of-domain advantage (+0.21 against SFT's -9.83 average change; the introduction prints -9.48) comes from one base model, Qwen3-30B-A3B-Thinking-2507<a class="cite" href="#ref-3">3</a> (Tables 1-2, App. A.2).</p>
+
+<h3 id="turn-local-nemotron">5.3 How Nemotron 3 Ultra mixes both</h3>
+<p>Nemotron 3 Ultra does not choose. Its unified RLVR stage spans terminal, office, SWE, search, tool-calling and non-agentic environments, with a deliberately diverse set of harness implementations "reducing overfitting to any particular harness design", asynchronous GRPO, "a global batch size of 8192, with each sample generating 16 rollouts", and a 48K maximum generation length later raised to 64K<a class="cite" href="#ref-9">9</a> (§3.2). The report does not say whether 8,192 counts prompts (then 131,072 rollouts per step) or rollouts (then 512 prompts), so both readings are shown rather than resolved. Its SWE teacher runs three stages: SFT on agentic data, PivotRL on single-step agentic environments, then an end-to-end SWE-RL stage where the model works a repository over multiple turns and a binary hidden-test reward feeds GRPO, with 192K generation length and at most 200 agent turns. That stage masks unfinished trajectories (maximum turns or timeouts), penalizes malformed reasoning and tool calls, and closes two channels by which the agent could read the gold patch: future commits are physically deleted from the in-container repository, and a runtime filter blocks remote git operations and downloads from GitHub domains (§3.3.2; Module 19 covers the exploit class).</p>
+<p>In the MOPD stage (Module 22), the student's rollouts get dense per-token rewards from a domain teacher, with 1,024 prompts per batch and one rollout per prompt, because "using multiple rollouts did not yield additional benefits" in their ablations. The report is candid about agentic tasks there: end-to-end agentic rollouts mixed with reasoning rollouts caused "substantial training inefficiency because rollout times can differ dramatically", so "we use single-turn rollouts, similar to PivotRL (Yi et al., 2026), for most of the agentic tasks". Whether end-to-end rollouts would gain more, and how to make them robust to distribution mismatch, is listed as open<a class="cite" href="#ref-9">9</a> (§3.3.1, §3.3.5).</p>
+
+<h2 id="recipes">6. GLM-5 and DeepSeek-V3.2: two end-to-end designs</h2>
+
+<h3 id="recipes-glm5">6.1 GLM-5: asynchronous traces, sample hygiene</h3>
+<p>GLM-5's agentic stage is a plain group-wise objective over agent traces (advantage \(r-\bar r\), model-generated tokens only), wrapped in infrastructure that keeps the learner fed. The training and inference engines sit on different GPUs; the inference engine generates continuously, a batch goes to the learner once a trajectory-count threshold is reached, and updated weights return every \(K\) gradient updates<a class="cite" href="#ref-1">1</a> (§4.1.1). Because tasks differ in tools and rollout logic, each task runs as an independent microservice registered with a central Multi-Task Rollout Orchestrator that sets the per-task rollout ratio and generation speed. All tasks' trajectories are standardized into one message-list format, and the orchestrator supports "over 1k concurrent rollouts" and dynamic changes to task sampling ratios. The scheduling is infrastructure (System Design Modules 37 and 38); the algorithm-side content is what happens to the samples.</p>
+<p>GLM-5 excludes samples whose failure came from the sandbox ("environment crashes"), on the grounds that they "reflect environment instability rather than the model's capability". Exclusion breaks GRPO's fixed group size, so the rule is: if the valid samples number more than half the group, pad by repeating valid ones; otherwise drop the group<a class="cite" href="#ref-1">1</a> (§4.1.2). With a group of 16, that pads groups with 9 to 15 valid samples and drops groups with 8 or fewer. The report does not say how the repeats are chosen. Two consequences follow (derived). Padding by repetition gives some samples double weight in the group mean. And if sandboxes fail more often on long or hard tasks, the survivors skew easy, the same survival effect as the length bias of Section 4.2. Neither is measured in the report.</p>
+
+<h3 id="recipes-v32">6.2 DeepSeek-V3.2: synthesized tasks inside one mixed stage</h3>
+<p>DeepSeek-V3.2's agentic RL is not a separate algorithm. It is GRPO in the same single stage that merges reasoning, agent and alignment training, with rule-based outcome reward, a length penalty and a language-consistency reward for reasoning and agent tasks<a class="cite" href="#ref-12">12</a> (§3). What is agent-specific is the task supply and the context rule of Section 1.3. Table 4 counts the task pool; the four rows sum to 85,267, the "85,000 complex prompts" of the introduction. Only the general-agent row (4,417 tasks, 1,827 environments) is synthesized end to end; the other three populations run in real environments.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> DeepSeek-V3.2 agent RL task pool (Table 1 of the report)<a class="cite" href="#ref-12">12</a>. The total is derived.</caption>
+  <thead><tr><th>Agent type</th><th class="num">Tasks</th><th>Environment</th><th>Prompts</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Code agent</td><td class="num">24,667</td><td>real</td><td>extracted</td></tr>
+    <tr><td class="row">Search agent</td><td class="num" data-best>50,275</td><td>real</td><td>synthesized</td></tr>
+    <tr><td class="row">General agent</td><td class="num">4,417</td><td>synthesized</td><td>synthesized</td></tr>
+    <tr><td class="row">Code interpreter</td><td class="num">5,908</td><td>real</td><td>extracted</td></tr>
+    <tr><td class="row">Total</td><td class="num">85,267</td><td></td><td></td></tr>
+  </tbody>
+</table>
+<p>The general-agent pool is built by an agent: for a task category it generates a sandbox database, task-specific tools, a task with a Python solution and a Python verifier that must agree, and then raises the difficulty step by step. After an RL pass with DeepSeek-V3.2 the pipeline keeps only instances with non-zero pass@100, which leaves 1,827 environments and 4,417 tasks (the table's general-agent row). On a 50-instance sample the difficulty is real: pass@1 is 12% for DeepSeek-V3.2-Exp against 34% (Sonnet-4.5), 51% (Gemini-3.0 Pro) and 62% (GPT-5-Thinking)<a class="cite" href="#ref-12">12</a> (§3.2.3, §4.3, Table 5). The ablation that carries the argument is qualitative: RL on synthetic general-agent data alone, from the SFT checkpoint in non-thinking mode, improves Tau2Bench, MCP-Mark and MCP-Universe, while RL on code and search environments alone does not (Figure 5, no numbers in the text). Environment design is Module 17's subject; the point for this module is that V3.2 improves tool-use generalization by changing the data, and the multi-turn mechanics are the single-turn recipe unchanged.</p>
+
+<h2 id="side-by-side">7. The designs side by side</h2>
+<table class="tbl tbl-dense">
+  <caption><b>Table 5.</b> Rollout unit, credit, staleness handling and treatment of unfinished or failed samples, as stated in each report. "Not stated" means not found in the passages read. Cross-references are to the loss and ratio details in Module 12.</caption>
+  <thead><tr><th>Report</th><th>Rollout unit</th><th>Advantage and credit</th><th>Staleness</th><th>Unfinished or failed</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Kimi k1.5<a class="cite" href="#ref-10">10</a></td><td>One long response, split across iterations by a token budget</td><td>Mean-reward baseline</td><td>Earlier segments reused from a replay buffer; current segment on-policy</td><td>Segments may be excluded from loss; repeats stopped and penalized</td></tr>
+    <tr><td class="row">Kimi K2.5<a class="cite" href="#ref-7">7</a></td><td>Trajectory; swarm trains the orchestrator only</td><td>\(r-\bar r\) token-level; PARL auxiliary rewards annealed to 0</td><td>Gradient mask outside a log-ratio band</td><td>Subagent trajectories excluded</td></tr>
+    <tr><td class="row">Kimi K3<a class="cite" href="#ref-2">2</a></td><td>Trajectory to 1M-token context; pause at \(\lambda NK\)</td><td>K2.5 algorithm; -1 override above \(\tau b_0\) tokens</td><td>Per-token regularization; no bound stated</td><td>Resumed next iteration in a checkpointed sandbox</td></tr>
+    <tr><td class="row">GLM-5<a class="cite" href="#ref-1">1</a></td><td>Message-list trace, 1k+ concurrent</td><td>\(r-\bar r\); model tokens only</td><td>Rollout log-probs as behavior proxy; two-sided mask; drop if \(w'-w_0&gt;\tau\)</td><td>Sandbox crashes excluded; group padded or dropped</td></tr>
+    <tr><td class="row">Nemotron 3 Ultra<a class="cite" href="#ref-9">9</a></td><td>Single-turn for most MOPD agentic tasks; end-to-end SWE to 200 turns</td><td>Binary reward in GRPO; dense teacher reward in MOPD; negative advantage on malformed tokens</td><td>One-step off-policy; behavior and proximal policies in MOPD</td><td>Loss masked on unfinished trajectories</td></tr>
+    <tr><td class="row">DeepSeek-V3.2<a class="cite" href="#ref-12">12</a></td><td>Trajectory; reasoning kept across tool results</td><td>\(A=R-\operatorname{mean}(R)\); outcome, length and language rewards</td><td>Sequence masking and routing replay (Module 12); nothing agent-specific</td><td>Tasks filtered to non-zero pass@100; unfinished: not stated</td></tr>
+    <tr><td class="row">MiMo-V2-Flash<a class="cite" href="#ref-16">16</a></td><td>Trajectory; overlong ones partitioned across steps</td><td>Not stated</td><td>Staleness-aware truncated IS; caps on staleness and on partial-sample share</td><td>Not stated</td></tr>
+  </tbody>
+</table>
+<p>Three patterns hold across the rows. Advantage is trajectory-level everywhere; the only step-level credit in this set is GiGPO's, outside the frontier reports. Staleness has four answers: tolerate (K3), cap (GLM-5, MiMo), avoid by construction (Nemotron's one-step lag), or never create it (V3.2 has no partial rollouts in the passages read). Unfinished trajectories are resumed (K3), masked (Nemotron) or dropped (GLM-5, under its staleness rule). Masking and dropping remove trajectories by length or timeout, which reintroduces the survivor bias of Section 4.2 (derived); only resumption keeps the long tail in the batch, at the price of staleness.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>Reading the designs against task structure (the writer's synthesis, not a claim in any report): for short tool loops of a few turns (search QA, the Search-R1 and GiGPO regime) concatenate, mask observations and use a group baseline, with step-level groups if states repeat. For long single-agent work (SWE, terminal; 12 to 200 turns) keep outcome reward at trajectory level, cap staleness, and decide whether pausing at a fraction (K3) or one-step asynchrony (Nemotron) fits the rollout tail. For decomposable wide tasks, an orchestrator with frozen workers and a critical-steps budget (K2.5). When rollouts dominate cost and SFT trajectories exist, pivot-based turn-local RL for part of the data (PivotRL, Nemotron).</p></aside>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Three questions are open for multi-turn RL: what unit receives credit, whether to train on whole trajectories or on single turns, and how much policy staleness to accept. The reports answer them differently and almost never ablate one answer against another, so the positions below are designs, not measured rivals.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Trajectory-level outcome reward is enough</h4>
+    <p class="who">GLM-5, Kimi K2.5 and K3, DeepSeek-V3.2, Nemotron 3 Ultra's end-to-end SWE stage<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-9">9</a>; RAGEN's StarPO is trajectory-level too<a class="cite" href="#ref-8">8</a></p>
+    <p>Scale and filtering average out turn-level noise. A step-level signal needs a state definition or a learned model, and the simple objective already runs at 1,000 to 100,000 concurrent rollouts.</p>
+    <ul class="pros"><li>No extra machinery; the Module 12 and 14 fixes apply unchanged</li><li>Works with any harness, including ones that rewrite history</li></ul>
+    <ul class="cons"><li>No frontier report ablates it against step-level credit</li><li>RAGEN reports Echo-Trap collapse at small scale; whether frontier runs hit it is not reported</li></ul>
+  </article>
+  <article class="position">
+    <h4>Add step-level credit from the environment, with no learned PRM</h4>
+    <p class="who">GiGPO (NTU, NeurIPS 2025)<a class="cite" href="#ref-14">14</a>; R1's supplement gives the case against learned PRMs<a class="cite" href="#ref-15">15</a></p>
+    <p>Compare actions taken from the same state across trajectories and add that to the episode advantage. It is critic-free and nearly free to compute.</p>
+    <ul class="pros"><li>+12.6 to +13.3 points ALFWorld success over GRPO at 1.5B and 7B (3 seeds)</li><li>Falls back to GRPO when no state repeats</li></ul>
+    <ul class="cons"><li>Needs recurring states; evidence stops at 7B on ALFWorld, WebShop and search QA</li><li>None of the nine frontier-class reports searched mentions it</li></ul>
+  </article>
+  <article class="position">
+    <h4>Stop rolling out whole trajectories; train on pivots</h4>
+    <p class="who">PivotRL (NVIDIA, UC Berkeley)<a class="cite" href="#ref-3">3</a>; Nemotron 3 Ultra's MOPD uses single-turn rollouts for most agentic tasks<a class="cite" href="#ref-9">9</a></p>
+    <p>Most turns carry no gradient under group normalization, and local rollouts remove tails and staleness entirely.</p>
+    <ul class="pros"><li>About 4.1 times fewer rollout turns and 5.5 times less wall-clock to a matched SWE-Bench accuracy</li><li>Keeps out-of-domain skills (+0.21 against SFT's -9.83)</li></ul>
+    <ul class="cons"><li>32.67% is below same-data SFT (37.40%) on SWE-Bench Verified, and the SWE verifier matches tool names only</li><li>Nemotron lists end-to-end rollouts as an open question</li></ul>
+  </article>
+  <article class="position">
+    <h4>Keep end-to-end rollouts and manage staleness: tolerate or cap</h4>
+    <p class="who">Tolerate: Kimi K3<a class="cite" href="#ref-2">2</a>. Cap: GLM-5 and MiMo-V2-Flash<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-16">16</a>. Resume instead of restarting: DeepSeek-V4<a class="cite" href="#ref-13">13</a></p>
+    <p>Tails are the cost of long-horizon training, so keep them and decide where the off-policy error goes: into the objective (K3's per-token regularization) or into a rule that drops samples older than \(\tau\) versions (GLM-5).</p>
+    <ul class="pros"><li>Trains on the behavior that only long episodes show</li><li>Resuming avoids the length bias of restarting</li></ul>
+    <ul class="cons"><li>No staleness histogram or synchronous baseline is published for K3</li><li>\(\tau\) and the clip values are not stated in the passages read</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Trajectory-level outcome reward is the default for good reason: every large run in this set uses it and none, in the passages read, reports a failure attributed to coarse credit. That is absence of evidence, not a result. GiGPO is the strongest case where states recur and horizons are tens of steps; for coding and terminal agents I would not expect exact state matches to fire, so the experiment that would settle it is GiGPO with similarity-based state keys against GRPO on a SWE-style task at 30B or more, with the group-size histogram reported. Turn-local RL is a cost and forgetting tool, not an accuracy tool: use it to bootstrap agentic skill from SFT data and where rollout cost dominates, and keep an end-to-end stage for recovery and long-horizon behavior, which is what Nemotron's SWE teacher does. On staleness, cap by default, because a cap is cheap to implement and a failure is visible in the data; K3's tolerance claim would be credible with a lag sweep, which no report has. Three of the four positions are compatible, which suggests the disagreement is about emphasis and budget more than correctness.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Context length is the driver. Kimi K3 trains agents at 1M-token context with co-located partial rollouts, an external KV pool and resumable sandboxes<a class="cite" href="#ref-2">2</a>, which turns the quadratic cost of Section 1.3 and the staleness of Section 4 into first-order design constraints. Training-time harness diversity (K3's composable modules, Nemotron's mixed harnesses) pushes history rules into the training distribution, so Section 1.3's segment bookkeeping will matter more. PivotRL's adoption in Nemotron 3 Super and Ultra<a class="cite" href="#ref-3">3</a> suggests turn-local RL becomes a standard first stage. Open items: step-level credit at frontier scale, co-training orchestrator and subagents, and how multi-teacher distillation (Module 22) handles long-horizon rollouts. The reports used here are dated 2025-2026 and the K3, K2.5 and Nemotron 3 Ultra figures are likely to be revised in later versions.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>GLM-5 Team (Aohan Zeng, Xin Lv, et al.), Zhipu AI and Tsinghua University. <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. arXiv 2602.15763v2, 24 Feb 2026. <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: agentic RL objective and the "only model-generated tokens" statement (§4.1), asynchronous design and Multi-Task Rollout Orchestrator (§4.1.1), TITO, rollout log-probability importance sampling, version-lag drop rule, sample hygiene and DP-aware routing (§4.1.2).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Kimi Team (Tongtong Bai, Yifan Bai, Yiping Bao, et al.), Moonshot AI. <em>Kimi K3: Open Frontier Intelligence</em>. arXiv 2607.24653v2, 7 Aug 2026. <a href="https://arxiv.org/pdf/2607.24653v2">https://arxiv.org/pdf/2607.24653v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: partial rollouts with completion fraction and per-token regularization (§4.1.2), budget override, white-box harness (§4.2.1), personal-assistant environments (§4.2.5), resumable sandbox (§5.3.2), preserved thinking and masked JSON block (chat-template appendix), steps scaling with RL FLOPs (Fig. 8).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Yi, J., Mosk-Aoyama, D., Huang, B., Gala, R., Wang, C., Devare, S. D., Bhardwaj, K., Gupta, A., Kuchaiev, O., Jiao, J., Zhang, J., Srinivasan, V. <em>PivotRL: High Accuracy Agentic Post-Training at Low Compute Cost</em>. NVIDIA and UC Berkeley, arXiv 2603.21383v1, 22 Mar 2026. <a href="https://arxiv.org/abs/2603.21383">https://arxiv.org/abs/2603.21383</a>. Accessed 2026-10-27. <span class="ref-use">Used for: pivot selection and functional reward (§3.1), 71% zero-signal turns (§2), Tables 1-2 and 4-6, rollout-turn comparison with end-to-end RL (§4.2, App. A.2). Not in the source map; full text read.</span></li>
+  <li id="ref-4"><span class="ref-type">repo</span>NVIDIA. <em>NeMo Gym README</em>. main branch snapshot showing release v0.7.0. <a href="https://raw.githubusercontent.com/NVIDIA-NeMo/Gym/main/README.md">https://raw.githubusercontent.com/NVIDIA-NeMo/Gym/main/README.md</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the definition of an environment as dataset, agent harness, verifier and per-task state. Unversioned snapshot read through a page extraction.</span></li>
+  <li id="ref-5"><span class="ref-type">official</span>Farama Foundation. <em>Gymnasium documentation: Basic Usage</em>. Live documentation, no version stamp. <a href="https://gymnasium.farama.org/introduction/basic_usage/">https://gymnasium.farama.org/introduction/basic_usage/</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the <code>terminated</code> and <code>truncated</code> flags returned by <code>step</code>. Quote is from a page extraction.</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Jin, B., Zeng, H., Yue, Z., Yoon, J., Arık, S. Ö., Wang, D., Zamani, H., Han, J. <em>Search-R1: Training LLMs to Reason and Leverage Search Engines with Reinforcement Learning</em>. COLM 2025; arXiv 2503.09516v5, 5 Aug 2025. <a href="https://arxiv.org/abs/2503.09516">https://arxiv.org/abs/2503.09516</a>. Accessed 2026-10-27. <span class="ref-use">Used for: retrieved-token loss masking and normalizer (§3.1, Eqs. 2-3), masking ablation (Tables 4 and 6, Fig. 3), PPO against GRPO stability (Fig. 2a). Not in the source map; full text read.</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Kimi Team (Tongtong Bai, Yifan Bai, Yiping Bao, et al.), Moonshot AI. <em>Kimi K2.5: Visual Agentic Intelligence</em>. arXiv 2602.02276v2, 7 Aug 2026. <a href="https://arxiv.org/pdf/2602.02276v2">https://arxiv.org/pdf/2602.02276v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: PARL architecture, reward and critical steps (§3), objective (§4.4.2, Eq. 1), Agent Swarm results (Figs. 7-8), rollout manager and Token-in-Token-out (Appendix D).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Wang, Z., Wang, K., Wang, Q., Zhang, P., et al. <em>RAGEN: Understanding Self-Evolution in LLM Agents via Multi-Turn Reinforcement Learning</em>. arXiv 2504.20073v2, 26 May 2025. <a href="https://arxiv.org/abs/2504.20073">https://arxiv.org/abs/2504.20073</a>. Accessed 2026-10-27. <span class="ref-use">Used for: trajectory-level StarPO, Echo Trap and uncertainty filtering in StarPO-S (§4.2), response-masking ablation (Appendix D, Fig. 12). Not in the source map; full text read.</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>NVIDIA (Aaron Blakeman, Aaron Thomas, et al.). <em>Nemotron 3 Ultra: Open, Efficient Mixture-of-Experts Hybrid Mamba-Transformer Model for Agentic Reasoning</em>. arXiv 2606.15007v1, 12 Jun 2026. <a href="https://arxiv.org/pdf/2606.15007v1">https://arxiv.org/pdf/2606.15007v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: unified RLVR stage (§3.2), MOPD algorithm and asynchronous setup (§3.3.1), SWE teacher and search teacher (§3.3.2), limitations (§3.3.5), one-step off-policy training (§3.6.1).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Kimi Team (Angang Du, Bofei Gao, Bowei Xing, et al.), Moonshot AI. <em>Kimi k1.5: Scaling Reinforcement Learning with LLMs</em>. arXiv 2501.12599v4, 3 Jun 2025. <a href="https://arxiv.org/pdf/2501.12599v4">https://arxiv.org/pdf/2501.12599v4</a>. Accessed 2026-10-26. <span class="ref-use">Used for: partial rollouts, replay buffer and segment exclusion (§2.6.2), mean-reward baseline.</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Kimi Team (Yifan Bai, Yiping Bao, Y. Charles, et al.), Moonshot AI. <em>Kimi K2: Open Agentic Intelligence</em>. arXiv 2507.20534v2, 3 Feb 2026. <a href="https://arxiv.org/pdf/2507.20534v2">https://arxiv.org/pdf/2507.20534v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: partial rollout in agentic rollout (§3.3.4); full-text search for masking statements.</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>DeepSeek-AI (Aixin Liu, Aoxue Mei, Bangcai Lin, et al.). <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv 2512.02556v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: mixed RL and rewards (§3), advantage (§3.1), thinking context management (§3.2.1), agent task pool (§3.2.3, Table 1), synthetic-task ablation and Table 5 (§4.3), test-time context management (§4.4).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>DeepSeek-AI (Anyi Xu, Bangcai Lin, Bing Xue, et al.). <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv 2606.19348v1. <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: interleaved thinking rule, preemptible rollout service and the length-bias argument against regenerating from scratch (§5.2.3).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Feng, L., Xue, Z., Liu, T., An, B. <em>Group-in-Group Policy Optimization for LLM Agent Training</em>. NeurIPS 2025; arXiv 2505.10978v3, 28 Oct 2025. <a href="https://arxiv.org/abs/2505.10978">https://arxiv.org/abs/2505.10978</a>. Accessed 2026-10-27. <span class="ref-use">Used for: anchor-state grouping and Eqs. 3-9 (§4), Tables 1-2, ablation, step-group dynamics and compute budget (§5.4-5.6), limitations, verl-agent step-wise paradigm (Appendix A). The source map had the abstract only; full text read.</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv 2501.12948v2 (expanded version). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the three limitations of process reward models (Supplement G.2).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>LLM-Core Xiaomi. <em>MiMo-V2-Flash Technical Report</em>. arXiv 2601.02780v2, 8 Jan 2026. <a href="https://arxiv.org/pdf/2601.02780v2">https://arxiv.org/pdf/2601.02780v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: partial rollout with staleness-aware truncated importance sampling and caps on staleness and partial-sample share (§4.6.2). Abstract-only pointer in the source map; the cached full text was read.</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Zheng, C., Liu, S., Li, M., Chen, X.-H., Yu, B., et al. (Qwen Team, Alibaba). <em>Group Sequence Policy Optimization</em>. arXiv 2507.18071v2, 28 Jul 2025. <a href="https://arxiv.org/pdf/2507.18071v2">https://arxiv.org/pdf/2507.18071v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the sequence-level clipping ranges 3e-4 and 4e-4 (§4).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

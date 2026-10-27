@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RL Environments for LLMs: Task Datasets, Harnesses, Verifiers, State, and Reward Shaping · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="What an RL environment is for an LLM: the Gymnasium contract and what changes for token and tool-call actions, the dataset-harness-verifier-state anatomy used by NeMo Gym, verifiers and OpenEnv, reward shapes, procedural generators, how labs build environments at scale, and what to test before trusting one.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 17</p>
+  <h1>RL Environments for LLMs: Task Datasets, Harnesses, Verifiers, State, and Reward Shaping</h1>
+  <p class="lede">An RL environment is the part of the training loop that is not the model: the tasks, the program through which the model acts, the state those actions change, and the verifier that turns the final state into a number. This module rebuilds the Gymnasium contract for token and tool-call actions and reads how NeMo Gym, verifiers, OpenEnv, Reasoning Gym and seven 2025-2026 technical reports construct, shape and validate environments. Afterwards you can specify an environment for a new domain (tasks, harness, verifier, state, reward) and name what to test before it feeds a gradient.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>50 min</b> read</span>
+    <span class="chip"><b>21</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 10</b>, <b>Module 16</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 350" role="img" aria-labelledby="f1t"><title id="f1t">The Gymnasium agent-environment loop beside the loop of an LLM agent that acts through a harness on a sandbox whose state a verifier reads at the end</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="10" y="10" width="320" height="330" rx="10" class="d-panel"/>
+    <text x="170" y="38" text-anchor="middle" class="d-title">Gymnasium contract</text>
+    <rect x="30" y="64" width="96" height="56" rx="8" class="d-block"/><text x="78" y="98" text-anchor="middle" class="d-text-inv d-bold">Agent</text>
+    <rect x="214" y="64" width="96" height="56" rx="8" class="d-block-2"/><text x="262" y="98" text-anchor="middle" class="d-text-inv d-bold">Env</text>
+    <path d="M126,80 L214,80" class="d-arrow" marker-end="url(#f1-arr)"/><text x="170" y="72" text-anchor="middle" class="d-mono d-small">action</text>
+    <path d="M214,106 L126,106" class="d-arrow" marker-end="url(#f1-arr)"/><text x="170" y="124" text-anchor="middle" class="d-mono d-small">obs, reward</text>
+    <text x="30" y="166" class="d-mono d-small">reset() -> (obs, info)</text>
+    <text x="30" y="188" class="d-mono d-small">step(a) -> (obs, reward,</text>
+    <text x="30" y="206" class="d-mono d-small">   terminated, truncated, info)</text>
+    <text x="30" y="244" class="d-small d-text-light">terminated: task ended or failed</text>
+    <text x="30" y="264" class="d-small d-text-light">truncated: time limit reached</text>
+    <text x="30" y="296" class="d-small d-text-light">action: one element of a Space</text>
+    <text x="30" y="316" class="d-small d-text-light">reward: returned at every step</text>
+    <rect x="350" y="10" width="440" height="330" rx="10" class="d-panel"/>
+    <text x="570" y="38" text-anchor="middle" class="d-title">LLM agent in a sandbox</text>
+    <rect x="366" y="64" width="90" height="56" rx="8" class="d-block"/><text x="411" y="98" text-anchor="middle" class="d-text-inv d-bold">LLM</text>
+    <rect x="530" y="64" width="90" height="56" rx="8" class="d-block-2"/><text x="575" y="98" text-anchor="middle" class="d-text-inv d-bold">Harness</text>
+    <rect x="694" y="64" width="84" height="56" rx="8" class="d-block-accent"/><text x="736" y="98" text-anchor="middle" class="d-text-inv d-bold">Sandbox</text>
+    <path d="M456,80 L530,80" class="d-arrow" marker-end="url(#f1-arr)"/><text x="493" y="72" text-anchor="middle" class="d-mono d-small">turn</text>
+    <path d="M530,106 L456,106" class="d-arrow" marker-end="url(#f1-arr)"/><text x="493" y="124" text-anchor="middle" class="d-mono d-small">text obs</text>
+    <path d="M620,80 L694,80" class="d-arrow" marker-end="url(#f1-arr)"/><text x="657" y="72" text-anchor="middle" class="d-mono d-small">call</text>
+    <path d="M694,106 L620,106" class="d-arrow" marker-end="url(#f1-arr)"/><text x="657" y="124" text-anchor="middle" class="d-mono d-small">result</text>
+    <rect x="694" y="190" width="84" height="50" rx="8" class="d-hl"/><text x="736" y="220" text-anchor="middle" class="d-bold">Verifier</text>
+    <path d="M736,120 L736,190" class="d-arrow-active" marker-end="url(#f1-arr)"/><text x="728" y="160" text-anchor="end" class="d-mono d-small">final state</text>
+    <rect x="366" y="190" width="90" height="50" rx="8" class="d-block-muted"/><text x="411" y="220" text-anchor="middle" class="d-bold">Trainer</text>
+    <path d="M694,215 L456,215" class="d-arrow-active" marker-end="url(#f1-arr)"/><text x="575" y="207" text-anchor="middle" class="d-mono d-small">reward r</text><text x="575" y="233" text-anchor="middle" class="d-small d-text-light">once, at the end</text>
+    <path d="M411,120 L411,190" class="d-arrow" marker-end="url(#f1-arr)"/><text x="419" y="160" class="d-mono d-small">tokens, logprobs</text>
+    <text x="366" y="276" class="d-small d-text-light">action: one model turn, many tokens</text>
+    <text x="366" y="296" class="d-small d-text-light">state: in the sandbox, not the context</text>
+    <text x="366" y="316" class="d-small d-text-light">reward: read from the final state</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> Left, the Gymnasium contract<a class="cite" href="#ref-1">1</a>. Right, the loop a trainer runs for an LLM agent, a schematic drawn from TRL's <code>environment_factory</code> (the trainer drives generation and tool calls; the reward is read from the environment after the episode)<a class="cite" href="#ref-2">2</a>, τ-bench's hidden database state and LLM-simulated user<a class="cite" href="#ref-3">3</a>, and the verifiers library's separation of harness, runtime and scoring<a class="cite" href="#ref-4">4</a>. The orange arrows have no Gymnasium counterpart: scoring happens once, from state the agent never sees directly.</figcaption>
+</figure>
+
+<h2 id="interface">1. From <code>reset</code> and <code>step</code> to a trajectory of turns</h2>
+
+<h3 id="interface-gym">1.1 What the Gymnasium contract promises</h3>
+<p>The 2016 OpenAI Gym whitepaper fixed the shape every environment library since has copied: <code>env.reset()</code> returns the first observation, <code>env.step(a)</code> returns <code>(observation, reward, done, info)</code>, and the library abstracts the environment only, not the agent. It also set a rule that matters for LLM work: any change to an environment's behavior must come with a new version name, because results before and after are incomparable<a class="cite" href="#ref-5">5</a>. Gymnasium split <code>done</code> into two flags in v0.26 "to make it clearer to users when the environment had terminated or truncated", which it calls "critical for reinforcement learning bootstrapping algorithms". <code>terminated</code> means the agent reached a terminal state of the task's MDP, positive or negative; <code>truncated</code> means a condition outside the MDP held, typically a time limit; either requires a <code>reset()</code><a class="cite" href="#ref-6">6</a>. <code>reset</code> returns <code>(observation, info)</code> and takes <code>seed</code> and <code>options</code>; <code>info</code> may hold "individual reward terms that are combined to produce the total reward"<a class="cite" href="#ref-6">6</a>. The docs call <code>Env</code> an MDP "not a perfect reconstruction, missing several components"<a class="cite" href="#ref-1">1</a>.</p>
+<p>The contract carries four assumptions that were free in Atari and MuJoCo and are not free for an LLM: the environment owns dynamics and reward; the action space is declared up front as a <code>Space</code> (<code>Box</code>, <code>Discrete</code>, <code>Dict</code>, and a <code>Text</code> space for strings with minimum and maximum length<a class="cite" href="#ref-1">1</a>); one <code>step</code> takes one action and returns one reward; and stepping is cheap. An agent that emits thousands of tokens per action on a machine that must be built, snapshotted and graded violates the last two (my reading; the docs make no such claim).</p>
+
+<h3 id="interface-llm">1.2 What the LLM does to each element</h3>
+<p>Module 2 gave two ways to cast a single completion into the contract: a token-level MDP and a bandit whose single action is the whole completion. A tool-using agent adds a third unit, the <em>turn</em>. A trajectory is \(\tau=(x,a_1,o_1,a_2,o_2,\dots,a_K)\): each \(a_k\) is a token sequence sampled from \(\pi_\theta\) (reasoning plus a tool call or final answer) and each \(o_k\) is text the environment wrote. The log-probability splits into a policy part and an environment part,
+$$\log p_\theta(\tau)=\sum_{k}\log\pi_\theta(a_k\mid x,a_{\lt k},o_{\lt k})+\sum_{k}\log P(o_k\mid x,a_{\le k},o_{\lt k}),$$
+and only the first sum depends on \(\theta\). So a unit test, a browser or a simulated user can sit in the loop without being differentiable, as Module 2 argued for a single completion. Not every token in \(\tau\) is a policy token, though: the \(o_k\) segments sit in the context but were not sampled, which is where loss masks come from (Module 18).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> The Gymnasium elements and what they become for an LLM. The single-completion column follows Module 2; the multi-turn column follows TRL's <code>environment_factory</code> contract<a class="cite" href="#ref-2">2</a> and τ-bench's formalization<a class="cite" href="#ref-3">3</a>.</caption>
+  <thead><tr><th>Element</th><th>Single completion</th><th>Multi-turn tool use</th></tr></thead>
+  <tbody>
+    <tr><td class="row">observation</td><td>prompt, then tokens so far</td><td>user message, tool output, page text; history re-enters the context</td></tr>
+    <tr><td class="row">action</td><td>next token, or whole completion</td><td>one model turn: reasoning plus a parsed tool call or answer</td></tr>
+    <tr><td class="row">action space</td><td>the vocabulary</td><td>the tool schema: names and typed arguments</td></tr>
+    <tr><td class="row"><code>reset</code></td><td>sample a prompt</td><td>load a task, build or restore the sandbox, return the first observation</td></tr>
+    <tr><td class="row"><code>step</code></td><td>append a token</td><td>execute the call in the sandbox, return its output as text</td></tr>
+    <tr><td class="row">reward</td><td>reward-model score at EOS, or verdict</td><td>verifier on final state; sometimes per-step terms</td></tr>
+    <tr><td class="row"><code>terminated</code></td><td>EOS</td><td>model submits; task solved or failed</td></tr>
+    <tr><td class="row"><code>truncated</code></td><td><code>max_new_tokens</code></td><td>context cap, turn cap, wall-clock timeout</td></tr>
+    <tr><td class="row">hidden state</td><td>none</td><td>files, database rows, processes, browser session</td></tr>
+  </tbody>
+</table>
+
+<p>Two rows deserve a closer look. The action space is now a schema, not a vocabulary. TRL discovers every public method of the environment class, exposes it as a function-calling tool, requires typed docstrings to build the schema, and advises against a generic <code>step(action)</code> because "the model needs meaningful tool names and argument descriptions to learn tool calling"<a class="cite" href="#ref-2">2</a>. And the state is no longer the observation. τ-bench writes its environment as a POMDP with \(S=S_{db}\otimes S_{user}\), \(A=A_{db}\cup A_{user}\), \(O=O_{db}\cup O_{user}\) and reward \(R:S\to[0,1]\); the database is "hidden from the agent and the user" and reachable only through API actions, while the user is a language model (gpt-4-0613) whose state is its prompt plus the conversation<a class="cite" href="#ref-3">3</a>. An environment can contain a model. The context window is a log of observations standing in for a belief state; the true state is in the sandbox, where the verifier reads it.</p>
+
+<h3 id="interface-truncation">1.3 Terminated, truncated, and what to do with a cut-off episode</h3>
+<p>Gymnasium's split exists so that a bootstrapping learner can treat a time-limit cut differently from a real end<a class="cite" href="#ref-6">6</a> (Module 2 explains why for a critic). A critic-free recipe faces a different question: should a truncated trajectory be graded at all? The sources document three answers. Grade it as usual, the default when the verifier reads whatever state exists. Skip it: verifiers has <code>skip_on_truncated</code> and <code>skip_on_timeout</code> switches that leave a cut-off run with no rewards, so its reward is 0 and <code>trace.info["scoring_skipped"]</code> records why<a class="cite" href="#ref-4">4</a>. Or penalize it: Kimi K2 enforces a per-sample token budget by task type, and "responses that exceed this token budget are truncated and assigned a penalty"<a class="cite" href="#ref-7">7</a> (§3.2.3). TRL adds a trap for multi-turn work: <code>max_completion_length</code> caps tokens across the whole conversation, "all model generations + tool results combined", so verbose tool output can exhaust it<a class="cite" href="#ref-2">2</a>. No source states a consensus on which flag to set or what reward should follow.</p>
+
+<pre class="code" data-lang="python" data-title="env_contract.py" data-hl="5,12,16"><code>class SqlEnv:
+    """One instance per rollout. State lives in the sandbox, not in the context."""
+
+    def reset(self, task):
+        self.db = sandbox.restore(task["snapshot"])        # task = one dataset row
+        self.gold, self.turns = task["gold_rows"], 0
+        return task["question"], {"task_id": task["id"]}    # (observation, info)
+
+    def step(self, action):                                # action = one parsed model turn
+        self.turns += 1
+        if action.tool == "run_sql":                       # exploration: no reward yet
+            obs = self.db.execute(action.args["query"])    # tool output returns as text
+            return str(obs), 0.0, False, self.turns &gt;= 8, {}
+        if action.tool == "submit":                        # final answer, graded from state
+            rows = self.db.execute(action.args["query"])
+            r = float(sorted(rows) == sorted(self.gold))   # unordered result-set equality
+            return "", r, True, False, {"verifier": "result_set_equality"}
+        return "unknown tool", 0.0, False, self.turns &gt;= 8, {}</code></pre>
+<p class="small muted">The contract as a sketch (mine, not any library's API). The reward rule mirrors the Bird SQL verifier in NeMo Gym's catalogue (Section 4.2). Everything hard is hidden in <code>sandbox.restore</code>, <code>execute</code> and the dataset; the rest of this module is about those three.</p>
+
+<h2 id="anatomy">2. Anatomy: tasks, harness, state, verifier</h2>
+
+<h3 id="anatomy-parts">2.1 Four parts under four vocabularies</h3>
+<p>NVIDIA's NeMo Gym defines an environment as "the complete system an agent interacts with to complete a task": a dataset (the tasks), an agent harness ("how the model interacts with the world"), a verifier and per-task state. Its quick start starts three servers, a <code>mcqa</code> resources server, a <code>mcqa_simple_agent</code> agent and a <code>policy_model</code>, so, as far as the README shows, tasks and verifier live in the resources server, the harness in the agent server and the model in a third (my reading of the layout). The README is candid about overkill: "if you're scoring model outputs with a stateless check and don't need scale or training, a script is probably sufficient"<a class="cite" href="#ref-8">8</a>.</p>
+<p>The verifiers library cuts the same object differently. A <em>Taskset</em> loads <em>Tasks</em> from a dataset or generator; a <em>Task</em> holds the lifecycle hooks (<code>setup</code>, <code>finalize</code>), tools, stop conditions, metrics and rewards; <em>TaskData</em> is the immutable record of prompt, reference answer, artifacts and per-task limits; the agent solves it "inside a <em>harness</em> running in a <em>runtime</em>" (subprocess, Docker, remote sandbox or custom)<a class="cite" href="#ref-4">4</a>. OpenEnv cuts at the network boundary: each environment is a Docker image exposing <code>reset()</code>, <code>step()</code> and <code>state()</code>, sync or async, over a WebSocket<a class="cite" href="#ref-9">9</a>. Table 2 lines them up; the rows for NeMo Gym, verifiers and OpenEnv are snapshots of main-branch documents and will drift.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 2.</b> Environment interfaces compared, read from each project's own documentation or README on 2026-10-27; none is pinned to a release except where stated.</caption>
+  <thead><tr><th>Library</th><th>Unit</th><th>Interface</th><th>Isolation</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Gymnasium<a class="cite" href="#ref-6">6</a></td><td><code>Env</code> class</td><td><code>reset</code>, five-element <code>step</code></td><td>in-process</td><td>single-agent</td></tr>
+    <tr><td class="row">OpenEnv<a class="cite" href="#ref-9">9</a></td><td>Docker image plus client</td><td><code>reset</code>, <code>step</code>, <code>state</code> over WebSocket; MCP at <code>/mcp</code></td><td>container per environment</td><td>"early development"; 40+ environments</td></tr>
+    <tr><td class="row">NeMo Gym<a class="cite" href="#ref-8">8</a></td><td>dataset + harness + verifier + state</td><td>resources, agent and model servers</td><td>seven sandbox providers by v0.5.0</td><td>README shows v0.7.0 (10/06/2026)</td></tr>
+    <tr><td class="row">verifiers<a class="cite" href="#ref-4">4</a></td><td>Taskset of Tasks in a runtime</td><td>async Python; <code>@vf.reward(weight)</code>, <code>@vf.metric</code>, built-in judges</td><td>subprocess, Docker, remote; optional isolated scoring</td><td>docs on <code>main</code>, no version</td></tr>
+    <tr><td class="row">Harbor<a class="cite" href="#ref-10">10</a></td><td>task directory</td><td><code>harbor run</code> with an "oracle" agent</td><td>Docker, Daytona, Modal</td><td>tutorial shows rewards 0 and 1</td></tr>
+    <tr><td class="row">TRL <code>environment_factory</code><a class="cite" href="#ref-2">2</a></td><td>Python class per generation</td><td><code>reset(**row)</code>; public methods become tools</td><td>none by itself</td><td>OpenEnv servers default to 1 session</td></tr>
+  </tbody>
+</table>
+
+<h3 id="anatomy-lifecycle">2.2 One rollout as a lifecycle</h3>
+<p>Whatever the vocabulary, a rollout passes through the same stages, and the order is where environments go wrong. The verifiers documentation states the lifecycle most explicitly, and the stepper below follows it.</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 330" role="img" aria-label="Six stages of one rollout: load task, setup, agent loop, finalize, score, emit trace, with the sandbox state spanning setup to scoring">
+      <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+      <rect x="4" y="50" width="112" height="64" rx="8" class="d-block-muted"/><text x="60" y="87" text-anchor="middle" class="d-bold">Load task</text>
+      <rect x="140" y="50" width="112" height="64" rx="8" class="d-block-muted"/><text x="196" y="87" text-anchor="middle" class="d-bold">Setup</text>
+      <rect x="276" y="50" width="112" height="64" rx="8" class="d-block-muted"/><text x="332" y="87" text-anchor="middle" class="d-bold">Agent loop</text>
+      <rect x="412" y="50" width="112" height="64" rx="8" class="d-block-muted"/><text x="468" y="87" text-anchor="middle" class="d-bold">Finalize</text>
+      <rect x="548" y="50" width="112" height="64" rx="8" class="d-block-muted"/><text x="604" y="87" text-anchor="middle" class="d-bold">Score</text>
+      <rect x="684" y="50" width="112" height="64" rx="8" class="d-block-muted"/><text x="740" y="87" text-anchor="middle" class="d-bold">Emit trace</text>
+      <path d="M116,82 L140,82" class="d-arrow" marker-end="url(#f2-arr)"/><path d="M252,82 L276,82" class="d-arrow" marker-end="url(#f2-arr)"/><path d="M388,82 L412,82" class="d-arrow" marker-end="url(#f2-arr)"/><path d="M524,82 L548,82" class="d-arrow" marker-end="url(#f2-arr)"/><path d="M660,82 L684,82" class="d-arrow" marker-end="url(#f2-arr)"/>
+      <text x="60" y="134" text-anchor="middle" class="d-mono d-small">TaskData</text>
+      <text x="196" y="134" text-anchor="middle" class="d-mono d-small">image + files</text>
+      <text x="332" y="134" text-anchor="middle" class="d-mono d-small">turns, tools</text>
+      <text x="468" y="134" text-anchor="middle" class="d-mono d-small">saved state</text>
+      <text x="604" y="134" text-anchor="middle" class="d-mono d-small">rewards</text>
+      <text x="740" y="134" text-anchor="middle" class="d-mono d-small">tokens + r</text>
+      <rect x="140" y="152" width="520" height="30" rx="6" class="d-panel d-dashed"/>
+      <text x="400" y="172" text-anchor="middle" class="d-small d-text-light">sandbox state: files, database rows, processes (exists from setup to scoring)</text>
+      <rect x="4" y="204" width="792" height="112" rx="10" class="d-surface"/>
+      <g data-step="1-1"><rect x="4" y="50" width="112" height="64" rx="8" class="d-hl"/><text x="60" y="87" text-anchor="middle" class="d-bold">Load task</text>
+        <text x="20" y="244" class="d-bold">TaskData: prompt, reference answer, artifacts, limits</text><text x="20" y="270" class="d-small d-text-light">from a dataset or an (optionally infinite) generator</text></g>
+      <g data-step="2-2"><rect x="140" y="50" width="112" height="64" rx="8" class="d-hl"/><text x="196" y="87" text-anchor="middle" class="d-bold">Setup</text>
+        <text x="20" y="244" class="d-bold">Task setup: files, repositories, services in the sandbox</text><text x="20" y="270" class="d-small d-text-light">the harness is installed in the same runtime</text></g>
+      <g data-step="3-3"><rect x="276" y="50" width="112" height="64" rx="8" class="d-hl"/><text x="332" y="87" text-anchor="middle" class="d-bold">Agent loop</text>
+        <text x="20" y="244" class="d-bold">Model and tools run until done or a stop condition</text><text x="20" y="270" class="d-small d-text-light">model traffic passes an interception server that records the trace</text></g>
+      <g data-step="4-4"><rect x="412" y="50" width="112" height="64" rx="8" class="d-hl"/><text x="468" y="87" text-anchor="middle" class="d-bold">Finalize</text>
+        <text x="20" y="244" class="d-bold">Capture state before grading mutates it</text><text x="20" y="270" class="d-small d-text-light">example: save the agent's git diff before test files are checked out</text></g>
+      <g data-step="5-5"><rect x="548" y="50" width="112" height="64" rx="8" class="d-hl"/><text x="604" y="87" text-anchor="middle" class="d-bold">Score</text>
+        <text x="20" y="244" class="d-bold">Metrics, then weighted rewards, then judges</text><text x="20" y="270" class="d-small d-text-light">a failing judge raises an error; it does not score 0</text></g>
+      <g data-step="6-6"><rect x="684" y="50" width="112" height="64" rx="8" class="d-hl"/><text x="740" y="87" text-anchor="middle" class="d-bold">Emit trace</text>
+        <text x="20" y="244" class="d-bold">Trace to the trainer: messages, rewards, exact token ids</text><text x="20" y="270" class="d-small d-text-light">token ids are captured where the model is called</text></g>
+    </svg>
+    <figcaption><b>Figure 2.</b> The rollout lifecycle. Stage 1 follows the verifiers taskset loader and stages 2 to 5 its documented lifecycle (task setup, harness setup, agent execution, finalize, scoring)<a class="cite" href="#ref-4">4</a>; stage 6 follows NeMo Gym's release notes on token-level trajectory capture<a class="cite" href="#ref-8">8</a> and OpenEnv's Harbor integration, which "captures the exact tokens for RL"<a class="cite" href="#ref-9">9</a>.</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><b>Load the task.</b> The taskset yields tasks from a dataset or generator; the client ships each <code>TaskData</code> to the worker that runs it. A generator can declare itself infinite, and every run must then bound it<a class="cite" href="#ref-4">4</a>.</li>
+    <li><b>Set up.</b> Task <code>setup</code> prepares files, repositories or services in the sandbox, and the harness is installed in the same runtime<a class="cite" href="#ref-4">4</a>. Harbor builds the image from <code>environment/Dockerfile</code>, allowing 600 s in its tutorial example<a class="cite" href="#ref-10">10</a>.</li>
+    <li><b>Run the agent loop.</b> The model and tools run until completion or a stop condition. verifiers routes model traffic through an interception server that builds traces live, which "prevents agents tampering with their own traces", and can run stop hooks that rewrite tool responses "for example, to block reward hacks"<a class="cite" href="#ref-4">4</a>.</li>
+    <li><b>Finalize.</b> <code>finalize</code> "captures any outputs or state needed for scoring and inspection before tests mutate the workspace"; for software tasks it saves the agent's git diff first. A run stopped mid-turn has its harness closed before grading, so the agent cannot edit during it<a class="cite" href="#ref-4">4</a>.</li>
+    <li><b>Score.</b> Metrics run first and affect nothing; rewards sum as score x weight (weight 0 logs a signal without training on it); judges run last. If a judge fails, the documentation says to raise "instead of returning 0.0, which would record an infrastructure failure as a wrong answer by the model"<a class="cite" href="#ref-4">4</a>.</li>
+    <li><b>Emit the trace.</b> The trainer receives messages, rewards, metrics and exact token ids captured at the model call, not re-tokenized from text. NeMo Gym v0.6.0 describes preserving "exact token IDs across multi-step runs" with external harnesses, and v0.7.0 adds durable worker-side capture for vLLM and Megatron<a class="cite" href="#ref-8">8</a>. What the loss does with them is Module 18.</li>
+  </ol>
+</div>
+
+<h3 id="anatomy-harbor">2.3 A concrete spec: the Harbor task directory</h3>
+<p>The cleanest statement of what a terminal-style task must contain is Harbor's tutorial, the format GLM-5's terminal environments use (Section 6.3). A task is a directory:</p>
+<pre class="code" data-lang="plaintext" data-title="ssh-key-pair/ (Harbor tutorial layout)" data-nohl><code>ssh-key-pair/
+|-- instruction.md          what the agent receives
+|-- task.toml               metadata; [verifier] timeout_sec = 120.0, [agent] timeout_sec = 120.0,
+|                           [environment] build_timeout_sec = 600.0
+|-- environment/Dockerfile  the container the agent works in
+|-- solution/solve.sh       reference solution, run by the "oracle" agent
+`-- tests/
+    |-- test.sh             verifier entry point; must write /logs/verifier/reward.txt
+    `-- test_outputs.py     pytest checks run by test.sh</code></pre>
+<p>The tutorial's <code>test.sh</code> writes <code>1</code> to the reward file if pytest exits 0 and <code>0</code> otherwise; for "multi-criterion verifiers, weighted scoring, or LLM-as-a-judge rubrics" it points to a separate library, RewardKit<a class="cite" href="#ref-10">10</a>. The validity check is built in: <code>harbor run -p ssh-key-pair -a oracle</code> executes <code>solve.sh</code> and a reward of 1 is the pass condition<a class="cite" href="#ref-10">10</a>. A task whose reference solution does not score 1 is broken whatever a policy later does with it; every pipeline in Section 6 contains this check under another name.</p>
+
+<h3 id="anatomy-census">2.4 A census of one catalogue</h3>
+<p>The NeMo Gym README's environment table is the largest public list of RL environments among the sources. As of the README fetched on 2026-10-27 it has 226 rows under 152 distinct names; repeated names are variants (Reasoning Gym appears nine times, the SWE-bench agent seven, single-step tool use seven) (my count; Figure 3). Agentic, coding and knowledge rows dominate, and 202 of the 226 rows show "-" in the Dataset column, which the README defines as data "not publicly released yet" or "procedurally generated using a provided script"<a class="cite" href="#ref-8">8</a>. The environment code is public and most of the environment data is not (derived: 24 rows link a public dataset). The README's "battle-tested in production Nemotron training" is a vendor claim; Nemotron 3 Ultra's report says it open-sources recipes, data and RL environments with the checkpoints<a class="cite" href="#ref-11">11</a>. The Nemotron repository README (fetched 2026-10-27) is narrower: its Ultra recipe "covers Pretrain → SFT", trains "exclusively on the open-sourced subset of training data", and states "Results will differ from the tech report benchmarks, which used additional proprietary data"<a class="cite" href="#ref-12">12</a>. RL environments may sit in the NeMo Gym or NeMo RL repositories; I inspected neither beyond the NeMo Gym README (Module 32).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f3t"><title id="f3t">Rows of the NeMo Gym environment table by domain label: agent 45, knowledge 36, coding 33, blank 28, math 25, other 23, instruction following 16, rlhf 7, games 6, safety 5, long context 1, e2e 1</title>
+    <line x1="170" y1="14" x2="170" y2="372" class="d-axis"/>
+    <line x1="170" y1="372" x2="740" y2="372" class="d-axis"/>
+    <line x1="290" y1="14" x2="290" y2="372" class="d-grid"/><line x1="410" y1="14" x2="410" y2="372" class="d-grid"/><line x1="530" y1="14" x2="530" y2="372" class="d-grid"/><line x1="650" y1="14" x2="650" y2="372" class="d-grid"/>
+    <text x="170" y="390" text-anchor="middle" class="d-small d-text-light">0</text><text x="290" y="390" text-anchor="middle" class="d-small d-text-light">10</text><text x="410" y="390" text-anchor="middle" class="d-small d-text-light">20</text><text x="530" y="390" text-anchor="middle" class="d-small d-text-light">30</text><text x="650" y="390" text-anchor="middle" class="d-small d-text-light">40</text>
+    <text x="740" y="390" text-anchor="end" class="d-small d-text-light">rows in the table</text>
+    <text x="160" y="35" text-anchor="end" class="d-small">agent</text><rect x="170" y="20" width="540" height="22" class="d-fill-blue"/><text x="716" y="36" class="d-mono d-small">45</text>
+    <text x="160" y="65" text-anchor="end" class="d-small">knowledge</text><rect x="170" y="50" width="432" height="22" class="d-fill-blue"/><text x="608" y="66" class="d-mono d-small">36</text>
+    <text x="160" y="95" text-anchor="end" class="d-small">coding</text><rect x="170" y="80" width="396" height="22" class="d-fill-blue"/><text x="572" y="96" class="d-mono d-small">33</text>
+    <text x="160" y="125" text-anchor="end" class="d-small">(domain blank)</text><rect x="170" y="110" width="336" height="22" class="d-fill-orange"/><text x="512" y="126" class="d-mono d-small">28</text>
+    <text x="160" y="155" text-anchor="end" class="d-small">math</text><rect x="170" y="140" width="300" height="22" class="d-fill-blue"/><text x="476" y="156" class="d-mono d-small">25</text>
+    <text x="160" y="185" text-anchor="end" class="d-small">other</text><rect x="170" y="170" width="276" height="22" class="d-fill-blue"/><text x="452" y="186" class="d-mono d-small">23</text>
+    <text x="160" y="215" text-anchor="end" class="d-small">instruction_following</text><rect x="170" y="200" width="192" height="22" class="d-fill-blue"/><text x="368" y="216" class="d-mono d-small">16</text>
+    <text x="160" y="245" text-anchor="end" class="d-small">rlhf</text><rect x="170" y="230" width="84" height="22" class="d-fill-blue"/><text x="260" y="246" class="d-mono d-small">7</text>
+    <text x="160" y="275" text-anchor="end" class="d-small">games</text><rect x="170" y="260" width="72" height="22" class="d-fill-blue"/><text x="248" y="276" class="d-mono d-small">6</text>
+    <text x="160" y="305" text-anchor="end" class="d-small">safety</text><rect x="170" y="290" width="60" height="22" class="d-fill-blue"/><text x="236" y="306" class="d-mono d-small">5</text>
+    <text x="160" y="335" text-anchor="end" class="d-small">long_context</text><rect x="170" y="320" width="12" height="22" class="d-fill-blue"/><text x="188" y="336" class="d-mono d-small">1</text>
+    <text x="160" y="365" text-anchor="end" class="d-small">e2e</text><rect x="170" y="350" width="12" height="22" class="d-fill-blue"/><text x="188" y="366" class="d-mono d-small">1</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Rows of the NeMo Gym README environment table by Domain label, 226 in total (my count, README fetched 2026-10-27)<a class="cite" href="#ref-8">8</a>. The orange bar is rows with no label; their names (SWE-Gym, SWE-rebench, R2E-Gym and variants) suggest software engineering. A row is a configuration, not a distinct environment: there are 152 distinct names.</figcaption>
+</figure>
+
+<h2 id="harness">3. The harness: who owns the loop</h2>
+
+<h3 id="harness-ownership">3.1 White-box loops and loop-owning harnesses</h3>
+<p>The harness is the program between the model and the sandbox: it renders the prompt, parses tool calls, runs them and decides what stays in context. OpenEnv's README names two ways to put one in a training run. In "environments as tools (white-box)" the trainer runs the multi-turn loop and the environment supplies tools and reward. In "real agent harnesses (loop-owning)" the agent runs its own loop and the integration "captures every model call as a framework-neutral <code>TrainingTrace</code>"<a class="cite" href="#ref-9">9</a>. TRL's guide draws the same line, calling its <code>environment_factory</code> path white-box and keeping <code>rollout_func</code> for external agent servers that own the loop<a class="cite" href="#ref-2">2</a>. Kimi K2.5 has built-in white-box environments and black-box ones "that can only run under standard LLM API protocol"<a class="cite" href="#ref-13">13</a> (Appendix D).</p>
+<p>The black-box case needs more than text: the trainer needs the exact token ids the model sampled (Module 18 covers why). Five systems solve it at the model boundary rather than inside the harness (Table 3); three of them describe the device as a proxy or gateway that speaks the harness's native API and records tokens in passing. verifiers' interception server forwards "using the API surface that the harness expects, such as OpenAI Responses for Codex or Anthropic Messages for Claude Code"<a class="cite" href="#ref-4">4</a>; NeMo Gym lists Claude Code and Codex against a model server's <code>/v1/messages</code> and <code>/v1/responses</code><a class="cite" href="#ref-8">8</a>; K2.5's LLM Gateway "keeps detailed records of rollout requests and responses"<a class="cite" href="#ref-13">13</a>; GLM-5's TITO gateway "intercepts all generation requests from rollout tasks and records each trajectory's token IDs and metadata"<a class="cite" href="#ref-14">14</a> (§4.1.2). System Design Modules 27 and 37 cover the harness, sandbox and serving engineering.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 3.</b> How each system lets a harness it does not control feed a trainer, from each source's own text; the sources do not benchmark these against one another.</caption>
+  <thead><tr><th>System</th><th>Trainer-run loop</th><th>Harness-run loop</th><th>Where tokens are recorded</th></tr></thead>
+  <tbody>
+    <tr><td class="row">OpenEnv + TRL<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-2">2</a></td><td><code>environment_factory</code></td><td>Harbor integration: Claude Code, Codex, OpenCode</td><td><code>TrainingTrace</code> per model call</td></tr>
+    <tr><td class="row">verifiers<a class="cite" href="#ref-4">4</a></td><td>harness in the runtime</td><td>any harness with a provider API</td><td>interception server, live traces</td></tr>
+    <tr><td class="row">NeMo Gym<a class="cite" href="#ref-8">8</a></td><td>in-tree agents (OpenHands, LangGraph)</td><td>Claude Code, Codex via <code>/v1/messages</code>, <code>/v1/responses</code></td><td>exact token ids (v0.6.0); worker-side capture (v0.7.0)</td></tr>
+    <tr><td class="row">Kimi K2.5<a class="cite" href="#ref-13">13</a></td><td>built-in white-box environments</td><td>black-box via LLM Gateway</td><td>gateway logs; token-in-token-out</td></tr>
+    <tr><td class="row">GLM-5<a class="cite" href="#ref-14">14</a></td><td>rollout logic in the framework</td><td>external agent frameworks</td><td>TITO gateway, per trajectory</td></tr>
+  </tbody>
+</table>
+
+<h3 id="harness-diversity">3.2 Harness diversity as a training-data property</h3>
+<p>Two reports treat the harness as something to vary. Kimi K3: "training with a single fixed agent harness can cause a model to overfit to a particular tool schema, system prompt, context management mechanism, or interaction protocol". Its white-box environment represents a harness as "a collection of configurable, composable modules" (tools, system prompts, context strategies, skills, memories, subagents), instantiates Kimi Code, Claude Code, Codex, OpenClaw and Hermes "as well as entirely new ones", and varies configurations by task group<a class="cite" href="#ref-15">15</a> (§4.2.1); web-development tasks use "diverse agent scaffolds rather than a single fixed harness"<a class="cite" href="#ref-15">15</a> (§4.2.7). Nemotron 3 Ultra sorts its tasks into five verticals and trains each under at least two of six harness families (Stirrup, OpenHands, OpenCode, Terminus, Droid, internal), "reducing overfitting to any particular harness design"<a class="cite" href="#ref-11">11</a> (§3.2, Appendix A.2). NeMo Gym shows the mechanism in configuration: the same Reasoning Gym tasks pair with Claude Code, Codex, and LangGraph orchestrator, parallel-thinking, reflection and ReWOO agents<a class="cite" href="#ref-8">8</a>. With the harness a config axis, diversity costs a YAML file instead of a new environment.</p>
+<p>The harness changes the task itself. DeepSeek-V3.2 keeps historical reasoning when only tool outputs are appended and discards it when a new user message arrives; frameworks that simulate tool results as user messages, such as Roo Code or Terminus, "may not fully benefit", so the report recommends non-thinking mode for them<a class="cite" href="#ref-16">16</a> (§3.2.1). One model under two context policies solves two different sequential problems, which argues for diversity and for pinning harness versions in reports. Neither K3 nor Nemotron states a harness version in the sections read.</p>
+
+<h3 id="harness-pivot">3.3 Environments that are not interactive</h3>
+<p>Not every agent environment runs a sandbox end to end. NeMo Gym's "PivotRL" verifiers score one proposed tool call against a demonstrated action: a single-step search verifier requires queries to match a golden word bag exactly, applies list-F1 guardrails, and scores a response with more than one tool call as 0, aiming at "eliminating partial-credit reward hacking"<a class="cite" href="#ref-8">8</a>. Nemotron 3 Ultra reports "single-turn rollouts, similar to PivotRL" for most agentic tasks in its distillation stage<a class="cite" href="#ref-11">11</a> (§3.3; Module 18 gives its reason). The trade is in the catalogue's own phrase, "behavior cloning per step": no sandbox cost or long-horizon credit assignment, but the target becomes matching a demonstration<a class="cite" href="#ref-8">8</a>.</p>
+
+<h2 id="verifier-reward">4. The verifier reads state, and the reward has a shape</h2>
+<p>Module 10 covers how to build a verifier for an answer string, a test suite or a constraint, and Module 16 covers judges. This section covers what is specific to an environment that has state: what the verifier is allowed to read, which reward shapes the shipped environments use, what shaping theory says about dense rewards, and the gates reports build into verifiers.</p>
+
+<h3 id="verifier-reward-state">4.1 Grade the state, not the transcript</h3>
+<p>τ-bench is the cleanest worked example of a state-based reward. Each task has a hidden annotation of the ground-truth database writes; the simulated user's instruction is written so "only one possible outcome" exists under the domain policy; and the reward is a product of two binary checks, \(r=r_{\text{action}}\times r_{\text{output}}\in\{0,1\}\): the final database must equal the unique ground-truth database, and the agent's replies must contain the required strings. Dialogue and read-only calls can vary freely<a class="cite" href="#ref-3">3</a>. The paper's example succeeds if the only write is one specific <code>return_delivered_order_items</code> call and the messages contain "54.04" and "41.64". The benchmark has 115 retail tasks (500 users, 50 products, 1,000 orders) and 50 airline tasks (500 users, 300 flights, 2,000 reservations)<a class="cite" href="#ref-3">3</a> (Table 1). The authors flag the residual false positive: \(r=1\) "might be a necessary but not sufficient condition", since the agent could issue the return without explicit user confirmation<a class="cite" href="#ref-3">3</a>. Reading state removes transcript ambiguity and leaves the policy-compliance gap.</p>
+<p>Kimi K3's Autonomous Execution Tasks state the principle in one line: "rewards are grounded in the verifier's evaluation of the final environment state rather than the agent's self-reported completion"<a class="cite" href="#ref-15">15</a> (§4.2.6). TRL's reward-design tips say the same in practice: "check the final state, not the path", so the model is free to discover its own strategies<a class="cite" href="#ref-2">2</a>.</p>
+
+<h3 id="verifier-reward-shapes">4.2 A catalogue of reward shapes</h3>
+<p>Module 10 (Section 3.4) reads NeMo Gym's Bird SQL, Spider2, Blackjack, GUI-coordinate and single-step tool-use verifiers. Table 4 adds the other shapes that appear in the shipped environments and the reports, and Figure 4 draws the shape classes. The plots are schematics: where a source states only the shape in words, I draw that shape and say so.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 440" role="img" aria-labelledby="f4t"><title id="f4t">Six reward shapes as small plots: ternary, binary equality, quadratic distance, gated then performance-scaled, milestone with a veto, and dense per-step sum</title>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="6" y="6" width="256" height="206" rx="8" class="d-panel"/>
+    <rect x="272" y="6" width="256" height="206" rx="8" class="d-panel"/>
+    <rect x="538" y="6" width="256" height="206" rx="8" class="d-panel"/>
+    <rect x="6" y="222" width="256" height="206" rx="8" class="d-panel"/>
+    <rect x="272" y="222" width="256" height="206" rx="8" class="d-panel"/>
+    <rect x="538" y="222" width="256" height="206" rx="8" class="d-panel"/>
+    <text x="134" y="28" text-anchor="middle" class="d-bold">Sparse ternary</text>
+    <line x1="40" y1="120" x2="240" y2="120" class="d-axis"/>
+    <rect x="62" y="120" width="34" height="50" class="d-fill-red"/><rect x="118" y="118" width="34" height="2" class="d-fill-amber"/><rect x="174" y="60" width="34" height="60" class="d-fill-green"/>
+    <text x="79" y="186" text-anchor="middle" class="d-small">loss</text><text x="135" y="186" text-anchor="middle" class="d-small">draw</text><text x="191" y="186" text-anchor="middle" class="d-small">win</text>
+    <text x="79" y="112" text-anchor="middle" class="d-mono d-small">-1</text><text x="135" y="112" text-anchor="middle" class="d-mono d-small">0</text><text x="191" y="52" text-anchor="middle" class="d-mono d-small">+1</text>
+    <text x="134" y="204" text-anchor="middle" class="d-small d-text-light">Blackjack</text>
+    <text x="400" y="28" text-anchor="middle" class="d-bold">Binary equality</text>
+    <line x1="306" y1="150" x2="500" y2="150" class="d-axis"/>
+    <rect x="330" y="148" width="40" height="2" class="d-fill-red"/><rect x="430" y="70" width="40" height="80" class="d-fill-green"/>
+    <text x="350" y="170" text-anchor="middle" class="d-small">differ</text><text x="450" y="170" text-anchor="middle" class="d-small">equal</text>
+    <text x="350" y="140" text-anchor="middle" class="d-mono d-small">0</text><text x="450" y="62" text-anchor="middle" class="d-mono d-small">1</text>
+    <text x="400" y="204" text-anchor="middle" class="d-small d-text-light">Bird SQL result sets</text>
+    <text x="666" y="28" text-anchor="middle" class="d-bold">Quadratic distance</text>
+    <line x1="580" y1="160" x2="760" y2="160" class="d-axis"/><line x1="580" y1="160" x2="580" y2="50" class="d-axis"/>
+    <polyline points="580,60 600,60.5 620,62 640,64.6 660,68.4 680,73.4 700,79.6 720,87 740,95.4 760,105" class="d-line d-stroke-blue"/>
+    <text x="572" y="64" text-anchor="end" class="d-mono d-small">1</text><text x="570" y="164" text-anchor="end" class="d-mono d-small">0</text>
+    <text x="670" y="184" text-anchor="middle" class="d-small d-text-light">distance to target</text>
+    <text x="666" y="204" text-anchor="middle" class="d-small d-text-light">GUI grounding (shape only)</text>
+    <text x="134" y="244" text-anchor="middle" class="d-bold">Gate, then scale</text>
+    <line x1="30" y1="380" x2="244" y2="380" class="d-axis"/><line x1="30" y1="380" x2="30" y2="270" class="d-axis"/>
+    <line x1="30" y1="325" x2="244" y2="325" class="d-grid"/>
+    <rect x="34" y="378" width="40" height="2" class="d-fill-red"/>
+    <polyline points="110,325 150,305 190,285 230,272" class="d-line d-stroke-green"/>
+    <text x="94" y="352" text-anchor="middle" class="d-bold">?</text>
+    <circle cx="110" cy="325" r="5" class="d-fill-orange"/>
+    <text x="22" y="272" text-anchor="end" class="d-mono d-small">1</text><text x="22" y="329" text-anchor="end" class="d-mono d-small">0.5</text><text x="22" y="384" text-anchor="end" class="d-mono d-small">0</text>
+    <text x="54" y="398" text-anchor="middle" class="d-small">wrong</text><text x="110" y="398" text-anchor="middle" class="d-small">expert</text><text x="226" y="398" text-anchor="middle" class="d-small">roofline</text>
+    <text x="134" y="420" text-anchor="middle" class="d-small d-text-light">K3 kernels (schematic)</text>
+    <text x="400" y="244" text-anchor="middle" class="d-bold">Milestones with veto</text>
+    <line x1="296" y1="380" x2="508" y2="380" class="d-axis"/><line x1="296" y1="380" x2="296" y2="270" class="d-axis"/>
+    <polyline points="296,380 330,364 370,352 410,330 450,308 490,276" class="d-line d-stroke-blue"/>
+    <circle cx="410" cy="380" r="5" class="d-fill-red"/>
+    <text x="410" y="372" text-anchor="middle" class="d-small">minefield: 0</text>
+    <text x="288" y="274" text-anchor="end" class="d-mono d-small">1</text><text x="288" y="384" text-anchor="end" class="d-mono d-small">0</text>
+    <text x="400" y="398" text-anchor="middle" class="d-small">milestones reached</text>
+    <text x="400" y="420" text-anchor="middle" class="d-small d-text-light">ToolSandbox (schematic)</text>
+    <text x="666" y="244" text-anchor="middle" class="d-bold">Dense, summed</text>
+    <line x1="560" y1="380" x2="775" y2="380" class="d-axis"/>
+    <rect x="570" y="330" width="22" height="50" class="d-fill-blue"/><rect x="600" y="345" width="22" height="35" class="d-fill-blue"/><rect x="630" y="318" width="22" height="62" class="d-fill-blue"/><rect x="660" y="352" width="22" height="28" class="d-fill-blue"/><rect x="690" y="322" width="22" height="58" class="d-fill-blue"/><rect x="720" y="338" width="22" height="42" class="d-fill-blue"/>
+    <text x="666" y="288" text-anchor="middle" class="d-mono d-small">return = sum of step rewards</text>
+    <text x="666" y="398" text-anchor="middle" class="d-small">step 1 ... 6</text>
+    <text x="666" y="420" text-anchor="middle" class="d-small d-text-light">OpenAir congestion (schematic)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Reward shapes in shipped environments. The ternary and binary values are stated in the NeMo Gym README; the quadratic, milestone and per-step panels draw shapes it gives only in words<a class="cite" href="#ref-8">8</a>. In the kernel panel, 0 (error above threshold), 0.5 (expert parity) and "toward 1" (near the hardware roofline) are Kimi K3's; the reward below expert parity is not stated (marked "?") and the slope above it is an assumption<a class="cite" href="#ref-15">15</a> (§4.2.4).</figcaption>
+</figure>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 4.</b> Reward shapes used by shipped environments and technical reports. "Shape" is my classification of the source's wording.</caption>
+  <thead><tr><th>Environment</th><th>Reward as described</th><th>Shape</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Blackjack<a class="cite" href="#ref-8">8</a></td><td>+1 win, 0 draw, -1 loss or bust</td><td>sparse ternary</td></tr>
+    <tr><td class="row">Bird SQL, Spider2 Lite<a class="cite" href="#ref-8">8</a></td><td>binary, from unordered result-set equality; no LLM judge</td><td>binary on state</td></tr>
+    <tr><td class="row">GUI coordinate<a class="cite" href="#ref-8">8</a></td><td>"smooth quadratic reward based on Euclidean distance"</td><td>smooth, distance-based</td></tr>
+    <tr><td class="row">ToolSandbox<a class="cite" href="#ref-8">8</a></td><td>milestone similarity in [0, 1]; 0 if a minefield is hit</td><td>graded with a veto</td></tr>
+    <tr><td class="row">OpenAir congestion<a class="cite" href="#ref-8">8</a></td><td>dense per-step KPI reward; the agent sums step rewards into the episode return</td><td>dense</td></tr>
+    <tr><td class="row">Long-form MT (LongMT)<a class="cite" href="#ref-8">8</a></td><td>reference-free COMETKiwi score of a document-level translation</td><td>learned metric as verifier</td></tr>
+    <tr><td class="row">Abstention<a class="cite" href="#ref-8">8</a></td><td>three-tier reward with an LLM judge; rewards abstaining over answering wrongly (Module 24)</td><td>tiered</td></tr>
+    <tr><td class="row">τ-bench<a class="cite" href="#ref-3">3</a></td><td>\(r_{\text{action}}\times r_{\text{output}}\in\{0,1\}\): database equals ground truth and replies contain required strings</td><td>product of binary state checks</td></tr>
+    <tr><td class="row">K3 kernel tasks<a class="cite" href="#ref-15">15</a></td><td>0 above a numerical-error threshold; 0.5 at expert performance, rising toward 1 near the hardware roofline; hack penalties</td><td>gated, then performance-scaled</td></tr>
+  </tbody>
+</table>
+
+<h3 id="verifier-reward-shaping">4.3 What shaping theory says about dense rewards</h3>
+<p>Ng, Harada and Russell's 1999 result is why dense rewards draw suspicion. Their Theorem 1 says a shaping reward \(F\) preserves optimal policies, without prior knowledge of the MDP, if and only if it is potential-based, \(F(s,a,s')=\gamma\Phi(s')-\Phi(s)\)<a class="cite" href="#ref-17">17</a> (§3). The paper opens with two bugs from non-potential shaping: a bicycle agent rewarded for moving toward the goal learned to ride in tiny circles, and a soccer robot rewarded for touching the ball learned to stay beside it and "vibrate"<a class="cite" href="#ref-17">17</a> (§1).</p>
+<p>With \(\gamma=1\), the usual setting for LLM episodes (Module 2), a derivation of mine shows what a potential does: the shaping terms telescope,
+$$\sum_{t=0}^{T-1}F(s_t,a_t,s_{t+1})=\Phi(s_T)-\Phi(s_0).$$
+A potential-based dense reward is therefore a function of the final state (up to the constant \(\Phi(s_0)\) for a fixed start) added to the sequence return, and for a group-relative method only the differences of \(\Phi(s_T)\) across the group survive. A safe dense reward carries no more path information than a terminal reward on a final-state score \(\Phi\), so the design question is the choice of \(\Phi\): partial credit by another name. A milestone count credited whenever it is reached is not a potential and can be farmed by revisiting, the cycle argument of the 1999 paper.</p>
+<p>Partial credit on the final output is a different object: another terminal reward, whose maximizer matches the original when the top score is reachable only by a correct output. It changes the ordering among failures, which binary treats as equal. TRL reports that in Wordle and Sudoku "binary rewards (1.0 for success, 0.0 otherwise) gave cleaner training signals than shaped rewards with partial credit", arguing that "GRPO compares completions within a group, so the relative ranking matters more than the absolute values", but gives no numbers<a class="cite" href="#ref-2">2</a>. Module 10 (Section 4) works the group arithmetic.</p>
+
+<h3 id="verifier-reward-gates">4.4 Gates and tamper resistance built into the verifier</h3>
+<p>Module 19 owns the exploit taxonomy; this lists the designs. K3's kernel tasks zero the reward above a numerical-error threshold, score performance against an expert implementation, and run "a hacking-detection system that penalizes reward-hacking strategies such as CUDA graph replay, input caching, and precision reduction", extended "as new hacking strategies are observed"<a class="cite" href="#ref-15">15</a> (§4.2.4). The reward function therefore changed during the run; Gym's versioning rule (Section 1.1) would call that a new environment, and the report does not say how versions were tracked (my reading). K3's Autonomous Execution Tasks isolate agents from verifiers, pair "public verifiers that offer diagnostic feedback with hidden verifiers that evaluate held-out scenarios", and use "penalty-based rewards under limited submission budgets"<a class="cite" href="#ref-15">15</a> (§4.2.6). verifiers offers isolated scoring: artifacts restored into a fresh container, retried up to 2 times by default on retryable errors<a class="cite" href="#ref-4">4</a>. GLM-5's terminal pipeline has a refine agent check that "the environments are robust against potential exploits or shortcuts"<a class="cite" href="#ref-14">14</a> (§4.2.2).</p>
+
+<h2 id="procedural">5. Procedural environments: a generator, a verifier and a difficulty knob</h2>
+
+<h3 id="procedural-design">5.1 An environment as a distribution, not a list</h3>
+<p>Reasoning Gym (Stojanovski et al., NeurIPS 2025 Datasets and Benchmarks) replaces the fixed dataset with a program: "over 100 data generators and verifiers" across algebra, arithmetic, computation, cognition, geometry, graph theory, logic and games, with "the ability to generate virtually infinite training data with adjustable complexity"<a class="cite" href="#ref-18">18</a>. Its principles: every task algorithmically verifiable (P1); large solution spaces, "rewarding generalizable strategies above overfitting and mitigating reward hacking" (P2); and "configurable parameters systematically control problem characteristics, enabling dynamic curricula via precise difficulty adjustment" (P3)<a class="cite" href="#ref-18">18</a> (§2). Parameters come as difficulty (node counts, polynomial degrees, word lengths), structural (dimensionality, constraint types, proof depth) and stylistic (variable names, number formats, framing), the last varying presentation without changing difficulty<a class="cite" href="#ref-18">18</a>. verifiers has the same pattern as a taskset whose <code>load()</code> is a generator with <code>INFINITE = True</code>, which forces every run to bound it<a class="cite" href="#ref-4">4</a>; NeMo Gym wraps Reasoning Gym as a resources server<a class="cite" href="#ref-8">8</a>.</p>
+<p>The environment is thus a distribution \(x\sim\mathcal D(\kappa)\) indexed by a configuration \(\kappa\) that the loop can move while it runs. Module 10 (Section 5) says why that matters: a prompt yields a gradient only when a group mixes successes and failures, so the useful band of \(\kappa\) is where the pass rate is neither near 0 nor near 1.</p>
+
+<h3 id="procedural-cliff">5.2 The cliff and the curriculum</h3>
+<p>Two measurements in the paper locate that band. On hard configurations the zero-shot ranking separates reasoning models (o3-mini 63.5%, DeepSeek-R1 59.5%, Grok 3 Mini 55.1%) from general-purpose ones (Llama 4 Maverick 41.5%, Claude 3.5 Sonnet 40.3%, Gemma 3 27B 20.3%)<a class="cite" href="#ref-18">18</a> (§3). And moving from easy to hard parameter settings produces what the authors call a difficulty cliff: DeepSeek-R1's score falls by 61.8 on code, 29.6 on graphs, 27.9 on algorithms and 11.8 on geometry; o3-mini's by 71.9, 33.8, 25.6 and 33.1<a class="cite" href="#ref-18">18</a> (the paper's Figure 3b, reported as "Δ score (%)").</p>
+<p>The curriculum experiment trains Qwen2.5-3B-Instruct with GRPO under two regimes. The curriculum starts at the easiest level and advances "when performance exceeds 70% over 20 training steps"; the baseline samples uniformly from all levels; both train for one epoch and are evaluated on 50 held-out examples per level<a class="cite" href="#ref-18">18</a> (§5). Figure 5 plots two of the three environments in the paper's Table 5; Table 5 below reproduces all three.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f5t"><title id="f5t">Accuracy by difficulty level for the base model, uniform-sampling GRPO and curriculum GRPO on Spell Backwards and Mini Sudoku</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="170" y="8" width="14" height="12" class="d-block-muted"/><text x="190" y="19" class="d-small">base model</text>
+<rect x="290" y="8" width="14" height="12" class="d-fill-blue"/><text x="310" y="19" class="d-small">uniform sampling</text>
+<rect x="450" y="8" width="14" height="12" class="d-fill-orange"/><text x="470" y="19" class="d-small">curriculum</text>
+<text x="220" y="46" text-anchor="middle" class="d-bold">Spell Backwards</text>
+<line x1="60" y1="256" x2="380" y2="256" class="d-axis"/><line x1="60" y1="256" x2="60" y2="56" class="d-axis"/>
+<line x1="60" y1="206" x2="380" y2="206" class="d-grid"/><text x="54" y="210" text-anchor="end" class="d-small d-text-light">20</text>
+<line x1="60" y1="156" x2="380" y2="156" class="d-grid"/><text x="54" y="160" text-anchor="end" class="d-small d-text-light">40</text>
+<line x1="60" y1="106" x2="380" y2="106" class="d-grid"/><text x="54" y="110" text-anchor="end" class="d-small d-text-light">60</text>
+<line x1="60" y1="56" x2="380" y2="56" class="d-grid"/><text x="54" y="60" text-anchor="end" class="d-small d-text-light">80</text>
+<text x="54" y="260" text-anchor="end" class="d-small d-text-light">0</text>
+<rect x="76" y="226.0" width="20" height="30.0" class="d-block-muted"/>
+<rect x="98" y="181.0" width="20" height="75.0" class="d-fill-blue"/>
+<rect x="120" y="79.3" width="20" height="176.7" class="d-fill-orange"/>
+<text x="130" y="74.3" text-anchor="middle" class="d-mono d-small">70.7</text>
+<text x="108" y="274" text-anchor="middle" class="d-small">4</text>
+<rect x="152" y="247.7" width="20" height="8.3" class="d-block-muted"/>
+<rect x="174" y="229.3" width="20" height="26.7" class="d-fill-blue"/>
+<rect x="196" y="181.0" width="20" height="75.0" class="d-fill-orange"/>
+<text x="206" y="176.0" text-anchor="middle" class="d-mono d-small">30.0</text>
+<text x="184" y="274" text-anchor="middle" class="d-small">6</text>
+<rect x="228" y="254.5" width="20" height="1.5" class="d-block-muted"/>
+<rect x="250" y="253.2" width="20" height="2.8" class="d-fill-blue"/>
+<rect x="272" y="247.6" width="20" height="8.4" class="d-fill-orange"/>
+<text x="282" y="242.6" text-anchor="middle" class="d-mono d-small">3.4</text>
+<text x="260" y="274" text-anchor="middle" class="d-small">8</text>
+<rect x="304" y="254.5" width="20" height="1.5" class="d-block-muted"/>
+<rect x="326" y="254.5" width="20" height="1.5" class="d-fill-blue"/>
+<rect x="348" y="254.5" width="20" height="1.5" class="d-fill-orange"/>
+<text x="358" y="249.5" text-anchor="middle" class="d-mono d-small">0.0</text>
+<text x="336" y="274" text-anchor="middle" class="d-small">10</text>
+<text x="220" y="294" text-anchor="middle" class="d-small d-text-light">word length (letters)</text>
+<text x="600" y="46" text-anchor="middle" class="d-bold">Mini Sudoku</text>
+<line x1="440" y1="256" x2="760" y2="256" class="d-axis"/><line x1="440" y1="256" x2="440" y2="56" class="d-axis"/>
+<line x1="440" y1="206" x2="760" y2="206" class="d-grid"/><text x="434" y="210" text-anchor="end" class="d-small d-text-light">20</text>
+<line x1="440" y1="156" x2="760" y2="156" class="d-grid"/><text x="434" y="160" text-anchor="end" class="d-small d-text-light">40</text>
+<line x1="440" y1="106" x2="760" y2="106" class="d-grid"/><text x="434" y="110" text-anchor="end" class="d-small d-text-light">60</text>
+<line x1="440" y1="56" x2="760" y2="56" class="d-grid"/><text x="434" y="60" text-anchor="end" class="d-small d-text-light">80</text>
+<text x="434" y="260" text-anchor="end" class="d-small d-text-light">0</text>
+<rect x="456" y="253.2" width="20" height="2.8" class="d-block-muted"/>
+<rect x="478" y="121.0" width="20" height="135.0" class="d-fill-blue"/>
+<rect x="500" y="116.0" width="20" height="140.0" class="d-fill-orange"/>
+<text x="510" y="111.0" text-anchor="middle" class="d-mono d-small">56.0</text>
+<text x="488" y="274" text-anchor="middle" class="d-small">4-6</text>
+<rect x="532" y="254.5" width="20" height="1.5" class="d-block-muted"/>
+<rect x="554" y="192.7" width="20" height="63.3" class="d-fill-blue"/>
+<rect x="576" y="186.0" width="20" height="70.0" class="d-fill-orange"/>
+<text x="586" y="181.0" text-anchor="middle" class="d-mono d-small">28.0</text>
+<text x="564" y="274" text-anchor="middle" class="d-small">6-8</text>
+<rect x="608" y="254.5" width="20" height="1.5" class="d-block-muted"/>
+<rect x="630" y="239.3" width="20" height="16.7" class="d-fill-blue"/>
+<rect x="652" y="206.0" width="20" height="50.0" class="d-fill-orange"/>
+<text x="662" y="201.0" text-anchor="middle" class="d-mono d-small">20.0</text>
+<text x="640" y="274" text-anchor="middle" class="d-small">8-10</text>
+<rect x="684" y="254.5" width="20" height="1.5" class="d-block-muted"/>
+<rect x="706" y="253.2" width="20" height="2.8" class="d-fill-blue"/>
+<rect x="728" y="242.7" width="20" height="13.3" class="d-fill-orange"/>
+<text x="738" y="237.7" text-anchor="middle" class="d-mono d-small">5.3</text>
+<text x="716" y="274" text-anchor="middle" class="d-small">10-12</text>
+<text x="600" y="294" text-anchor="middle" class="d-small d-text-light">empty cells</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Held-out accuracy by difficulty level, Qwen2.5-3B-Instruct, one epoch of GRPO: base model, uniform sampling over levels, and a curriculum that advances at 70% accuracy over 20 steps. Labels give the curriculum value. Data: Reasoning Gym Table 5<a class="cite" href="#ref-18">18</a>. The base model's own collapse with word length (12.0, 3.3, 0.0, 0.0) is the cliff; the curriculum moves accuracy at the easy end and leaves the hardest level where it was.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 5.</b> Reasoning Gym curriculum results, accuracy in % on 50 held-out problems per level (Table 5 of the paper<a class="cite" href="#ref-18">18</a>). The last column is curriculum minus uniform sampling, in percentage points.</caption>
+  <thead><tr><th>Environment (level = …)</th><th>Level</th><th class="num">Base</th><th class="num">Uniform</th><th class="num">Curriculum</th><th class="num">Gain (pp)</th></tr></thead>
+  <tbody>
+    <tr><td class="row" rowspan="4">Spell Backwards (word length)</td><td>4</td><td class="num">12.00</td><td class="num">30.00</td><td class="num">70.67</td><td class="num">+40.67</td></tr>
+    <tr><td>6</td><td class="num">3.33</td><td class="num">10.67</td><td class="num">30.00</td><td class="num">+19.33</td></tr>
+    <tr><td>8</td><td class="num">0.00</td><td class="num">1.13</td><td class="num">3.37</td><td class="num">+2.24</td></tr>
+    <tr><td>10</td><td class="num">0.00</td><td class="num">0.01</td><td class="num">0.01</td><td class="num">+0.00</td></tr>
+    <tr><td class="row" rowspan="4">Mini Sudoku (empty cells)</td><td>4-6</td><td class="num">1.13</td><td class="num">54.00</td><td class="num">56.00</td><td class="num">+2.00</td></tr>
+    <tr><td>6-8</td><td class="num">0.00</td><td class="num">25.33</td><td class="num">28.00</td><td class="num">+2.67</td></tr>
+    <tr><td>8-10</td><td class="num">0.00</td><td class="num">6.67</td><td class="num">20.00</td><td class="num">+13.33</td></tr>
+    <tr><td>10-12</td><td class="num">0.00</td><td class="num">1.13</td><td class="num">5.33</td><td class="num">+4.20</td></tr>
+    <tr><td class="row" rowspan="3">Count Primes (number range)</td><td>100-500</td><td class="num">12.00</td><td class="num">4.00</td><td class="num">30.67</td><td class="num">+26.67</td></tr>
+    <tr><td>100-1000</td><td class="num">3.33</td><td class="num">5.03</td><td class="num">12.67</td><td class="num">+7.64</td></tr>
+    <tr><td>100-5000</td><td class="num">1.33</td><td class="num">0.00</td><td class="num">3.03</td><td class="num">+3.03</td></tr>
+  </tbody>
+</table>
+
+<p>Three things follow. The gain is largest where the base model is mid-range and vanishes at the cliff: Spell Backwards at length 10 is 0.01% under both regimes, so one epoch of curriculum does not cross it. The curves show the authors' mechanism: "increases in difficulty level are followed by a sharp drop in reward", and in Count Primes the curriculum model "never advanced past the initial level" yet beat uniform sampling at every level<a class="cite" href="#ref-18">18</a> (the paper's §5 and its Figure 6). My reading, consistent with Module 10's zero-variance argument and not stated by the paper, is that uniform sampling spends part of each batch where the pass rate is near zero and groups carry no gradient. The authors also caution that a curriculum's value "may be more limited in environments where progression paths are ambiguous or difficult to formalize"<a class="cite" href="#ref-18">18</a>: a difficulty knob is a property of the domain, and most agentic domains lack one.</p>
+<p>Other results bound the pattern. RLVR on one category transfers within it, and an RG-Math model trained on Qwen2.5-3B-Instruct gains 9.7 on MATH, 7.7 on Big-Bench Hard and 0.5 on GSM8K (the paper's "%"), at "approximately 1500 A6000 hours" for all experiments<a class="cite" href="#ref-18">18</a>. The authors list limits: knowledge- or creativity-heavy domains resist generators; verification functions "may not capture all aspects of solution quality"; and the library "focuses on single-turn, text-based reasoning"<a class="cite" href="#ref-18">18</a> (§7). Module 20 covers how to read transfer claims.</p>
+
+<h2 id="construction">6. Building environments at scale</h2>
+<p>Environment construction is the least documented part of the stack in the comparative sense: every report describes its pipeline, almost none ablates it, and the numbers that exist are scale counts rather than quality measurements. Table 6 collects each pipeline's source, validity gate and difficulty filter; the text reads them in order of how much each discloses.</p>
+
+<h3 id="construction-funnel">6.1 The funnel, priced</h3>
+<p>SWE-bench fixed the template for turning repositories into verifiable tasks. It keeps merged pull requests that resolve an issue and edit test files, runs the PR's tests before and after its other changes, and keeps an instance only if at least one test flips from fail to pass and installation succeeds; it drops tasks whose tests call names first introduced by the solution, since resolving those "may be an impossible task even for human developers"<a class="cite" href="#ref-19">19</a> (§2.1, Appendix A.3). Its Table 10 funnel runs from 93,139 crawled pull requests through 11,407 task instances to 2,294 validated ones: yields of 2.46% and 20.1% (derived). A patch resolves an issue only if it applies and all the task's tests pass<a class="cite" href="#ref-19">19</a> (§2.2).</p>
+<p>SWE-Gym, the first training-oriented version, says why the validated fraction is the scarce part: its 64,689 raw instances over 358 repositories "do not contain executable environments or a guarantee that [their] unit tests are effective", so the authors "semi-manually create executable environments" for 11 repositories<a class="cite" href="#ref-20">20</a> (§3.1). Validation (the gold patch must pass more unit tests than the original code) "required approximately 200 human annotation hours and 10,000 CPU core hours" for 2,438 instances shipped as 6 TB of Docker images: about 4.1 CPU core-hours, 4.9 human-minutes and, if TB means 10<sup>12</sup> bytes, 2.5 GB per instance (derived). Its repositories are disjoint from SWE-bench's to avoid contamination<a class="cite" href="#ref-20">20</a>.</p>
+
+<h3 id="construction-automation">6.2 Replacing the human hours with a setup agent</h3>
+<p>The 2025-2026 reports automate that step. DeepSeek-V3.2 mines "millions" of issue-PR pairs, filters them by heuristics and LLM judgments, and has a V3.2-powered setup agent install packages, resolve dependencies and run tests, with JUnit output so parsing is uniform. The gate is stated precisely: "an environment is deemed successfully built only when applying the gold patch results in a non-zero count of false-to-positive (F2P) test cases … and a zero count of pass-to-fail (P2F) test cases (indicating no regressions)"; the result is "tens of thousands" of environments across languages that include Python, Java, JavaScript, TypeScript, C, C++, Go and PHP<a class="cite" href="#ref-16">16</a> (§3.2.3). GLM-5 uses the RepoLaunch framework and LLM-written log parsers to extract fail-to-pass and pass-to-pass tests, and reports over 10,000 environments across thousands of repositories and nine languages<a class="cite" href="#ref-14">14</a> (§4.2.1). Neither gives a funnel yield, so SWE-bench's 2.46% cannot be compared with the 2026 pipelines.</p>
+
+<h3 id="construction-synthesis">6.3 Environments with no repository to start from</h3>
+<p>Most agentic domains have no pull-request history. Four reports show four ways to manufacture the tuple of environment, task and verifier.</p>
+<p><strong>DeepSeek-V3.2, general agents.</strong> A synthesis agent gets a task category and a sandbox with bash and search, fetches data into a sandbox database, writes task-specific tools as functions, then proposes a simple task with a Python solution function and a Python verification function. The solution may call only the tools or do logic, "and cannot call other functions or directly access the database, ensuring the task can only be solved through the tool interface"; its output must pass the verifier, and the agent edits either until it does. It then raises the difficulty, augmenting the toolset when needed (Figure 6). The target is tasks that are "hard to solve but easy to verify", illustrated by a trip-planning task with a 15-function tool set and a constraint check on the submitted itinerary<a class="cite" href="#ref-16">16</a> (§3.2.3).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f6t"><title id="f6t">DeepSeek-V3.2 general-agent environment synthesis: fetch data, write tools, propose a task with solution and verifier, validate, raise difficulty in a loop, then filter by pass@100 to 1,827 environments and 4,417 tasks</title>
+    <defs><marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="20" y="24" width="220" height="56" rx="8" class="d-block"/><text x="130" y="48" text-anchor="middle" class="d-text-inv d-bold">Category + sandbox</text><text x="130" y="66" text-anchor="middle" class="d-text-inv d-small">bash and search tools</text>
+    <rect x="290" y="24" width="220" height="56" rx="8" class="d-block"/><text x="400" y="48" text-anchor="middle" class="d-text-inv d-bold">Fetch data</text><text x="400" y="66" text-anchor="middle" class="d-text-inv d-small">into a sandbox database</text>
+    <rect x="560" y="24" width="220" height="56" rx="8" class="d-block"/><text x="670" y="48" text-anchor="middle" class="d-text-inv d-bold">Write task tools</text><text x="670" y="66" text-anchor="middle" class="d-text-inv d-small">each tool a function</text>
+    <path d="M240,52 L290,52" class="d-arrow" marker-end="url(#f6-arr)"/><path d="M510,52 L560,52" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <path d="M670,80 L670,112 L130,112 L130,138" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <rect x="20" y="138" width="220" height="62" rx="8" class="d-block-2"/><text x="130" y="162" text-anchor="middle" class="d-text-inv d-bold">Propose task</text><text x="130" y="180" text-anchor="middle" class="d-text-inv d-small">solution fn + verifier fn</text>
+    <rect x="290" y="138" width="220" height="62" rx="8" class="d-hl"/><text x="400" y="162" text-anchor="middle" class="d-bold">Solution passes verifier?</text><text x="400" y="180" text-anchor="middle" class="d-small">solution uses tools only</text>
+    <rect x="560" y="138" width="220" height="62" rx="8" class="d-block-2"/><text x="670" y="162" text-anchor="middle" class="d-text-inv d-bold">Raise difficulty</text><text x="670" y="180" text-anchor="middle" class="d-text-inv d-small">add tools if needed</text>
+    <path d="M240,169 L290,169" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <path d="M510,169 L560,169" class="d-arrow-active" marker-end="url(#f6-arr)"/><text x="535" y="161" text-anchor="middle" class="d-mono d-small">yes</text>
+    <path d="M400,200 L400,218 L170,218 L170,200" class="d-arrow" marker-end="url(#f6-arr)"/><text x="285" y="213" text-anchor="middle" class="d-small">no: edit either function</text>
+    <path d="M670,200 L670,248 L90,248 L90,200" class="d-arrow-active" marker-end="url(#f6-arr)"/><text x="380" y="242" text-anchor="middle" class="d-small">harder task, updated solution and verifier</text>
+    <path d="M90,248 L90,282" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <rect x="20" y="282" width="220" height="62" rx="8" class="d-block-muted"/><text x="130" y="306" text-anchor="middle" class="d-bold">Thousands of tuples</text><text x="130" y="324" text-anchor="middle" class="d-small d-mono">(env, tools, task, verifier)</text>
+    <rect x="290" y="282" width="220" height="62" rx="8" class="d-block-muted"/><text x="400" y="306" text-anchor="middle" class="d-bold">RL with V3.2</text><text x="400" y="324" text-anchor="middle" class="d-small">keep pass@100 &gt; 0</text>
+    <rect x="560" y="282" width="220" height="62" rx="8" class="d-block-accent"/><text x="670" y="306" text-anchor="middle" class="d-text-inv d-bold">1,827 environments</text><text x="670" y="324" text-anchor="middle" class="d-text-inv d-small">4,417 tasks</text>
+    <path d="M240,313 L290,313" class="d-arrow" marker-end="url(#f6-arr)"/><path d="M510,313 L560,313" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <text x="104" y="270" class="d-small d-text-light">when the task is hard enough</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> DeepSeek-V3.2's synthesis of general-agent environments, redrawn from the workflow in §3.2.3 of the report<a class="cite" href="#ref-16">16</a>. The orange path is the difficulty loop; the grey path is the final filter. The report does not say when the loop stops ("iteratively increases the difficulty"), so the stopping rule in the lower left is my gloss.</figcaption>
+</figure>
+
+<p><strong>GLM-5, terminal and search.</strong> Terminal tasks come from two pipelines. From seed tasks, an LLM drafts verifiable tasks, a construction agent writes them in Harbor format, and a refine agent iterates against manual rubrics so images build, tests match the task text and shortcuts fail: "thousands" of environments with "Docker construction accuracy exceeding 90%". From web pages, a coding agent writes a task and runs the Harbor validation script on its own output until it passes; "only tasks that successfully clear this self-verification loop are admitted"<a class="cite" href="#ref-14">14</a> (§4.2.2). Such a loop shows a task is internally consistent, not that it is worth learning from (my reading). Search questions come from a web knowledge graph over more than two million pages, then a three-stage filter: drop a question if a tool-free reasoning model answers it correctly in at least one of eight attempts; drop it if an early-stage agent solves it in a few steps; have a verification agent validate question and answer "bidirectionally", rejecting non-unique answers<a class="cite" href="#ref-14">14</a> (§4.2.3).</p>
+<p><strong>Kimi K3.</strong> Agents grow a hierarchical knowledge graph by web search; sampled nodes drive retrieval of public materials, and a synthesis agent writes tasks of a chosen type. Personal-assistant tasks run in mock Gmail, Notion, Slack and Canvas that "preserve the core semantics of their real-world counterparts", over multiple simulated days with dozens of interdependent events, each with its own rule or LLM criterion; "a single rollout may involve up to thousands of tool calls and millions of context tokens". Autonomous Execution Tasks specify an initial state, a constrained goal, a tool-based action space, budgets and an independent verifier, and show the agent no "reference trajectories or predefined procedures"<a class="cite" href="#ref-15">15</a> (§4.2.2, §4.2.5, §4.2.6).</p>
+<p><strong>Kimi K2: a correction to the source map.</strong> K2's pipeline (3,000+ real MCP tools, 20,000+ synthetic tools evolved from domain hierarchies, thousands of agents, a rubric per task, LLM-simulated users, and a tool simulator "functionally equivalent to a world model" that keeps state) sits in the report's supervised fine-tuning section. It produces demonstrations: an LLM judge keeps only trajectories that meet the rubric, "effectively implement[ing] large-scale rejection sampling", with real sandboxes where "authenticity is crucial"<a class="cite" href="#ref-7">7</a> (§3.1.1). The RL section describes something else: a Gym-like framework, many verifiable tasks, a Kubernetes sandbox service with "over 10,000 concurrent sandbox instances", and a self-critic reward<a class="cite" href="#ref-7">7</a> (§3.2). The report does not say the simulated environments are reused for RL, and this module does not assume it.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 6.</b> Environment construction pipelines as described in their sources. "Not stated" means the sections read do not say; it does not mean the step is absent.</caption>
+  <thead><tr><th>Pipeline</th><th>Source material</th><th>Validity gate</th><th>Difficulty filter</th><th>Reported scale</th></tr></thead>
+  <tbody>
+    <tr><td class="row">SWE-bench<a class="cite" href="#ref-19">19</a></td><td>PRs from 12 Python repositories</td><td>at least one fail-to-pass test; install and runtime succeed</td><td>none (benchmark)</td><td>93,139 to 11,407 to 2,294</td></tr>
+    <tr><td class="row">SWE-Gym<a class="cite" href="#ref-20">20</a></td><td>PRs from 11 Python repositories</td><td>gold patch passes more tests; semi-manual setup</td><td>not stated</td><td>2,438 validated; 64,689 raw</td></tr>
+    <tr><td class="row">V3.2 code agent<a class="cite" href="#ref-16">16</a></td><td>millions of issue-PR pairs</td><td>gold patch gives F2P &gt; 0 and P2F = 0</td><td>not stated</td><td>"tens of thousands" of environments</td></tr>
+    <tr><td class="row">GLM-5 SWE<a class="cite" href="#ref-14">14</a></td><td>issue-PR pairs, RepoLaunch setup</td><td>F2P and P2P tests extracted by LLM-written log parsers</td><td>not stated</td><td>over 10k environments, 9 languages</td></tr>
+    <tr><td class="row">V3.2 general agent<a class="cite" href="#ref-16">16</a></td><td>LLM-written data, tools, task, verifier</td><td>tools-only solution must pass the verifier</td><td>iterated harder; keep pass@100 &gt; 0</td><td>1,827 environments; 4,417 tasks</td></tr>
+    <tr><td class="row">GLM-5 terminal<a class="cite" href="#ref-14">14</a></td><td>seed tasks or web pages, Harbor format</td><td>refine agent, manual rubrics; Harbor validation</td><td>stratified sampling (web route)</td><td>thousands; build accuracy over 90%</td></tr>
+    <tr><td class="row">GLM-5 search<a class="cite" href="#ref-14">14</a></td><td>web knowledge graph, over 2M pages</td><td>bidirectional question-answer verification</td><td>drop if solved by a tool-free model (1 of 8) or an early agent</td><td>not stated</td></tr>
+    <tr><td class="row">Kimi K3<a class="cite" href="#ref-15">15</a></td><td>knowledge graph; mock applications; AET</td><td>independent verifier; per-event criteria</td><td>hidden verifiers on held-out scenarios (AET)</td><td>not stated in the sections read</td></tr>
+    <tr><td class="row">Kimi K2 (SFT data)<a class="cite" href="#ref-7">7</a></td><td>3,000+ MCP tools; 20,000+ synthetic tools</td><td>LLM judge vs per-task rubric; real sandboxes for code</td><td>not stated</td><td>"tens of thousands" of training examples</td></tr>
+  </tbody>
+</table>
+
+<h3 id="construction-filter">6.4 What a pass@100 &gt; 0 filter admits</h3>
+<p>DeepSeek-V3.2 keeps only synthesized tasks with non-zero pass@100 after RL with V3.2<a class="cite" href="#ref-16">16</a>. That is a solvability filter, and its arithmetic is worth doing because it is easy to read as a difficulty filter. Let \(p\) be a task's per-sample success probability. The filter passes the task with probability \(1-(1-p)^{100}\), one half at \(p=1-0.5^{1/100}\approx0.0069\). A group of \(G\) samples gives a gradient only if it contains both outcomes (Module 10, Section 5; Module 11), with probability \(1-p^{G}-(1-p)^{G}\). At \(p=0.0069\) and \(G=16\), the group size Nemotron 3 Ultra uses<a class="cite" href="#ref-11">11</a>, that is 10.5% (derived): a task at the edge of the filter yields a usable group about one time in ten, and the filter says nothing about where learning is fastest.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 280" role="img" aria-labelledby="f7t"><title id="f7t">Probability that a task passes a pass@100 filter, and that a group of 8 or 16 samples contains both outcomes, as a function of per-sample success probability on a log axis</title>
+    <line x1="70" y1="220" x2="710" y2="220" class="d-axis"/><line x1="70" y1="220" x2="70" y2="40" class="d-axis"/>
+    <line x1="70" y1="135" x2="710" y2="135" class="d-grid"/><line x1="70" y1="50" x2="710" y2="50" class="d-grid"/>
+    <line x1="283.3" y1="50" x2="283.3" y2="220" class="d-grid"/><line x1="496.7" y1="50" x2="496.7" y2="220" class="d-grid"/>
+    <text x="62" y="224" text-anchor="end" class="d-small d-text-light">0</text><text x="62" y="139" text-anchor="end" class="d-small d-text-light">0.5</text><text x="62" y="54" text-anchor="end" class="d-small d-text-light">1</text>
+    <text x="70" y="240" text-anchor="middle" class="d-small d-text-light">0.001</text><text x="283" y="240" text-anchor="middle" class="d-small d-text-light">0.01</text><text x="497" y="240" text-anchor="middle" class="d-small d-text-light">0.1</text><text x="710" y="240" text-anchor="middle" class="d-small d-text-light">1</text>
+    <text x="390" y="262" text-anchor="middle" class="d-small d-text-light">per-sample success probability p (log axis)</text>
+    <text x="70" y="30" class="d-small d-text-light">probability</text>
+    <polyline points="70.0,203.8 80.7,201.9 91.3,199.9 102.0,197.6 112.7,195.1 123.3,192.3 134.0,189.2 144.7,185.9 155.3,182.2 166.0,178.2 176.7,173.8 187.3,169.1 198.0,164.1 208.7,158.6 219.3,152.9 230.0,146.7 240.7,140.3 251.3,133.5 262.0,126.6 272.7,119.4 283.3,112.2 294.0,105.0 304.7,97.9 315.3,91.0 326.0,84.4 336.7,78.3 347.3,72.7 358.0,67.7 368.7,63.4 379.3,59.7 390.0,56.8 400.7,54.6 411.3,52.9 422.0,51.8 432.7,51.0 443.3,50.5 454.0,50.3 464.7,50.1 475.3,50.0 710.0,50.0" class="d-line d-stroke-blue"/>
+    <polyline points="70.0,217.3 91.3,216.6 112.7,215.7 134.0,214.7 155.3,213.3 176.7,211.6 198.0,209.5 219.3,206.9 240.7,203.6 262.0,199.6 283.3,194.7 304.7,188.8 326.0,181.7 347.3,173.1 368.7,163.2 390.0,151.7 411.3,138.7 432.7,124.7 454.0,109.9 475.3,95.2 496.7,81.5 518.0,69.7 539.3,60.7 560.7,54.8 582.0,51.7 603.3,50.4 624.7,50.1 646.0,50.0 667.3,50.1 678.0,50.7 688.7,54.3 699.3,76.9 710.0,220.0" class="d-line d-stroke-orange"/>
+    <polyline points="70.0,218.6 91.3,218.3 112.7,217.9 134.0,217.3 155.3,216.6 176.7,215.7 198.0,214.7 219.3,213.3 240.7,211.6 262.0,209.5 283.3,206.9 304.7,203.6 326.0,199.6 347.3,194.7 368.7,188.7 390.0,181.5 411.3,172.8 432.7,162.7 454.0,150.9 475.3,137.7 496.7,123.2 518.0,107.9 539.3,92.7 560.7,78.7 582.0,66.8 603.3,58.1 624.7,53.0 646.0,51.3 667.3,54.3 688.7,76.9 699.3,117.7 710.0,220.0" class="d-line d-stroke-cyan"/>
+    <line x1="249.1" y1="135" x2="249.1" y2="220" class="d-line d-stroke-orange d-dashed"/>
+    <circle cx="249.1" cy="135" r="5" class="d-fill-orange"/><circle cx="249.1" cy="202.2" r="5" class="d-fill-orange"/>
+    <text x="249" y="256" text-anchor="middle" class="d-mono d-small">0.0069</text>
+    <rect x="520" y="112" width="176" height="68" rx="6" class="d-label-bg"/>
+    <line x1="530" y1="128" x2="554" y2="128" class="d-line d-stroke-blue"/><text x="562" y="132" class="d-small">pass@100 at least 1</text>
+    <line x1="530" y1="146" x2="554" y2="146" class="d-line d-stroke-orange"/><text x="562" y="150" class="d-small">group of 16 is mixed</text>
+    <line x1="530" y1="164" x2="554" y2="164" class="d-line d-stroke-cyan"/><text x="562" y="168" class="d-small">group of 8 is mixed</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> Derived curves, not measurements. Blue: probability that a task with per-sample success probability \(p\) passes a pass@100 &gt; 0 filter. Orange and cyan: probability that a group of 16 or 8 samples contains both a success and a failure. At \(p=0.0069\) (dashed line) the filter passes half the tasks and a 16-group is mixed 10.5% of the time. Filter rule from the DeepSeek-V3.2 report<a class="cite" href="#ref-16">16</a>; group size 16 from Nemotron 3 Ultra<a class="cite" href="#ref-11">11</a>.</figcaption>
+</figure>
+
+<div class="calc">
+  <p class="calc-title">What a pass@N filter admits, and what the group sees</p>
+  <div class="calc-row"><label for="c1p">Per-sample success p</label><input type="range" id="c1p" name="p" min="0.001" max="0.2" step="0.001" value="0.007" data-format="fixed:3"></div>
+  <div class="calc-row"><label for="c1n">Filter samples N</label><input type="range" id="c1n" name="N" min="4" max="256" step="4" value="100" data-format="int"></div>
+  <div class="calc-row"><label for="c1g">Group size G</label><input type="range" id="c1g" name="G" min="4" max="64" step="1" value="16" data-format="int"></div>
+  <div class="calc-out">
+    <div>Task passes pass@N &gt; 0<output data-expr="1 - pow(1 - p, N)" data-format="pct"></output></div>
+    <div>Group has both outcomes<output data-expr="1 - pow(p, G) - pow(1 - p, G)" data-format="pct"></output></div>
+    <div>Group is all-fail<output data-expr="pow(1 - p, G)" data-format="pct"></output></div>
+  </div>
+  <p class="calc-note">Formulas: \(1-(1-p)^N\) and \(1-p^G-(1-p)^G\), independent samples, fixed per-task \(p\). N = 100 is the report's value; G = 16 is Nemotron 3 Ultra's<a class="cite" href="#ref-11">11</a>.</p>
+</div>
+
+<p>The arithmetic also shows what the filter catches. A verifier that wrongly rejects correct solutions drives \(p\) to zero and the task is dropped, a useful check. A verifier that wrongly accepts wrong answers raises \(p\) and passes easily, so the filter cannot catch false positives (my reasoning; the report does not discuss it). The check that does is a negative control: run a known-wrong or empty solution and require a reward of 0. None of the formats read here builds that in; R1's code pipeline approximates it by keeping test subsets that expose flaws in known-incorrect submissions (Module 10, Section 3.2).</p>
+
+<h3 id="construction-ablation">6.5 The one environment ablation</h3>
+<p>V3.2's Section 4.3 is the only environment-design ablation in the reports read for this module (K2, K2.5, K3, V3.2, V4, GLM-5, Nemotron 3 Ultra); a search of their texts for "ablat" finds ablations of pre-training, RL infrastructure and distillation, none of environments, harnesses or difficulty filters. For difficulty, it samples 50 general synthesized tasks and evaluates the synthesis model and three frontier models (Table 7). For transfer, it runs RL on the SFT checkpoint using only synthetic general-agent tasks in non-thinking mode, against that SFT model and against V3.2-Exp, trained with RL only on search and code. RL on synthetic data "yields substantial improvements" on τ²-Bench, MCP-Mark and MCP-Universe, whereas "restricting RL to code and search scenarios does not improve performance on these benchmarks"<a class="cite" href="#ref-16">16</a> (§4.3; the report's Figure 5 plots curves, which I do not quote numerically).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 7.</b> Accuracy on 50 randomly sampled synthesized general-agent tasks, pass@K, in %<a class="cite" href="#ref-16">16</a> (Table 5 of the report).</caption>
+  <thead><tr><th>Pass@K</th><th class="num">DeepSeek-V3.2-Exp</th><th class="num">Sonnet-4.5</th><th class="num">Gemini-3.0 Pro</th><th class="num">GPT-5-Thinking</th></tr></thead>
+  <tbody>
+    <tr><td class="row">1</td><td class="num">12</td><td class="num">34</td><td class="num">51</td><td class="num" data-best>62</td></tr>
+    <tr><td class="row">2</td><td class="num">18</td><td class="num">47</td><td class="num">65</td><td class="num" data-best>75</td></tr>
+    <tr><td class="row">4</td><td class="num">26</td><td class="num">62</td><td class="num">74</td><td class="num" data-best>82</td></tr>
+  </tbody>
+</table>
+
+<p>Three limits. The sample is 50 tasks and one run per condition. The comparison arm differs in task content (code and search versus general agent), so the result says synthetic general-agent tasks add something code-and-search RL does not, not that synthetic beats real. And the generalization claim rests on the benchmarks' "environments and toolsets" not having been "encountered during RL training"<a class="cite" href="#ref-16">16</a> (§4.1), an overlap the reader cannot audit without the environment lists. The task mix is also easy to misread: the report's "over 1,800 distinct environments and 85,000 complex prompts" are different populations. Table 1 of the report counts 24,667 code-agent tasks (real environment), 50,275 search-agent tasks (real environment, synthesized prompts), 4,417 general-agent tasks (synthesized environments) and 5,908 code-interpreter tasks (real), summing to 85,267 (derived). The 1,827 synthesized environments carry 5.2% of the tasks, about 2.4 tasks each (derived)<a class="cite" href="#ref-16">16</a>.</p>
+
+<h2 id="trust">7. What to test before an environment feeds a gradient</h2>
+<p>The sources contain no end-to-end environment audit, so this section assembles one from checks that individual reports or libraries document, and says where a check has no documented source. Module 19 owns the exploit taxonomy and Module 20 the measurement questions.</p>
+
+<h3 id="trust-failures">7.1 Failures that are not the model's</h3>
+<p>An agent rollout touches containers, networks, simulated users and judges, and any can fail for reasons unrelated to the policy. GLM-5 is explicit: coding-agent sandboxes "may fail for reasons unrelated to the model (e.g., environment crashes)", and such failures "introduce noisy training signals because they reflect environment instability rather than the model's capability". It records the failure reason per sample, excludes environment failures, and repairs the resulting short GRPO group: "we pad the group by repeating valid samples if the number of valid samples exceeds half of the group size; otherwise, we drop the entire group"<a class="cite" href="#ref-14">14</a> (§4.1.2). verifiers takes the same stance at the scoring layer: let judge failures propagate rather than score 0, and let a rubric judge return a <code>drop</code> verdict (for example <code>rubric: outcome=task_defect</code>) that "records no reward and drops the trace", so it "counts in no reward mean or training batch"<a class="cite" href="#ref-4">4</a>.</p>
+<p>The repair rule has a simple cost curve. If each of \(G\) samples independently fails with probability \(q\), the group is dropped when at most \(G/2\) samples are valid:
+$$P_{\text{drop}}=\sum_{v=0}^{\lfloor G/2\rfloor}\binom{G}{v}(1-q)^{v}q^{G-v}.$$
+With \(G=16\) and \(q=20\%\) (derived), 0.70% of groups are dropped but 96.5% need repair; with \(G=8\) and \(q=30\%\), 19.4% are dropped. Repeated samples carry extra weight in the group statistics, a side effect the report does not discuss (my reading). Independence is also generous: a broken task fails all its samples, so the dropped fraction then equals the fraction of broken tasks, whatever \(G\) is.</p>
+
+<div class="calc">
+  <p class="calc-title">Group survival under environment failures</p>
+  <div class="calc-row"><label for="c2g">Group size G</label><input type="range" id="c2g" name="G" min="2" max="64" step="1" value="16" data-format="int"></div>
+  <div class="calc-row"><label for="c2q">Per-sample failure q</label><input type="range" id="c2q" name="q" min="0" max="0.6" step="0.01" value="0.2" data-format="pct"></div>
+  <div class="calc-out">
+    <div>Group dropped<output data-expr="Array.from({length: floor(G/2) + 1}, function(_, v){ return Array.from({length: v}, function(_, i){ return (G - i) / (i + 1); }).reduce(function(a, b){ return a * b; }, 1) * pow(1 - q, v) * pow(q, G - v); }).reduce(function(a, b){ return a + b; }, 0)" data-format="pct"></output></div>
+    <div>All samples valid<output data-expr="pow(1 - q, G)" data-format="pct"></output></div>
+    <div>Kept after repair<output data-expr="1 - Array.from({length: floor(G/2) + 1}, function(_, v){ return Array.from({length: v}, function(_, i){ return (G - i) / (i + 1); }).reduce(function(a, b){ return a * b; }, 1) * pow(1 - q, v) * pow(q, G - v); }).reduce(function(a, b){ return a + b; }, 0) - pow(1 - q, G)" data-format="pct"></output></div>
+  </div>
+  <p class="calc-note">Rule: keep the group if more than G/2 samples are valid (GLM-5<a class="cite" href="#ref-14">14</a>); formula as above. Independent failures are an assumption.</p>
+</div>
+
+<p>NeMo Gym addresses the same problem from the data side: v0.5.0 added <code>gym eval reverify</code>, which lets you "recompute rewards from stored rollouts without re-running inference", and v0.6.0 added health checks and token, tool-call, turn and latency diagnostics<a class="cite" href="#ref-8">8</a>. Re-scoring stored rollouts makes a verifier fix cheap and answers the versioning problem of Section 4.4.</p>
+
+<h3 id="trust-validity">7.2 Is the task itself valid</h3>
+<p>Validity checks in the sources fall into four kinds. A reference solution must score full reward: Harbor's oracle run<a class="cite" href="#ref-10">10</a>, verifiers' <code>validate()</code> hook for tasks that have "a known reference solution or gold check that can be verified without calling a model"<a class="cite" href="#ref-4">4</a>, and the gold-patch conditions of SWE-bench, SWE-Gym and V3.2<a class="cite" href="#ref-19">19</a><a class="cite" href="#ref-20">20</a><a class="cite" href="#ref-16">16</a>. The answer must be unique and checkable: τ-bench writes instructions that admit one outcome<a class="cite" href="#ref-3">3</a>, and GLM-5's search pipeline rejects non-unique answers<a class="cite" href="#ref-14">14</a>. A capable policy must beat chance: TRL advises that "if a capable model can't score higher than a random baseline, the reward signal may need adjustment"<a class="cite" href="#ref-2">2</a>. And the pass-rate profile must sit in a learnable band, which Nemotron 3 Ultra handles by "reward profiling prior to training" and re-profiling when accuracy saturates<a class="cite" href="#ref-11">11</a> (§3.2, §3.3.2; Module 10 Section 5 covers the filters).</p>
+<p>Environment bugs also reach public benchmarks. GLM-5 reports Terminal-Bench 2.0 on a "verified" version that "resolves some ambiguous instructions" alongside the original<a class="cite" href="#ref-14">14</a>; DeepSeek-V4 "acknowledge[s] the environment-related issues noted by GLM-5.1", reports the original dataset for consistency, and gives approximately 72.0 for V4-Pro on the verified subset<a class="cite" href="#ref-21">21</a> (§5.3.1). If a widely used benchmark needed a verified edition, a training environment built by a synthesis agent and checked by a self-verification loop is unlikely to be cleaner (my inference).</p>
+
+<h3 id="trust-checklist">7.3 The checklist, with sources</h3>
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 8.</b> Checks to run on an environment before training on it, each tied to the source that documents it. A row whose source cell says "none" is my addition.</caption>
+  <thead><tr><th>Check</th><th>What it catches</th><th>Documented in</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Reference solution scores full reward</td><td>broken tasks, missing dependencies</td><td>Harbor oracle<a class="cite" href="#ref-10">10</a>; verifiers <code>validate()</code><a class="cite" href="#ref-4">4</a>; V3.2 F2P and P2F<a class="cite" href="#ref-16">16</a></td></tr>
+    <tr><td class="row">A wrong or empty solution scores zero</td><td>a verifier that is too lenient</td><td>none for environments; R1 test filtering (Module 10)</td></tr>
+    <tr><td class="row">Solvable at least once, not always</td><td>unsolvable and trivial tasks</td><td>V3.2 pass@100 &gt; 0<a class="cite" href="#ref-16">16</a>; GLM-5 search filters<a class="cite" href="#ref-14">14</a>; K2 pass@k band<a class="cite" href="#ref-7">7</a></td></tr>
+    <tr><td class="row">Unique, checkable answer</td><td>ambiguous tasks, multiple valid outcomes</td><td>τ-bench<a class="cite" href="#ref-3">3</a>; GLM-5 bidirectional check<a class="cite" href="#ref-14">14</a></td></tr>
+    <tr><td class="row">A capable model beats random</td><td>sign errors, dead rewards</td><td>TRL<a class="cite" href="#ref-2">2</a></td></tr>
+    <tr><td class="row">Infrastructure failures are excluded, not scored 0</td><td>noise that looks like model error</td><td>GLM-5 rule<a class="cite" href="#ref-14">14</a>; verifiers<a class="cite" href="#ref-4">4</a></td></tr>
+    <tr><td class="row">Truncation and timeout have a stated policy</td><td>length-driven reward noise</td><td>verifiers skip flags<a class="cite" href="#ref-4">4</a>; K2 penalty<a class="cite" href="#ref-7">7</a>; TRL total-length cap<a class="cite" href="#ref-2">2</a></td></tr>
+    <tr><td class="row">The agent cannot reach the verifier</td><td>tampering, answer leakage</td><td>verifiers isolated scoring<a class="cite" href="#ref-4">4</a>; K3 hidden verifiers<a class="cite" href="#ref-15">15</a></td></tr>
+    <tr><td class="row">Reward changes are versioned and rollouts re-scorable</td><td>silent drift of the objective</td><td>Gym versioning rule<a class="cite" href="#ref-5">5</a>; <code>gym eval reverify</code><a class="cite" href="#ref-8">8</a></td></tr>
+    <tr><td class="row">More than one harness per task distribution</td><td>overfitting to one tool schema or context rule</td><td>K3<a class="cite" href="#ref-15">15</a>; Nemotron 3 Ultra<a class="cite" href="#ref-11">11</a></td></tr>
+  </tbody>
+</table>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The source map records no dispute about environment design, and this module's evidence explains why: reports describe their environments without ablating them. The one ablation, DeepSeek-V3.2's Section 4.3, compares synthetic general-agent RL against code-and-search RL and nothing else<a class="cite" href="#ref-16">16</a>. What exists is divergent practice with stated reasons and little head-to-head evidence. Four practices are separated below; whether to train under one harness or several has a stated position for diversity (Section 3.2) and none against, so it appears in the assessment.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Binary rewards on final state</h4>
+    <p class="who">TRL's OpenEnv guide (Wordle and Sudoku experiments)<a class="cite" href="#ref-2">2</a>; NeMo Gym's single-step tool verifier<a class="cite" href="#ref-8">8</a>; τ-bench<a class="cite" href="#ref-3">3</a></p>
+    <p>A group-relative method uses only ranking inside a group, so partial credit adds a hackable target without adding rank information that a final-state check lacks: "binary rewards (1.0 for success, 0.0 otherwise) gave cleaner training signals than shaped rewards with partial credit"<a class="cite" href="#ref-2">2</a>. NeMo Gym's single-step tool verifier demands exact matches and scores a multi-call response 0, with the stated aim of "eliminating partial-credit reward hacking"<a class="cite" href="#ref-8">8</a>.</p>
+    <ul class="pros"><li>Few places to hide a hack; easy to audit and re-score</li><li>Consistent with the shaping theorem: non-potential dense rewards can change the optimal policy<a class="cite" href="#ref-17">17</a></li></ul>
+    <ul class="cons"><li>An all-fail group carries no gradient, so hard tasks stall (Module 10)</li><li>The supporting evidence is a practitioner remark with no numbers<a class="cite" href="#ref-2">2</a></li></ul>
+  </article>
+  <article class="position">
+    <h4>Graded or shaped rewards where progress is meaningful</h4>
+    <p class="who">Kimi K3's kernel and web tasks<a class="cite" href="#ref-15">15</a>; NeMo Gym's distance, milestone and per-step environments<a class="cite" href="#ref-8">8</a>; Ng et al. on safe shaping<a class="cite" href="#ref-17">17</a></p>
+    <p>When the quantity is naturally continuous (speed against a roofline, pixel distance) or full success is rare, a graded reward gives signal that binary does not. K3 gates on correctness first, scales performance second, and adds a hack-detector<a class="cite" href="#ref-15">15</a>. Potential-based shaping is the one form with an optimality guarantee<a class="cite" href="#ref-17">17</a>.</p>
+    <ul class="pros"><li>Ranks failures, so hard tasks still teach</li><li>Matches the true objective where it is continuous</li></ul>
+    <ul class="cons"><li>Partial credit is the classic hack surface: bicycle circles and a vibrating soccer robot<a class="cite" href="#ref-17">17</a>; K3 extended its detector during the run<a class="cite" href="#ref-15">15</a></li><li>No ablation in the sources compares the shapes at matched compute</li></ul>
+  </article>
+  <article class="position">
+    <h4>Real, executable environments first</h4>
+    <p class="who">SWE-Gym<a class="cite" href="#ref-20">20</a>; GLM-5's SWE pipeline<a class="cite" href="#ref-14">14</a>; Kimi K2's hybrid design<a class="cite" href="#ref-7">7</a></p>
+    <p>Real repositories with real tests give "reliable reward signals" that were "largely absent" in software engineering<a class="cite" href="#ref-20">20</a>. K2 acknowledges "the inherent limitation of simulation fidelity" and adds real sandboxes for coding "where authenticity is crucial"<a class="cite" href="#ref-7">7</a>.</p>
+    <ul class="pros"><li>Ground truth from tests the repository's authors wrote</li><li>No simulator to drift from reality</li></ul>
+    <ul class="cons"><li>Needs a repository history; most agentic domains have none</li><li>Environment setup cost: 200 human-hours for 2,438 instances in SWE-Gym<a class="cite" href="#ref-20">20</a>; 2026 reports automate it without publishing yields</li></ul>
+  </article>
+  <article class="position">
+    <h4>Synthetic and simulated environments at scale</h4>
+    <p class="who">DeepSeek-V3.2<a class="cite" href="#ref-16">16</a>; Kimi K3's mock applications<a class="cite" href="#ref-15">15</a>; Kimi K2's tool simulator<a class="cite" href="#ref-7">7</a></p>
+    <p>Where the world cannot be snapshotted, build it: V3.2's synthetic general-agent tasks improved τ²-Bench, MCP-Mark and MCP-Universe where code-and-search RL did not<a class="cite" href="#ref-16">16</a>; K3's mock Gmail, Notion, Slack and Canvas offer "reproducible, large-scale interaction without external APIs or rate limits"<a class="cite" href="#ref-15">15</a>.</p>
+    <ul class="pros"><li>Breadth independent of repositories or live services</li><li>Verifier and state under the builder's control</li></ul>
+    <ul class="cons"><li>Fidelity is unmeasured; self-verification shows consistency, not relevance</li><li>The one ablation is one run on 50 sampled tasks, against a non-matched arm<a class="cite" href="#ref-16">16</a></li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span>
+<p><strong>Reward shape.</strong> Default to a binary reward on final state when a program can read an end state and the pass rate is mid-range. Use a graded reward when the quantity is natively continuous or pass rates are too low for groups to mix, and then do what K3 does: gate on correctness, scale second, and run a hack-detector you expect to extend; make dense per-step credit a potential over state. A matched-compute comparison of binary and partial credit across difficulty bands would settle it; Reasoning Gym has the difficulty knob to run one<a class="cite" href="#ref-18">18</a>, and no source reports it.</p>
+<p><strong>Real versus synthetic.</strong> The positions are complements: use real artifacts where they exist and synthesize where they do not, with the Section 7 checks on both. V3.2 shows synthetic tasks can transfer to unseen benchmarks, not that they match real tasks per unit of compute. A same-budget comparison of real and synthetic tasks in one domain, evaluated on environments in neither, would settle it.</p>
+<p><strong>One harness or several.</strong> K3 and Nemotron 3 Ultra argue for diversity<a class="cite" href="#ref-15">15</a><a class="cite" href="#ref-11">11</a>, and V3.2's context rule shows a harness policy can change what is learned<a class="cite" href="#ref-16">16</a>. No report trains under one harness against several, so the case rests on mechanism (tool schemas and context rules are part of the task), not a measured gap. Training on one harness set and evaluating on a held-out harness would settle it. Until then, Nemotron's hedge is cheap: two or more harnesses per task distribution, at the cost of trace capture for each<a class="cite" href="#ref-11">11</a>.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The interfaces are moving faster than the evidence about them. OpenEnv's README says the project "is in early development, so APIs may still change" and lists a technical committee of twelve organizations<a class="cite" href="#ref-9">9</a>. NeMo Gym shipped five minor releases in about four months, dated 06/04, 07/01, 08/06, 09/03 and 10/06/2026 in the README (read as month/day, consistent with the sequence), a mean gap of 31 days (derived)<a class="cite" href="#ref-8">8</a>. What is quoted here about those two, and about the main-branch documentation of verifiers and TRL, will drift within a quarter.</p>
+<p>Three trends are visible. Interface convergence at the model boundary: five systems capture tokens there, three of them through a proxy or gateway (Table 3). The unit of environment is widening from a task to task plus harness plus runtime, with harness choice a configuration axis<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-15">15</a>. And construction is being automated end to end, with setup agents, refine agents and self-verification loops replacing SWE-Gym's 200 human-hours<a class="cite" href="#ref-20">20</a><a class="cite" href="#ref-14">14</a>, which moves the failure mode from too few environments to too many unaudited ones. Open questions the sources leave: funnel yields for the 2026 pipelines, any ablation of harness diversity, a matched-compute comparison of reward shapes, the fidelity of simulated against real environments, and how reward changes made during a run are versioned.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">official</span>Farama Foundation. <em>Basic Usage</em>. Gymnasium documentation, live docs (no version stamp). <a href="https://gymnasium.farama.org/introduction/basic_usage/">https://gymnasium.farama.org/introduction/basic_usage/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: <code>Env</code> as an MDP class "not a perfect reconstruction", the reset and step return tuples, terminated versus truncated, and the Space types including <code>Text</code>.</span></li>
+  <li id="ref-2"><span class="ref-type">official</span>Hugging Face. <em>OpenEnv Integration for Training LLMs with Environments</em>. TRL documentation, main branch. <a href="https://huggingface.co/docs/trl/openenv">https://huggingface.co/docs/trl/openenv</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the <code>environment_factory</code> contract, tools versus environments, the reward-design tips (binary versus partial credit, check the final state, test the reward), <code>max_completion_length</code> over a whole conversation, server concurrency, white-box versus harness training.</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Yao, S., Shinn, N., Razavi, P., Narasimhan, K. <em>τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains</em>. arXiv:2406.12045v1, 17 Jun 2024. <a href="https://arxiv.org/pdf/2406.12045">https://arxiv.org/pdf/2406.12045</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the POMDP formulation and hidden database state (§2), the reward \(r_{\text{action}}\times r_{\text{output}}\) and its stated limitation, the simulated user, Table 1 statistics.</span></li>
+  <li id="ref-4"><span class="ref-type">repo</span>Prime Intellect. <em>verifiers documentation</em>: <code>docs/architecture.md</code>, <code>docs/tasksets.md</code>, <code>docs/agent.md</code> (main branch, <code>verifiers.v1</code> API, no version pinned). <a href="https://raw.githubusercontent.com/PrimeIntellect-ai/verifiers/main/docs/architecture.md">architecture.md</a>, <a href="https://raw.githubusercontent.com/PrimeIntellect-ai/verifiers/main/docs/tasksets.md">tasksets.md</a>, <a href="https://raw.githubusercontent.com/PrimeIntellect-ai/verifiers/main/docs/agent.md">agent.md</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Taskset, Task and TaskData; the rollout lifecycle; shared versus isolated scoring; the interception server; skip-on-truncated and skip-on-timeout; infinite tasksets; reward weights; <code>validate()</code>; the <code>drop</code> verdict.</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Brockman, G., Cheung, V., Pettersson, L., Schneider, J., Schulman, J., Tang, J., Zaremba, W. <em>OpenAI Gym</em>. arXiv:1606.01540v1, 5 Jun 2016. <a href="https://arxiv.org/pdf/1606.01540">https://arxiv.org/pdf/1606.01540</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the 2016 reset and four-element step interface, "environments, not agents", strict versioning of environments (§3).</span></li>
+  <li id="ref-6"><span class="ref-type">official</span>Farama Foundation. <em>Env</em>. Gymnasium API reference, live docs (no version stamp). <a href="https://gymnasium.farama.org/api/env/">https://gymnasium.farama.org/api/env/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the v0.26 split of <code>done</code> into <code>terminated</code> and <code>truncated</code> and its rationale, <code>reset(seed, options)</code>, the <code>info</code> field, multi-agent pointer to PettingZoo.</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Kimi Team. <em>Kimi K2: Open Agentic Intelligence</em>. arXiv:2507.20534v2, 3 Feb 2026. <a href="https://arxiv.org/pdf/2507.20534v2">https://arxiv.org/pdf/2507.20534v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §3.1.1 agentic data synthesis (SFT), §3.2.1 verifiable-reward gym and sandbox scale, §3.2.3 budget control, §3.3.4 agentic rollout.</span></li>
+  <li id="ref-8"><span class="ref-type">repo</span>NVIDIA. <em>NeMo Gym</em> (NVIDIA-NeMo/Gym README). README on main showing release v0.7.0 dated 10/06/2026 (date format unlabeled; read as month/day). <a href="https://raw.githubusercontent.com/NVIDIA-NeMo/Gym/main/README.md">https://raw.githubusercontent.com/NVIDIA-NeMo/Gym/main/README.md</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the environment definition, quick-start servers, release notes v0.3.0 to v0.7.0, the environment table (226 rows parsed by me) and the reward shapes in it.</span></li>
+  <li id="ref-9"><span class="ref-type">repo</span>Meta-PyTorch with Hugging Face and partners. <em>OpenEnv: Agentic Execution Environments</em> (README). README on main, BSD 3-Clause, "early development". <a href="https://raw.githubusercontent.com/meta-pytorch/OpenEnv/main/README.md">https://raw.githubusercontent.com/meta-pytorch/OpenEnv/main/README.md</a>. Accessed 2026-10-27. <span class="ref-use">Used for: <code>reset</code>, <code>step</code>, <code>state</code> over WebSocket, Docker per environment, white-box versus loop-owning training modes, Harbor <code>TrainingTrace</code>, the maturity statement and the technical committee.</span></li>
+  <li id="ref-10"><span class="ref-type">official</span>Harbor Framework. <em>Create a task</em> (Harbor tutorial). <a href="https://docs.harborframework.com/tutorials/create-a-task">https://docs.harborframework.com/tutorials/create-a-task</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the task directory layout, <code>task.toml</code> timeouts, the reward file, the oracle-agent validation run, RewardKit pointer.</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>NVIDIA. <em>Nemotron 3 Ultra: Open, Efficient Mixture-of-Experts Hybrid Mamba-Transformer Model for Agentic Reasoning</em>. arXiv:2606.15007v1, 12 Jun 2026. <a href="https://arxiv.org/pdf/2606.15007v1">https://arxiv.org/pdf/2606.15007v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §3.2 unified RLVR, harness diversity, 16 rollouts per sample and reward profiling; §3.3 single-turn rollouts; Appendix A.2 harness robustness.</span></li>
+  <li id="ref-12"><span class="ref-type">repo</span>NVIDIA. <em>NVIDIA Nemotron Developer Repository</em> (NVIDIA-NeMo/Nemotron README). README on main, Apache 2.0; Nemotron 3 Ultra section. <a href="https://raw.githubusercontent.com/NVIDIA-NeMo/Nemotron/main/README.md">https://raw.githubusercontent.com/NVIDIA-NeMo/Nemotron/main/README.md</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the Ultra recipe scope (Pretrain → SFT), the "Open-Source Data Only" notice and its statement that results differ from the tech report benchmarks.</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Kimi Team. <em>Kimi K2.5: Visual Agentic Intelligence</em>. arXiv:2602.02276v2. <a href="https://arxiv.org/pdf/2602.02276v2">https://arxiv.org/pdf/2602.02276v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Appendix D, the Gym-like interface, white-box and black-box environments, LLM Gateway, token-in-token-out.</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>GLM-5 Team (Zhipu AI and Tsinghua University). <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. arXiv:2602.15763v2, 24 Feb 2026. <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §4.1.2 TITO gateway and the environment-failure repair rule, §4.2.1-§4.2.3 SWE, terminal and search environment pipelines, the verified Terminal-Bench 2.0 note.</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Kimi Team. <em>Kimi K3: Open Frontier Intelligence</em>. arXiv:2607.24653v2, 7 Aug 2026. <a href="https://arxiv.org/pdf/2607.24653v2">https://arxiv.org/pdf/2607.24653v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §4.2.1 white-box harness, §4.2.2 knowledge-graph synthesis, §4.2.4 kernel tasks, §4.2.5 mock applications, §4.2.6 Autonomous Execution Tasks, §4.2.7 web development.</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv:2512.02556v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §3.2.1 context management, §3.2.3 Table 1 and the code and general-agent environment pipelines, §4.1 generalization claim, §4.3 Table 5 and Figure 5.</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Ng, A. Y., Harada, D., Russell, S. <em>Policy invariance under reward transformations: Theory and application to reward shaping</em>. ICML 1999. <a href="https://people.eecs.berkeley.edu/~pabbeel/cs287-fa09/readings/NgHaradaRussell-shaping-ICML1999.pdf">https://people.eecs.berkeley.edu/~pabbeel/cs287-fa09/readings/NgHaradaRussell-shaping-ICML1999.pdf</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Theorem 1 (§3) on potential-based shaping and the bicycle and soccer examples (§1); read from the PDF pages as images.</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Stojanovski, Z., Stanley, O., Sharratt, J., Jones, R., Adefioye, A., Kaddour, J., Köpf, A. <em>Reasoning Gym: Reasoning Environments for Reinforcement Learning with Verifiable Rewards</em>. NeurIPS 2025 Datasets and Benchmarks; arXiv:2505.24760v2, 20 Oct 2025. <a href="https://arxiv.org/pdf/2505.24760v2">https://arxiv.org/pdf/2505.24760v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: design principles P1-P3 (§2), zero-shot scores and the difficulty cliff (§3, Figure 3), curriculum experiment and Table 5 (§5), limitations (§7).</span></li>
+  <li id="ref-19"><span class="ref-type">paper</span>Jimenez, C. E., Yang, J., Wettig, A., Yao, S., Pei, K., Press, O., Narasimhan, K. <em>SWE-bench: Can Language Models Resolve Real-World GitHub Issues?</em> ICLR 2024; arXiv:2310.06770. <a href="https://arxiv.org/pdf/2310.06770">https://arxiv.org/pdf/2310.06770</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the three-stage construction pipeline and resolution criterion (§2), Table 10 (93,139, 11,407, 2,294), execution-based validation (Appendix A.3).</span></li>
+  <li id="ref-20"><span class="ref-type">paper</span>Pan, J., Wang, X., Neubig, G., Jaitly, N., Ji, H., Suhr, A., Zhang, Y. <em>Training Software Engineering Agents and Verifiers with SWE-Gym</em>. arXiv:2412.21139v2, 6 Jun 2025. <a href="https://arxiv.org/pdf/2412.21139v2">https://arxiv.org/pdf/2412.21139v2</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §3 and §3.1, the 2,438 validated instances, 64,689 raw instances, 200 human annotation hours, 10,000 CPU core hours, 6 TB of images.</span></li>
+  <li id="ref-21"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv:2606.19348v1. <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the Terminal-Bench 2.0 environment-issue note and verified-subset score (§5.3.1).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KL Regularization and Reward-Model Over-Optimization · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Derives the KL-regularized objective and its closed-form optimum, compares the k1, k2 and k3 sampled estimators and the gradient each one actually produces in the reward and in the loss, tabulates the KL coefficients and reference policies used in published recipes, and reads the gold-versus-proxy scaling laws of reward-model over-optimization.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 6</p>
+  <h1>KL Regularization and Reward-Model Over-Optimization: Reference Policies, the k1/k2/k3 Estimators, and Gold-versus-Proxy Scaling Laws</h1>
+  <p class="lede">Almost every RLHF-style recipe keeps the policy on a KL leash to a reference model, and then spends compute finding out how far the leash can be loosened. This module derives what the leash does (a closed-form optimum), how it is estimated from sampled tokens and where it is placed (reward or loss, k1/k2/k3), what gradient each choice really produces, and what the gold-versus-proxy scaling laws say about how much optimization a learned reward survives. Afterwards you can pick and implement a KL estimator for a given placement, read a KL curve, and say what a KL budget buys.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>22</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Modules 3, 4, 5</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">The KL-regularized setup: the policy samples a response, a reward model scores it, the frozen reference policy scores its log-probability, and the two are combined into the objective that updates the policy</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f1-arra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+    </defs>
+    <rect x="15" y="140" width="72" height="50" rx="8" class="d-surface"/>
+    <text x="51" y="170" text-anchor="middle" class="d-mono">prompt x</text>
+    <path d="M87,165 L105,165" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="105" y="135" width="120" height="60" rx="8" class="d-block"/>
+    <text x="165" y="162" text-anchor="middle" class="d-text-inv d-bold">policy π_θ</text>
+    <text x="165" y="181" text-anchor="middle" class="d-text-inv d-small">trained</text>
+    <path d="M225,165 L245,165" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="245" y="140" width="80" height="50" rx="8" class="d-surface"/>
+    <text x="285" y="170" text-anchor="middle" class="d-mono">y ~ π_θ</text>
+
+    <path d="M325,165 L360,165 L360,70 L385,70" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M360,165 L360,260 L385,260" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="385" y="42" width="160" height="56" rx="8" class="d-block-2"/>
+    <text x="465" y="68" text-anchor="middle" class="d-text-inv d-bold">reward model</text>
+    <text x="465" y="86" text-anchor="middle" class="d-text-inv d-small">r_φ(x, y): the proxy</text>
+    <rect x="385" y="232" width="160" height="56" rx="8" class="d-block-muted"/>
+    <text x="465" y="258" text-anchor="middle" class="d-bold">reference π_ref</text>
+    <text x="465" y="276" text-anchor="middle" class="d-small">frozen, forward only</text>
+    <text x="465" y="30" text-anchor="middle" class="d-small d-text-light">§5  proxy versus gold</text>
+    <text x="465" y="308" text-anchor="middle" class="d-small d-text-light">§2  estimated from sampled log-probs</text>
+
+    <path d="M545,70 L705,70 L705,130" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M545,260 L705,260 L705,200" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="625" y="62" text-anchor="middle" class="d-mono d-small">r_φ</text>
+    <text x="625" y="252" text-anchor="middle" class="d-mono d-small">log π_θ − log π_ref</text>
+    <rect x="620" y="130" width="170" height="70" rx="8" class="d-block-accent"/>
+    <text x="705" y="157" text-anchor="middle" class="d-text-inv d-bold">objective J(θ)</text>
+    <text x="705" y="181" text-anchor="middle" class="d-text-inv d-mono d-small">E[r_φ] − β·KL(π_θ‖π_ref)</text>
+    <text x="705" y="118" text-anchor="middle" class="d-small d-text-light">§1 optimum · §3 placement</text>
+
+    <path d="M775,200 L775,322 L165,322 L165,195" class="d-arrow-active" marker-end="url(#f1-arra)"/>
+    <text x="470" y="336" text-anchor="middle" class="d-small d-text-light">policy-gradient step on θ (reference stays fixed unless reset, §4)</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The setup this module analyses. The objective is the reward-minus-KL form of Ziegler et al.<a class="cite" href="#ref-1">1</a>; §1 derives its optimum, §2 how the KL term is estimated, §3 where it enters the update, §4 how the coefficient and reference are chosen, and §5 how a learned reward fails under optimization.</figcaption>
+</figure>
+
+<h2 id="why-the-leash">1. Why the policy is kept on a leash</h2>
+
+<h3 id="why-the-leash-objective">1.1 The objective and the collapse it prevents</h3>
+<p>Maximizing expected reward alone has a degenerate optimum. If the reward is a function of the sequence, the optimal policy is a point mass on the highest-scoring sequence, and Korbak et al. point out that this holds even with perfect exploration and a reward that perfectly captures preferences<a class="cite" href="#ref-2">2</a>. Empirically the collapse shows up as lost fluency and diversity: higher perplexity, lower entropy, repetition<a class="cite" href="#ref-2">2</a>. Ziegler et al., who first ran RL against a learned reward on language, saw it directly. Without a KL term their mock-sentiment policy reached a score of about +8.0 (99.97% positive) while emitting gibberish built from repeated words such as "instantly" and "tightly"<a class="cite" href="#ref-1">1</a> (Table 10).</p>
+<p>Their remedy, still the template, is to subtract a log-ratio from the reward: \(R(x,y)=r(x,y)-\beta\log\frac{\pi(y|x)}{\rho(y|x)}\), with \(\rho\) the initial language model (their Eq. 2). They list three roles for the term: it acts as an entropy bonus, it keeps the policy in the range where the reward model is valid, and on style tasks it is part of the task definition<a class="cite" href="#ref-1">1</a>. Stiennon et al. restate the first two<a class="cite" href="#ref-3">3</a>, and InstructGPT adds a per-token KL penalty from the SFT model "to mitigate over-optimization of the reward model"<a class="cite" href="#ref-4">4</a> (§3.5). In the notation of the DPO paper (Eq. 3)<a class="cite" href="#ref-5">5</a> the objective is</p>
+$$ J(\theta)\;=\;\mathbb{E}_{x\sim\mathcal D,\;y\sim\pi_\theta(\cdot|x)}\big[r_\phi(x,y)\big]\;-\;\beta\,\mathbb{D}_{\mathrm{KL}}\big[\pi_\theta(\cdot|x)\,\|\,\pi_{\mathrm{ref}}(\cdot|x)\big]. $$
+<p>The entropy-bonus role is literal. Since \(\mathrm{KL}(\pi\|\pi_{\mathrm{ref}})=-H(\pi)-\mathbb{E}_{\pi}[\log\pi_{\mathrm{ref}}]\), the objective equals \(\mathbb{E}[r_\phi+\beta\log\pi_{\mathrm{ref}}]+\beta H(\pi_\theta)\) (derived): an entropy bonus plus a reward for reference likelihood.</p>
+<aside class="callout callout-note"><span class="callout-title">Not the PPO trust region</span><p>The clip of Module 3 anchors the update to \(\pi_{\mathrm{old}}\), which moves every iteration. The leash here anchors to \(\pi_{\mathrm{ref}}\), which is fixed until you reset it (§4). They interact: Gao et al. note that PPO's surrogate carries an implicit penalty on \(D_{\mathrm{KL}}(\pi_{\mathrm{old}}\|\pi)\) that slows the growth of the KL to the <em>initial</em> policy<a class="cite" href="#ref-6">6</a> (§3.6).</p></aside>
+
+<h3 id="why-the-leash-optimum">1.2 The optimum in closed form</h3>
+<p>For a fixed prompt define \(Z(x)=\sum_y \pi_{\mathrm{ref}}(y|x)\,e^{r(x,y)/\beta}\) and \(\pi^*(y|x)=\pi_{\mathrm{ref}}(y|x)\,e^{r(x,y)/\beta}/Z(x)\). Then, following the DPO paper's Appendix A.1<a class="cite" href="#ref-5">5</a>,</p>
+$$ J=\mathbb{E}_{y\sim\pi}\Big[r-\beta\log\tfrac{\pi}{\pi_{\mathrm{ref}}}\Big]=-\beta\,\mathbb{E}_{y\sim\pi}\Big[\log\tfrac{\pi}{\pi^*}-\log Z\Big]=-\beta\,\mathrm{KL}(\pi\|\pi^*)+\beta\log Z(x). $$
+<p>\(Z\) does not depend on \(\pi\), so maximizing \(J\) is minimizing \(\mathrm{KL}(\pi\|\pi^*)\): the optimum is \(\pi=\pi^*\), and the best attainable objective is \(\beta\log Z(x)\) (the last step is derived here). The same cancellation of \(Z\) is what lets DPO skip the RL loop; Module 7 reuses this result. Korbak et al. read \(\pi^*\) as a Bayesian posterior with prior \(\pi_{\mathrm{ref}}\) and evidence \(e^{r/\beta}\), so that RL with a KL penalty is variational inference toward it<a class="cite" href="#ref-2">2</a> (§4).</p>
+<p>Table 1 evaluates this on four candidate responses with rewards 0 to 3 and reference probabilities (0.50, 0.30, 0.15, 0.05), so the reference expects \(\mathbb{E}_{\mathrm{ref}}[r]=0.75\). The rare, best response is amplified by \(e^{3/\beta}/Z\): from 0.05 to 0.29 at \(\beta=1\) and 0.65 at \(\beta=0.5\), for 0.53 and 1.65 nats.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> The exponential tilt \(\pi^*\propto\pi_{\mathrm{ref}}e^{r/\beta}\) on a four-response toy (derived here from the formula in <a class="cite" href="#ref-5">5</a>; rewards 0, 1, 2, 3; \(\pi_{\mathrm{ref}}\) = 0.50, 0.30, 0.15, 0.05). Reward in the units of \(r\), KL in nats.</caption>
+  <thead><tr><th>\(\beta\)</th><th class="num">\(\pi^*(r{=}0)\)</th><th class="num">\(\pi^*(r{=}1)\)</th><th class="num">\(\pi^*(r{=}2)\)</th><th class="num">\(\pi^*(r{=}3)\)</th><th class="num">\(\mathbb{E}_{\pi^*}[r]\)</th><th class="num">KL(\(\pi^*\|\pi_{\mathrm{ref}}\)) (nats)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">\(\infty\) (= reference)</td><td class="num">0.5000</td><td class="num">0.3000</td><td class="num">0.1500</td><td class="num">0.0500</td><td class="num">0.7500</td><td class="num">0</td></tr>
+    <tr><td class="row">3</td><td class="num">0.3713</td><td class="num">0.3109</td><td class="num">0.2169</td><td class="num">0.1009</td><td class="num">1.0475</td><td class="num">0.0515</td></tr>
+    <tr><td class="row">1</td><td class="num">0.1459</td><td class="num">0.2379</td><td class="num">0.3233</td><td class="num">0.2930</td><td class="num">1.7634</td><td class="num">0.5314</td></tr>
+    <tr><td class="row">0.5</td><td class="num">0.0161</td><td class="num">0.0713</td><td class="num">0.2635</td><td class="num" data-best>0.6491</td><td class="num" data-best>2.5456</td><td class="num" data-worst>1.6546</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Grouped bars of the reference distribution and the KL-regularized optimum at beta equal to 3, 1 and 0.5 over four responses with rewards 0 to 3; smaller beta moves mass to the highest-reward response</title>
+    <line x1="70" y1="202" x2="760" y2="202" class="d-grid"/>
+    <text x="62" y="206" text-anchor="end" class="d-mono d-small d-text-light">0.2</text>
+    <line x1="70" y1="142" x2="760" y2="142" class="d-grid"/>
+    <text x="62" y="146" text-anchor="end" class="d-mono d-small d-text-light">0.4</text>
+    <line x1="70" y1="82" x2="760" y2="82" class="d-grid"/>
+    <text x="62" y="86" text-anchor="end" class="d-mono d-small d-text-light">0.6</text>
+    <line x1="70" y1="262" x2="760" y2="262" class="d-axis"/>
+    <line x1="70" y1="40" x2="70" y2="262" class="d-axis"/>
+    <text x="62" y="266" text-anchor="end" class="d-mono d-small d-text-light">0</text>
+    <text x="70" y="32" class="d-small d-text-light">probability</text>
+    <rect x="100" y="112.0" width="30" height="150.0" rx="2" class="d-block-muted"/>
+    <text x="115" y="108" text-anchor="middle" class="d-mono d-small">0.50</text>
+    <rect x="136" y="150.6" width="30" height="111.4" rx="2" class="d-fill-cyan"/>
+    <text x="151" y="146.6" text-anchor="middle" class="d-mono d-small">0.37</text>
+    <rect x="172" y="218.2" width="30" height="43.8" rx="2" class="d-fill-blue"/>
+    <text x="187" y="214.2" text-anchor="middle" class="d-mono d-small">0.15</text>
+    <rect x="208" y="257.2" width="30" height="4.8" rx="2" class="d-fill-orange"/>
+    <text x="223" y="253.2" text-anchor="middle" class="d-mono d-small">0.02</text>
+    <text x="169" y="282" text-anchor="middle" class="d-mono">r = 0</text>
+    <rect x="260" y="172.0" width="30" height="90.0" rx="2" class="d-block-muted"/>
+    <text x="275" y="168" text-anchor="middle" class="d-mono d-small">0.30</text>
+    <rect x="296" y="168.7" width="30" height="93.3" rx="2" class="d-fill-cyan"/>
+    <text x="311" y="164.7" text-anchor="middle" class="d-mono d-small">0.31</text>
+    <rect x="332" y="190.6" width="30" height="71.4" rx="2" class="d-fill-blue"/>
+    <text x="347" y="186.6" text-anchor="middle" class="d-mono d-small">0.24</text>
+    <rect x="368" y="240.6" width="30" height="21.4" rx="2" class="d-fill-orange"/>
+    <text x="383" y="236.6" text-anchor="middle" class="d-mono d-small">0.07</text>
+    <text x="329" y="282" text-anchor="middle" class="d-mono">r = 1</text>
+    <rect x="420" y="217.0" width="30" height="45.0" rx="2" class="d-block-muted"/>
+    <text x="435" y="213" text-anchor="middle" class="d-mono d-small">0.15</text>
+    <rect x="456" y="196.9" width="30" height="65.1" rx="2" class="d-fill-cyan"/>
+    <text x="471" y="192.9" text-anchor="middle" class="d-mono d-small">0.22</text>
+    <rect x="492" y="165.0" width="30" height="97.0" rx="2" class="d-fill-blue"/>
+    <text x="507" y="161" text-anchor="middle" class="d-mono d-small">0.32</text>
+    <rect x="528" y="182.9" width="30" height="79.0" rx="2" class="d-fill-orange"/>
+    <text x="543" y="178.9" text-anchor="middle" class="d-mono d-small">0.26</text>
+    <text x="489" y="282" text-anchor="middle" class="d-mono">r = 2</text>
+    <rect x="580" y="247.0" width="30" height="15.0" rx="2" class="d-block-muted"/>
+    <text x="595" y="243" text-anchor="middle" class="d-mono d-small">0.05</text>
+    <rect x="616" y="231.7" width="30" height="30.3" rx="2" class="d-fill-cyan"/>
+    <text x="631" y="227.7" text-anchor="middle" class="d-mono d-small">0.10</text>
+    <rect x="652" y="174.1" width="30" height="87.9" rx="2" class="d-fill-blue"/>
+    <text x="667" y="170.1" text-anchor="middle" class="d-mono d-small">0.29</text>
+    <rect x="688" y="67.3" width="30" height="194.7" rx="2" class="d-fill-orange"/>
+    <text x="703" y="63.3" text-anchor="middle" class="d-mono d-small">0.65</text>
+    <text x="649" y="282" text-anchor="middle" class="d-mono">r = 3</text>
+    <rect x="220" y="22" width="14" height="14" rx="2" class="d-block-muted"/><text x="240" y="34" class="d-small">π_ref</text>
+    <rect x="300" y="22" width="14" height="14" rx="2" class="d-fill-cyan"/><text x="320" y="34" class="d-small">β = 3</text>
+    <rect x="380" y="22" width="14" height="14" rx="2" class="d-fill-blue"/><text x="400" y="34" class="d-small">β = 1</text>
+    <rect x="460" y="22" width="14" height="14" rx="2" class="d-fill-orange"/><text x="480" y="34" class="d-small">β = 0.5</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Table 1 as bars. Each group is one response (reward \(r\) = 0 to 3); within a group the bars are the reference probability and the optimum at \(\beta\) = 3, 1, 0.5. Lowering \(\beta\) moves mass to the high-reward, low-prior response. Computed here from \(\pi^*\propto\pi_{\mathrm{ref}}e^{r/\beta}\)<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Along this frontier the marginal exchange rate is exactly \(\beta\): \(d\,\mathbb{E}_{\pi^*}[r]/d\,\mathrm{KL}=\beta\) (derived; numerically 3.000, 1.000 and 0.500 for the three rows of Table 1). \(\beta\) is a price in reward units per nat at the margin, so it means nothing until you fix the reward scale and how KL is summed (§4.1).</p></aside>
+<details class="more"><summary>Derivation of the slope identity</summary>
+<p>Let \(s=1/\beta\), \(\pi_s\propto\pi_{\mathrm{ref}}e^{sr}\) and \(\Lambda(s)=\log\sum_y\pi_{\mathrm{ref}}(y)e^{sr(y)}\). Then \(\mathbb{E}_{\pi_s}[r]=\Lambda'(s)\), \(\mathrm{Var}_{\pi_s}[r]=\Lambda''(s)\), and \(\mathrm{KL}(\pi_s\|\pi_{\mathrm{ref}})=s\Lambda'(s)-\Lambda(s)\). Differentiating, \(d\mathrm{KL}/ds=s\Lambda''(s)\) and \(d\mathbb{E}[r]/ds=\Lambda''(s)\), so \(d\mathbb{E}[r]/d\mathrm{KL}=1/s=\beta\).</p>
+</details>
+
+<h3 id="why-the-leash-direction">1.3 Which direction of KL, and what it fails to protect</h3>
+<p>RLHF penalizes the <em>reverse</em> KL, \(\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})\), an expectation under the policy being trained, so it can be estimated from the policy's own rollouts. Lambert describes the consequence: it applies a large penalty when the new model puts substantial mass where the reference assigns little, whereas the other direction behaves like distillation or behavioral cloning<a class="cite" href="#ref-7">7</a> (§15.1). Figure 3 shows the geometry on a constructed example: a single Gaussian fitted to a two-mode target. Minimizing the forward KL gives the moment-matched fit, centered between the modes. Minimizing the reverse KL locks onto one mode, at a cost of \(\ln 2\).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f3t"><title id="f3t">A two-mode target density and two single-Gaussian fits: the forward-KL fit is broad and centered between the modes, the reverse-KL fit is narrow and sits on the right mode</title>
+    <line x1="60" y1="250" x2="740" y2="250" class="d-axis"/>
+    <line x1="400" y1="40" x2="400" y2="250" class="d-grid"/>
+    <text x="128" y="268" text-anchor="middle" class="d-mono d-small d-text-light">-4</text>
+    <text x="264" y="268" text-anchor="middle" class="d-mono d-small d-text-light">-2</text>
+    <text x="400" y="268" text-anchor="middle" class="d-mono d-small d-text-light">0</text>
+    <text x="536" y="268" text-anchor="middle" class="d-mono d-small d-text-light">2</text>
+    <text x="672" y="268" text-anchor="middle" class="d-mono d-small d-text-light">4</text>
+    <text x="400" y="288" text-anchor="middle" class="d-small d-text-light">y (one-dimensional stand-in for a sequence)</text>
+    <polyline points="60.0,250.0 73.6,250.0 87.2,250.0 100.8,250.0 114.4,249.9 128.0,249.6 141.6,248.9 155.2,247.3 168.8,243.8 182.4,237.1 196.0,226.3 209.6,210.9 223.2,192.4 236.8,173.9 250.4,160.1 264.0,155.0 277.6,160.1 291.2,173.9 304.8,192.4 318.4,210.9 332.0,226.3 345.6,237.1 359.2,243.7 372.8,247.3 386.4,248.8 400.0,249.3 413.6,248.8 427.2,247.3 440.8,243.7 454.4,237.1 468.0,226.3 481.6,210.9 495.2,192.4 508.8,173.9 522.4,160.1 536.0,155.0 549.6,160.1 563.2,173.9 576.8,192.4 590.4,210.9 604.0,226.3 617.6,237.1 631.2,243.8 644.8,247.3 658.4,248.9 672.0,249.6 685.6,249.9 699.2,250.0 712.8,250.0 726.4,250.0 740.0,250.0" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+    <polyline points="60.0,246.9 73.6,246.1 87.2,245.2 100.8,244.1 114.4,242.8 128.0,241.3 141.6,239.6 155.2,237.7 168.8,235.5 182.4,233.1 196.0,230.6 209.6,227.8 223.2,224.9 236.8,221.8 250.4,218.7 264.0,215.5 277.6,212.4 291.2,209.3 304.8,206.4 318.4,203.7 332.0,201.3 345.6,199.3 359.2,197.6 372.8,196.4 386.4,195.7 400.0,195.4 413.6,195.7 427.2,196.4 440.8,197.6 454.4,199.3 468.0,201.3 481.6,203.7 495.2,206.4 508.8,209.3 522.4,212.4 536.0,215.5 549.6,218.7 563.2,221.8 576.8,224.9 590.4,227.8 604.0,230.6 617.6,233.1 631.2,235.5 644.8,237.7 658.4,239.6 672.0,241.3 685.6,242.8 699.2,244.1 712.8,245.2 726.4,246.1 740.0,246.9" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+    <polyline points="60.0,250.0 73.6,250.0 87.2,250.0 100.8,250.0 114.4,250.0 128.0,250.0 141.6,250.0 155.2,250.0 168.8,250.0 182.4,250.0 196.0,250.0 209.6,250.0 223.2,250.0 236.8,250.0 250.4,250.0 264.0,250.0 277.6,250.0 291.2,250.0 304.8,250.0 318.4,250.0 332.0,250.0 345.6,250.0 359.2,250.0 372.8,249.9 386.4,249.7 400.0,249.2 413.6,247.7 427.2,244.2 440.8,236.9 454.4,223.4 468.0,201.6 481.6,170.9 495.2,134.2 508.8,98.1 522.4,71.3 536.0,61.6 549.6,71.9 563.2,99.1 576.8,135.3 590.4,171.9 604.0,202.3 617.6,223.9 631.2,237.2 644.8,244.4 658.4,247.8 672.0,249.2 685.6,249.8 699.2,249.9 712.8,250.0 726.4,250.0 740.0,250.0" class="d-line d-stroke-green" style="stroke-width:2.5"/>
+    <rect x="86" y="40" width="262" height="76" rx="6" class="d-label-bg"/>
+    <line x1="98" y1="58" x2="122" y2="58" class="d-line d-stroke-blue" style="stroke-width:2.5"/><text x="130" y="62" class="d-small">target p: two modes at ±2, sd 0.6</text>
+    <line x1="98" y1="80" x2="122" y2="80" class="d-line d-stroke-orange" style="stroke-width:2.5"/><text x="130" y="84" class="d-small">forward fit: N(0, 2.09²)</text>
+    <line x1="98" y1="102" x2="122" y2="102" class="d-line d-stroke-green" style="stroke-width:2.5"/><text x="130" y="106" class="d-small">reverse fit: N(2.00, 0.60²)</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Forward-KL fit (orange) versus reverse-KL fit (green) of one Gaussian to a bimodal target (blue). Constructed example, computed here: the reverse fit has \(\mathrm{KL}(q\|p)=0.692\) nats against \(\ln 2=0.693\), but \(\mathrm{KL}(p\|q)=10.23\); the forward fit has \(\mathrm{KL}(p\|q)=0.555\) and \(\mathrm{KL}(q\|p)=1.175\). RLHF penalizes the reverse direction<a class="cite" href="#ref-7">7</a>, and in that direction dropping a mode is cheap (derived).</figcaption>
+</figure>
+
+<p>The general version of the green fit's cost is a one-line identity (derived): if the policy equals the reference restricted to a set of reference mass \(m\), then \(\mathrm{KL}(\pi\|\pi_{\mathrm{ref}})=\ln(1/m)\). Discarding 90% of the reference's mass costs \(\ln 10=2.30\) nats, a bounded price that a coefficient of order 0.01 to 0.1 turns into a negligible penalty. This is my reading, not a result from the cited papers: the reverse-KL leash restrains drift into regions the reference finds unlikely far better than it restrains loss of diversity, which is one reason entropy collapse (Module 13) can proceed with the penalty switched on.</p>
+
+<h2 id="kl-estimators">2. Estimating KL from sampled tokens</h2>
+
+<h3 id="kl-estimators-setting">2.1 What a training loop can compute</h3>
+<p>Fix one token position. Samples come from the policy, \(x\sim q=\pi_\theta(\cdot|\text{prefix})\); the other distribution is \(p=\pi_{\mathrm{ref}}\); write \(r=p(x)/q(x)=\pi_{\mathrm{ref}}/\pi_\theta\). Schulman's setting is the right one for LLMs: probabilities are computable for any \(x\), the sum over the vocabulary is not wanted, and "we can simplify code by just storing the log-prob, not the whole distribution"<a class="cite" href="#ref-8">8</a>. At sequence level the KL is the expected sum of per-token KLs along sequences sampled from the policy<a class="cite" href="#ref-9">9</a> (§4), so a sampled-token estimator summed over positions estimates the sequence KL.</p>
+<p>The systems reason is memory. An exact per-token KL needs the full next-token distribution from both models. With a 128K-token vocabulary<a class="cite" href="#ref-10">10</a> (§3.2), fp32 logits are about 128,000 × 4 B = 500 KiB per token per model, so a 1M-token rollout batch is about 512 GB per model if materialized (derived; real implementations chunk the computation). A sampled estimator needs one gathered log-probability per token per model, 4 MB per million tokens. The reference model itself is one forward pass, with no gradients, over each rollout. When the coefficient is zero TRL does not load it at all: "reducing memory usage and improving training speed"<a class="cite" href="#ref-11">11</a>. In bf16 (2 B per parameter, derived) that avoids 16 GB of reference weights at 8B parameters, 140 GB at 70B and 810 GB at 405B. Module 1 counts the models in an RL step; System Design Modules 36 to 38 cover where they are placed.</p>
+
+<h3 id="kl-estimators-three">2.2 The three estimators</h3>
+<p>Schulman's post builds three single-sample estimators of \(\mathrm{KL}[q,p]=\mathbb{E}_q[\log(q/p)]\) from samples of \(q\)<a class="cite" href="#ref-8">8</a>:</p>
+<ul>
+<li>\(k_1=-\log r\). Unbiased but noisy: "it's negative for half of the samples, whereas KL is always positive".</li>
+<li>\(k_2=\tfrac12(\log r)^2\). Lower variance, biased. Its expectation is an f-divergence with \(f(x)=\tfrac12(\log x)^2\), and every f-divergence with differentiable \(f\) looks like KL to second order when \(q\approx p\) (both have \(f''(1)=1\)), which is why the bias is small near the reference.</li>
+<li>\(k_3=(r-1)-\log r\). Take \(k_1\) and add \(\lambda(r-1)\), which has zero mean because \(\mathbb{E}_q[r]=1\). With \(\lambda=1\) the result is non-negative, since \(\log x\le x-1\): it is the vertical distance between the log curve and its tangent.</li>
+</ul>
+<p>The same construction gives an estimator for the opposite direction, \(\mathrm{KL}[p,q]\): use \(f(r)-f'(1)(r-1)\) with \(f(x)=x\log x\), giving \(r\log r-(r-1)\)<a class="cite" href="#ref-8">8</a>.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> The three estimators of \(\mathrm{KL}[q,p]\), with \(r=p/q\) and samples from \(q\). Numbers are the two tables in Schulman's post<a class="cite" href="#ref-8">8</a>: unit-variance Gaussians with true KL 0.005 and 0.5. Bias and standard deviation are divided by the true KL.</caption>
+  <thead><tr><th>Estimator</th><th>Expression</th><th>Unbiased value?</th><th>Always \(\ge 0\)?</th><th class="num">std/KL at 0.005</th><th class="num">std/KL at 0.5</th><th class="num">bias/KL at 0.005</th><th class="num">bias/KL at 0.5</th></tr></thead>
+  <tbody>
+    <tr><td class="row">\(k_1\)</td><td>\(-\log r\)</td><td>yes</td><td>no</td><td class="num" data-worst>20</td><td class="num">2</td><td class="num">0</td><td class="num">0</td></tr>
+    <tr><td class="row">\(k_2\)</td><td>\(\tfrac12(\log r)^2\)</td><td>no</td><td>yes</td><td class="num">1.42</td><td class="num" data-worst>1.73</td><td class="num">0.002</td><td class="num" data-worst>0.25</td></tr>
+    <tr><td class="row">\(k_3\)</td><td>\((r-1)-\log r\)</td><td>yes</td><td>yes</td><td class="num" data-best>1.42</td><td class="num" data-best>1.7</td><td class="num">0</td><td class="num">0</td></tr>
+  </tbody>
+</table>
+<p>Schulman's verdict is "k3 has even lower standard deviation than k2 while being unbiased, so it appears to be a strictly better estimator"<a class="cite" href="#ref-8">8</a>. That is a statement about estimating the <em>value</em> of the KL. §3 shows it answers a different question from the one a training loop asks.</p>
+
+<h3 id="kl-estimators-numbers">2.3 Reproducing the numbers</h3>
+<p>For equal-variance Gaussians with mean shift \(\mu\) (true KL \(=\mu^2/2\)), the table entries have closed forms (derived here):</p>
+$$ \frac{\mathrm{std}(k_1)}{\mathrm{KL}}=\frac{2}{\mu},\qquad \frac{\mathrm{bias}(k_2)}{\mathrm{KL}}=\frac{\mu^2}{4}=\frac{\mathrm{KL}}{2},\qquad \frac{\mathrm{std}(k_2)}{\mathrm{KL}}=2\sqrt{\tfrac12+\tfrac{\mu^2}{4}},\qquad \frac{\mathrm{std}(k_3)}{\mathrm{KL}}=\frac{\sqrt{e^{\mu^2}-1-\mu^2}}{\mu^2/2}. $$
+<p>At \(\mu=0.1\) these give 20, 0.0025, 1.4177 and 1.4166; at \(\mu=1\) they give 2, 0.25, 1.7321 and 1.6950. They agree with the post's tables. The one visible difference is the first \(k_2\) bias, which the post prints as 0.002 from a Monte Carlo run; my rerun with \(2\times10^7\) samples gave 0.0020 against a standard error of about 0.0003, so the exact 0.0025 is consistent with it. The practical reading of the 20 in the first row (derived): to estimate a KL of 0.005 to 10% relative error, \(k_1\) needs about \((20/0.1)^2=40{,}000\) tokens and \(k_3\) about \((1.42/0.1)^2\approx 200\).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 310" role="img" aria-labelledby="f4t"><title id="f4t">Two panels of grouped bars for k1, k2 and k3 at true KL 0.005 and 0.5: standard deviation relative to the true KL on a log axis, and bias relative to the true KL on a linear axis</title>
+    <rect x="290" y="8" width="14" height="14" rx="2" class="d-fill-blue"/><text x="310" y="20" class="d-small">true KL 0.005</text>
+    <rect x="410" y="8" width="14" height="14" rx="2" class="d-fill-orange"/><text x="430" y="20" class="d-small">true KL 0.5</text>
+    <line x1="70" y1="270" x2="400" y2="270" class="d-axis"/><line x1="70" y1="60" x2="70" y2="270" class="d-axis"/>
+    <line x1="70" y1="229.2" x2="400" y2="229.2" class="d-grid"/><text x="62" y="233.2" text-anchor="end" class="d-mono d-small d-text-light">2</text>
+    <line x1="70" y1="175.4" x2="400" y2="175.4" class="d-grid"/><text x="62" y="179.4" text-anchor="end" class="d-mono d-small d-text-light">5</text>
+    <line x1="70" y1="134.6" x2="400" y2="134.6" class="d-grid"/><text x="62" y="138.6" text-anchor="end" class="d-mono d-small d-text-light">10</text>
+    <line x1="70" y1="93.8" x2="400" y2="93.8" class="d-grid"/><text x="62" y="97.8" text-anchor="end" class="d-mono d-small d-text-light">20</text>
+    <text x="62" y="274" text-anchor="end" class="d-mono d-small d-text-light">1</text>
+    <rect x="102" y="93.8" width="34" height="176.2" rx="2" class="d-fill-blue"/><text x="119" y="89.8" text-anchor="middle" class="d-mono d-small">20</text>
+    <rect x="144" y="229.2" width="34" height="40.8" rx="2" class="d-fill-orange"/><text x="161" y="225.2" text-anchor="middle" class="d-mono d-small">2</text>
+    <text x="140" y="292" text-anchor="middle" class="d-mono">k1</text>
+    <rect x="202" y="249.4" width="34" height="20.6" rx="2" class="d-fill-blue"/><text x="219" y="245.4" text-anchor="middle" class="d-mono d-small">1.42</text>
+    <rect x="244" y="237.8" width="34" height="32.2" rx="2" class="d-fill-orange"/><text x="261" y="233.8" text-anchor="middle" class="d-mono d-small">1.73</text>
+    <text x="240" y="292" text-anchor="middle" class="d-mono">k2</text>
+    <rect x="302" y="249.4" width="34" height="20.6" rx="2" class="d-fill-blue"/><text x="319" y="245.4" text-anchor="middle" class="d-mono d-small">1.42</text>
+    <rect x="344" y="238.8" width="34" height="31.2" rx="2" class="d-fill-orange"/><text x="361" y="234.8" text-anchor="middle" class="d-mono d-small">1.7</text>
+    <text x="340" y="292" text-anchor="middle" class="d-mono">k3</text>
+    <text x="70" y="48" class="d-small d-text-light">std / true KL (log scale)</text>
+    <line x1="470" y1="270" x2="780" y2="270" class="d-axis"/><line x1="470" y1="60" x2="470" y2="270" class="d-axis"/>
+    <line x1="470" y1="203.3" x2="780" y2="203.3" class="d-grid"/><text x="462" y="207.3" text-anchor="end" class="d-mono d-small d-text-light">0.1</text>
+    <line x1="470" y1="136.7" x2="780" y2="136.7" class="d-grid"/><text x="462" y="140.7" text-anchor="end" class="d-mono d-small d-text-light">0.2</text>
+    <line x1="470" y1="70.0" x2="780" y2="70.0" class="d-grid"/><text x="462" y="74.0" text-anchor="end" class="d-mono d-small d-text-light">0.3</text>
+    <text x="462" y="274" text-anchor="end" class="d-mono d-small d-text-light">0</text>
+    <text x="519" y="266" text-anchor="middle" class="d-mono d-small">0</text>
+    <text x="561" y="266" text-anchor="middle" class="d-mono d-small">0</text>
+    <text x="540" y="292" text-anchor="middle" class="d-mono">k1</text>
+    <rect x="602" y="268.7" width="34" height="1.3" rx="2" class="d-fill-blue"/><text x="619" y="264.7" text-anchor="middle" class="d-mono d-small">0.002</text>
+    <rect x="644" y="103.3" width="34" height="166.7" rx="2" class="d-fill-orange"/><text x="661" y="99.3" text-anchor="middle" class="d-mono d-small">0.25</text>
+    <text x="640" y="292" text-anchor="middle" class="d-mono">k2</text>
+    <text x="719" y="266" text-anchor="middle" class="d-mono d-small">0</text>
+    <text x="761" y="266" text-anchor="middle" class="d-mono d-small">0</text>
+    <text x="740" y="292" text-anchor="middle" class="d-mono">k3</text>
+    <text x="470" y="48" class="d-small d-text-light">bias / true KL (linear)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Left: standard deviation of each estimator relative to the true KL (log axis; \(k_1\) is 14 times noisier than \(k_2\) or \(k_3\) at KL 0.005). Right: bias relative to the true KL; only \(k_2\) is biased, and its relative bias grows to 0.25 at KL 0.5. Data: the two result tables in Schulman's post<a class="cite" href="#ref-8">8</a>.</figcaption>
+</figure>
+
+<h2 id="kl-placement">3. Where the term enters: reward or loss, and the gradient each produces</h2>
+
+<h3 id="kl-placement-reward">3.1 KL in the reward</h3>
+<p>In the PPO-RLHF lineage the log-ratio is attached to each token's reward and treated as data. DeepSeekMath writes the standard form (its Eq. 2)<a class="cite" href="#ref-12">12</a> (§4.1.1):</p>
+$$ r_t=r_\phi(q,o_{\le t})-\beta\log\frac{\pi_\theta(o_t\mid q,o_{&lt;t})}{\pi_{\mathrm{ref}}(o_t\mid q,o_{&lt;t})}, $$
+<p>with the reward-model score typically present only at the last token. This is \(k_1\), one sample per position; summed over positions the log-ratios give the sequence log-ratio. Because it sits in the reward it passes through the return and GAE into the advantage \(\hat A_t\), and the policy gradient then uses it as a coefficient on \(\nabla\log\pi_\theta\). InstructGPT applies no discount when estimating the advantage<a class="cite" href="#ref-4">4</a> (Appendix C.4), so the return at token \(t\) contains the KL terms of all later tokens. Module 5 draws this dataflow.</p>
+
+<h3 id="kl-placement-loss">3.2 KL in the loss</h3>
+<p>GRPO moves the term out of the reward: "instead of adding KL penalty in the reward, GRPO regularizes by directly adding the KL divergence between the trained policy and the reference policy to the loss, avoiding complicating the calculation of \(\hat A_{i,t}\)"<a class="cite" href="#ref-12">12</a> (§4.1.1). The estimator is \(k_3\) (their Eq. 4), described as "guaranteed to be positive", and DeepSeek-R1 uses the same form in its Eqs. 1 and 2<a class="cite" href="#ref-13">13</a> (§2.1). TRL's GRPO trainer applies the same per-token estimate inside the loss, with the coefficient defaulting to 0.0<a class="cite" href="#ref-11">11</a>. Here nothing is detached: automatic differentiation reaches the KL term through \(\log\pi_\theta\) directly.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f5t"><title id="f5t">Two lanes: with KL in the reward the log-ratio is folded into the token reward and reaches the policy only through the advantage; with KL in the loss the advantage is KL-free and the k3 term feeds the loss directly</title>
+    <defs>
+      <marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f5-arra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+    </defs>
+    <rect x="10" y="28" width="780" height="160" rx="10" class="d-panel"/>
+    <text x="24" y="50" class="d-bold">KL in the reward (PPO-RLHF, InstructGPT)</text>
+    <rect x="25" y="78" width="120" height="64" rx="8" class="d-surface"/>
+    <text x="85" y="106" text-anchor="middle" class="d-small">rollout</text><text x="85" y="124" text-anchor="middle" class="d-mono d-small">y ~ π_θ</text>
+    <path d="M145,110 L180,110" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="180" y="72" width="200" height="76" rx="8" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="280" y="96" text-anchor="middle" class="d-bold">token reward</text>
+    <text x="280" y="116" text-anchor="middle" class="d-mono d-small">−β·log(π_θ/π_ref)</text>
+    <text x="280" y="134" text-anchor="middle" class="d-small">+ r_φ at the last token</text>
+    <path d="M380,110 L415,110" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="415" y="78" width="150" height="64" rx="8" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="490" y="106" text-anchor="middle" class="d-bold">GAE</text><text x="490" y="124" text-anchor="middle" class="d-mono d-small">advantage Â_t</text>
+    <path d="M565,110 L600,110" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="600" y="78" width="165" height="64" rx="8" class="d-block"/>
+    <text x="682" y="106" text-anchor="middle" class="d-text-inv d-bold">PPO loss</text><text x="682" y="124" text-anchor="middle" class="d-text-inv d-small">ratio and clip</text>
+    <text x="280" y="170" text-anchor="middle" class="d-small d-text-light">detached: a number, not a graph</text>
+    <text x="490" y="170" text-anchor="middle" class="d-small d-text-light">KL enters Â_t</text>
+
+    <rect x="10" y="208" width="780" height="186" rx="10" class="d-panel"/>
+    <text x="24" y="230" class="d-bold">KL in the loss (GRPO, DeepSeek-R1)</text>
+    <rect x="25" y="258" width="120" height="64" rx="8" class="d-surface"/>
+    <text x="85" y="286" text-anchor="middle" class="d-small">G rollouts</text><text x="85" y="304" text-anchor="middle" class="d-small">per prompt</text>
+    <path d="M145,290 L180,290" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="180" y="258" width="200" height="64" rx="8" class="d-block-2"/>
+    <text x="280" y="286" text-anchor="middle" class="d-text-inv d-bold">outcome reward R_i</text><text x="280" y="304" text-anchor="middle" class="d-text-inv d-small">verifier or RM</text>
+    <path d="M380,290 L415,290" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="415" y="258" width="150" height="64" rx="8" class="d-block-2"/>
+    <text x="490" y="286" text-anchor="middle" class="d-text-inv d-bold">group advantage</text><text x="490" y="304" text-anchor="middle" class="d-text-inv d-small">Â_i, no KL</text>
+    <path d="M565,290 L600,290" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="600" y="258" width="165" height="64" rx="8" class="d-block"/>
+    <text x="682" y="286" text-anchor="middle" class="d-text-inv d-bold">GRPO loss</text><text x="682" y="304" text-anchor="middle" class="d-text-inv d-small">ratio and clip</text>
+    <rect x="600" y="346" width="165" height="38" rx="8" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="682" y="370" text-anchor="middle" class="d-mono d-small">+ β·k3 per token</text>
+    <path d="M682,346 L682,322" class="d-arrow-active" marker-end="url(#f5-arra)"/>
+    <text x="670" y="338" text-anchor="end" class="d-small d-text-light">autodiff through log π_θ</text>
+    <text x="490" y="346" text-anchor="middle" class="d-small d-text-light">KL bypasses the advantage</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Where the KL term enters. Top: PPO-RLHF folds a detached log-ratio into every token's reward<a class="cite" href="#ref-4">4</a>, so it reaches the policy only through the advantage. Bottom: GRPO computes a KL-free group advantage and adds the \(k_3\) term to the loss, where it is differentiated directly<a class="cite" href="#ref-12">12</a>.</figcaption>
+</figure>
+
+<h3 id="kl-placement-gradient">3.3 Value is not gradient</h3>
+<p>A training loop never uses the estimator's value; it differentiates it. The KL is an expectation under \(\pi_\theta\), so its gradient has two parts: a pathwise term from the integrand and a score-function term from the sampling distribution. Differentiating a sampled loss with the sample held fixed yields only the first<a class="cite" href="#ref-9">9</a> (§3), and Shah et al. write the full gradient as the sum of both<a class="cite" href="#ref-14">14</a> (Eq. 4). Write \(s=\nabla_\theta\log\pi_\theta(x)\), so \(\mathbb{E}_{x\sim\pi_\theta}[s]=0\), and apply the chain rule to \(r=\pi_{\mathrm{ref}}/\pi_\theta\), for which \(\nabla r=-r\,s\). The per-sample loss gradients are (derived):</p>
+$$ \nabla k_1=s,\qquad \nabla k_2=\log\tfrac{\pi_\theta}{\pi_{\mathrm{ref}}}\,s,\qquad \nabla k_3=\Big(1-\tfrac{\pi_{\mathrm{ref}}}{\pi_\theta}\Big)s. $$
+<p>Taking expectations under \(x\sim\pi_\theta\): \(\mathbb{E}[\nabla k_1]=\mathbb{E}[s]=0\). \(\mathbb{E}[\nabla k_2]=\mathbb{E}[\log\frac{\pi_\theta}{\pi_{\mathrm{ref}}}\,s]=\nabla\,\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})\), which is the score-function form of the reverse-KL gradient. And \(\mathbb{E}[\nabla k_3]=0-\sum_x\pi_{\mathrm{ref}}(x)\nabla\log\pi_\theta(x)=\nabla\,\mathrm{KL}(\pi_{\mathrm{ref}}\|\pi_\theta)\), the gradient of the <em>forward</em> KL. So differentiating \(k_1\) adds only zero-mean noise<a class="cite" href="#ref-9">9</a> (Eq. 2), differentiating \(k_2\) gives the right gradient although \(k_2\) is a biased value estimate, and differentiating \(k_3\), the estimator everyone uses, regularizes toward the wrong direction of KL<a class="cite" href="#ref-9">9</a> (Eq. 3). Liu et al. reach the same conclusions: \(k_1\) in the reward and \(k_2\) as a loss are gradient-equivalent on-policy, and \(k_3\) as a loss is a biased first-order approximation<a class="cite" href="#ref-15">15</a>. Shah et al. add that the \(k_3\)-in-loss gradient is a sum of per-token forward-KL gradients<a class="cite" href="#ref-14">14</a> (§4.1).</p>
+
+<table class="tbl tbl-dense">
+  <caption><b>Table 3.</b> Per-token values and gradient coefficients (derived here). \(r=\pi_{\mathrm{ref}}/\pi_\theta\). "Coefficient" is the multiplier of \(\nabla\log\pi_\theta\) in the gradient of each estimator used as a loss; a positive coefficient means descent lowers that token's log-probability. Nats.</caption>
+  <thead><tr><th class="num">\(\pi_{\mathrm{ref}}\)</th><th class="num">\(\pi_\theta\)</th><th class="num">\(r\)</th><th class="num">\(k_1\)</th><th class="num">\(k_2\)</th><th class="num">\(k_3\)</th><th class="num">coef \(k_1\)</th><th class="num">coef \(k_2\)</th><th class="num">coef \(k_3\)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0.30</td><td class="num">0.30</td><td class="num">1</td><td class="num">0.000</td><td class="num">0.000</td><td class="num">0.000</td><td class="num">1</td><td class="num">0.000</td><td class="num">0.000</td></tr>
+    <tr><td class="num">0.30</td><td class="num">0.60</td><td class="num">0.5</td><td class="num">0.693</td><td class="num">0.240</td><td class="num">0.193</td><td class="num">1</td><td class="num">0.693</td><td class="num">0.500</td></tr>
+    <tr><td class="num">0.60</td><td class="num">0.30</td><td class="num">2</td><td class="num">-0.693</td><td class="num">0.240</td><td class="num">0.307</td><td class="num">1</td><td class="num">-0.693</td><td class="num">-1.000</td></tr>
+    <tr><td class="num">0.02</td><td class="num">0.40</td><td class="num">0.05</td><td class="num">2.996</td><td class="num">4.487</td><td class="num">2.046</td><td class="num">1</td><td class="num">2.996</td><td class="num">0.950</td></tr>
+    <tr><td class="num">0.50</td><td class="num">0.001</td><td class="num">500</td><td class="num">-6.215</td><td class="num">19.311</td><td class="num" data-worst>492.785</td><td class="num">1</td><td class="num">-6.215</td><td class="num" data-worst>-499.000</td></tr>
+  </tbody>
+</table>
+<p>The last row is the case DeepSeek-V3.2 warns about (§3.6): the policy has learned to avoid a token the reference likes. Sampled once, it contributes 492.8 to the \(k_3\) sum, which is about 1.0 to the per-token mean of a 500-token response, and its gradient coefficient is -499, against -6.2 for \(k_2\). Note also that \(k_1\) is negative on the rows where the policy has moved <em>away</em> from a token the reference favors; it is an unbiased average, not a per-token distance.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> Expected gradient with respect to the logits, on-policy, for a four-token distribution \(\pi_\theta=(0.55,0.25,0.15,0.05)\), \(\pi_{\mathrm{ref}}=(0.30,0.30,0.25,0.15)\) (so \(\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})=0.1562\), \(\mathrm{KL}(\pi_{\mathrm{ref}}\|\pi_\theta)=0.1654\) nats). Exact enumeration over the four tokens, computed here; each estimator is differentiated as a loss with the sample held fixed.</caption>
+  <thead><tr><th>Quantity</th><th class="num">token a</th><th class="num">token b</th><th class="num">token c</th><th class="num">token d</th><th>Equals</th></tr></thead>
+  <tbody>
+    <tr><td class="row">true \(\nabla\,\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})\)</td><td class="num">+0.2474</td><td class="num">-0.0846</td><td class="num">-0.1001</td><td class="num">-0.0627</td><td>the target (reverse KL)</td></tr>
+    <tr><td class="row">true \(\nabla\,\mathrm{KL}(\pi_{\mathrm{ref}}\|\pi_\theta)\)</td><td class="num">+0.2500</td><td class="num">-0.0500</td><td class="num">-0.1000</td><td class="num">-0.1000</td><td>\(\pi_\theta-\pi_{\mathrm{ref}}\) (forward KL)</td></tr>
+    <tr><td class="row">\(\mathbb{E}[\nabla k_1]\)</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td>nothing</td></tr>
+    <tr><td class="row">\(\mathbb{E}[\nabla k_2]\)</td><td class="num" data-best>+0.2474</td><td class="num" data-best>-0.0846</td><td class="num" data-best>-0.1001</td><td class="num" data-best>-0.0627</td><td>reverse KL</td></tr>
+    <tr><td class="row">\(\mathbb{E}[\nabla k_3]\)</td><td class="num" data-worst>+0.2500</td><td class="num" data-worst>-0.0500</td><td class="num" data-worst>-0.1000</td><td class="num" data-worst>-0.1000</td><td>forward KL</td></tr>
+    <tr><td class="row">\(\mathbb{E}[\nabla(\tfrac{\pi_\theta}{\pi_{\mathrm{old}}}k_3)]\), \(\pi_{\mathrm{old}}=\pi_\theta\)</td><td class="num" data-best>+0.2474</td><td class="num" data-best>-0.0846</td><td class="num" data-best>-0.1001</td><td class="num" data-best>-0.0627</td><td>reverse KL (DeepSeek-V3.2 form, §3.6)</td></tr>
+  </tbody>
+</table>
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Treating "unbiased estimator of the KL" as "gradient of the KL". The \(k_1\) and \(k_3\) tables in §2 are about values. Used as a loss, \(k_1\) has zero expected gradient and \(k_3\) has the gradient of the opposite KL. Tang and Munos call differentiating KL estimates "generally incorrect" and note it appears in TRL, Open Instruct and the GRPO pseudocode<a class="cite" href="#ref-9">9</a>.</p></aside>
+
+<h3 id="kl-placement-sequence">3.4 Token-level losses give a partial gradient</h3>
+<p>A correct per-token estimator still does not give the gradient of the sequence KL. The sequence KL is \(\mathbb{E}\big[\sum_t \mathrm{KL}_t\big]\) over sequences drawn from \(\pi_\theta\), and a token \(y_t\) also changes the distribution of every later token, hence their KL terms. A sum of token-level losses omits that dependence; Tang and Munos: "token-level losses only produce a partial derivative at best"<a class="cite" href="#ref-9">9</a> (§4.1). Their sequence-level estimator multiplies the summed log-ratios by the summed score, and dropping the terms with zero mean gives the cumulative form \(\sum_t\big(\sum_{s\ge t}\log\rho_s\big)\nabla\log\pi(y_t|y_{&lt;t})\) with \(\rho=\pi_\theta/\pi_{\mathrm{ref}}\)<a class="cite" href="#ref-9">9</a> (§4.2). KL-in-reward with no discount has this structure by construction, since the return at token \(t\) is \(-\beta\sum_{s\ge t}\log\rho_s\) (derived). My reading is that PPO-RLHF's placement is therefore sequence-correct up to GAE's \(\lambda\) and critic error, while GRPO's placement inherited the token-level shortcut.</p>
+<p>How much it matters depends on how far the policy travels. In Tang and Munos's low-KL experiment (Llama 3 8B on MATH training prompts with a string-match reward, \(\beta=0.001\)) the \(k_3\)-style loss and the proper estimator trace similar performance-versus-KL curves; they suggest that when KL is small the two directions coincide, \(\mathrm{KL}(\pi,\pi_{\mathrm{ref}})\approx\mathrm{KL}(\pi_{\mathrm{ref}},\pi)\)<a class="cite" href="#ref-9">9</a> (§5.1). In their high-KL experiment, on-policy distillation of a 70B model into an 8B model by minimizing the KL itself, the \(k_3\)-style loss "does not make much progress", the vanilla token-level estimate does, and proper sequence-level estimators with variance reduction do best<a class="cite" href="#ref-9">9</a> (§5.2, Figure 8). That second setting is the subject of Module 21.</p>
+
+<h3 id="kl-placement-grid">3.5 The empirical grid</h3>
+<p>Shah et al. (COLM 2026) tested the 2×2 of estimator by placement with everything else fixed: an RLOO baseline, batch 256, 5 samples per prompt, 1,024 maximum tokens, learning rate \(10^{-6}\), on MATH training prompts, with \(\beta\in\{0.05,0.1,0.3,1\}\)<a class="cite" href="#ref-14">14</a> (§4.1). Only one cell has an unbiased sequence-level gradient (Table 5).</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> KL configurations on Qwen2.5-7B and Llama-3.1-8B-Instruct<a class="cite" href="#ref-14">14</a> (Table 1, §4.1). Gains are relative improvements of K1-in-reward over K3-in-loss at \(\beta=0.05\): in-domain MATH500 and MATH², out-of-domain MMLU college physics, chemistry and biology, mean@32 over three seeds, 250 steps.</caption>
+  <thead><tr><th>Configuration</th><th>Gradient of the sequence reverse KL</th><th>Training outcome</th></tr></thead>
+  <tbody>
+    <tr><td class="row">K1 in reward</td><td>unbiased</td><td data-best>stable; ahead of K3-in-loss on every task in both models. Gain over K3-in-loss: Qwen2.5-7B +6.21% in-domain, +19.06% out-of-domain; Llama-3.1-8B-Instruct +15.94% in-domain, +3.65% out-of-domain</td></tr>
+    <tr><td class="row">K1 in loss</td><td>biased (zero in expectation)</td><td>training instabilities in both models at several \(\beta\); where stable, it matches training with no KL</td></tr>
+    <tr><td class="row">K3 in reward</td><td>biased</td><td data-worst>complete or partial collapse for every \(\beta\) tried</td></tr>
+    <tr><td class="row">K3 in loss (GRPO, TRL)</td><td>biased: per-token forward KL</td><td>stable, but behind K1-in-reward</td></tr>
+  </tbody>
+</table>
+<p>Two further results from the same paper. In an asynchronous setup (Qwen3-4B-Instruct-2507 on Countdown, staleness levels 5, 10 and 20), K1-in-reward and K3-in-loss stayed stable while no KL, K1-in-loss and K3-in-reward did not, so the KL term helps with staleness as well as drift<a class="cite" href="#ref-14">14</a> (§4.2, Figure 5). And adding the estimator to both the reward and the loss recovers the correct gradient up to a normalizing factor, on-policy<a class="cite" href="#ref-14">14</a> (§2.2). The paper's own text is slightly inconsistent about which \(\beta\) values were stable for K1-in-loss (the Figure 2 caption and the body disagree for Qwen2.5-7B at \(\beta=0.1\)), so Table 5 states only what both agree on.</p>
+
+<h3 id="kl-placement-fix">3.6 DeepSeek-V3.2's importance-ratio fix</h3>
+<p>Rollouts come from \(\pi_{\mathrm{old}}\), not \(\pi_\theta\). DeepSeek-V3.2 therefore weights the \(k_3\) term by \(\pi_\theta/\pi_{\mathrm{old}}\) (its Eq. 7) and states that the gradient of the original \(k_3\) "assigns disproportionately large, unbounded weights to maximize the likelihood of these tokens" when sampled tokens are much less probable under the current policy than under the reference, \(\pi_\theta\ll\pi_{\mathrm{ref}}\); it also reports that for domains such as mathematics a weak KL penalty, or none, can work better<a class="cite" href="#ref-16">16</a> (§3.1). Zhang et al. (ICLR 2026) independently identify "an off-policy importance-weighting mismatch in GRPO's KL term"<a class="cite" href="#ref-17">17</a>.</p>
+<p>What the fix does to the gradient is not printed in the report, but it follows in two lines (derived). With \(w=\pi_\theta/\pi_{\mathrm{old}}\) differentiated through, \(\nabla(w\,k_3)=w\,(k_3+1-r)\,s=w\,\log\tfrac{\pi_\theta}{\pi_{\mathrm{ref}}}\,s\), because \(k_3+1-r=-\log r\). Under \(\pi_{\mathrm{old}}\) the expectation is \(\mathbb{E}_{\pi_\theta}[\log\tfrac{\pi_\theta}{\pi_{\mathrm{ref}}}\,s]=\nabla\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})\), the correct reverse-KL gradient (last row of Table 4), and the per-sample coefficient grows like a logarithm (-6.2 in Table 3's last row) rather than like \(1/\pi_\theta\) (-499). This is still a token-level loss, so §3.4 applies.</p>
+<pre class="code" data-lang="python" data-title="kl_variants.py"><code># logp: log pi_theta of sampled tokens (requires grad); old_logp, ref_logp: detached; one row per token
+log_ratio = logp - ref_logp                       # log(pi_theta / pi_ref) = -log r
+
+k1_loss = log_ratio                                # value is an unbiased KL estimate; E[grad] = 0 on-policy
+k3_loss = (-log_ratio).exp() - 1 + log_ratio       # GRPO/TRL: E[grad] = grad of forward KL(pi_ref || pi_theta)
+k2_surrogate = log_ratio.detach() * logp           # grad = log_ratio * grad(logp) = reverse-KL gradient
+k3_is_loss = (logp - old_logp).exp() * k3_loss     # DeepSeek-V3.2 Eq. 7: weight pi_theta/pi_old, differentiated through
+
+# KL in the reward instead (PPO-RLHF): no gradient path, folded into per-token rewards
+token_reward = -beta * log_ratio.detach()          # add r_phi at the last token, then GAE
+</code></pre>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>If you keep a KL term, the options that match the reverse-KL objective are \(k_1\) in the reward (PPO-style, sequence-correct), the \(k_2\) surrogate above, or the importance-weighted \(k_3\). If you copy GRPO's \(k_3\)-in-loss, you are regularizing a per-token forward KL; at the coefficients reports use (0.001 to 0.04, Table 6) the difference may be small<a class="cite" href="#ref-9">9</a>, but the cost of the correct form is one detach.</p></aside>
+
+<h2 id="kl-budget">4. What a KL budget buys: the coefficient, the reference policy and the schedule</h2>
+
+<h3 id="kl-budget-beta">4.1 The coefficient is a price in reward units per nat</h3>
+<p>By the identity of §1.2, at the optimum one more nat of KL must buy \(\beta\) more reward. A coefficient therefore carries no meaning without two other facts: the scale of the reward, and how the KL is summed. Tulu 3's verifiable reward is 0 or \(\alpha=10\), "based on pilot experiments"<a class="cite" href="#ref-18">18</a> (§6, Eq. 8), with \(\beta=0.05\). R1's reward is accuracy plus format, converted to a group-standardized advantage<a class="cite" href="#ref-13">13</a> (Eq. 3), with \(\beta=0.001\). InstructGPT normalizes the reward model so labeler demonstrations score 0 on average and uses \(\beta=0.02\) on a token-summed log-ratio<a class="cite" href="#ref-4">4</a> (§3.5, Appendix C.4). GRPO averages the KL over tokens, but it averages the surrogate the same way (the common \(1/|o_i|\) in DeepSeekMath's Eq. 3), so relative to the advantage the KL still enters at \(\beta\) per nat of sequence KL (derived). The numbers in Table 6 are priced in different currencies; they are not a menu.</p>
+<p>InstructGPT's own sweep shows the same trade: the human Likert score is poor at coefficients 0 and 2, with the best region around 0.01 to 0.02<a class="cite" href="#ref-4">4</a> (Appendix E.7), and raising the coefficient to 2.0, 100 times the default, did not repair the NLP-benchmark regressions, which needed the pretraining mix of Module 5 instead<a class="cite" href="#ref-4">4</a> (Appendix E).</p>
+
+<table class="tbl tbl-dense">
+  <caption><b>Table 6.</b> KL placement, estimator, coefficient and reference policy in published recipes (as of 2026-10). "Not stated" means the passage read did not give it. Coefficients are not comparable across rows (§4.1).</caption>
+  <thead><tr><th>Recipe</th><th>Placement</th><th>Estimator</th><th>Coefficient \(\beta\)</th><th>Reference policy</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Ziegler et al. 2019</td><td>reward</td><td>log-ratio (\(k_1\))</td><td>constant, or adapted to a target KL</td><td>initial LM \(\rho\)</td><td><a class="cite" href="#ref-1">1</a> (§2, §2.2)</td></tr>
+    <tr><td class="row">Stiennon et al. 2020</td><td>reward</td><td>log-ratio (\(k_1\))</td><td>0.05 (both main runs)</td><td>SFT model</td><td><a class="cite" href="#ref-3">3</a> (§3.4, App. B.1)</td></tr>
+    <tr><td class="row">InstructGPT 2022</td><td>reward, per token</td><td>log-ratio (\(k_1\))</td><td>0.02; best Likert near 0.01 to 0.02</td><td>SFT model (with pretraining mix)</td><td><a class="cite" href="#ref-4">4</a> (App. C.4, E.7)</td></tr>
+    <tr><td class="row">DeepSeekMath-RL 2024</td><td>loss</td><td>\(k_3\)</td><td>0.04</td><td>the instruction-tuned model; iterative GRPO (Algorithm 1, explored in §5.2) resets it to the current policy each iteration</td><td><a class="cite" href="#ref-12">12</a> (§4.2, Alg. 1)</td></tr>
+    <tr><td class="row">DeepSeek-R1-Zero, R1 stage 1 2025</td><td>loss</td><td>\(k_3\)</td><td>0.001</td><td>replaced by the latest policy every 400 steps</td><td><a class="cite" href="#ref-13">13</a> (§2.1, §3.2.1)</td></tr>
+    <tr><td class="row">Tulu 3 RLVR 2024</td><td>in the objective (Eq. 7)</td><td>not stated</td><td>0.05 (8B), 0.07 (70B); sweep 0.1, 0.05, 0.03, 0.01</td><td>start model (best DPO checkpoint)</td><td><a class="cite" href="#ref-18">18</a> (§6, Table 21)</td></tr>
+    <tr><td class="row">DeepSeek-V3.2 2025</td><td>loss</td><td>\(k_3\times\pi_\theta/\pi_{\mathrm{old}}\)</td><td>domain-dependent; weak or none for math</td><td>not stated</td><td><a class="cite" href="#ref-16">16</a> (§3.1)</td></tr>
+    <tr><td class="row">ProRL 2025</td><td>loss</td><td>not stated</td><td>not stated</td><td>hard reset to a recent policy snapshot, optimizer re-initialized</td><td><a class="cite" href="#ref-19">19</a> (§2.3.1)</td></tr>
+    <tr><td class="row">DAPO 2025</td><td>none</td><td>none</td><td>removed</td><td>none</td><td><a class="cite" href="#ref-20">20</a> (§2.3)</td></tr>
+    <tr><td class="row">Olmo 3 (OlmoRL) 2025</td><td>none</td><td>none</td><td>"No KL loss"</td><td>none</td><td><a class="cite" href="#ref-21">21</a> (§4.4.1)</td></tr>
+    <tr><td class="row">GLM-5 reasoning RL 2026</td><td>none</td><td>none</td><td>removed relative to IcePop</td><td>none</td><td><a class="cite" href="#ref-22">22</a> (§3.2)</td></tr>
+    <tr><td class="row">TRL GRPOTrainer (docs)</td><td>loss</td><td>\(k_3\)</td><td>default 0.0, so the reference is not loaded; docs cite R1's 0.001</td><td>not stated; <code>sync_ref_model</code> defaults to False</td><td><a class="cite" href="#ref-11">11</a></td></tr>
+  </tbody>
+</table>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Tulu 3 reports the final 70B RLVR coefficient as 0.07 in the Table 21 caption but writes "\(\beta=0.7\)" in the §6.4 description of the 70B run<a class="cite" href="#ref-18">18</a>. Table 6 uses the caption; the discrepancy is most likely a typo but the report does not say.</p></aside>
+
+<h3 id="kl-budget-reference">4.2 The reference policy: anchored, started-from, moving, or absent</h3>
+<p>The early RLHF papers anchor to the SFT model for the whole run<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a>; InstructGPT also reports that using pretrained GPT-3 instead of the PPO initialization as the KL model "gives similar results"<a class="cite" href="#ref-4">4</a> (§4.2). Later recipes anchor to whatever the stage started from, which makes the coefficient depend on the starting checkpoint: Tulu 3 found that RLVR from an SFT model and from the DPO model reached the same verifiable reward, but the SFT start incurred a larger KL at the same \(\beta\) on GSM8K, because the SFT model was further from good at the task<a class="cite" href="#ref-18">18</a> (§6.2.1, Figure 20). KL measures distance travelled, not capability gained.</p>
+<p>A third pattern moves the anchor. DeepSeekMath's iterative GRPO sets the reference to the current policy at the start of every outer iteration<a class="cite" href="#ref-12">12</a> (Algorithm 1), R1 replaces it every 400 steps<a class="cite" href="#ref-13">13</a>, and ProRL hard-resets it, with the optimizer state, because "the KL term may increasingly dominate the loss, leading to diminishing policy updates", and also when validation metrics degrade or plateau<a class="cite" href="#ref-19">19</a> (§2.3.1, Appendix E). The fourth pattern, no reference, is Table 6's bottom block; Module 13 weighs it for long-CoT runs.</p>
+<p>Resets change what the leash means. Suppose each stage converges to the optimum of §1.2 for a fixed reward \(r\). After the first stage \(\pi_1\propto\pi_0e^{r/\beta}\); resetting the reference to \(\pi_1\) and optimizing again gives \(\pi_2\propto\pi_1e^{r/\beta}\propto\pi_0e^{2r/\beta}\), and after \(k\) stages \(\pi_k\propto\pi_0e^{kr/\beta}\) (derived). Relative to the original SFT model the effective coefficient is \(\beta/k\) and the cumulative KL is unbounded in the number of resets. Real stages do not converge and the reward drifts, so the identity is an idealization, but the direction is right: a reset turns "stay near the SFT model" into "stay near the recent past", which is a trust region (Module 3) more than a leash.</p>
+
+<h3 id="kl-budget-controller">4.3 Fixed coefficient or controlled KL</h3>
+<p>Ziegler et al. noticed that runs with the same \(\beta\) but different seeds ended at quite different KL values, "making them hard to compare", and for some experiments adapted \(\beta\) to hit a target KL with a log-space proportional controller<a class="cite" href="#ref-1">1</a> (§2.2):</p>
+$$ e_t=\mathrm{clip}\Big(\frac{\mathrm{KL}(\pi_t,\rho)-\mathrm{KL}_{\mathrm{target}}}{\mathrm{KL}_{\mathrm{target}}},\,-0.2,\,0.2\Big),\qquad \beta_{t+1}=\beta_t\,(1+K_\beta e_t),\quad K_\beta=0.1. $$
+<p>The clip bounds each update to a 2% change in \(\beta\) (\(0.1\times0.2\)), so moving \(\beta\) by a factor of 10 takes \(\ln10/\ln1.02\approx116\) updates (derived). Every other recipe in Table 6 that keeps a KL term reports a fixed \(\beta\). The controller converts a price into a target: it equalizes the KL budget across runs, which is what you want when comparing algorithms, and it is the one place where the question "how many nats should this run spend" becomes an input rather than a result. The scaling laws below say what that input should be.</p>
+
+<h2 id="overoptimization-scaling">5. Gold versus proxy: scaling laws for over-optimization</h2>
+
+<h3 id="overoptimization-setup">5.1 Measuring Goodhart's law with a synthetic human</h3>
+<p>A learned reward is a proxy, and optimizing it hard eventually lowers the true objective. Measuring that needs ground truth, which means human labels, too expensive to sweep. Gao et al. replace the human with a fixed "gold" reward model, the 6B InstructGPT RM, and train proxy RMs of 3M to 3B parameters on comparisons the gold model labels: 100,000 synthetic comparisons, 10% held out, the higher gold score always marked preferred<a class="cite" href="#ref-6">6</a> (§2.1). Policies are GPT-3-series models fine-tuned for two epochs on InstructGPT demonstrations. Optimization is PPO (batch 256, clip 0.2, GAE \(\lambda=0.95\), Appendix C) or best-of-\(n\) (BoN); the KL penalty is zero in every RL run except §3.6, and scores are recentered so the initial policy averages 0<a class="cite" href="#ref-6">6</a> (§2.2).</p>
+<p>The x-axis of everything that follows is KL, and for BoN it is known in closed form: \(\mathrm{KL}_{\mathrm{bon}}=\ln n-\frac{n-1}{n}\)<a class="cite" href="#ref-6">6</a> (§2), taken from Stiennon et al.<a class="cite" href="#ref-3">3</a> (Appendix G.3). This gives 1.40 nats at \(n=10\), 3.62 at 100, 5.91 at 1,000, 8.21 at 10,000 and 10.00 at 60,000 (derived from the formula). The authors hypothesized their functional forms from BoN data up to \(n=1{,}000\) (about 6 nats), then ran BoN to \(n=60{,}000\) (about 10 nats) as a true advance prediction<a class="cite" href="#ref-6">6</a> (§3.1).</p>
+<div class="calc">
+  <p class="calc-title">Best-of-n: how many nats does sampling n candidates spend?</p>
+  <div class="calc-row"><label for="c1-e">log10 of n</label><input type="range" id="c1-e" name="e" min="0.3" max="4.8" step="0.05" value="3"></div>
+  <div class="calc-out">
+    <div>n<output data-expr="pow(10,e)" data-format="si"></output></div>
+    <div>KL of BoN (nats)<output data-expr="log(pow(10,e)) - (pow(10,e)-1)/pow(10,e)" data-format="fixed:3"></output></div>
+    <div>d = sqrt(KL)<output data-expr="sqrt(log(pow(10,e)) - (pow(10,e)-1)/pow(10,e))" data-format="fixed:3"></output></div>
+  </div>
+  <p class="calc-note">Formula: \(\mathrm{KL}_{\mathrm{bon}}=\ln n-\frac{n-1}{n}\), Gao et al. §2 and Stiennon et al. Appendix G.3. The slider is continuous in \(\log_{10}n\); \(n\) itself need not be an integer here.</p>
+</div>
+
+<h3 id="overoptimization-forms">5.2 Two functional forms, and where they peak</h3>
+<p>Write \(d=\sqrt{\mathrm{KL}(\pi\|\pi_{\mathrm{init}})}\), chosen because KL behaves as a quadratic distance<a class="cite" href="#ref-6">6</a> (§1). The gold reward as a function of \(d\) follows, with \(R(0):=0\),</p>
+$$ R_{\mathrm{bon}}(d)=d\,(\alpha_{\mathrm{bon}}-\beta_{\mathrm{bon}}\,d),\qquad R_{\mathrm{RL}}(d)=d\,(\alpha_{\mathrm{RL}}-\beta_{\mathrm{RL}}\log d). $$
+<p>The RL form has infinite slope at the origin, so it likely fails near \(d=0\); the two finite-slope alternatives they tried, \(d(\alpha-\beta\log(1+d))\) and a power law, fit or extrapolated worse (the first) or needed an extra free exponent whose best values approached the log form (the second)<a class="cite" href="#ref-6">6</a> (footnote 1, Appendix B). The proxy score is roughly linear in \(d\) for both methods<a class="cite" href="#ref-6">6</a> (§3.2). Setting the derivative to zero gives the peak (derived):</p>
+$$ \text{BoN: } d^*=\frac{\alpha}{2\beta},\;\; R^*=\frac{\alpha^2}{4\beta};\qquad \text{RL: } d^*=e^{\alpha/\beta-1},\;\; R^*=\beta\,d^*. $$
+<p>(For RL, \(R'(d)=\alpha-\beta\log d-\beta=0\), and at that point \(\alpha-\beta\log d^*=\beta\).) Before the peak both rise together; after it the policy is still buying proxy reward but losing gold reward, and the gap is the shortfall. Gao et al. map the two coefficients onto Goodhart's taxonomy: the \(\alpha\) term, the difference between the proxy's slope and the gold curve's linear part, measures regressional Goodhart (optimization selecting on the proxy's noise), while the \(\beta\) term, mostly responsible for the non-monotonic gold curve, reflects extremal Goodhart (the policy leaving the distribution the proxy was trained on)<a class="cite" href="#ref-6">6</a> (§4.2). Causal Goodhart behaves like regressional; adversarial Goodhart is not captured because the models are not capable enough to manipulate the reward model, and the authors advise caution when extrapolating to systems that can<a class="cite" href="#ref-6">6</a> (§4.2.4).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 450" role="img" aria-labelledby="f6t"><title id="f6t">Schematic gold reward versus square root of KL for best-of-n and for RL, with a roughly linear proxy reward: the best-of-n gold curve peaks early and falls steeply, the RL gold curve peaks much later at a similar height, and the proxy keeps rising</title>
+    <defs>
+      <marker id="f6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <line x1="70" y1="366" x2="740" y2="366" class="d-grid"/><text x="62" y="370" text-anchor="end" class="d-mono d-small d-text-light">-2</text>
+    <line x1="70" y1="328" x2="740" y2="328" class="d-grid"/><text x="62" y="332" text-anchor="end" class="d-mono d-small d-text-light">-1</text>
+    <line x1="70" y1="252" x2="740" y2="252" class="d-grid"/><text x="62" y="256" text-anchor="end" class="d-mono d-small d-text-light">1</text>
+    <line x1="70" y1="214" x2="740" y2="214" class="d-grid"/><text x="62" y="218" text-anchor="end" class="d-mono d-small d-text-light">2</text>
+    <line x1="70" y1="176" x2="740" y2="176" class="d-grid"/><text x="62" y="180" text-anchor="end" class="d-mono d-small d-text-light">3</text>
+    <line x1="70" y1="138" x2="740" y2="138" class="d-grid"/><text x="62" y="142" text-anchor="end" class="d-mono d-small d-text-light">4</text>
+    <line x1="70" y1="290" x2="740" y2="290" class="d-axis"/><text x="62" y="294" text-anchor="end" class="d-mono d-small d-text-light">0</text>
+    <line x1="70" y1="120" x2="70" y2="392" class="d-axis"/>
+    <text x="70" y="112" class="d-small d-text-light">reward (schematic units)</text>
+    <line x1="204" y1="120" x2="204" y2="392" class="d-grid"/><line x1="338" y1="120" x2="338" y2="392" class="d-grid"/><line x1="472" y1="120" x2="472" y2="392" class="d-grid"/><line x1="606" y1="120" x2="606" y2="392" class="d-grid"/><line x1="740" y1="120" x2="740" y2="392" class="d-grid"/>
+    <text x="70" y="408" text-anchor="middle" class="d-mono d-small d-text-light">0</text><text x="204" y="408" text-anchor="middle" class="d-mono d-small d-text-light">2</text><text x="338" y="408" text-anchor="middle" class="d-mono d-small d-text-light">4</text><text x="472" y="408" text-anchor="middle" class="d-mono d-small d-text-light">6</text><text x="606" y="408" text-anchor="middle" class="d-mono d-small d-text-light">8</text><text x="740" y="408" text-anchor="middle" class="d-mono d-small d-text-light">10</text>
+    <text x="70" y="422" text-anchor="middle" class="d-mono d-small d-text-light">KL 0</text><text x="204" y="422" text-anchor="middle" class="d-mono d-small d-text-light">4</text><text x="338" y="422" text-anchor="middle" class="d-mono d-small d-text-light">16</text><text x="472" y="422" text-anchor="middle" class="d-mono d-small d-text-light">36</text><text x="606" y="422" text-anchor="middle" class="d-mono d-small d-text-light">64</text><text x="740" y="422" text-anchor="middle" class="d-mono d-small d-text-light">100 nats</text>
+    <text x="405" y="438" text-anchor="middle" class="d-small d-text-light">d = √KL (top row), KL in nats (bottom row)</text>
+    <polyline points="70.0,290.0 103.5,278.6 137.0,267.2 170.5,255.8 204.0,244.4 237.5,233.0 271.0,221.6 304.5,210.2 338.0,198.8 371.5,187.4 405.0,176.0 438.5,164.6 472.0,153.2 505.5,141.8 539.0,130.4" class="d-line d-stroke-green d-dashed" style="stroke-width:2"/>
+    <polyline points="70.0,290.0 86.8,281.0 103.5,272.9 120.2,265.8 137.0,259.6 153.8,254.4 170.5,250.1 187.2,246.8 204.0,244.4 220.8,243.0 237.5,242.5 254.3,243.0 271.0,244.4 287.8,246.8 304.5,250.1 321.2,254.4 338.0,259.6 354.8,265.8 371.5,272.9 388.2,281.0 405.0,290.0 421.8,300.0 438.5,310.9 455.2,322.8 472.0,335.6 488.8,349.4 505.5,364.1 522.2,379.8" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+    <polyline points="73.3,287.7 80.0,284.3 86.8,281.5 103.5,275.8 120.2,271.2 137.0,267.2 153.8,263.7 170.5,260.7 187.2,257.9 204.0,255.5 220.8,253.3 237.5,251.3 254.3,249.5 271.0,247.9 287.8,246.5 304.5,245.2 321.2,244.1 338.0,243.1 354.8,242.2 371.5,241.4 388.2,240.8 405.0,240.2 421.8,239.8 438.5,239.4 455.2,239.2 472.0,239.0 488.8,238.9 505.5,238.9 522.2,239.0 539.0,239.1 555.8,239.3 572.5,239.6 589.2,239.9 606.0,240.4 622.8,240.8 639.5,241.4 656.2,242.0 673.0,242.6 689.8,243.3 706.5,244.1 723.2,244.9 740.0,245.7" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+    <circle cx="237.5" cy="242.5" r="6" class="d-fill-blue"/>
+    <circle cx="499.2" cy="238.9" r="6" class="d-fill-orange"/>
+    <path d="M499,148 L499,230" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <text x="507" y="192" class="d-small">gap at the RL peak</text>
+    <text x="237" y="322" text-anchor="middle" class="d-small">BoN peak, KL 6.25</text>
+    <path d="M237,312 L237,252" class="d-arrow" marker-end="url(#f6-arr)"/>
+    <text x="499" y="266" text-anchor="middle" class="d-small">RL peak, KL 41.0</text>
+    <rect x="86" y="126" width="238" height="82" rx="6" class="d-label-bg"/>
+    <line x1="98" y1="146" x2="122" y2="146" class="d-line d-stroke-green d-dashed" style="stroke-width:2"/><text x="130" y="150" class="d-small">proxy: roughly linear in d</text>
+    <line x1="98" y1="168" x2="122" y2="168" class="d-line d-stroke-blue" style="stroke-width:2.5"/><text x="130" y="172" class="d-small">gold, best-of-n: d(1.0 − 0.20 d)</text>
+    <line x1="98" y1="190" x2="122" y2="190" class="d-line d-stroke-orange" style="stroke-width:2.5"/><text x="130" y="194" class="d-small">gold, RL: d(0.6 − 0.21 ln d)</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Schematic of the published functional forms<a class="cite" href="#ref-6">6</a> (§1). The coefficients are illustrative, chosen here to reproduce the qualitative findings (best-of-n peaks at a small KL and falls steeply; RL is slower in KL terms, needs far more KL to reach its peak, and peaks about as high); they are not the paper's fitted values, which appear only graphically. The proxy line has an arbitrary slope of 0.6. Peaks follow the derived formulas: BoN at \(d^*=2.5\) (KL 6.25 nats, \(R^*=1.25\)), RL at \(d^*=6.41\) (KL 41.0 nats, \(R^*=1.345\)).</figcaption>
+</figure>
+
+<div class="calc">
+  <p class="calc-title">Peak of the fitted forms for chosen coefficients</p>
+  <div class="calc-row"><label for="c2-a1">alpha, best-of-n</label><input type="range" id="c2-a1" name="a1" min="0.2" max="2" step="0.05" value="1"></div>
+  <div class="calc-row"><label for="c2-b1">beta, best-of-n</label><input type="range" id="c2-b1" name="b1" min="0.05" max="0.5" step="0.01" value="0.2"></div>
+  <div class="calc-row"><label for="c2-a2">alpha, RL</label><input type="range" id="c2-a2" name="a2" min="0.2" max="2" step="0.05" value="0.6"></div>
+  <div class="calc-row"><label for="c2-b2">beta, RL</label><input type="range" id="c2-b2" name="b2" min="0.05" max="0.5" step="0.01" value="0.21"></div>
+  <div class="calc-out">
+    <div>BoN peak KL (nats)<output data-expr="pow(a1/(2*b1),2)" data-format="fixed:1"></output></div>
+    <div>BoN peak gold reward<output data-expr="a1*a1/(4*b1)" data-format="fixed:2"></output></div>
+    <div>RL peak KL (nats)<output data-expr="pow(exp(a2/b2-1),2)" data-format="fixed:1"></output></div>
+    <div>RL peak gold reward<output data-expr="b2*exp(a2/b2-1)" data-format="fixed:2"></output></div>
+  </div>
+  <p class="calc-note">Formulas (derived): BoN \(d^*=\alpha/2\beta\), \(R^*=\alpha^2/4\beta\); RL \(d^*=e^{\alpha/\beta-1}\), \(R^*=\beta d^*\); KL\(^*=d^{*2}\). Defaults are the illustrative coefficients of Figure 6, not fitted values. The RL peak KL is exponential in \(\alpha/\beta\), so small changes in the ratio move it by orders of magnitude.</p>
+</div>
+
+<h3 id="overoptimization-scaling-factors">5.3 What moves the coefficients</h3>
+<p>Gao et al. vary one factor at a time and read the effect off \(\alpha\) and \(\beta\) (Table 7). The result that matters for planning is the first row: the coefficients move smoothly with reward-model size, so peak gold reward for a larger proxy can be predicted from smaller ones. The result that matters for expectations is the third: a bigger policy gains less from the same reward model but over-optimizes about as much, peaking at nearly the same KL.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 7.</b> What changes the gold-versus-KL curve, from Gao et al.<a class="cite" href="#ref-6">6</a>. All results use the InstructGPT synthetic setup of §5.1; the authors flag that policy size was varied over only two values.</caption>
+  <thead><tr><th>Factor</th><th>Range tested</th><th>Finding</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Proxy RM parameters</td><td>3M to 3B (policy 1.2B, 90,000 RM examples)</td><td>\(\alpha_{\mathrm{bon}},\beta_{\mathrm{bon}}\) change smoothly, about logarithmically; for RL, \(\alpha_{\mathrm{RL}}\) can be held fixed and \(\beta_{\mathrm{RL}}\) carries the scaling; peak gold scores are predictable</td><td>§1, §3.2, Figs. 3, 12</td></tr>
+    <tr><td class="row">Proxy RM data</td><td>RM fixed at 12M; up to 90,000 comparisons</td><td>near-chance below about 2,000 comparisons; more data then lowers Goodharting. Four epochs on 2,000 examples gave no gain, one epoch on 8,000 did; larger RMs show the threshold no earlier</td><td>§3.3, Figs. 6, 13</td></tr>
+    <tr><td class="row">Policy size</td><td>1.2B versus 6B (RM 12M; 3B RM repeated)</td><td>larger policy gains less from optimization but gold peaks at almost the same KL and the proxy-gold gap is almost the same</td><td>§3.4, Figs. 7, 24</td></tr>
+    <tr><td class="row">RM validation loss</td><td>across RM size and data size</td><td>weak evidence that equal validation loss means equal robustness to optimization</td><td>§3.3, Fig. 5</td></tr>
+    <tr><td class="row">KL penalty in RL</td><td>several coefficients</td><td>gold score depends only on the KL reached; the penalty only makes it converge earlier</td><td>§3.6, Fig. 9</td></tr>
+  </tbody>
+</table>
+<p>For the policy-size result the authors offer one hypothesis, from the Bayesian reading of §1.2: if RLHF is inference from the prior of the initial policy, a larger policy only improves the model of the demonstration distribution<a class="cite" href="#ref-6">6</a> (§4.4). They do not test it.</p>
+
+<h3 id="overoptimization-rl-vs-bon">5.4 RL versus best-of-n, and the penalty as early stopping</h3>
+<p>The same gold reward costs different amounts of KL under different optimizers. BoN searches close to the initial policy, and its KL grows like \(\ln n\); RL moves the policy a little every step, and without a penalty its KL grows roughly quadratically in the number of steps<a class="cite" href="#ref-6">6</a> (§3.5). Stiennon et al. had seen the same ordering: at a given average reward the two had similar human-judged quality, but the PPO policy was farther from the supervised model in KL<a class="cite" href="#ref-3">3</a> (Appendix G.3). Measured against the proxy score instead of KL, BoN and RL look much more alike, although RL begins with a larger proxy-gold gap and then peaks at a higher gold score<a class="cite" href="#ref-6">6</a> (§3.5, Figure 8). The authors conclude that KL "should not be used to compare the amount of optimization between different optimization algorithms": perturbations orthogonal to the reward raise KL without raising any reward, and tiny, well-aimed perturbations can change behavior within a small KL budget<a class="cite" href="#ref-6">6</a> (§4.1).</p>
+<p>The same paper's finding about the penalty is the least comfortable one for §1. Varying the KL coefficient in RL changed only how soon the gold score converged, not the gold-versus-KL frontier: "akin to early stopping". A nonzero penalty also produced a strictly larger proxy-gold gap, so the authors set it to zero elsewhere, while noting the result "could be particularly sensitive to hyperparameters"<a class="cite" href="#ref-6">6</a> (§3.6). They also observe that PPO's own clipped surrogate acts as an implicit penalty toward recent policies that slows KL growth and appears to over-optimize less than an explicit penalty, for reasons they do not know<a class="cite" href="#ref-6">6</a> (§3.6). One reconciliation with InstructGPT's tuned coefficient, which is poor at 0 and at 2 (this module's §4.1): if the penalty is a stopping rule, the best \(\beta\) is the one whose equilibrium KL lands near the gold peak. That is my reading, not a result of either paper.</p>
+
+<h3 id="overoptimization-iterated">5.5 Iterating the reward model</h3>
+<p>Bai et al. recommended refreshing the reward model with new preference data during RLHF; Gao et al. analyze it under two assumptions, constant \(\alpha_{\mathrm{RL}},\beta_{\mathrm{RL}}\) across iterations and additive \(d\)<a class="cite" href="#ref-6">6</a> (§4.3). With \(k\) iterations each covering \(d/k\), the gold reward becomes \(d(\alpha_{\mathrm{RL}}-\beta_{\mathrm{RL}}\log d+\beta_{\mathrm{RL}}\log k)\). The \(\alpha\) term, regressional Goodhart, is untouched; the gain is \(\beta_{\mathrm{RL}}\,d\,\ln k\). At fixed total distance, 2, 4 and 8 iterations are worth 0.69, 1.39 and 2.08 times \(\beta_{\mathrm{RL}}d\) (derived), and the authors state the law can hold only up to some maximum \(k\). This is different from the reference-policy resets of §4.2, where the reward stays fixed: here the proxy is replaced, so the extremal-Goodhart term is renewed.</p>
+
+<h3 id="overoptimization-practice">5.6 Over-optimization outside the synthetic setup</h3>
+<p>With real human judgments the curve has the same shape. Stiennon et al. optimized against an earlier reward model at a range of KL coefficients; labelers preferred the policies under light optimization, then preference fell off relative to the reward model's prediction, and "eventually the reward model becomes anti-correlated with human preferences"<a class="cite" href="#ref-3">3</a> (§4.3, Figure 5). Lambert's textbook describes the same shape with a train and test preference model, where gains on the training model stop transferring at roughly 150K training samples, and states that over-optimization is "fundamental and unavoidable" for a learned reward<a class="cite" href="#ref-7">7</a> (§14.2). The mitigations it lists are larger policies, reward-model ensembles and changing the optimizer, and it adds that direct alignment algorithms are still prone to it.</p>
+<p>Verifiable rewards remove the learned proxy but not the KL curve. In Tulu 3's RLVR runs on GSM8K and MATH, spending more KL did not necessarily raise the verifiable reward; lowering \(\beta\) raised the KL and typically lowered the average score over evaluations, with one exception; some higher-KL IFEval runs produced visibly over-optimized outputs; and a higher learning rate made the KL explode early<a class="cite" href="#ref-18">18</a> (§6.2.1, Appendix B.4, §6.4). The final 70B run, at a lower learning rate, stayed well below 1. The operating point in these reports is chosen by held-out evaluation, not by the coefficient: Tulu 3 evaluated every 100 steps (40 for 70B) and took the 8B checkpoint with the best overall MATH and IFEval performance<a class="cite" href="#ref-18">18</a> (§6.4). DeepSeek-R1 cites Gao et al. when explaining why it avoided model-based process rewards at scale<a class="cite" href="#ref-13">13</a> (Supplement G.2). Module 19 covers the exploits that remain with rule-based rewards.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 8.</b> What the cited reports watch during a run, and why. No report here prescribes thresholds; the signals are the ones their figures and text track.</caption>
+  <thead><tr><th>Signal</th><th>What it indicates</th><th>Where it appears</th></tr></thead>
+  <tbody>
+    <tr><td class="row">KL to the reference, per token and per sequence</td><td>distance spent; a "very large" value "can indicate a potential bug or broken model"; early explosions followed a higher learning rate</td><td><a class="cite" href="#ref-7">7</a> (§14.2); <a class="cite" href="#ref-18">18</a> (§6.4, footnote 18)</td></tr>
+    <tr><td class="row">Proxy reward versus a held-out judge, RM or human preference</td><td>the shortfall between predicted and actual reward is the exploitation</td><td><a class="cite" href="#ref-6">6</a> (§3.4); <a class="cite" href="#ref-3">3</a> (Figure 5)</td></tr>
+    <tr><td class="row">Response length</td><td>very long answers when short ones would be preferred; a recurring extremal or causal exploit</td><td><a class="cite" href="#ref-6">6</a> (footnote 10); <a class="cite" href="#ref-18">18</a> (Figure 19, length plotted beside reward and KL)</td></tr>
+    <tr><td class="row">Average over held-out evaluations, not only the optimized metric</td><td>narrow gains with broad loss; more KL typically meant a lower average</td><td><a class="cite" href="#ref-18">18</a> (§6.2.1, Figure 21)</td></tr>
+  </tbody>
+</table>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Two questions are tangled in the reports: whether the KL-to-reference term should be there at all, and, if it is, which estimator in which place. The RLHF-era papers answered the first with "yes" and the second by habit. The reasoning-RL era split on both. Module 13 treats the long-chain-of-thought case in depth; this section sets out the four positions the sources support.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Keep the term and make its gradient the reverse-KL gradient</h4>
+    <p class="who">Tang and Munos (Meta)<a class="cite" href="#ref-9">9</a>; Shah et al. (Mila, COLM 2026)<a class="cite" href="#ref-14">14</a>; Liu et al.<a class="cite" href="#ref-15">15</a>; the PPO-RLHF tradition<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a></p>
+    <p>The term exists to be a specific gradient, so the estimator is a gradient choice: \(k_1\) in the reward, \(k_2\) as a loss, or an importance-weighted \(k_3\). Differentiating \(k_3\) or \(k_1\) as a loss optimizes something else.</p>
+    <ul class="pros"><li>The derivations are exact and checkable (Table 4); three independent groups agree on them.</li><li>K1-in-reward beat K3-in-loss on every reported task in both models, and KL of the right kind stabilized asynchronous runs<a class="cite" href="#ref-14">14</a>.</li><li>In the high-KL regime, such as distillation, the proper sequence-level gradient minimized KL fastest<a class="cite" href="#ref-9">9</a>.</li></ul>
+    <ul class="cons"><li>The evidence is 7B to 8B models, math tasks, 250 steps; at \(\beta=0.001\) Tang and Munos saw similar curves for the "incorrect" and correct losses.</li><li>Gao et al. found the penalty equivalent to early stopping in their setup<a class="cite" href="#ref-6">6</a>, which weakens the case for caring about its exact form.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Keep it as GRPO ships it: \(k_3\) in the loss</h4>
+    <p class="who">DeepSeekMath and DeepSeek-R1<a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-13">13</a>; TRL's implementation<a class="cite" href="#ref-11">11</a>; DeepSeek-V3.2 with an importance-ratio correction<a class="cite" href="#ref-16">16</a></p>
+    <p>Keeping the KL out of the reward leaves the advantage computation untouched, and \(k_3\) is low-variance and non-negative. At coefficients of 0.001 to 0.04 it has trained models at scale.</p>
+    <ul class="pros"><li>Simple, and it was stable in every K3-in-loss run of Shah et al.<a class="cite" href="#ref-14">14</a>.</li><li>Used in R1 for 10,400 steps<a class="cite" href="#ref-13">13</a>; V3.2 patches its known failure rather than abandoning it.</li></ul>
+    <ul class="cons"><li>Its expected gradient is the forward-KL gradient, with unbounded weight on tokens where \(\pi_\theta\ll\pi_{\mathrm{ref}}\)<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-16">16</a>.</li><li>It is a token-level partial gradient (§3.4) and trails K1-in-reward in Shah et al.'s evaluations.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Drop the term for long-chain-of-thought RL with verifiers</h4>
+    <p class="who">DAPO<a class="cite" href="#ref-20">20</a>; Olmo 3<a class="cite" href="#ref-21">21</a>; GLM-5<a class="cite" href="#ref-22">22</a>; TRL's default of 0.0<a class="cite" href="#ref-11">11</a></p>
+    <p>A reasoning policy is expected to diverge a lot from its initialization, so a restriction toward it is unnecessary<a class="cite" href="#ref-20">20</a>. Olmo 3 reports that removing it "allows less-restricted policy updates" and does not lead to over-optimization or destabilized training<a class="cite" href="#ref-21">21</a>. With a rule-based verifier there is no learned proxy to exploit.</p>
+    <ul class="pros"><li>Frees the update and saves a policy-size reference model and one forward pass per rollout.</li><li>Consistent with Gao et al.'s finding that the penalty did not improve the gold-versus-KL frontier<a class="cite" href="#ref-6">6</a>.</li></ul>
+    <ul class="cons"><li>The sources read give the decision, not an ablation: DAPO's ablation ladder (Table 1) has no KL row.</li><li>It leans on the verifier not being hackable (Module 19), and V3.2 says KL strength is domain-dependent, not absent everywhere<a class="cite" href="#ref-16">16</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Keep it, but reset the anchor</h4>
+    <p class="who">ProRL<a class="cite" href="#ref-19">19</a>; R1's 400-step replacement<a class="cite" href="#ref-13">13</a>; DeepSeekMath's iterative GRPO<a class="cite" href="#ref-12">12</a></p>
+    <p>Starting from an SFT or distilled checkpoint rather than a raw base model, an explicit KL term holds entropy and stability better than other tricks, and when the term starts to dominate the loss the reference and optimizer are reset. ProRL says the "remove KL" advice mostly applies to base models before any supervised fine-tuning<a class="cite" href="#ref-19">19</a>.</p>
+    <ul class="pros"><li>Keeps a restoring force while allowing unbounded cumulative progress.</li><li>Resets also gave a point to retune hyperparameters and data in ProRL's long run.</li></ul>
+    <ul class="cons"><li>By §4.2 the leash becomes a trust region; it no longer limits distance from the SFT model.</li><li>Evidence is a 1.5B model on one recipe, and the reset schedules (every 400 steps; on plateau) are heuristics.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The positions answer different questions, and the evidence supports a split rather than a winner. Whether: with a learned proxy (a reward model or a generative judge) keep a KL term, or an equivalent held-out early-stopping rule, because the over-optimization curve of §5 is real, appears with human judges as well, and the cited recipes pick their stopping point from held-out evaluation. With a rule-based verifier on a long-chain-of-thought run, removal is the convergent practice of three independent open recipes; I would still treat it as unablated, since none of the reports read isolates it. How: if you keep the term at a coefficient above roughly 0.01 or expect large KL (distillation, long runs), use a gradient-correct form (k1 in the reward, the k2 surrogate, or the importance-weighted k3). At 0.001, Tang and Munos suggest the choice barely matters; that is their conjecture from one experiment, not an established result. What would settle it: a matched ablation of {no KL, k3 in loss, k1 in reward, importance-weighted k3, k3 with resets} on one long-chain-of-thought recipe for thousands of steps, reporting held-out evaluations, entropy and KL; Shah et al.'s grid is the closest existing test and covers 250 steps on 7B to 8B math.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Estimator correctness has gone from folklore to published bug since mid-2025: Tang and Munos (June 2025), V3.2's corrected \(k_3\) (December 2025) and Shah et al. (v4, August 2026) all postdate DeepSeekMath's original choice (February 2024)<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-16">16</a><a class="cite" href="#ref-14">14</a>. TRL's default is still \(\beta=0\) with a \(k_3\) loss available<a class="cite" href="#ref-11">11</a>, so check the version you run. The scaling-law evidence is 2022-vintage: GPT-3-family policies, PPO, a 6B gold model<a class="cite" href="#ref-6">6</a>. The sources read contain no comparable gold-versus-proxy law for generative-judge or rubric rewards (Module 16), or for on-policy distillation, where the reverse KL is the objective itself and gradient correctness matters most (Module 21).</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Ziegler, D. M., Stiennon, N., Wu, J., Brown, T. B., Radford, A., Amodei, D., Christiano, P., Irving, G. <em>Fine-Tuning Language Models from Human Preferences</em>. arXiv 1909.08593 v2, 8 Jan 2020. <a href="https://arxiv.org/abs/1909.08593">https://arxiv.org/abs/1909.08593</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the KL-penalized reward and its stated purposes (§2, Eq. 2), the adaptive KL controller and its constants (§2.2), the no-KL gibberish samples and +8.0 mock-sentiment score (Table 10).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Korbak, T., Perez, E., Buckley, C. L. <em>RL with KL penalties is better viewed as Bayesian inference</em>. arXiv 2205.11275 v2, 21 Oct 2022. <a href="https://arxiv.org/abs/2205.11275">https://arxiv.org/abs/2205.11275</a>. Accessed 2026-10-27. <span class="ref-use">Used for: distribution collapse of the plain RL objective (§2), the KL-regularised objective (§3, Eq. 3) and its reading as a Bayesian posterior (§4, Eq. 5).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Stiennon, N., Ouyang, L., Wu, J., Ziegler, D. M., Lowe, R., Voss, C., Radford, A., Amodei, D., Christiano, P. <em>Learning to summarize from human feedback</em>. NeurIPS 2020; arXiv 2009.01325 v3, 15 Feb 2022. <a href="https://arxiv.org/pdf/2009.01325">https://arxiv.org/pdf/2009.01325</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the KL-penalized reward and its two purposes (§3.4), the 0.05 coefficient (Appendix B.1), over-optimization against the reward model judged by humans (§4.3, Figure 5), the best-of-N KL formula and the PPO-versus-BoN comparison (Appendix G.3).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Ouyang, L., Wu, J., Jiang, X., Almeida, D. et al. <em>Training language models to follow instructions with human feedback</em>. NeurIPS 2022; arXiv v1, 4 Mar 2022. <a href="https://arxiv.org/pdf/2203.02155v1">https://arxiv.org/pdf/2203.02155v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the per-token KL penalty and the PPO-ptx objective (§3.5, Eq. 2), \(\beta=0.02\) and no discounting (Appendix C.4), the pretraining mix versus a larger KL coefficient and the KL-model remark (§4.2, Appendix E.6), the optimal-coefficient sweep (Appendix E.7).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Rafailov, R., Sharma, A., Mitchell, E., Ermon, S., Manning, C. D., Finn, C. <em>Direct Preference Optimization: Your Language Model is Secretly a Reward Model</em>. NeurIPS 2023; arXiv v3, 29 Jul 2024. <a href="https://arxiv.org/pdf/2305.18290v3">https://arxiv.org/pdf/2305.18290v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the KL-constrained reward-maximization objective (§3, Eq. 3), the closed-form optimal policy and partition function (§4, Eq. 4) and their derivation (Appendix A.1).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Gao, L., Schulman, J., Hilton, J. <em>Scaling Laws for Reward Model Overoptimization</em>. ICML 2023; arXiv v1, 19 Oct 2022. <a href="https://arxiv.org/pdf/2210.10760v1">https://arxiv.org/pdf/2210.10760v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the synthetic gold/proxy setup (§2), the functional forms (§1, Appendix B), scaling with RM size, RM data and policy size (§3.2-3.4), RL versus best-of-n (§3.5), the KL penalty as early stopping (§3.6), KL as a yardstick and the Goodhart mapping (§4.1-4.2), iterated RLHF (§4.3), hyperparameters (Appendix C).</span></li>
+  <li id="ref-7"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback (RLHF Book)</em>. arXiv v12, 11 Sep 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the reverse-KL penalty and its direction (§15.1), over-optimization, the train/test preference-model example, KL monitoring and mitigations (§14.2).</span></li>
+  <li id="ref-8"><span class="ref-type">blog</span>Schulman, J. <em>Approximating KL Divergence</em>. Personal site, posted 2020-03-07. <a href="http://joschu.net/blog/kl-approx.html">http://joschu.net/blog/kl-approx.html</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the definitions of \(k_1\), \(k_2\), \(k_3\) and the reverse-direction estimator, the two numerical tables (true KL 0.005 and 0.5) and the experiment code.</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Tang, Y., Munos, R. <em>On a few pitfalls in KL divergence gradient estimation for RL</em>. arXiv 2506.09477 v1, 11 Jun 2025. <a href="https://arxiv.org/abs/2506.09477">https://arxiv.org/abs/2506.09477</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the expected gradients of the \(k_1\), \(k_2\) and \(k_3\) losses (§3, Eqs. 2-4), the sequence-level partial-gradient pitfall and cumulative estimator (§4), the low-KL and on-policy-distillation experiments (§5, Figures 7-8).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Grattafiori, A., Dubey, A., Jauhri, A. et al. (Llama Team, AI @ Meta) <em>The Llama 3 Herd of Models</em>. arXiv v3, 23 Nov 2024. <a href="https://arxiv.org/pdf/2407.21783v3">https://arxiv.org/pdf/2407.21783v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the 128K-token vocabulary (§3.2).</span></li>
+  <li id="ref-11"><span class="ref-type">official</span>Hugging Face TRL maintainers <em>TRL documentation: GRPO Trainer (main branch)</em>. docs/trl/main; version not stated on the page. <a href="https://huggingface.co/docs/trl/main/en/grpo_trainer">https://huggingface.co/docs/trl/main/en/grpo_trainer</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the per-token \(k_3\) estimator inside the loss, the default \(\beta=0.0\) with the reference model not loaded, the R1 value of 0.001, and the <code>sync_ref_model</code> default in the config signature. Quotes are WebFetch extractions of a 114,487-character page, of which the first 100,000 characters were read.</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R. et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: KL in the reward (§4.1.1, Eq. 2), KL in the loss and the \(k_3\) estimator (§4.1.1, Eqs. 3-4), the 0.04 coefficient (§4.2), the reference reset in iterative GRPO (Algorithm 1).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>DeepSeek-AI <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv v2, 4 Jan 2026 (expanded version; Nature 645:633-638, 2025); v1, 22 Jan 2025. <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the GRPO objective with the \(k_3\) KL term and group-standardized advantage (§2.1, Eqs. 1-3), \(\beta=0.001\) and the 400-step reference replacement (§2.1, §3.2.1), the reward-hacking argument against model-based process rewards citing Gao et al. (Supplement G.2).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Shah, V., Obando-Ceron, J., Jain, V. et al. <em>A Comedy of Estimators: On KL Regularization in RL Training of LLMs</em>. COLM 2026; arXiv 2512.21852 v4, 25 Aug 2026. <a href="https://arxiv.org/abs/2512.21852">https://arxiv.org/abs/2512.21852</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the gradient bias of \(K_1\) and \(K_3\) in the reward and in the loss (§2, Table 1, Eq. 4), the on-policy grid on Qwen2.5-7B and Llama-3.1-8B-Instruct (§4.1, Figures 2-4), the asynchronous experiments (§4.2, Figure 5).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Liu, K., Liu, J. K., Chen, M., Liu, Y. <em>Rethinking KL Regularization in RLHF: From Value Estimation to Gradient Optimization</em>. arXiv 2510.01555 v2, 6 Oct 2025. <a href="https://arxiv.org/abs/2510.01555">https://arxiv.org/abs/2510.01555</a>. Accessed 2026-10-27. <span class="ref-use">Used for: gradient equivalence of \(k_1\) in the reward and \(k_2\) as a loss, and \(k_3\) as a loss as a biased first-order approximation (Abstract, §1).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>DeepSeek-AI (Liu, A., Mei, A., Lin, B. et al.) <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the importance-ratio-corrected \(K_3\) estimator, the unbounded-gradient argument and the domain-dependent KL strength (§3.1, Eq. 7).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Zhang, Y., Liu, Y., Yuan, H., Yuan, Y., Gu, Q., Yao, A. C.-C. <em>On the Design of KL-Regularized Policy Gradient Algorithms for LLM Reasoning</em>. ICLR 2026; arXiv 2505.17508 v4, 19 Feb 2026. <a href="https://arxiv.org/abs/2505.17508">https://arxiv.org/abs/2505.17508</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the off-policy importance-weighting mismatch in GRPO's KL term (Abstract). Only the abstract and introduction were read.</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S. et al. <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv v5, 14 Apr 2025. <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the RLVR objective and reward of 10 (§6, Eqs. 7-8), the \(\beta\) sweeps and over-optimization findings (§6.2.1, Figures 19-21), Table 21 coefficients, final-run selection and the low 70B KL (§6.4), IFEval over-optimized outputs (Appendix B.4).</span></li>
+  <li id="ref-19"><span class="ref-type">paper</span>Liu, M., Diao, S., Lu, X., Hu, J. et al. (NVIDIA) <em>ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models</em>. arXiv v1, 30 May 2025. <a href="https://arxiv.org/pdf/2505.24864v1">https://arxiv.org/pdf/2505.24864v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the KL penalty, its dominance of the loss over time, the reference-policy and optimizer reset, and the argument that KL removal applies to raw base models (§2.3.1; Appendix E).</span></li>
+  <li id="ref-20"><span class="ref-type">paper</span>Yu, Q., Zhang, Z., Zhu, R., Yuan, Y. et al. <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv v2, 20 May 2025. <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the removal of the KL term for long-CoT reasoning (§2.3) and the ablation ladder (Table 1).</span></li>
+  <li id="ref-21"><span class="ref-type">paper</span>Team Olmo (Ettinger, A., Bertsch, A. et al.) <em>Olmo 3</em>. arXiv v2, 14 Apr 2026. <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: OlmoRL's omission of the KL loss and its stated reason (§4.4.1).</span></li>
+  <li id="ref-22"><span class="ref-type">paper</span>GLM-5 Team (Zeng, A., Lv, X. et al.) <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. arXiv v2, 24 Feb 2026. <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the removal of the KL regularization term from the IcePop-based reasoning-RL loss (§3.2).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

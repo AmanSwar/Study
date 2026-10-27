@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>From TRPO to PPO · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Derives TRPO's KL trust region, PPO's clipped surrogate and GAE from the primary papers, shows what the clip does and does not guarantee, and places GRPO (which DeepSeek-R1 uses) on the TRPO to PPO lineage.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 3</p>
+  <h1>From TRPO to PPO: Trust Regions, the Clipped Surrogate, and GAE</h1>
+  <p class="lede">PPO is the algorithm InstructGPT used and the one GRPO modifies; TRPO is the 2015 trust-region method PPO simplified, and GAE is the advantage estimator inside both. This module derives each constraint, shows what the clip does and does not guarantee, and computes a GAE advantage by hand. Afterwards you can read any PPO-family loss and name what it keeps from TRPO, what it drops, and where DeepSeek-R1 sits (it trains with GRPO, not TRPO).</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>19</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisite: <b>Module 2</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f1t"><title id="f1t">Lineage from TRPO (2015) through GAE, PPO and InstructGPT to GRPO (2024) and DeepSeek-R1 (2025), with what each step keeps and drops</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+
+    <rect x="10" y="20" width="112" height="56" rx="8" class="d-block"/>
+    <text x="66" y="44" text-anchor="middle" class="d-text-inv d-bold">TRPO</text><text x="66" y="64" text-anchor="middle" class="d-text-inv d-mono d-small">2015</text>
+    <rect x="143" y="20" width="112" height="56" rx="8" class="d-block"/>
+    <text x="199" y="44" text-anchor="middle" class="d-text-inv d-bold">GAE</text><text x="199" y="64" text-anchor="middle" class="d-text-inv d-mono d-small">2016</text>
+    <rect x="276" y="20" width="112" height="56" rx="8" class="d-block"/>
+    <text x="332" y="44" text-anchor="middle" class="d-text-inv d-bold">PPO</text><text x="332" y="64" text-anchor="middle" class="d-text-inv d-mono d-small">2017</text>
+    <rect x="409" y="20" width="112" height="56" rx="8" class="d-block-2"/>
+    <text x="465" y="44" text-anchor="middle" class="d-text-inv d-bold">InstructGPT</text><text x="465" y="64" text-anchor="middle" class="d-text-inv d-mono d-small">2022</text>
+    <rect x="542" y="20" width="112" height="56" rx="8" class="d-block-accent"/>
+    <text x="598" y="44" text-anchor="middle" class="d-text-inv d-bold">GRPO</text><text x="598" y="64" text-anchor="middle" class="d-text-inv d-mono d-small">Feb 2024</text>
+    <rect x="675" y="20" width="112" height="56" rx="8" class="d-block-accent"/>
+    <text x="731" y="44" text-anchor="middle" class="d-text-inv d-bold">DeepSeek-R1</text><text x="731" y="64" text-anchor="middle" class="d-text-inv d-mono d-small">Jan 2025</text>
+
+    <path d="M122,48 L141,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M255,48 L274,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M388,48 L407,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M521,48 L540,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M654,48 L673,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+
+    <rect x="10" y="90" width="112" height="76" rx="8" class="d-surface"/>
+    <text x="66" y="112" text-anchor="middle" class="d-small">avg KL ≤ 0.01</text><text x="66" y="131" text-anchor="middle" class="d-small">CG + line search</text><text x="66" y="150" text-anchor="middle" class="d-small">second-order</text>
+    <rect x="143" y="90" width="112" height="76" rx="8" class="d-surface"/>
+    <text x="199" y="112" text-anchor="middle" class="d-small">TD residuals</text><text x="199" y="131" text-anchor="middle" class="d-small">λ-weighted sum</text><text x="199" y="150" text-anchor="middle" class="d-small">bias vs variance</text>
+    <rect x="276" y="90" width="112" height="76" rx="8" class="d-surface"/>
+    <text x="332" y="112" text-anchor="middle" class="d-small">ratio clip 0.2</text><text x="332" y="131" text-anchor="middle" class="d-small">Adam, K epochs</text><text x="332" y="150" text-anchor="middle" class="d-small">first-order</text>
+    <rect x="409" y="90" width="112" height="76" rx="8" class="d-surface"/>
+    <text x="465" y="112" text-anchor="middle" class="d-small">PPO on an RM</text><text x="465" y="131" text-anchor="middle" class="d-small">KL in the reward</text><text x="465" y="150" text-anchor="middle" class="d-small">value init: RM</text>
+    <rect x="542" y="90" width="112" height="76" rx="8" class="d-surface"/>
+    <text x="598" y="112" text-anchor="middle" class="d-small">PPO clip kept</text><text x="598" y="131" text-anchor="middle" class="d-small">no critic, no GAE</text><text x="598" y="150" text-anchor="middle" class="d-small">KL in the loss</text>
+    <rect x="675" y="90" width="112" height="76" rx="8" class="d-surface"/>
+    <text x="731" y="112" text-anchor="middle" class="d-small">trains with GRPO</text><text x="731" y="131" text-anchor="middle" class="d-small">clip ε = 10</text><text x="731" y="150" text-anchor="middle" class="d-small">16 minibatches</text>
+
+    <rect x="10" y="190" width="380" height="132" rx="10" class="d-panel"/>
+    <text x="24" y="214" class="d-bold">TRPO to PPO</text>
+    <text x="24" y="240" class="d-small">keeps: ratio × advantage surrogate</text>
+    <text x="24" y="262" class="d-small">drops: hard KL bound, Fisher step,</text>
+    <text x="24" y="282" class="d-small">line search, improvement guarantee</text>
+    <text x="24" y="306" class="d-small d-text-light">Sections 2 to 5</text>
+
+    <rect x="410" y="190" width="380" height="132" rx="10" class="d-panel"/>
+    <text x="424" y="214" class="d-bold">PPO to GRPO</text>
+    <text x="424" y="240" class="d-small">keeps: ratio, clip, minibatch reuse</text>
+    <text x="424" y="262" class="d-small">drops: value model and GAE</text>
+    <text x="424" y="282" class="d-small">moves: KL to loss; adds group baseline</text>
+    <text x="424" y="306" class="d-small d-text-light">Sections 6 and 7; GRPO itself is Module 9</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The lineage this module covers. TRPO appeared at ICML 2015<a class="cite" href="#ref-1">1</a>, GAE at ICLR 2016 and was run inside TRPO<a class="cite" href="#ref-2">2</a>, PPO in 2017<a class="cite" href="#ref-3">3</a>. InstructGPT's RL stage used PPO<a class="cite" href="#ref-4">4</a>. GRPO was introduced in DeepSeekMath, Feb 2024<a class="cite" href="#ref-5">5</a>; DeepSeek-R1 adopts it and reports a first-stage clip ratio of 10 and 16 minibatches per rollout<a class="cite" href="#ref-6">6</a> (§3.2.1).</figcaption>
+</figure>
+
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>DeepSeek-R1 is not trained with TRPO. Its RL algorithm is GRPO, which DeepSeekMath introduced in February 2024 as a PPO variant that drops the critic<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-6">6</a>. TRPO (Schulman et al., 2015) is PPO's ancestor<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-3">3</a>. R1 popularized GRPO at frontier scale; it did not originate it. Module 9 teaches GRPO and Module 27 reads R1 stage by stage.</p></aside>
+
+<h2 id="why-unconstrained-steps-fail">1. Why a plain policy-gradient step is unsafe to reuse</h2>
+<p>Module 2 ended with the estimator \(\hat g=\hat{\mathbb E}_t[\nabla_\theta\log\pi_\theta(a_t\mid s_t)\,\hat A_t]\) and the remark that it is valid only at the \(\theta\) that generated the samples. Three facts turn step size into the central problem of every algorithm in this module: the surrogate is local, parameter distance is not policy distance, and reuse of rollouts is what makes both bite.</p>
+
+<h3 id="why-unconstrained-steps-fail-local">1.1 The gradient is a first-order statement</h3>
+<p>TRPO replaces the true return \(\eta(\pi)\) with a local surrogate that weights advantages by the <em>old</em> policy's state-visitation frequencies \(\rho_\pi\):</p>
+$$L_\pi(\tilde\pi)=\eta(\pi)+\sum_s\rho_\pi(s)\sum_a\tilde\pi(a\mid s)\,A_\pi(s,a).$$
+<p>The surrogate agrees with \(\eta\) in value and gradient at \(\theta_{old}\) (Eq. 4 of the paper), "but does not give us any guidance on how big of a step to take"<a class="cite" href="#ref-1">1</a> (§2). It ignores what changes as soon as the policy moves: the states the new policy would visit, and everything beyond first order. Every method below is a different way to pay for that ignorance.</p>
+
+<h3 id="why-unconstrained-steps-fail-metric">1.2 Parameter distance is not policy distance</h3>
+<p>A step of fixed length in \(\theta\) moves the policy by very different amounts in different places. The smallest example is a Bernoulli policy with logit \(\theta\) and \(p=\sigma(\theta)\). Solving exactly for the logit shift that produces \(\mathrm{KL}(p\,\|\,q)=0.01\) nats (derived):</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> Logit shift \(\Delta\theta\) that moves a Bernoulli policy by exactly 0.01 nats of KL, for four starting probabilities (exact root of \(\mathrm{KL}(p\Vert q)=0.01\), derived by the writer).</caption>
+  <thead><tr><th class="num">Start \(p\)</th><th class="num">Logit shift \(\Delta\theta\)</th><th class="num">New \(q\)</th><th class="num">Ratio \(q/p\)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0.5</td><td class="num">0.283</td><td class="num">0.570</td><td class="num">1.14</td></tr>
+    <tr><td class="num">0.1</td><td class="num">0.444</td><td class="num">0.148</td><td class="num">1.48</td></tr>
+    <tr><td class="num">0.01</td><td class="num">1.157</td><td class="num">0.0311</td><td class="num">3.11</td></tr>
+    <tr><td class="num">0.001</td><td class="num">2.617</td><td class="num">0.0135</td><td class="num">13.5</td></tr>
+  </tbody>
+</table>
+<p>Two lessons. A trust region has to be measured in policy space, because the same logit shift buys very different KL depending on where the policy sits. And an average-KL budget and a per-token ratio bound constrain different things: the same 0.01 nats lets a rare token (\(p=0.01\)) triple while a common one (\(p=0.5\)) moves 14%. Section 5.2 returns to this mismatch.</p>
+
+<h3 id="why-unconstrained-steps-fail-reuse">1.3 Reuse is what makes it matter</h3>
+<p>If every optimizer step used a fresh rollout, a small enough learning rate would be the only safeguard needed. It is not affordable: rollouts are the dominant cost of an RL iteration (Module 1), so recipes feed one rollout to several optimizer steps. PPO's authors state the consequence for the plain objective \(L^{PG}=\hat{\mathbb E}_t[\log\pi_\theta(a_t\mid s_t)\hat A_t]\): taking multiple steps on the same trajectory "is not well-justified, and empirically it often leads to destructively large policy updates"<a class="cite" href="#ref-3">3</a> (§2.1). Their ablation on seven MuJoCo tasks shows the size of the effect: with neither clipping nor a KL penalty the average normalized score is \(-0.39\), worse than the random policy at 0, because one environment (HalfCheetah) collapses<a class="cite" href="#ref-3">3</a> (§6.1, Table 1). TRPO's authors report the same failure mode at the single-step level: without a line search on the final step, "the algorithm occasionally computes large steps that cause a catastrophic degradation of performance"<a class="cite" href="#ref-1">1</a> (App. C).</p>
+
+<h2 id="trpo-theory">2. TRPO's theory: a lower bound on improvement</h2>
+<p>TRPO starts from a guarantee and then approximates it. PPO inherits its surrogate from that guarantee, and GRPO inherits PPO's.</p>
+
+<h3 id="trpo-theory-identity">2.1 The identity the surrogate comes from</h3>
+<p>Module 2 used the performance-difference identity of Kakade and Langford. In TRPO's notation, for any two policies,</p>
+$$\eta(\tilde\pi)=\eta(\pi)+\mathbb{E}_{\tau\sim\tilde\pi}\Big[\sum_{t=0}^{\infty}\gamma^{t}A_\pi(s_t,a_t)\Big]=\eta(\pi)+\sum_s\rho_{\tilde\pi}(s)\sum_a\tilde\pi(a\mid s)A_\pi(s,a),$$
+<p>where \(\rho_\pi(s)=\sum_t\gamma^tP(s_t=s\mid\pi)\) is the discounted visitation frequency<a class="cite" href="#ref-1">1</a> (§2, Eqs. 1-2). Any update whose expected advantage is nonnegative at every state cannot reduce \(\eta\). The catch is in the weights: \(\rho_{\tilde\pi}\) belongs to the new policy, so the right-hand side cannot be maximized directly. The surrogate \(L_\pi\) of Section 1.1 swaps in \(\rho_\pi\), which is computable from old-policy samples.</p>
+
+<h3 id="trpo-theory-bound">2.2 Theorem 1 and the penalty form</h3>
+<p>Kakade and Langford bounded the error of that swap for a mixture update \(\pi_{new}=(1-\alpha)\pi_{old}+\alpha\pi'\). TRPO's main theoretical result extends the bound to arbitrary stochastic policies by replacing \(\alpha\) with a distance. With the total-variation distance \(D_{TV}^{\max}(\pi,\tilde\pi)=\max_sD_{TV}(\pi(\cdot\mid s)\,\|\,\tilde\pi(\cdot\mid s))\) and \(\alpha=D_{TV}^{\max}(\pi_{old},\pi_{new})\):</p>
+$$\eta(\pi_{new})\ \ge\ L_{\pi_{old}}(\pi_{new})-\frac{4\epsilon\gamma}{(1-\gamma)^2}\,\alpha^2,\qquad \epsilon=\max_{s,a}|A_\pi(s,a)|.$$
+<p>Because \(D_{TV}(p\|q)^2\le D_{KL}(p\|q)\), the bound becomes a KL penalty<a class="cite" href="#ref-1">1</a> (§3, Theorem 1 and Eq. 9):</p>
+$$\eta(\tilde\pi)\ \ge\ L_\pi(\tilde\pi)-C\,D_{KL}^{\max}(\pi,\tilde\pi),\qquad C=\frac{4\epsilon\gamma}{(1-\gamma)^2},\quad D_{KL}^{\max}=\max_sD_{KL}(\pi(\cdot\mid s)\,\|\,\tilde\pi(\cdot\mid s)).$$
+<p>The right-hand side equals \(\eta\) at \(\tilde\pi=\pi\) and lies below it everywhere else, so it is a minorizer of \(\eta\). Maximizing it at each iteration is a minorization-maximization step: writing \(M_i(\pi)=L_{\pi_i}(\pi)-CD_{KL}^{\max}(\pi_i,\pi)\), the chain \(\eta(\pi_{i+1})-\eta(\pi_i)\ge M_i(\pi_{i+1})-M_i(\pi_i)\ge0\) gives a monotonically non-decreasing sequence of returns. The paper notes the algorithm is also "reminiscent of proximal gradient methods and mirror descent"<a class="cite" href="#ref-1">1</a> (§3).</p>
+
+<h3 id="trpo-theory-gap">2.3 What the theory does not give you</h3>
+<p>The authors say plainly where it fails as an algorithm: "if we used the penalty coefficient \(C\) recommended by the theory above, the step sizes would be very small"<a class="cite" href="#ref-1">1</a> (§4). The size of \(C\) is a function of the discount alone:</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> The theory's penalty coefficient per unit of \(\epsilon\), \(C/\epsilon=4\gamma/(1-\gamma)^2\), against the effective horizon \(1/(1-\gamma)\) that the GAE paper associates with the discount<a class="cite" href="#ref-2">2</a> (§4). Values derived from the formula in Theorem 1 / Eq. 9<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th class="num">Discount \(\gamma\)</th><th class="num">Horizon \(1/(1-\gamma)\) (steps)</th><th class="num">\(C/\epsilon\)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0.9</td><td class="num">10</td><td class="num">360</td></tr>
+    <tr><td class="num">0.99</td><td class="num">100</td><td class="num">39,600</td></tr>
+    <tr><td class="num">0.999</td><td class="num">1,000</td><td class="num">3,996,000</td></tr>
+    <tr><td class="num">1 (LLM default)</td><td class="num">unbounded</td><td class="num" data-worst>undefined</td></tr>
+  </tbody>
+</table>
+<p>\(C\) grows with the square of the horizon, so a theory-sized penalty pins the policy to \(\pi_{old}\). Three more gaps matter for an LLM practitioner.</p>
+<ul>
+  <li><strong>Worst case over states.</strong> \(D_{KL}^{\max}\) is "impractical to solve due to the large number of constraints"<a class="cite" href="#ref-1">1</a> (§4); for a language model the states are every possible prefix.</li>
+  <li><strong>Discounting.</strong> The theorem is stated for an infinite-horizon MDP with \(\gamma\in(0,1)\)<a class="cite" href="#ref-1">1</a> (§2). The LLM setup of Module 2 is finite-horizon with \(\gamma=1\), the common choice in RLHF code<a class="cite" href="#ref-7">7</a> (§6.4.1), where \(C\) as written is undefined. I did not find a finite-horizon version in the sources read for this course, so treat the theorem as motivation for a KL-shaped trust region, not as a guarantee for LLM RL (the writer's reading).</li>
+  <li><strong>Exact advantages.</strong> The practical algorithm "ignores estimation error for the advantage function"<a class="cite" href="#ref-1">1</a> (§5); in LLM RL the advantage is a noisy sample estimate (Module 2).</li>
+</ul>
+
+<h2 id="trpo-practical">3. Practical TRPO: an average-KL constraint and a natural-gradient step</h2>
+
+<h3 id="trpo-practical-problem">3.1 The constrained problem, and where PPO's ratio comes from</h3>
+<p>The practical algorithm makes three substitutions. The penalty becomes a hard constraint, because "it is hard to choose a single value of \(\beta\) that performs well across different problems—or even within a single problem"<a class="cite" href="#ref-3">3</a> (§2.2). The max over states becomes an average over states visited by the old policy. And the sum over actions becomes an importance-sampling estimate. The result is<a class="cite" href="#ref-1">1</a> (§4-§5, Eqs. 12 and 14):</p>
+$$\max_\theta\ \mathbb{E}_{s\sim\rho_{\theta_{old}},\,a\sim q}\Big[\frac{\pi_\theta(a\mid s)}{q(a\mid s)}\,Q_{\theta_{old}}(s,a)\Big]\quad\text{s.t.}\quad \mathbb{E}_{s\sim\rho_{\theta_{old}}}\big[D_{KL}\big(\pi_{\theta_{old}}(\cdot\mid s)\,\|\,\pi_\theta(\cdot\mid s)\big)\big]\le\delta.$$
+<p>In the single-path scheme \(q=\pi_{\theta_{old}}\), so the importance weight is \(\pi_\theta/\pi_{\theta_{old}}\): exactly the ratio \(r_t(\theta)\) that PPO writes down two years later<a class="cite" href="#ref-1">1</a> (§5.1)<a class="cite" href="#ref-3">3</a> (§3). Two details are worth fixing in memory because they survive into every PPO-family loss. The KL has the old policy first, \(D_{KL}(\pi_{old}\|\pi_\theta)\), and PPO's restatement of the constraint uses the same order<a class="cite" href="#ref-3">3</a> (Eq. 4). Replacing \(A\) by \(Q\) "only changes the objective by a constant", so a baseline is a variance device, not part of the trust-region problem<a class="cite" href="#ref-1">1</a> (§5). The step size was \(\delta=0.01\) "for all experiments" (§8.1).</p>
+
+<h3 id="trpo-practical-solve">3.2 Solving it: Fisher matrix, conjugate gradient, line search</h3>
+<p>The paper solves the constrained problem approximately, with a linear model of the objective and a quadratic model of the constraint. The quadratic model is \(D_{KL}(\theta_{old},\theta)\approx\tfrac12(\theta-\theta_{old})^\top A(\theta-\theta_{old})\), where \(A\) (written \(F\) in Figure 2) is the Fisher information matrix, built "by analytically computing the Hessian of the KL divergence" rather than from gradient covariances<a class="cite" href="#ref-1">1</a> (§6). With \(g=\nabla_\theta L\), maximizing \(g^\top\Delta\) subject to \(\tfrac12\Delta^\top A\Delta\le\delta\) gives (derived by a Lagrangian; it is the paper's \(\beta s\) with \(s=A^{-1}g\)):</p>
+$$\Delta\theta=\sqrt{\frac{2\delta}{g^\top A^{-1}g}}\;A^{-1}g,\qquad \beta=\sqrt{\frac{2\delta}{s^\top As}}\ \text{ for }\ s\approx A^{-1}g\ \ \text{(App. C)}.$$
+<p>Three engineering pieces make this tractable for a neural policy<a class="cite" href="#ref-1">1</a> (App. C, C.1). \(A^{-1}g\) is found by conjugate gradient from Fisher-vector products alone, never forming \(A\); a product costs "about as expensive as computing the gradient of an objective", and \(k=10\) iterations were "quite effective". Because \(A\) only acts as a metric, it can be computed on 10% of the data, making "the total cost of Hessian-vector products ... about the same as computing the gradient". And a line search shrinks \(\beta\) exponentially until the true surrogate improves and the true KL constraint holds, since both depart from the quadratic model; without it "the algorithm occasionally computes large steps that cause a catastrophic degradation of performance".</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f2t"><title id="f2t">A two-parameter toy: the KL ellipse, a vanilla gradient step that overshoots it, the same step shrunk to the KL budget, and the TRPO natural-gradient step on the boundary</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="10" y="10" width="480" height="320" rx="12" class="d-panel"/>
+    <ellipse cx="250" cy="270" rx="212" ry="42.4" class="d-fill-blue-soft d-stroke-blue" style="stroke-width:1.5"/>
+    <text x="30" y="244" class="d-small d-text-light">KL ≤ 0.01 region</text>
+    <circle cx="250" cy="270" r="4" class="d-fill-blue"/>
+    <text x="236" y="296" text-anchor="end" class="d-mono d-small">θ_old</text>
+    <path d="M250,270 L397,123" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <circle cx="397" cy="123" r="4" class="d-fill-red"/>
+    <text x="388" y="116" text-anchor="end" class="d-small">vanilla, same length</text>
+    <text x="388" y="132" text-anchor="end" class="d-mono d-small">KL 0.125</text>
+    <path d="M250,270 L291.6,228.4" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <circle cx="291.6" cy="228.4" r="4" class="d-fill-cyan"/>
+    <text x="300" y="214" class="d-small">scaled to budget</text>
+    <path d="M250,270 L458,262" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+    <circle cx="458" cy="262" r="4" class="d-fill-orange"/>
+    <text x="400" y="312" class="d-small d-bold">TRPO step</text>
+    <line x1="30" y1="320" x2="130" y2="320" class="d-axis"/>
+    <text x="30" y="314" class="d-small d-text-light">θ₁: KL-flat direction (F = 1)</text>
+    <text x="400" y="42" class="d-small d-text-light">θ₂: KL-sensitive (F = 25)</text>
+
+    <text x="505" y="40" class="d-bold">Same toy, three steps</text>
+    <text x="700" y="68" text-anchor="end" class="d-small d-text-light">KL (nats)</text>
+    <text x="785" y="68" text-anchor="end" class="d-small d-text-light">gain gᵀΔθ</text>
+    <line x1="505" y1="76" x2="790" y2="76" class="d-axis"/>
+    <circle cx="512" cy="100" r="4" class="d-fill-red"/>
+    <text x="524" y="104" class="d-small">vanilla, same length</text>
+    <text x="700" y="104" text-anchor="end" class="d-mono d-small">0.125</text><text x="785" y="104" text-anchor="end" class="d-mono d-small">0.196</text>
+    <circle cx="512" cy="132" r="4" class="d-fill-cyan"/>
+    <text x="524" y="136" class="d-small">vanilla, scaled to δ</text>
+    <text x="700" y="136" text-anchor="end" class="d-mono d-small">0.010</text><text x="785" y="136" text-anchor="end" class="d-mono d-small">0.055</text>
+    <circle cx="512" cy="164" r="4" class="d-fill-orange"/>
+    <text x="524" y="168" class="d-small d-bold">TRPO natural step</text>
+    <text x="700" y="168" text-anchor="end" class="d-mono d-small d-bold">0.010</text><text x="785" y="168" text-anchor="end" class="d-mono d-small d-bold">0.144</text>
+    <text x="505" y="210" class="d-small d-text-light">illustrative toy, derived by the writer:</text>
+    <text x="505" y="230" class="d-mono d-small">F = diag(1, 25), g = (1, 1), δ = 0.01</text>
+    <text x="505" y="256" class="d-small d-text-light">at equal KL the natural step</text>
+    <text x="505" y="274" class="d-small d-text-light">gains 2.6x more first-order</text>
+    <text x="505" y="292" class="d-small d-text-light">improvement than the gradient step</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Why the metric matters, on a toy with an assumed Fisher matrix \(F=\mathrm{diag}(1,25)\) and gradient \(g=(1,1)\) (illustrative; arrows to scale, 1,500 px per unit of \(\theta\)). A gradient step as long as the TRPO step lands at 12.5x the KL budget; scaled to the budget it gains 0.055. The natural step \(\beta F^{-1}g\)<a class="cite" href="#ref-1">1</a> (App. C) reaches the boundary and gains 0.144, 2.6x more. All numbers derived from the formulas in the text.</figcaption>
+</figure>
+
+<p>The toy also fixes the relationship to simpler methods. The TRPO paper shows that its update contains the natural policy gradient as a special case (linear \(L\), quadratic KL, Eq. 17) and the standard gradient as another (an \(\ell_2\) constraint, Eq. 18); what TRPO adds over natural gradient is that it enforces the KL bound at every update, which "significantly improves the algorithm's performance on larger problems"<a class="cite" href="#ref-1">1</a> (§7). On hopper and walker, natural gradient with a fixed penalty "was unable to generate hopping and walking gaits that made forward progress" while TRPO solved all problems<a class="cite" href="#ref-1">1</a> (§8.1).</p>
+
+<h3 id="trpo-practical-vine">3.3 Single path and vine, and why vine matters again for LLMs</h3>
+<p>TRPO's two sampling schemes estimate \(Q_{\theta_{old}}\) differently<a class="cite" href="#ref-1">1</a> (§5). <strong>Single path</strong> simulates the policy, collects trajectories, and sets \(\hat Q\) to the discounted sum of rewards that followed each state-action pair; it needs no resets. <strong>Vine</strong> picks a rollout set of states along "trunk" trajectories, samples several actions at each, and runs a short rollout after each action with common random numbers to cut the variance of the \(Q\)-differences. Vine gives "much better estimates of the advantage values" at the price of far more simulator calls and the requirement that the system can be restored to arbitrary states, "which is typically only possible in simulation" (§1).</p>
+<p>A language model satisfies the reset requirement for free: a state is a token prefix, so any prefix can be re-fed and continued. VinePPO uses exactly this. For each state in a sampled completion it draws \(K\) continuations from the current policy, sets \(\hat V_{MC}(s_t)=\frac1K\sum_{k=1}^{K}R(\eta_k)\) and forms the advantage \(r_t+\gamma\hat V_{MC}(s_{t+1})-\hat V_{MC}(s_t)\), with \(K=9\) by default; the paper cites TRPO's vine variant as the precedent<a class="cite" href="#ref-8">8</a> (§3, §4, §5). Its authors report that this unbiased estimate beats a learned value network on MATH and GSM8K, up to 3.0x faster in wall-clock (their claim, on DeepSeekMath 7B and RhoMath 1.1B)<a class="cite" href="#ref-8">8</a> (abstract, §6.1-§6.2). For an inference engineer the cost model is the interesting part: vine trades a policy-sized critic for extra decode work that shares prefixes (the writer's reading). Module 18 returns to credit assignment by rollout.</p>
+
+<h3 id="trpo-practical-llm">3.4 Why LLM recipes do not run TRPO</h3>
+<p>The sources give one direct reason. PPO's authors say TRPO "is relatively complicated, and is not compatible with architectures that include noise (such as dropout) or parameter sharing (between the policy and value function, or with auxiliary tasks)"<a class="cite" href="#ref-3">3</a> (§1). No source in this course's map trains an LLM with TRPO, so the rest is the writer's reasoning, not a documented failure:</p>
+<ul>
+  <li>The paper's accounting is favourable (about one extra gradient per update). What it omits is engineering: a Fisher-vector product is a Jacobian-vector product through the whole network and the line search needs extra forward passes, neither of which fits cleanly into sharded, mixed-precision trainers.</li>
+  <li>A first-order clip needs only the per-token log-probabilities the trainer computes anyway (Section 4).</li>
+  <li>RLHF already has a second regularizer, the KL to the reference model; Lambert argues this makes much of the difference between PPO and plain REINFORCE "far less meaningful for fine-tuning language models than training agents from scratch"<a class="cite" href="#ref-7">7</a> (§6.4.2).</li>
+</ul>
+<p>The trust-region idea itself survives in LLM recipes as a clip (PPO, GRPO), as a KL-regularized proximal objective (Kimi k1.5's online mirror descent<a class="cite" href="#ref-9">9</a> (§2.3.2)), and as a KL term to a reference policy (Module 6).</p>
+
+<h2 id="ppo-clip">4. PPO: the clipped surrogate</h2>
+
+<h3 id="ppo-clip-objective">4.1 The objective and its gradient, case by case</h3>
+<p>PPO keeps TRPO's surrogate and drops the constraint. Define the probability ratio \(r_t(\theta)=\pi_\theta(a_t\mid s_t)/\pi_{\theta_{old}}(a_t\mid s_t)\), so \(r(\theta_{old})=1\). TRPO's objective is \(L^{CPI}(\theta)=\hat{\mathbb E}_t[r_t(\theta)\hat A_t]\), named after conservative policy iteration, and PPO states that "without a constraint, maximization of \(L^{CPI}\) would lead to an excessively large policy update"<a class="cite" href="#ref-3">3</a> (§3, Eq. 6). The clipped objective is</p>
+$$L^{CLIP}(\theta)=\hat{\mathbb E}_t\Big[\min\big(r_t(\theta)\hat A_t,\ \operatorname{clip}(r_t(\theta),1-\epsilon,1+\epsilon)\hat A_t\big)\Big],\qquad \epsilon=0.2\ \text{suggested}$$
+<p>(Eq. 7)<a class="cite" href="#ref-3">3</a>. The second term removes the incentive to push \(r_t\) outside \([1-\epsilon,1+\epsilon]\); the \(\min\) keeps the objective a lower bound on \(L^{CPI}\). The gradient of one token's term follows from \(\nabla_\theta r_t=r_t\nabla_\theta\log\pi_\theta\) and is (derived)</p>
+$$\nabla_\theta\,\ell_t=\mathbf 1[\text{active}]\;\hat A_t\,r_t(\theta)\,\nabla_\theta\log\pi_\theta(a_t\mid s_t),\qquad \text{active}\iff (\hat A_t>0\wedge r_t\le1+\epsilon)\ \vee\ (\hat A_t<0\wedge r_t\ge1-\epsilon).$$
+<p>Where the term is active, the gradient is the Module 2 policy-gradient term multiplied by the ratio, which is the importance correction; where it is inactive, it is exactly zero. Table 3 gives the cases; Lambert's chapter enumerates the same regions<a class="cite" href="#ref-7">7</a> (§6.2.5-§6.2.6).</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 3.</b> Gradient of one token's \(L^{CLIP}\) term by sign of advantage and region of the ratio. Derived from Eq. 7; the same regions appear in Lambert's Figure 23<a class="cite" href="#ref-7">7</a> and in the PPO paper's Figure 1<a class="cite" href="#ref-3">3</a>.</caption>
+  <thead><tr><th></th><th>\(r\lt1-\epsilon\)</th><th>\(1-\epsilon\le r\le1+\epsilon\)</th><th>\(r\gt1+\epsilon\)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">\(\hat A\gt0\)</td><td>active: \(\hat A\,r\,\nabla\log\pi\), still pushes up</td><td>active</td><td data-worst>zero: objective flat at \((1+\epsilon)\hat A\)</td></tr>
+    <tr><td class="row">\(\hat A\lt0\)</td><td data-worst>zero: objective flat at \((1-\epsilon)\hat A\)</td><td>active</td><td>active: still pushes down (the pessimistic branch)</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f3t"><title id="f3t">Two-panel plot of one token's clipped surrogate against the probability ratio, for positive and negative advantage, with epsilon 0.2</title>
+    <text x="20" y="20" class="d-bold">A &gt; 0: a better-than-baseline token</text>
+    <text x="410" y="20" class="d-bold">A &lt; 0: a worse-than-baseline token</text>
+    <!-- left panel: x(r)=50+165r, y(L)=290-130L -->
+    <rect x="248" y="30" width="132" height="260" class="d-fill-red-soft"/>
+    <line x1="50" y1="290" x2="385" y2="290" class="d-axis"/><line x1="50" y1="30" x2="50" y2="290" class="d-axis"/>
+    <line x1="182" y1="30" x2="182" y2="290" class="d-line d-dashed d-dim"/><line x1="248" y1="30" x2="248" y2="290" class="d-line d-dashed d-dim"/>
+    <polyline points="248,134 380,30" class="d-line d-dashed d-stroke-cyan"/>
+    <polyline points="50,290 248,134 380,134" class="d-line d-stroke-blue" style="stroke-width:3"/>
+    <circle cx="215" cy="160" r="5" class="d-fill-orange"/>
+    <text x="50" y="308" text-anchor="middle" class="d-mono d-small">0</text>
+    <text x="182" y="308" text-anchor="middle" class="d-mono d-small">0.8</text>
+    <text x="215" y="324" text-anchor="middle" class="d-mono d-small">1</text>
+    <text x="248" y="308" text-anchor="middle" class="d-mono d-small">1.2</text>
+    <text x="380" y="308" text-anchor="middle" class="d-mono d-small">2</text>
+    <text x="215" y="190" text-anchor="middle" class="d-small d-text-light">start r = 1</text>
+    <text x="314" y="226" text-anchor="middle">gradient = 0</text>
+    <text x="314" y="246" text-anchor="middle" class="d-small d-text-light">flat at 1.2 A</text>
+    <text x="300" y="60" text-anchor="end" class="d-small d-text-light">dashed: r · A</text>
+    <text x="60" y="110" class="d-small d-text-light">active, even below 0.8</text>
+    <!-- right panel: x(r)=430+165r, y(L)=30-130L -->
+    <rect x="430" y="30" width="132" height="260" class="d-fill-red-soft"/>
+    <line x1="430" y1="290" x2="775" y2="290" class="d-axis"/><line x1="430" y1="30" x2="430" y2="290" class="d-axis"/>
+    <line x1="562" y1="30" x2="562" y2="290" class="d-line d-dashed d-dim"/><line x1="628" y1="30" x2="628" y2="290" class="d-line d-dashed d-dim"/>
+    <polyline points="430,30 562,134" class="d-line d-dashed d-stroke-cyan"/>
+    <polyline points="430,134 562,134 760,290" class="d-line d-stroke-blue" style="stroke-width:3"/>
+    <circle cx="595" cy="160" r="5" class="d-fill-orange"/>
+    <text x="430" y="308" text-anchor="middle" class="d-mono d-small">0</text>
+    <text x="562" y="308" text-anchor="middle" class="d-mono d-small">0.8</text>
+    <text x="595" y="324" text-anchor="middle" class="d-mono d-small">1</text>
+    <text x="628" y="308" text-anchor="middle" class="d-mono d-small">1.2</text>
+    <text x="760" y="308" text-anchor="middle" class="d-mono d-small">2</text>
+    <text x="496" y="226" text-anchor="middle">gradient = 0</text>
+    <text x="496" y="246" text-anchor="middle" class="d-small d-text-light">flat at 0.8 A</text>
+    <text x="575" y="60" class="d-small d-text-light">dashed: r · A</text>
+    <text x="700" y="226" class="d-small d-text-light">active: keeps</text>
+    <text x="700" y="244" class="d-small d-text-light">pushing down</text>
+    <text x="20" y="330" class="d-small d-text-light">horizontal axis: r = π_θ / π_old</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> One token's term of \(L^{CLIP}\) (solid) against \(r\), with \(\epsilon=0.2\) and \(|A|=1\); dashed is the unclipped \(rA\) that the \(\min\) discards; the orange dot is the start, \(r=1\). Left: above 1.2 a good token's gradient vanishes, but below 0.8 it stays active. Right: a bad token whose probability has risen is still pushed down. Redrawn from Eq. 7 and the paper's Figure 1<a class="cite" href="#ref-3">3</a> (§3); regions as in Lambert §6.2.6<a class="cite" href="#ref-7">7</a>.</figcaption>
+</figure>
+
+<h3 id="ppo-clip-pessimistic">4.2 The min as a pessimistic bound</h3>
+<p>Because \(\min(a,b)\le a\), \(L^{CLIP}\le L^{CPI}\) pointwise, and the two agree to first order at \(r=1\)<a class="cite" href="#ref-3">3</a> (§3). The authors describe the asymmetry: "we only ignore the change in probability ratio when it would make the objective improve, and we include it when it makes the objective worse". In Table 3 that is the two flagged cells (the clip) against the two off-diagonal active cells (the pessimism). A good token that has already become more likely stops contributing; a good token whose probability has fallen below \(1-\epsilon\) still pushes up; a bad token whose probability has risen above \(1+\epsilon\) is still pushed down.</p>
+<p>One qualification (the writer's reading). The paper's introduction calls the clipped objective "a pessimistic estimate (i.e., lower bound) of the performance of the policy"<a class="cite" href="#ref-3">3</a> (§1), but what \(\min\) bounds is \(L^{CPI}\), the surrogate. TRPO's penalty form bounds the true return \(\eta\) (Section 2.2). PPO's pessimism makes the optimizer unwilling to exploit surrogate errors in the favourable direction; it does not carry TRPO's improvement guarantee.</p>
+
+<h3 id="ppo-clip-scale">4.3 How big is \(\epsilon=0.2\) next to \(\delta=0.01\)?</h3>
+<p>For small policy changes, \(\mathrm{KL}(\pi_{old}\|\pi_\theta)=\mathbb{E}_{old}[-\log r]\approx\tfrac12\mathbb{E}_{old}[(r-1)^2]\), because \(\mathbb{E}_{old}[r]=1\) kills the linear term (derived). The root-mean-square deviation of the ratio is therefore \(\sqrt{2\,\mathrm{KL}}\): 0.141 for TRPO's \(\delta=0.01\), and a KL of \(\tfrac12\epsilon^2=0.02\) for a typical ratio sitting exactly at \(1\pm0.2\). On random 50-way softmax pairs with logit noise up to 0.2 the approximation is within 2% of the exact KL (derived by script). The PPO paper's Figure 2 lands in the same place: the updated policy at the maximum of \(L^{CLIP}\), for the first Hopper update, "has a KL divergence of about 0.02 from the initial policy"<a class="cite" href="#ref-3">3</a> (§3, Fig. 2).</p>
+<p>That is an equivalence of scale, not of guarantee. TRPO bounds the <em>mean</em> KL across states; PPO's clip acts on individual samples in the tails of the ratio distribution and says nothing about the mean (Section 5).</p>
+
+<h3 id="ppo-clip-loop">4.4 The loop: sample, then several optimizer passes over the same data</h3>
+<p>PPO's Algorithm 1 is a plain loop<a class="cite" href="#ref-3">3</a> (§5): run \(\pi_{\theta_{old}}\), compute advantage estimates, optimize the surrogate "with \(K\) epochs and minibatch size \(M\le NT\)", set \(\theta_{old}\leftarrow\theta\), repeat. With shared policy and value parameters the objective adds a value-regression term and an entropy bonus, \(\hat{\mathbb E}_t[L^{CLIP}_t-c_1L^{VF}_t+c_2S[\pi_\theta](s_t)]\) (Eq. 9). In an LLM trainer the "timesteps" \(NT\) are the response tokens of a rollout batch, and \(K\) and the minibatch count set how stale the last optimizer step is (Module 2, Table 5). The clipped term is the part found in every PPO-family trainer (the code is the writer's, written from Eq. 7; the token-mean normalization is one of several in use, see Module 11):</p>
+<pre class="code" data-lang="python" data-title="clip_loss.py"><code>def ppo_clip_loss(logp_new, logp_old, adv, mask, eps=0.2):
+    # (B, L) tensors. logp_old and adv are constants from the rollout phase.
+    ratio = torch.exp(logp_new - logp_old)                 # r_t(theta)
+    unclipped = ratio * adv                                # L^CPI term
+    clipped = torch.clamp(ratio, 1 - eps, 1 + eps) * adv
+    per_token = torch.minimum(unclipped, clipped)          # Eq. 7
+    loss = -(per_token * mask).sum() / mask.sum()          # token-mean over the batch
+    # fraction of tokens outside the interval (a monitor, not all have zero gradient)
+    outside = ((ratio - 1).abs() &gt; eps) &amp; (mask &gt; 0)
+    return loss, outside.float().sum() / mask.sum()</code></pre>
+<p>Two properties of this loop decide how much the clip matters in practice.</p>
+<ul>
+  <li><strong>The first optimizer step is unclipped.</strong> The ratios start at exactly 1, so the first step "is identical to a maximization step over the unclipped surrogate objective"<a class="cite" href="#ref-10">10</a> (§4); the clip can only act on later passes. Tulu 3 makes the dependency explicit: rollout-phase and learning-phase log-probabilities must match so that the ratio is 1 on the first pass, and if they differ "drastically due to dropout, all ratios could potentially be clipped, resulting in zero gradient", so dropout is disabled<a class="cite" href="#ref-11">11</a> (§6.2). A mismatch between sampling engine and trainer has the same effect (Module 14).</li>
+  <li><strong>Many LLM recipes barely reuse data.</strong> PPO and GRPO are often run with one gradient step per batch, so "the PPO-native regularization is never applied" and the KL to the reference dominates; DAPO uses 16 gradient steps per batch, and Tulu 3 uses \(K=4\) for 8B and 70B and \(K=1\) for 405B<a class="cite" href="#ref-7">7</a> (§6.4.2)<a class="cite" href="#ref-11">11</a> (Tables 21, 35). Lambert's practical monitor is the clip fraction, with the caveat that only the flat cells of Table 3 have zero gradient<a class="cite" href="#ref-7">7</a> (§6.4.2).</li>
+</ul>
+
+<h3 id="ppo-clip-vs-kl">4.5 Why the clip beat the KL penalty</h3>
+<p>PPO's paper includes the alternative that keeps TRPO's penalty form: add \(-\beta\,\mathrm{KL}[\pi_{\theta_{old}},\pi_\theta]\) to the surrogate and adapt \(\beta\) so each update lands near a target \(d_{targ}\). After optimizing, compute \(d=\hat{\mathbb E}_t[\mathrm{KL}]\); if \(d\lt d_{targ}/1.5\), halve \(\beta\); if \(d\gt1.5\,d_{targ}\), double it<a class="cite" href="#ref-3">3</a> (§4, Eq. 8). The authors report that "the KL penalty performed worse than the clipped surrogate objective" and kept it "because it's an important baseline". Figure 4 plots their ablation (7 MuJoCo tasks, 3 seeds, 21 runs per bar).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f4t"><title id="f4t">Average normalized score on seven MuJoCo tasks for PPO surrogate variants: no clipping or penalty, clipping at three epsilons, adaptive KL at three targets, fixed KL at four coefficients</title>
+    <line x1="250" y1="28" x2="250" y2="302" class="d-grid"/><line x1="420" y1="28" x2="420" y2="302" class="d-axis"/><line x1="590" y1="28" x2="590" y2="302" class="d-grid"/><line x1="760" y1="28" x2="760" y2="302" class="d-grid"/>
+    <text x="250" y="320" text-anchor="middle" class="d-mono d-small">-0.5</text><text x="420" y="320" text-anchor="middle" class="d-mono d-small">0</text><text x="590" y="320" text-anchor="middle" class="d-mono d-small">0.5</text><text x="760" y="320" text-anchor="middle" class="d-mono d-small">1.0</text>
+    <text x="30" y="20" class="d-small d-text-light">average normalized score (random policy = 0, best result = 1)</text>
+
+    <text x="240" y="48" text-anchor="end" class="d-small">No clipping or penalty</text>
+    <rect x="287.4" y="36" width="132.6" height="18" rx="2" class="d-fill-red"/><text x="280" y="50" text-anchor="end" class="d-mono d-small d-bold">-0.39</text>
+    <text x="240" y="76" text-anchor="end" class="d-small">Clipping, ε = 0.1</text>
+    <rect x="420" y="64" width="258.4" height="18" rx="2" class="d-fill-blue"/><text x="686" y="78" class="d-mono d-small d-bold">0.76</text>
+    <text x="240" y="104" text-anchor="end" class="d-small d-bold">Clipping, ε = 0.2</text>
+    <rect x="420" y="92" width="278.8" height="18" rx="2" class="d-fill-orange"/><text x="706" y="106" class="d-mono d-small d-bold">0.82</text>
+    <text x="240" y="132" text-anchor="end" class="d-small">Clipping, ε = 0.3</text>
+    <rect x="420" y="120" width="238" height="18" rx="2" class="d-fill-blue"/><text x="666" y="134" class="d-mono d-small d-bold">0.70</text>
+    <text x="240" y="160" text-anchor="end" class="d-small">Adaptive KL, d_targ = 0.003</text>
+    <rect x="420" y="148" width="231.2" height="18" rx="2" class="d-fill-cyan"/><text x="659" y="162" class="d-mono d-small d-bold">0.68</text>
+    <text x="240" y="188" text-anchor="end" class="d-small">Adaptive KL, d_targ = 0.01</text>
+    <rect x="420" y="176" width="251.6" height="18" rx="2" class="d-fill-cyan"/><text x="679" y="190" class="d-mono d-small d-bold">0.74</text>
+    <text x="240" y="216" text-anchor="end" class="d-small">Adaptive KL, d_targ = 0.03</text>
+    <rect x="420" y="204" width="241.4" height="18" rx="2" class="d-fill-cyan"/><text x="669" y="218" class="d-mono d-small d-bold">0.71</text>
+    <text x="240" y="244" text-anchor="end" class="d-small">Fixed KL, β = 0.3</text>
+    <rect x="420" y="232" width="210.8" height="18" rx="2" class="d-fill-green"/><text x="639" y="246" class="d-mono d-small d-bold">0.62</text>
+    <text x="240" y="272" text-anchor="end" class="d-small">Fixed KL, β = 1</text>
+    <rect x="420" y="260" width="241.4" height="18" rx="2" class="d-fill-green"/><text x="669" y="274" class="d-mono d-small d-bold">0.71</text>
+    <text x="240" y="300" text-anchor="end" class="d-small">Fixed KL, β = 3 (β = 10: 0.69)</text>
+    <rect x="420" y="288" width="244.8" height="14" rx="2" class="d-fill-green"/><text x="672" y="300" class="d-mono d-small d-bold">0.72</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> PPO's comparison of surrogate objectives: mean normalized score over 21 runs (7 MuJoCo tasks, 3 seeds), 1M timesteps, \(\beta\) initialized at 1 for the adaptive variants. Clipping at \(\epsilon=0.2\) scores highest (0.82); best adaptive KL 0.74; best fixed KL 0.72 (\(\beta=10\), 0.69, not drawn). The paper reports no spread, so do not over-read differences of a few hundredths. Data: Table 1<a class="cite" href="#ref-3">3</a> (§6.1).</figcaption>
+</figure>
+
+<p>The comparison supports a narrow claim: on small continuous-control tasks with the other hyperparameters fixed (the paper's Table 3), the best clipped setting beat the best KL-penalty settings (0.82 against 0.74 and 0.72). The spread across \(\epsilon\) (0.70 to 0.82) is as wide as the spread across KL-penalty settings (0.62 to 0.74), so it does not show that a KL penalty is worse in general. Clipping in log space was "no better"<a class="cite" href="#ref-3">3</a> (§6.1). For LLM RL the record is thinner and mixed (Where experts disagree).</p>
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Two different KL terms appear in LLM RL and they do different jobs. PPO's \(\mathrm{KL}(\pi_{old}\|\pi_\theta)\) measures how far one update has moved from the policy that generated the rollout; it is a step-size device. RLHF's KL to the reference, \(\mathrm{KL}(\pi_\theta\|\pi_{ref})\), anchors the policy to the SFT model over the whole run: InstructGPT puts it in the reward as a per-token penalty<a class="cite" href="#ref-4">4</a> (§3.5), and GRPO adds it to the loss<a class="cite" href="#ref-5">5</a> (§4.1.1). A recipe can have either, both, or neither. Module 6 treats the reference KL.</p></aside>
+
+<h2 id="what-clipping-does-not-guarantee">5. What the clip does not guarantee</h2>
+<p>The clip is a cheap heuristic that became the default. Four of its limits are documented, and each returns in a later module.</p>
+
+<h3 id="what-clipping-does-not-guarantee-kl">5.1 There is no KL bound; the optimizer sets the step</h3>
+<p>Engstrom et al. measured what TRPO and PPO actually enforce on MuJoCo. TRPO "precisely enforces" its mean-KL region, "nearly by construction". PPO does not enforce the ratio region it is trained on: the maximum ratio "consistently" violates \(1+\epsilon\), and "all three algorithms fail to maintain a ratio-based trust region, despite PPO and PPO-M being trained directly with a ratio-clipping objective"<a class="cite" href="#ref-10">10</a> (§4, Fig. 2). Their explanation is the one from Section 4.4: the first step is unclipped, and after that the step is "determined solely by the steepness of the surrogate landscape", so the trust region PPO realizes depends on the optimizer and its learning rate, not on the objective<a class="cite" href="#ref-10">10</a> (§4).</p>
+<p>The same study found that "code-level optimizations" present in the PPO implementation but not in the TRPO baseline (value-function clipping, reward scaling, learning-rate annealing, global gradient clipping and others) "are responsible for most of PPO's gain in cumulative reward over TRPO"<a class="cite" href="#ref-10">10</a> (abstract, §3). The LLM analogue is Tulu 3's PPO recipe: advantage whitening, a gradient-norm threshold of 1.0, a value-function coefficient of 0.1, a \(-10\) penalty for responses without EOS, and dropout disabled<a class="cite" href="#ref-11">11</a> (§6.2, Table 21). When two reports both say "PPO" and differ by a few points, details like these are the first suspects (Module 5).</p>
+
+<h3 id="what-clipping-does-not-guarantee-headroom">5.2 The probability headroom is relative, so rare tokens barely move</h3>
+<p>The clip bounds the ratio, not the probability change. A token with \(\pi_{old}=p\) can gain at most \(\epsilon p\) in probability before its gradient dies, and can lose at most \(\epsilon p\). DAPO states the consequence with two numbers: for \(\epsilon=0.2\) and \(\hat A>0\), tokens at \(0.01\) and \(0.9\) have upper bounds of \(0.012\) and \(1.08\); the high-probability token is "not constrained to get even extremely larger probabilities like 0.999", while the rare one needs a large relative rise to matter<a class="cite" href="#ref-12">12</a> (§3.1). They also measure that the mean probability of up-clipped tokens is below 0.2<a class="cite" href="#ref-12">12</a> (§3.1, Fig. 3a). Table 4 generalizes (derived from the clip definition).</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> Probability reachable within the clip for a token with \(\hat A>0\) (upper limits) or \(\hat A<0\) (lower limit), by prior probability \(p\). "Gain" is limit minus \(p\). Derived by the writer from Eq. 7 with \(\epsilon=0.2\) and DAPO's asymmetric \(\epsilon_{high}=0.28\)<a class="cite" href="#ref-12">12</a> (§3.1, §4.1). A limit of 1 or more means the up-clip cannot fire.</caption>
+  <thead><tr><th class="num">Prior \(p\)</th><th class="num">Upper limit, \(\epsilon=0.2\)</th><th class="num">Gain</th><th class="num">Upper limit, \(\epsilon_{high}=0.28\)</th><th class="num">Gain</th><th class="num">Lower limit, \(\epsilon=0.2\)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0.01</td><td class="num">0.012</td><td class="num" data-worst>+0.002</td><td class="num">0.0128</td><td class="num">+0.0028</td><td class="num">0.008</td></tr>
+    <tr><td class="num">0.05</td><td class="num">0.06</td><td class="num">+0.010</td><td class="num">0.064</td><td class="num">+0.014</td><td class="num">0.04</td></tr>
+    <tr><td class="num">0.1</td><td class="num">0.12</td><td class="num">+0.020</td><td class="num">0.128</td><td class="num">+0.028</td><td class="num">0.08</td></tr>
+    <tr><td class="num">0.3</td><td class="num">0.36</td><td class="num">+0.060</td><td class="num">0.384</td><td class="num">+0.084</td><td class="num">0.24</td></tr>
+    <tr><td class="num">0.5</td><td class="num">0.60</td><td class="num">+0.100</td><td class="num">0.64</td><td class="num">+0.140</td><td class="num">0.40</td></tr>
+    <tr><td class="num">0.9</td><td class="num" data-best>1.08 (never fires)</td><td class="num">to 1.0</td><td class="num">1.152 (never fires)</td><td class="num">to 1.0</td><td class="num">0.72</td></tr>
+  </tbody>
+</table>
+<p>Two thresholds follow (derived): with \(\epsilon=0.2\) the up-clip can never fire for \(p\ge1/1.2=0.833\), and with \(\epsilon_{high}=0.28\) not for \(p\ge0.781\). Compare Table 1: a KL budget of 0.01 let a \(p=0.01\) token triple, while the clip stops it at \(1.2\times\). DAPO's response is Clip-Higher: \(\epsilon_{high}=0.28\), \(\epsilon_{low}=0.2\), keeping the lower bound because raising it "will suppress the probability of these tokens to 0, resulting in the collapse of the sampling space"<a class="cite" href="#ref-12">12</a> (§3.1, §4.1). MiniMax-M1 reaches the same diagnosis from the other side: rare reflective "fork" tokens ("However", "Recheck", "Wait", "Aha") have low base-model probability, receive a large ratio after the first update, and are clipped out of every later off-policy update<a class="cite" href="#ref-13">13</a> (§3.1). Its fix, CISPO, clips the importance weight and keeps every token's gradient (Module 12).</p>
+
+<h3 id="what-clipping-does-not-guarantee-bias">5.3 The clip is biased even when the reward carries no information</h3>
+<p>The cleanest demonstration is the Spurious Rewards study. Train Qwen2.5-Math-7B with GRPO on random rewards, independent of the rollout, and MATH-500 still rises by 21.4 points absolute, against 29.1 with ground-truth rewards<a class="cite" href="#ref-14">14</a> (abstract). The authors' account is a gradient bias from the clip term. With random rewards the group-centered advantage has zero mean, so without clipping the expected gradient is zero. With clipping, the expected token gradient (their Eq. 2, up to a positive constant) is \(+\nabla\log\pi\) when \(r\lt1-\epsilon\), 0 inside the interval, and \(-\nabla\log\pi\) when \(r\gt1+\epsilon\): in each outer region the half of the advantage distribution that would push further out is clipped away, leaving a net push back toward the interval (the sign-by-region reading follows from Table 3)<a class="cite" href="#ref-14">14</a> (§4, App. B). Since \(r\le1/p_{old}\), a token with \(p_{old}=0.85\) can never reach the upper clip at 1.2, while one at 0.02 is out of range once its probability passes 0.024; the net effect "asymmetrically suppresses low-probability tokens and reinforces high-probability ones"<a class="cite" href="#ref-14">14</a> (§4). With clipping disabled (three variants, including one update per rollout) random rewards give no consistent gains<a class="cite" href="#ref-14">14</a> (§4, Fig. 4). The behaviour amplified in Qwen2.5-Math is code-style reasoning, up from 65.0% of MATH-500 solutions to about 90% within 15 steps<a class="cite" href="#ref-14">14</a> (§5.2), and the effect is model-dependent: spurious rewards stay effective on Qwen2.5 models but generally fail on other families such as OLMo2 and Llama3<a class="cite" href="#ref-14">14</a> (§1, §3, Fig. 3).</p>
+<p>Read this as a documented mechanism with a hypothesis attached: the paper presents the clipping-bias account as a hypothesis that its ablations support, on one model family. What it settles here is that the clip term is not a neutral stability device; it carries a prior-favouring bias that interacts with whatever the pretrained model already does well (Module 20).</p>
+
+<h3 id="what-clipping-does-not-guarantee-practice">5.4 How loose the clip is allowed to be in reasoning recipes</h3>
+<p>DeepSeek-R1's report lists, for the first RL stage, "the GRPO clip ratio \(\epsilon\) to 10", with 16 minibatches of 512 outputs from each 8,192-output rollout and one inner epoch<a class="cite" href="#ref-6">6</a> (§3.2.1). With \(\epsilon=10\) the interval is \([-9,11]\); a ratio is never negative, so the lower clip cannot fire, and the upper clip fires only when a token's probability rises elevenfold within one rollout (derived). I read that as a clip close to switched off, with step control carried by the learning rate (3e-6), the few optimizer steps per rollout and the KL coefficient of 0.001; the report does not say why it chose 10, so that reading is the writer's. The R1-Zero hyperparameters in the main text (§2.1) do not state \(\epsilon\) at all<a class="cite" href="#ref-6">6</a>.</p>
+<p>The R1 report also writes its GRPO objective with a sequence-level ratio and no \(1/|o_i|\) factor<a class="cite" href="#ref-6">6</a> (§2.1, Eq. 1), where DeepSeekMath's Eq. 3 had a token-level ratio and \(1/|o_i|\)<a class="cite" href="#ref-5">5</a> (§4.1.1); the report does not say whether that is shorthand or an implementation change. When you read a PPO-family loss, check where the ratio and the normalization live (Modules 11 and 12).</p>
+
+<h2 id="gae">6. Generalized advantage estimation</h2>
+<p>PPO needs an advantage \(\hat A_t\) per timestep. Module 2 showed that a learned \(V\) redistributes the sequence-level credit \(R-V(x)\) along the tokens and listed the TD residual as one choice of \(\Psi_t\). GAE interpolates between that residual and the Monte Carlo return, and it is the advantage inside every critic-based recipe in this course.</p>
+
+<h3 id="gae-definition">6.1 Definition and recursion</h3>
+<p>With a value function \(V\) and discount \(\gamma\), the TD residual is \(\delta_t=r_t+\gamma V(s_{t+1})-V(s_t)\). Summing \(k\) residuals gives the \(k\)-step estimator \(\hat A_t^{(k)}=\sum_{l=0}^{k-1}\gamma^l\delta_{t+l}=-V(s_t)+r_t+\gamma r_{t+1}+\dots+\gamma^{k-1}r_{t+k-1}+\gamma^kV(s_{t+k})\), which is a \(k\)-step return minus a baseline. GAE is the exponentially weighted average of these<a class="cite" href="#ref-2">2</a> (§3, Eqs. 11-16):</p>
+$$\hat A_t^{GAE(\gamma,\lambda)}=(1-\lambda)\big(\hat A_t^{(1)}+\lambda\hat A_t^{(2)}+\lambda^2\hat A_t^{(3)}+\dots\big)=\sum_{l=0}^{\infty}(\gamma\lambda)^l\,\delta_{t+l}.$$
+<p>Computed backward over a finished trajectory, the sum is a one-line recursion, \(\hat A_t=\delta_t+\gamma\lambda\hat A_{t+1}\), with \(\hat A_{T+1}=0\); that is the loop in Lambert's reference implementation<a class="cite" href="#ref-7">7</a> (§6.4.1), which also resets the accumulator at terminal tokens so that packed sequences do not leak into each other. The two endpoints are<a class="cite" href="#ref-2">2</a> (Eqs. 17-18):</p>
+<ul>
+  <li>\(\lambda=0\): \(\hat A_t=\delta_t=r_t+\gamma V(s_{t+1})-V(s_t)\). One real reward, then trust the critic.</li>
+  <li>\(\lambda=1\): \(\hat A_t=\sum_l\gamma^lr_{t+l}-V(s_t)\). The empirical return minus the critic as a baseline, with no bootstrapping.</li>
+</ul>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f5t"><title id="f5t">GAE as a spectrum from one-step TD at lambda 0 to Monte Carlo at lambda 1, with the weight placed on each TD residual for three lambdas</title>
+<defs><marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="40" y="16" width="720" height="34" rx="8" class="d-surface"/>
+<text x="56" y="38" class="d-bold">λ = 0: one-step TD</text><text x="744" y="38" text-anchor="end" class="d-bold">λ = 1: Monte Carlo return minus V</text>
+<path d="M400,72 L100,72" class="d-arrow-active" marker-end="url(#f5-arr)"/><text x="250" y="66" text-anchor="middle" class="d-small">more bias if V is wrong</text>
+<path d="M400,72 L700,72" class="d-arrow" marker-end="url(#f5-arr)"/><text x="550" y="66" text-anchor="middle" class="d-small">more variance from rewards</text>
+<rect x="34" y="92" width="232" height="206" rx="10" class="d-panel"/>
+<line x1="40" y1="270" x2="260" y2="270" class="d-axis"/>
+<rect x="42.0" y="120.0" width="16" height="150.0" rx="2" class="d-fill-blue"/>
+<text x="150" y="288" text-anchor="middle" class="d-bold">λ = 0</text>
+<text x="150" y="304" text-anchor="middle" class="d-small d-mono">Â = δ_t</text>
+<rect x="284" y="92" width="232" height="206" rx="10" class="d-panel"/>
+<line x1="290" y1="270" x2="510" y2="270" class="d-axis"/>
+<rect x="292.0" y="120.0" width="16" height="150.0" rx="2" class="d-fill-blue"/>
+<rect x="313.6" y="135.0" width="16" height="135.0" rx="2" class="d-fill-blue"/>
+<rect x="335.2" y="148.5" width="16" height="121.5" rx="2" class="d-fill-blue"/>
+<rect x="356.8" y="160.6" width="16" height="109.4" rx="2" class="d-fill-blue"/>
+<rect x="378.4" y="171.6" width="16" height="98.4" rx="2" class="d-fill-blue"/>
+<rect x="400.0" y="181.4" width="16" height="88.6" rx="2" class="d-fill-blue"/>
+<rect x="421.6" y="190.3" width="16" height="79.7" rx="2" class="d-fill-blue"/>
+<rect x="443.2" y="198.3" width="16" height="71.7" rx="2" class="d-fill-blue"/>
+<rect x="464.8" y="205.4" width="16" height="64.6" rx="2" class="d-fill-blue"/>
+<rect x="486.4" y="211.9" width="16" height="58.1" rx="2" class="d-fill-blue"/>
+<text x="400" y="288" text-anchor="middle" class="d-bold">λ = 0.9</text>
+<text x="400" y="304" text-anchor="middle" class="d-small d-mono">Â = Σ 0.9^l δ_(t+l)</text>
+<rect x="534" y="92" width="232" height="206" rx="10" class="d-panel"/>
+<line x1="540" y1="270" x2="760" y2="270" class="d-axis"/>
+<rect x="542.0" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<rect x="563.6" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<rect x="585.2" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<rect x="606.8" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<rect x="628.4" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<rect x="650.0" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<rect x="671.6" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<rect x="693.2" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<rect x="714.8" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<rect x="736.4" y="120.0" width="16" height="150.0" rx="2" class="d-fill-orange"/>
+<text x="650" y="288" text-anchor="middle" class="d-bold">λ = 1</text>
+<text x="650" y="304" text-anchor="middle" class="d-small d-mono">Â = return − V(s_t)</text>
+<text x="46" y="112" class="d-small d-text-light">weight on δ_(t+l), l = 0 to 9 steps ahead (γ = 1)</text>
+</svg>
+  <figcaption><b>Figure 5.</b> The GAE spectrum: the weight \((\gamma\lambda)^l\) that the advantage at token \(t\) puts on the TD residual \(l\) steps ahead, for \(\gamma=1\). At \(\lambda=0\) the estimate leans entirely on \(V\); at \(\lambda=1\) all residuals count equally and the sum telescopes to the empirical return. Weights from Eq. 16<a class="cite" href="#ref-2">2</a>; annotations follow the paper's discussion (§3).</figcaption>
+</figure>
+
+<h3 id="gae-bias-variance">6.2 Two knobs, two different kinds of bias</h3>
+<p>The paper's bias-variance statements are specific, and the distinction between \(\gamma\) and \(\lambda\) is the useful part<a class="cite" href="#ref-2">2</a> (§3). An advantage estimator is \(\gamma\)-just if it does not bias the discounted policy gradient; a sufficient condition (Proposition 1) is that it equals an unbiased estimate of \(Q^{\pi,\gamma}\) minus any baseline that depends only on earlier states and actions. Then:</p>
+<ul>
+  <li>\(\mathrm{GAE}(\gamma,1)\) is \(\gamma\)-just "regardless of the accuracy of \(V\)", but has high variance from the long sum of rewards.</li>
+  <li>\(\mathrm{GAE}(\gamma,0)\) is \(\gamma\)-just only if \(V=V^{\pi,\gamma}\); otherwise it is biased, but has much lower variance.</li>
+  <li>"Taking \(\gamma\lt1\) introduces bias into the policy gradient estimate, regardless of the value function's accuracy. On the other hand, \(\lambda\lt1\) introduces bias only when the value function is inaccurate."</li>
+</ul>
+<p>That asymmetry is the paper's explanation for why the best \(\lambda\) is lower than the best \(\gamma\): \(\lambda\) is the cheaper knob. In their cart-pole sweep "the best results are obtained at intermediate values of the parameters: \(\gamma\in[0.96,0.99]\) and \(\lambda\in[0.92,0.99]\)"<a class="cite" href="#ref-2">2</a> (§6.3.1). The discount also has a horizon reading: \(\gamma\lt1\) drops terms with \(l\gg1/(1-\gamma)\), and \(\gamma\lambda\) ignores residuals with \(l\gg1/(1-\gamma\lambda)\)<a class="cite" href="#ref-2">2</a> (§4). For PPO's MuJoCo setting (\(\gamma=0.99\), \(\lambda=0.95\))<a class="cite" href="#ref-3">3</a> that is \(1/(1-0.9405)=16.8\) steps (derived). With potential \(\Phi=V\) the shaped reward is the residual \(\delta^V\), and a good \(V\) turns a temporally extended response of reward to action into an immediate one<a class="cite" href="#ref-2">2</a> (§4, Eqs. 20-25).</p>
+<p>One more TRPO echo: the GAE paper fits the value function under its own average-KL trust region, solved with conjugate gradient<a class="cite" href="#ref-2">2</a> (§5, Eqs. 29-30). PPO's reference implementation (OpenAI baselines) instead fits the value network with a clipped, PPO-like objective, listed first among its code-level optimizations<a class="cite" href="#ref-10">10</a> (§3); Lambert's critic code carries the same optional clip<a class="cite" href="#ref-7">7</a> (§6.2.7).</p>
+
+<h3 id="gae-llm-closed-form">6.3 The LLM case in closed form, and a hand computation</h3>
+<p>Take \(\gamma=1\), a reward only at the EOS token, \(r_T=R\), and \(V=0\) after the terminal state (per-token KL terms are ignored here; Module 5 adds them). Then \(\delta_t=V(s_{t+1})-V(s_t)\) for \(t\lt T\) and \(\delta_T=R-V(s_T)\), as in Module 2 Section 5.1. Summing \(\sum_l\lambda^l\delta_{t+l}\) and rearranging gives (derived; the derivation follows below):</p>
+$$\hat A_t=\underbrace{\lambda^{T-t}R+(1-\lambda)\sum_{m=1}^{T-t}\lambda^{m-1}V(s_{t+m})}_{\text{weights sum to }1}\;-\;V(s_t).$$
+<p>The advantage is a convex mixture of what actually happened (\(R\)) and what the critic predicts at later positions, minus what it predicts now. At \(\lambda=1\) the mixture is all \(R\) and \(\hat A_t=R-V(s_t)\); at \(\lambda=0\) it is all \(V(s_{t+1})\). The part that matters for LLMs is the weight \(\lambda^{T-t}\): the final reward reaches a token \(k=T-t\) positions before the end directly only with weight \(\lambda^k\); everything else the token sees is the critic talking to itself.</p>
+<details class="more"><summary>Derivation by summation by parts</summary>
+<p>Split \(\hat A_t=\sum_{l=0}^{n-1}\lambda^l\big(V(s_{t+l+1})-V(s_{t+l})\big)+\lambda^{n}\big(R-V(s_T)\big)\) with \(n=T-t\). The first sum telescopes with weights: \(\sum_{l=0}^{n-1}\lambda^lV_{t+l+1}-\sum_{l=0}^{n-1}\lambda^lV_{t+l}=-V_t+(1-\lambda)\sum_{m=1}^{n-1}\lambda^{m-1}V_{t+m}+\lambda^{n-1}V_{t+n}\). Since \(V_{t+n}=V_T\), the terms in \(V_T\) combine as \(\lambda^{n-1}V_T-\lambda^nV_T=(1-\lambda)\lambda^{n-1}V_T\), which extends the weighted sum to \(m=n\). What remains is \(\lambda^nR+(1-\lambda)\sum_{m=1}^{n}\lambda^{m-1}V_{t+m}-V_t\). The weights \(\lambda^n+(1-\lambda)\sum_{m=1}^{n}\lambda^{m-1}=\lambda^n+(1-\lambda^n)=1\). I verified the closed form against the backward recursion numerically on the example below for \(\lambda\in\{0,0.5,0.9,0.95,1\}\).</p>
+</details>
+<p>Table 5 computes it by hand for a five-token response. The critic values \(V(s_1),\dots,V(s_5)\) are invented for illustration (\(V(s_5)=0.30\) is the predicted success probability just before the EOS token), the verifier returns \(R=1\), and \(\gamma=1\). The residuals are \(\delta=(-0.10,\,0.15,\,0.05,\,-0.30,\,0.70)\), whose sum \(0.50\) equals \(R-V(s_1)\), the telescoping identity of Module 2. For \(\lambda=0.9\) the backward recursion \(\hat A_t=\delta_t+0.9\,\hat A_{t+1}\) runs: \(\hat A_5=0.70\); \(\hat A_4=-0.30+0.9(0.70)=0.33\); \(\hat A_3=0.05+0.9(0.33)=0.347\); \(\hat A_2=0.15+0.9(0.347)=0.4623\); \(\hat A_1=-0.10+0.9(0.4623)=0.3161\).</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> GAE advantages for one five-token response with a final reward \(R=1\), \(\gamma=1\), and invented critic values (illustrative; all numbers derived by the writer from Eq. 16<a class="cite" href="#ref-2">2</a>). The \(\lambda=1\) column is \(R-V(s_t)\); the \(\lambda=0\) column is the raw residual \(\delta_t\).</caption>
+  <thead><tr><th class="num">Token \(t\)</th><th class="num">\(V(s_t)\)</th><th class="num">\(\delta_t\)</th><th class="num">\(\hat A\), \(\lambda=0\)</th><th class="num">\(\hat A\), \(\lambda=0.5\)</th><th class="num">\(\hat A\), \(\lambda=0.9\)</th><th class="num">\(\hat A\), \(\lambda=1\)</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td class="num">0.50</td><td class="num">-0.10</td><td class="num">-0.1000</td><td class="num">-0.0063</td><td class="num">0.3161</td><td class="num">0.5000</td></tr>
+    <tr><td class="num">2</td><td class="num">0.40</td><td class="num">0.15</td><td class="num">0.1500</td><td class="num">0.1875</td><td class="num">0.4623</td><td class="num">0.6000</td></tr>
+    <tr><td class="num">3</td><td class="num">0.55</td><td class="num">0.05</td><td class="num">0.0500</td><td class="num">0.0750</td><td class="num">0.3470</td><td class="num">0.4500</td></tr>
+    <tr><td class="num">4</td><td class="num">0.60</td><td class="num">-0.30</td><td class="num" data-worst>-0.3000</td><td class="num">0.0500</td><td class="num">0.3300</td><td class="num" data-best>0.4000</td></tr>
+    <tr><td class="num">5 (EOS)</td><td class="num">0.30</td><td class="num">0.70</td><td class="num">0.7000</td><td class="num">0.7000</td><td class="num">0.7000</td><td class="num">0.7000</td></tr>
+  </tbody>
+</table>
+<p>Read down the token-4 row. The critic says the fourth token cut the predicted success probability from 0.60 to 0.30. At \(\lambda=0\) the advantage records that (\(-0.30\)) and the token is discouraged although the response succeeded; at \(\lambda=1\) it is \(+0.40\) and the token is reinforced, because the only information used is that the whole response was correct. If the critic is right, \(\lambda=0\) is the sharper signal; if it is wrong, \(\lambda=0\) bakes the error into the gradient. That is the bias-variance trade in one cell.</p>
+
+<h3 id="gae-llm-lambda">6.4 What \(\lambda\) does at reasoning-model lengths</h3>
+<p>The effective horizon in Section 6.2 was about 17 steps. A reasoning trace is thousands of tokens, and \(\lambda^k\) decays fast: Figure 6 plots the direct weight of the final reward against distance from the end.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f6t"><title id="f6t">Weight that the final reward receives at a token k positions before the end, lambda to the power k, for lambda 0.95, 0.99 and 0.999, on a log axis</title>
+<line x1="80" y1="260" x2="600" y2="260" class="d-axis"/><line x1="80" y1="38" x2="80" y2="260" class="d-axis"/>
+<line x1="80" y1="206.0" x2="600" y2="206.0" class="d-grid"/><text x="72" y="210.0" text-anchor="end" class="d-mono d-small">0.25</text>
+<line x1="80" y1="152.0" x2="600" y2="152.0" class="d-grid"/><text x="72" y="156.0" text-anchor="end" class="d-mono d-small">0.50</text>
+<line x1="80" y1="98.0" x2="600" y2="98.0" class="d-grid"/><text x="72" y="102.0" text-anchor="end" class="d-mono d-small">0.75</text>
+<line x1="80" y1="44.0" x2="600" y2="44.0" class="d-grid"/><text x="72" y="48.0" text-anchor="end" class="d-mono d-small">1.00</text>
+<text x="72" y="264" text-anchor="end" class="d-mono d-small">0</text>
+<line x1="80.0" y1="260" x2="80.0" y2="265" class="d-axis"/><text x="80.0" y="280" text-anchor="middle" class="d-mono d-small">1</text>
+<line x1="220.5" y1="260" x2="220.5" y2="265" class="d-axis"/><text x="220.5" y="280" text-anchor="middle" class="d-mono d-small">10</text>
+<line x1="361.1" y1="260" x2="361.1" y2="265" class="d-axis"/><text x="361.1" y="280" text-anchor="middle" class="d-mono d-small">100</text>
+<line x1="501.6" y1="260" x2="501.6" y2="265" class="d-axis"/><text x="501.6" y="280" text-anchor="middle" class="d-mono d-small">1,000</text>
+<text x="340" y="302" text-anchor="middle" class="d-small d-text-light">k = tokens between this token and the end of the response (log scale)</text>
+<text x="80" y="22" class="d-small d-text-light">λ^k: share of the final reward that reaches the token through its own TD residual (γ = 1)</text>
+<polyline points="80.0,54.8 85.8,55.8 91.6,57.0 97.3,58.2 103.1,59.6 108.9,61.1 114.7,62.7 120.4,64.5 126.2,66.4 132.0,68.5 137.8,70.7 143.6,73.2 149.3,75.9 155.1,78.8 160.9,81.9 166.7,85.3 172.4,88.9 178.2,92.9 184.0,97.1 189.8,101.6 195.6,106.4 201.3,111.5 207.1,116.9 212.9,122.6 218.7,128.7 224.4,135.0 230.2,141.6 236.0,148.4 241.8,155.5 247.6,162.8 253.3,170.2 259.1,177.7 264.9,185.2 270.7,192.7 276.4,200.1 282.2,207.2 288.0,214.1 293.8,220.7 299.6,226.8 305.3,232.4 311.1,237.5 316.9,242.0 322.7,246.0 328.4,249.3 334.2,252.1 340.0,254.3 345.8,256.0 351.6,257.3 357.3,258.3 363.1,258.9 368.9,259.4 374.7,259.6 380.4,259.8 386.2,259.9 392.0,260.0 397.8,260.0 403.6,260.0 409.3,260.0 415.1,260.0 420.9,260.0 426.7,260.0 432.4,260.0 438.2,260.0 444.0,260.0 449.8,260.0 455.6,260.0 461.3,260.0 467.1,260.0 472.9,260.0 478.7,260.0 484.4,260.0 490.2,260.0 496.0,260.0 501.8,260.0 507.6,260.0 513.3,260.0 519.1,260.0 524.9,260.0 530.7,260.0 536.4,260.0 542.2,260.0 548.0,260.0 553.8,260.0 559.6,260.0 565.3,260.0 571.1,260.0 576.9,260.0 582.7,260.0 588.4,260.0 594.2,260.0 600.0,260.0" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+<polyline points="80.0,46.2 85.8,46.4 91.6,46.6 97.3,46.9 103.1,47.1 108.9,47.5 114.7,47.8 120.4,48.2 126.2,48.6 132.0,49.0 137.8,49.5 143.6,50.1 149.3,50.7 155.1,51.3 160.9,52.0 166.7,52.8 172.4,53.6 178.2,54.6 184.0,55.6 189.8,56.7 195.6,57.9 201.3,59.3 207.1,60.7 212.9,62.3 218.7,64.1 224.4,65.9 230.2,68.0 236.0,70.2 241.8,72.7 247.6,75.3 253.3,78.1 259.1,81.2 264.9,84.5 270.7,88.1 276.4,92.0 282.2,96.1 288.0,100.5 293.8,105.3 299.6,110.3 305.3,115.7 311.1,121.3 316.9,127.3 322.7,133.6 328.4,140.1 334.2,146.9 340.0,154.0 345.8,161.2 351.6,168.6 357.3,176.1 363.1,183.6 368.9,191.1 374.7,198.5 380.4,205.7 386.2,212.6 392.0,219.3 397.8,225.5 403.6,231.2 409.3,236.4 415.1,241.1 420.9,245.2 426.7,248.6 432.4,251.5 438.2,253.8 444.0,255.7 449.8,257.1 455.6,258.1 461.3,258.8 467.1,259.3 472.9,259.6 478.7,259.8 484.4,259.9 490.2,259.9 496.0,260.0 501.8,260.0 507.6,260.0 513.3,260.0 519.1,260.0 524.9,260.0 530.7,260.0 536.4,260.0 542.2,260.0 548.0,260.0 553.8,260.0 559.6,260.0 565.3,260.0 571.1,260.0 576.9,260.0 582.7,260.0 588.4,260.0 594.2,260.0 600.0,260.0" class="d-line d-stroke-cyan" style="stroke-width:2.5"/>
+<polyline points="80.0,44.2 85.8,44.2 91.6,44.3 97.3,44.3 103.1,44.3 108.9,44.3 114.7,44.4 120.4,44.4 126.2,44.5 132.0,44.5 137.8,44.6 143.6,44.6 149.3,44.7 155.1,44.7 160.9,44.8 166.7,44.9 172.4,45.0 178.2,45.1 184.0,45.2 189.8,45.3 195.6,45.4 201.3,45.6 207.1,45.7 212.9,45.9 218.7,46.1 224.4,46.3 230.2,46.5 236.0,46.8 241.8,47.0 247.6,47.3 253.3,47.7 259.1,48.0 264.9,48.4 270.7,48.9 276.4,49.3 282.2,49.9 288.0,50.4 293.8,51.1 299.6,51.7 305.3,52.5 311.1,53.3 316.9,54.2 322.7,55.2 328.4,56.3 334.2,57.5 340.0,58.8 345.8,60.2 351.6,61.7 357.3,63.4 363.1,65.2 368.9,67.2 374.7,69.4 380.4,71.7 386.2,74.3 392.0,77.0 397.8,80.0 403.6,83.3 409.3,86.8 415.1,90.5 420.9,94.5 426.7,98.9 432.4,103.5 438.2,108.4 444.0,113.6 449.8,119.2 455.6,125.0 461.3,131.2 467.1,137.7 472.9,144.4 478.7,151.3 484.4,158.5 490.2,165.8 496.0,173.3 501.8,180.8 507.6,188.3 513.3,195.7 519.1,203.0 524.9,210.1 530.7,216.8 536.4,223.2 542.2,229.1 548.0,234.6 553.8,239.4 559.6,243.7 565.3,247.4 571.1,250.5 576.9,253.0 582.7,255.0 588.4,256.6 594.2,257.7 600.0,258.6" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<circle cx="262.8" cy="182.6" r="5" class="d-fill-orange"/>
+<circle cx="361.1" cy="180.9" r="5" class="d-fill-cyan"/>
+<circle cx="501.6" cy="180.6" r="5" class="d-fill-blue"/>
+<line x1="361.1" y1="44" x2="361.1" y2="260" class="d-line d-dashed d-dim"/>
+<circle cx="361.1" cy="258.7" r="4" class="d-fill-red"/>
+<text x="353.1" y="246.7" text-anchor="end" class="d-mono d-small d-bold">0.95^100 = 0.0059</text>
+<rect x="620" y="60" width="170" height="104" rx="8" class="d-label-bg"/>
+<line x1="632" y1="82" x2="658" y2="82" class="d-line d-stroke-orange" style="stroke-width:2.5"/><text x="668" y="86" class="d-mono d-small">λ = 0.95</text>
+<line x1="632" y1="104" x2="658" y2="104" class="d-line d-stroke-cyan" style="stroke-width:2.5"/><text x="668" y="108" class="d-mono d-small">λ = 0.99</text>
+<line x1="632" y1="126" x2="658" y2="126" class="d-line d-stroke-blue" style="stroke-width:2.5"/><text x="668" y="130" class="d-mono d-small">λ = 0.999</text>
+<circle cx="640" cy="148" r="5" class="d-fill-orange"/><text x="656" y="152" class="d-small">dot: k = 1/(1−λ)</text>
+</svg>
+  <figcaption><b>Figure 6.</b> The weight \(\lambda^k\) that the final reward receives at a token \(k\) positions before EOS (\(\gamma=1\); Section 6.3). Dots mark \(k=1/(1-\lambda)\), where each curve has fallen to \(e^{-1}\approx0.37\): 20, 100 and 1,000 tokens. At \(k=100\), \(\lambda=0.95\) gives 0.0059, the "\(\approx0.006\)" VAPO quotes<a class="cite" href="#ref-15">15</a> (§4.2). Derived from \(\lambda^k\).</figcaption>
+</figure>
+
+<p>At \(\lambda=0.95\), a token 100 positions from the end sees 0.6% of the reward directly, and one 1,000 positions away about \(5\times10^{-23}\) (derived). For \(\lambda=0.99\) the 1,000-token weight is \(4.3\times10^{-5}\); only \(\lambda=0.999\) leaves 0.37. The VAPO authors draw the practical conclusion: with \(\lambda=0.95\) value updates "become almost entirely bootstrapped, relying on highly biased estimates", because the end reward "propagates backward as \(\lambda^{T-t}R\)"<a class="cite" href="#ref-15">15</a> (§3.1). In the closed form of Section 6.3 the early tokens' advantages are then dominated by the critic's own predictions, which makes critic quality decisive. Three reports bear on it, and they agree on direction.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> Evidence on the GAE \(\lambda\) for LLM policy optimization, as reported by each paper's authors. RLOO paper §3.1, Fig. 1<a class="cite" href="#ref-16">16</a>; DeepSeek-R1 App. A.3<a class="cite" href="#ref-6">6</a>; VAPO §4-§5, Table 1<a class="cite" href="#ref-15">15</a>. Tulu 3 fixes \(\lambda=0.95\), \(\gamma=1\) with responses capped at 1,024 to 2,048 tokens and reports no \(\lambda\) sweep<a class="cite" href="#ref-11">11</a> (Table 21); Lambert calls 0.95 "a common default for LLM fine-tuning"<a class="cite" href="#ref-7">7</a> (§6.4.1).</caption>
+  <thead><tr><th>Report</th><th>Setting</th><th>\(\lambda\) compared</th><th>Reported result</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Ahmadian et al. (RLOO paper)</td><td>PPO, Llama-7B-based models, HH dataset</td><td>1.0, 0.95, 0.5, 0</td><td>"monotonically decreasing reward with decreasing \(\lambda\)"; \(\lambda=1\) best</td></tr>
+    <tr><td class="row">DeepSeek-R1, Supplement A.3</td><td>PPO vs GRPO on MATH, DeepSeekCoder-V2-Lite (16B MoE, 2.4B active)</td><td>0.95 (the open-source default), 1.0</td><td>0.95: "considerably worse than GRPO"; 1.0: improves "substantially, nearing" GRPO</td></tr>
+    <tr><td class="row">VAPO (ByteDance Seed)</td><td>Qwen-32B, AIME24 avg@32</td><td>0.95 with RM-initialized value; decoupled; length-adaptive</td><td>vanilla PPO 5; without decoupled GAE 33; without length-adaptive GAE 45; full VAPO 60</td></tr>
+  </tbody>
+</table>
+<p>The RLOO paper's argument is structural: a pretrained LLM starts with probability mass concentrated on a few tokens, so variance is less of a problem than in MuJoCo and bias is the avoidable cost<a class="cite" href="#ref-16">16</a> (§3.1). R1 adds a mechanism for why a critic is hard on long reasoning: reflection and revision mean early content "may later be revised or contradicted, which makes it even less feasible to predict the final reward based on a partial response"<a class="cite" href="#ref-6">6</a> (App. A.3). VAPO is the constructive answer from the PPO side, with three changes<a class="cite" href="#ref-15">15</a> (§4.1, §4.2, §5.1, Table 1): <em>decoupled GAE</em> (value target with \(\lambda_{critic}=1.0\), policy advantage with a separate \(\lambda\)); <em>value pretraining</em> (a 50-step value warmup, without which VAPO reaches 11 on AIME24); and <em>length-adaptive GAE</em>, \(\lambda_{policy}=1-1/(\alpha\ell)\) with \(\alpha=0.05\) and \(\ell\) the response length, so that \(1/(1-\lambda)\) is proportional to length. For \(\ell=100,1{,}000,10{,}000\) that gives \(\lambda=0.8,0.98,0.998\) (derived). One consequence the paper does not state: \(\lambda^\ell\to e^{-1/\alpha}=e^{-20}\approx2\times10^{-9}\) for long responses, so the design does not make the final reward reach the first token directly; it fixes the bootstrapping horizon at 5% of the response and relies on the \(\lambda=1\)-trained critic for the rest (the writer's derivation).</p>
+<p>Two cautions. The VAPO and R1 comparisons are ablations by the proposers, on their own recipes. And the field has not converged on critic initialization: Tulu 3 reports "Initializing RLVR's Value Function from a General RM Works Best"<a class="cite" href="#ref-11">11</a> (§6.2.1), while VAPO attributes a positive initialization bias to RM-initialized value models (following VC-PPO) and pretrains the value function separately<a class="cite" href="#ref-15">15</a> (§3.1). GRPO removes the \(\lambda\) problem by giving every token the same group-relative advantage, which corresponds to the \(\lambda=1\) end of the spectrum with an unlearned baseline; Module 9 takes up that comparison.</p>
+
+<h2 id="lineage-and-grpo">7. The lineage in one table, and what GRPO keeps</h2>
+<p>Everything so far can be compared on the same rows. Table 7 places TRPO, PPO as published, PPO as run in LLM post-training, and GRPO side by side; Table 8 puts the reference hyperparameters of the original papers next to the values that later LLM recipes report.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 7.</b> TRPO, PPO and GRPO compared. TRPO: §4-§6, App. C<a class="cite" href="#ref-1">1</a>; GAE: §3<a class="cite" href="#ref-2">2</a>; PPO: §3, §5, App. A<a class="cite" href="#ref-3">3</a>; LLM PPO: InstructGPT §3.5<a class="cite" href="#ref-4">4</a> and Tulu 3 Table 21<a class="cite" href="#ref-11">11</a>; GRPO: DeepSeekMath §4.1<a class="cite" href="#ref-5">5</a> and R1 §2.1, §3.2.1<a class="cite" href="#ref-6">6</a>. The last row is the writer's summary of Sections 2 and 5.</caption>
+  <thead><tr><th></th><th>TRPO (2015)</th><th>PPO-clip (2017)</th><th>PPO for LLMs</th><th>GRPO</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Step control</td><td>mean KL(old, new) \(\le\delta=0.01\), true KL checked by line search</td><td>per-sample ratio clip, \(\epsilon=0.2\); no KL check</td><td>same clip, \(\epsilon=0.2\); KL to reference folded into the reward</td><td>same clip; KL to reference added to the loss</td></tr>
+    <tr><td class="row">Optimizer</td><td>conjugate gradient on Fisher-vector products, then line search</td><td>first-order (Adam), several epochs of minibatches</td><td>first-order; \(K=4\) (8B, 70B) or 1 (405B) in Tulu 3</td><td>first-order; 1 update (DeepSeekMath) or 16 minibatches (R1)</td></tr>
+    <tr><td class="row">Critic</td><td>none in the algorithm; GAE paper adds a value net with its own trust region</td><td>value net, separate or shared with the policy</td><td>policy-sized value model, initialized from an RM</td><td data-best>none</td></tr>
+    <tr><td class="row">Advantage</td><td>\(\hat Q\) from single-path or vine rollouts (GAE paper: GAE)</td><td>GAE, \(\gamma=0.99\), \(\lambda=0.95\)</td><td>per-token GAE, \(\gamma=1\), \(\lambda=0.95\)</td><td>group-normalized reward, one value per sequence</td></tr>
+    <tr><td class="row">Improvement guarantee</td><td>theory only, for \(\gamma\lt1\) and exact advantages</td><td data-worst>none</td><td data-worst>none</td><td data-worst>none</td></tr>
+  </tbody>
+</table>
+<table class="tbl tbl-dense">
+  <caption><b>Table 8.</b> Reference hyperparameters: the original papers and later reports. Dashes mean the report does not state the value (or the method has none). PPO MuJoCo: its Appendix A Table 3 and §6.1; PPO Atari: its Appendix A Table 5<a class="cite" href="#ref-3">3</a>; TRPO: §8 and App. E<a class="cite" href="#ref-1">1</a>; Tulu 3 RLVR 8B: Table 21<a class="cite" href="#ref-11">11</a>; DeepSeekMath-RL: §4.2<a class="cite" href="#ref-5">5</a>; R1 first RL stage: §3.2.1<a class="cite" href="#ref-6">6</a>; DAPO: §3.1, §4.1<a class="cite" href="#ref-12">12</a>; VAPO: §4.2, §5.1<a class="cite" href="#ref-15">15</a>.</caption>
+  <thead><tr><th>Setting</th><th class="num">\(\gamma\)</th><th class="num">\(\lambda\)</th><th class="num">Clip \(\epsilon\) or KL bound</th><th>Reuse per rollout</th><th class="num">Learning rate</th></tr></thead>
+  <tbody>
+    <tr><td class="row">TRPO, locomotion</td><td class="num">0.99</td><td class="num">-</td><td class="num">\(\delta=0.01\)</td><td>one constrained step per batch</td><td class="num">-</td></tr>
+    <tr><td class="row">PPO, MuJoCo (1M steps)</td><td class="num">0.99</td><td class="num">0.95</td><td class="num">0.2</td><td>10 epochs, minibatch 64, horizon 2,048</td><td class="num">\(3\times10^{-4}\)</td></tr>
+    <tr><td class="row">PPO, Atari</td><td class="num">0.99</td><td class="num">0.95</td><td class="num">\(0.1\alpha\), \(\alpha\) annealed 1 to 0</td><td>3 epochs, minibatch \(32\times8\), horizon 128, 8 actors</td><td class="num">\(2.5\times10^{-4}\alpha\)</td></tr>
+    <tr><td class="row">Tulu 3 RLVR, 8B (PPO)</td><td class="num">1.0</td><td class="num">0.95</td><td class="num">0.2; KL coefficient 0.05</td><td>\(K=4\), 1 minibatch</td><td class="num">\(3\times10^{-7}\)</td></tr>
+    <tr><td class="row">DeepSeekMath-RL (GRPO)</td><td class="num">-</td><td class="num">-</td><td class="num">not stated; KL coefficient 0.04</td><td>single update per exploration</td><td class="num">\(1\times10^{-6}\)</td></tr>
+    <tr><td class="row">R1, first RL stage (GRPO)</td><td class="num">-</td><td class="num">-</td><td class="num" data-worst>10; KL coefficient 0.001</td><td>16 minibatches of 512, 1 epoch</td><td class="num">\(3\times10^{-6}\)</td></tr>
+    <tr><td class="row">DAPO (GRPO variant)</td><td class="num">-</td><td class="num">-</td><td class="num">0.2 low, 0.28 high; no KL</td><td>16 updates (minibatch 512 of 8,192)</td><td class="num">\(1\times10^{-6}\)</td></tr>
+    <tr><td class="row">VAPO (PPO, Qwen-32B)</td><td class="num">1.0</td><td class="num">critic 1.0; policy \(1-1/(0.05\ell)\)</td><td class="num">0.2 low, 0.28 high</td><td>16 updates (minibatch 512 of 8,192)</td><td class="num">actor \(1\times10^{-6}\), critic \(2\times10^{-6}\)</td></tr>
+  </tbody>
+</table>
+
+<h3 id="lineage-and-grpo-kept">7.1 Kept, dropped, moved</h3>
+<p>DeepSeekMath writes PPO and GRPO with the same shape: a per-token ratio, the same \(\min\) and clip, and a \(1/|o|\) average over tokens<a class="cite" href="#ref-5">5</a> (§4.1.1, Eqs. 1 and 3). What changes is the advantage and the KL.</p>
+<ul>
+  <li><strong>Kept from TRPO via PPO:</strong> the ratio, the surrogate \(rA\), the pessimistic min, the clip interval, and reuse of one rollout for several optimizer steps. The 1/|o| length averaging was already in open-source PPO implementations<a class="cite" href="#ref-17">17</a> (§3.1); Lambert notes it "comes from common implementation practices, but is not in a formal derivation of the loss"<a class="cite" href="#ref-7">7</a> (§6.2.5).</li>
+  <li><strong>Dropped:</strong> the value model and GAE, for the memory of a policy-sized critic and the difficulty of an accurate per-token value when only the last token is rewarded<a class="cite" href="#ref-5">5</a> (§4.1.1), plus R1's reflection argument (Section 6.4)<a class="cite" href="#ref-6">6</a>.</li>
+  <li><strong>Moved:</strong> the KL to the reference leaves the reward and enters the loss, "avoiding complicating the calculation of \(\hat A_{i,t}\)"<a class="cite" href="#ref-5">5</a> (§4.1.1). R1 adds that PPO's per-token KL reward penalizes cumulative KL, "which may implicitly penalize the length of the response"<a class="cite" href="#ref-6">6</a> (App. A.3).</li>
+  <li><strong>Added:</strong> a group baseline, \(\hat A_i=(r_i-\mathrm{mean})/\mathrm{std}\) over the \(G\) samples of a prompt<a class="cite" href="#ref-6">6</a> (§2.1, Eq. 3). Module 9 develops it; Modules 11 and 12 take apart the length weighting and the ratio.</li>
+</ul>
+<p>One branch left the PPO family. Kimi k1.5 trains with a variant of online policy mirror descent (a relative-entropy-regularized objective whose reference is the current model, a mean-of-\(k\)-samples baseline and a squared-error surrogate) and uses no value function<a class="cite" href="#ref-9">9</a> (abstract, §2.3.2). That is the mirror-descent reading of Section 2.2 taken literally (Module 9).</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>For LLM RL the live question about this lineage is not whether to use PPO's surrogate but what, if anything, should limit the step. The four positions differ on whether a per-token ratio clip is the right device, and each rests on a different kind of evidence. Module 12 develops the variants.</p>
+<div class="positions">
+  <article class="position">
+    <h4>A. Keep the token-level clip and retune it</h4>
+    <p class="who">PPO's authors<a class="cite" href="#ref-3">3</a>; DeepSeekMath and R1<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-6">6</a>; DAPO's Clip-Higher<a class="cite" href="#ref-12">12</a>; Tulu 3<a class="cite" href="#ref-11">11</a></p>
+    <p>The clip is the cheapest device that makes multi-step reuse of a rollout safe, and it needs only per-token log-probabilities. Where it hurts (entropy collapse from suppressed rare tokens) the fix is a different \(\epsilon_{high}\), not a different mechanism: DAPO's ladder goes from 36 to 38 AIME24 points when Clip-Higher is added to overlong filtering<a class="cite" href="#ref-12">12</a> (Table 1).</p>
+    <ul class="pros"><li>Implemented everywhere; one scalar to tune.</li><li>Beat adaptive and fixed KL penalties on MuJoCo<a class="cite" href="#ref-3">3</a> (Table 1).</li></ul>
+    <ul class="cons"><li>No KL bound; the realized trust region is set by the optimizer<a class="cite" href="#ref-10">10</a>.</li><li>Biased under random rewards; relative headroom starves rare tokens (Table 4)<a class="cite" href="#ref-14">14</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B. The trust region is unnecessary in LLM RL</h4>
+    <p class="who">Ahmadian et al. (Cohere)<a class="cite" href="#ref-16">16</a>; Lambert<a class="cite" href="#ref-7">7</a></p>
+    <p>A pretrained LLM already concentrates probability on a few tokens, so destructive steps are rare: the PPO loss was clipped "on average &lt; 5% of the time per batch", and removing clipping and the ratio "gives a slight boost"<a class="cite" href="#ref-16">16</a> (§3.2). Lambert adds that with one gradient step per batch the PPO-native regularization "is never applied"<a class="cite" href="#ref-7">7</a> (§6.4.2).</p>
+    <ul class="pros"><li>No ratio, no clip bias, no second set of log-probabilities to keep consistent.</li><li>With one update per exploration the clip is inert even by DeepSeekMath's analysis<a class="cite" href="#ref-5">5</a> (App. A.1.5).</li></ul>
+    <ul class="cons"><li>Needs fresh rollouts per step; DAPO and R1 reuse a rollout 16 times<a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-6">6</a>.</li><li>Evidence is short-response RLHF on 7B-class models, not long-CoT RLVR.</li></ul>
+  </article>
+  <article class="position">
+    <h4>C. Move the ratio to the sequence</h4>
+    <p class="who">Qwen team, GSPO<a class="cite" href="#ref-18">18</a></p>
+    <p>The authors trace GRPO's instability to "the fundamental misapplication and invalidation of importance sampling weights": a token-level weight rests on a single sample per next-token distribution, so it cannot correct the distribution and injects noise that grows with length and is amplified by clipping. GSPO uses the length-normalized sequence likelihood ratio with clip ranges of 3e-4 and 4e-4 (GRPO tuned to 0.2 and 0.27), and drops the need for Routing Replay on their MoE<a class="cite" href="#ref-18">18</a> (§1, §3-§5.3).</p>
+    <ul class="pros"><li>Matches a sequence-level reward; large MoE-stability gain.</li></ul>
+    <ul class="cons"><li><mark class="unverified" title="From the researcher's source-map note on the SAPO paper (arXiv 2511.20347, abstract only); that paper was not read for this module">The SAPO authors argue that one sequence-level ratio suppresses a whole sequence when only a few tokens are off-policy.</mark></li><li>Evidence is from the proposing team's own models.</li></ul>
+  </article>
+  <article class="position">
+    <h4>D. Keep every token's gradient; clip the weight or gate softly</h4>
+    <p class="who">MiniMax-M1, CISPO<a class="cite" href="#ref-13">13</a>; SAPO per Lambert and TRL<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-19">19</a></p>
+    <p>PPO-style clipping removes rare "fork" tokens from later updates. CISPO "clips importance sampling weights rather than token updates" and matches DAPO's score with 50% of the steps on Qwen2.5-32B<a class="cite" href="#ref-13">13</a> (abstract, §3.1). SAPO replaces the hard clip with a smooth temperature-controlled gate<a class="cite" href="#ref-7">7</a> (§6.4.3)<a class="cite" href="#ref-19">19</a>.</p>
+    <ul class="pros"><li>Addresses the rare-token problem of Table 4 directly.</li></ul>
+    <ul class="cons"><li>Gives up the pessimistic min; an extreme weight is bounded only by the chosen cap, and comparisons are by the proposers.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>This is the writer's reasoning, not a sourced result. Where rollouts are used once, A and B are the same algorithm, because the ratio is 1 and the clip never fires; the choice only matters once data is reused or stale (asynchronous pipelines, 16-minibatch regimes, MoE routing noise). Then the evidence is uneven: B rests on short-response RLHF at 7B, C and D on the proposers' ablations on their own long-CoT and MoE models. A with a raised \(\epsilon_{high}\) is the lowest-risk default today, because it is the baseline everything else is measured against, and R1's \(\epsilon=10\) suggests the exact range matters less than the learning rate, the reuse count and the KL. What would settle it: matched-compute runs on one base model and verifier set that vary only the ratio treatment at fixed staleness, reporting clip fraction, mean KL to the sampling policy and entropy with the score. No such study is in this course's source map.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Three things are moving as of October 2026. The clip is becoming a configuration surface: the Hugging Face TRL GRPO trainer exposes \(\epsilon\) (default 0.2), a separate \(\epsilon_{high}\) (DAPO recommends 0.28), an importance-sampling level that defaults to "token" with "sequence" giving GSPO's behaviour, and DAPO, CISPO and SAPO loss types<a class="cite" href="#ref-19">19</a>; the page is main-branch documentation without a version number, so read the defaults as a snapshot. The critic is being re-argued, not retired: VAPO is a 2025 attempt to make a value model work at reasoning lengths, while Tulu 3 listed value-free GRPO as untried future work<a class="cite" href="#ref-11">11</a> (Limitations). And the trust-region idea is migrating from the step to the data: the ratio is increasingly a mask or weight against sampler-trainer mismatch and staleness (TRL turns sequence-level masked importance sampling on by default for vLLM generation<a class="cite" href="#ref-19">19</a>; Modules 12, 14 and 18).</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Schulman, J., Levine, S., Moritz, P., Jordan, M. I., Abbeel, P. <em>Trust Region Policy Optimization</em>. ICML 2015; arXiv v5, 20 Apr 2017. <a href="https://arxiv.org/pdf/1502.05477v5">https://arxiv.org/pdf/1502.05477v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Theorem 1 and Eq. 9 (§3); average-KL constraint and importance-sampling form, Eqs. 12 and 14 (§4-§5); single path and vine (§5); Fisher matrix, natural-gradient relation and Eqs. 17-18 (§6-§7); delta = 0.01 and the natural-gradient comparison (§8.1); conjugate gradient, Fisher-vector products and line search (App. C, C.1); Tables 2-3 (App. E).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Schulman, J., Moritz, P., Levine, S., Jordan, M. I., Abbeel, P. <em>High-Dimensional Continuous Control Using Generalized Advantage Estimation</em>. ICLR 2016; arXiv v6, 20 Oct 2018. <a href="https://arxiv.org/pdf/1506.02438v6">https://arxiv.org/pdf/1506.02438v6</a>. Accessed 2026-10-26. <span class="ref-use">Used for: GAE definition and endpoints, Eqs. 11-18 (§3); gamma-just estimators and Proposition 1; gamma versus lambda bias; horizon and reward-shaping reading (§4); value-function trust region, Eqs. 29-30 (§5); cart-pole ranges (§6.3.1); TRPO as the policy optimizer (§6.1).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Schulman, J., Wolski, F., Dhariwal, P., Radford, A., Klimov, O. <em>Proximal Policy Optimization Algorithms</em>. arXiv v2, 28 Aug 2017. <a href="https://arxiv.org/pdf/1707.06347v2">https://arxiv.org/pdf/1707.06347v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: L^CPI and L^CLIP, Eqs. 6-7 and Figs. 1-2 (§3); adaptive KL penalty (§4); Algorithm 1 and combined objective, Eq. 9 (§5); the surrogate comparison, Table 1 (§6.1); hyperparameters, Tables 3 and 5 (App. A).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Ouyang, L. et al. <em>Training language models to follow instructions with human feedback</em>. NeurIPS 2022; arXiv v1, 4 Mar 2022. <a href="https://arxiv.org/pdf/2203.02155v1">https://arxiv.org/pdf/2203.02155v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: PPO as the RL stage, per-token KL penalty from the SFT model, value function initialized from the RM (§3.5).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Shao, Z. et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: introduction of GRPO; PPO and GRPO objectives, Eqs. 1 and 3, and the critic and KL arguments (§4.1.1); DeepSeekMath-RL settings (§4.2); the single-update simplification (App. A.1.5).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv v2, 4 Jan 2026. <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: GRPO as R1's algorithm and its displayed objective (§2.1, Eqs. 1-3); first-stage hyperparameters including clip ratio 10 (§3.2.1); PPO versus GRPO with lambda 0.95 and 1.0, and the value-model and KL arguments (App. A.3).</span></li>
+  <li id="ref-7"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv v12, 11 Sep 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: PPO objective and the sign-by-region analysis (§6.2.5-§6.2.6, Fig. 23); value function and optional value clip (§6.2.7); GAE and gamma = 1 (§6.4.1); double regularization, clip fraction and update counts (§6.4.2); SAPO and VAPO summaries (§6.4.3).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Kazemnejad, A., Aghajohari, M., Portelance, E., Sordoni, A., Reddy, S., Courville, A., Le Roux, N. <em>VinePPO: Refining Credit Assignment in RL Training of LLMs</em>. ICML 2025; arXiv v2, 3 Jun 2025. <a href="https://arxiv.org/abs/2410.01679">https://arxiv.org/abs/2410.01679</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the vine variant of TRPO transplanted to LLMs, Monte Carlo value estimates with K auxiliary rollouts, K = 9 default (§4, §5); the authors' MATH and GSM8K results and the 3.0x wall-clock claim (abstract, §6.1-§6.2). Source added by the writer beyond the source map.</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Kimi Team. <em>Kimi k1.5: Scaling Reinforcement Learning with LLMs</em>. arXiv v4, 3 Jun 2025. <a href="https://arxiv.org/pdf/2501.12599v4">https://arxiv.org/pdf/2501.12599v4</a>. Accessed 2026-10-26. <span class="ref-use">Used for: online policy mirror descent variant with a relative-entropy term and no value function (abstract, §2.3.2).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Engstrom, L., Ilyas, A., Santurkar, S., Tsipras, D., Janoos, F., Rudolph, L., Madry, A. <em>Implementation Matters in Deep Policy Gradients: A Case Study on PPO and TRPO</em>. ICLR 2020; arXiv v1, 25 May 2020. <a href="https://arxiv.org/abs/2005.12729">https://arxiv.org/abs/2005.12729</a>. Accessed 2026-10-27. <span class="ref-use">Used for: code-level optimizations list (§3), PPO's first step equal to the unclipped step, ratio violations and KL enforcement of TRPO versus PPO (§4, Fig. 2), attribution of PPO's gain over TRPO (abstract). Source added by the writer beyond the source map.</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Lambert, N. et al. <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv v5, 14 Apr 2025. <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: PPO hyperparameters for RM and RLVR runs (Table 21; the 405B table, labelled Table 35); implementation details, dropout and advantage whitening, value initialization (§6.2, §6.2.1); the value-free GRPO limitation (§8.1, Limitations).</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Yu, Q. et al. <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv v2, 20 May 2025. <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Clip-Higher and the 0.01 / 0.9 example (§3.1, Fig. 3a); epsilon_low 0.2, epsilon_high 0.28 and 16 updates per rollout (§4.1); ablation ladder (Table 1).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>MiniMax. <em>MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention</em>. arXiv v1, 16 Jun 2025. <a href="https://arxiv.org/pdf/2506.13585v1">https://arxiv.org/pdf/2506.13585v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: clipping of rare fork tokens and the CISPO weight clip (§3.1); the comparison with DAPO (abstract, Fig. 2).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Shao, R. et al. <em>Spurious Rewards: Rethinking Training Signals in RLVR</em>. arXiv v2, 25 Feb 2026. <a href="https://arxiv.org/pdf/2506.10947v2">https://arxiv.org/pdf/2506.10947v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: random-reward gains on Qwen2.5-Math-7B (abstract); clipping-bias account, Eq. 2, the 0.85 / 0.02 token example and the clipping ablation (§4, App. B, Fig. 4); code-reasoning frequency (§5.2); model dependence (§3, Fig. 3).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Yue, Y. et al. (ByteDance Seed). <em>VAPO: Efficient and Reliable Reinforcement Learning for Advanced Reasoning Tasks</em>. arXiv v3, 11 Apr 2025. <a href="https://arxiv.org/abs/2504.05118">https://arxiv.org/abs/2504.05118</a>. Accessed 2026-10-27. <span class="ref-use">Used for: reward decay lambda^(T-t) and value bias with lambda 0.95 (§3.1); decoupled GAE, value pretraining and length-adaptive GAE (§4.1-§4.2); settings and ablation, Table 1 (§5). Source added by the writer beyond the source map.</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Ahmadian, A., Cremer, C., Gallé, M., Fadaee, M., Kreutzer, J., Pietquin, O., Üstün, A., Hooker, S. <em>Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs</em>. ACL 2024; arXiv v2, 26 Feb 2024. <a href="https://arxiv.org/pdf/2402.14740v2">https://arxiv.org/pdf/2402.14740v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the GAE lambda ablation (§3.1, Fig. 1); clipping rarely active, under 5% (§3.2).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Liu, Z. et al. <em>Understanding R1-Zero-Like Training: A Critical Perspective</em>. COLM 2025; arXiv v2, 6 Oct 2025. <a href="https://arxiv.org/pdf/2503.20783v2">https://arxiv.org/pdf/2503.20783v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: 1/|o| length normalization already present in open-source PPO implementations (§3.1).</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Zheng, C. et al. (Qwen Team, Alibaba). <em>Group Sequence Policy Optimization</em>. arXiv v2, 28 Jul 2025. <a href="https://arxiv.org/pdf/2507.18071v2">https://arxiv.org/pdf/2507.18071v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the single-sample argument against token-level importance weights (§1), sequence-level ratio and clip ranges (§3, §4), Routing Replay (§5.3).</span></li>
+  <li id="ref-19"><span class="ref-type">official</span>Hugging Face. <em>TRL documentation: GRPO Trainer</em> (main branch; version not stated on the page). <a href="https://huggingface.co/docs/trl/main/en/grpo_trainer">https://huggingface.co/docs/trl/main/en/grpo_trainer</a>. Accessed 2026-10-26. <span class="ref-use">Used for: epsilon, epsilon_high, importance_sampling_level defaults and the DAPO, CISPO and SAPO loss types; default masked importance sampling for vLLM generation.</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

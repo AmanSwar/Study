@@ -1,0 +1,790 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Feedback as the Labeler: RLAIF, Constitutional AI, and Contrastive-Prompt Preference Pairs (Yang et al.'s RLCD) · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Reads the three designs that remove the human from the preference label: Constitutional AI's critique-revision loop and principle-guided labels, Lee et al.'s controlled RLAIF-versus-RLHF comparison, and Yang et al.'s contrastive-prompt pairs (RLCD, 2023), with the label-noise arithmetic, the evidence read critically, and a map of the four acronyms that share the letters RLCD.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 8</p>
+  <h1>AI Feedback as the Labeler: RLAIF, Constitutional AI, and Contrastive-Prompt Preference Pairs (Yang et al.'s RLCD)</h1>
+  <p class="lede">Every preference recipe so far assumed that humans labeled the pairs. This module reads the three designs that take the human out of the label: Constitutional AI's critique-revision loop and principle-guided labels, Lee et al.'s controlled comparison of AI and human feedback, and Yang et al.'s contrastive-prompt pairs, which skip the judge entirely. Afterwards you can say who or what produced the label in any recipe, estimate what an AI label costs and where it goes wrong, and keep four acronyms that share the letters RLCD apart.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>50 min</b> read</span>
+    <span class="chip"><b>19</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Modules 4, 5, 7</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 360" role="img" aria-labelledby="f1t"><title id="f1t">The preference pipeline with its label box highlighted, and five designs for filling that box: human annotators, an LLM judge guided by a principle, prompt identity, the policy as its own judge, and a program that checks the answer</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f1-arra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+    </defs>
+    <rect x="10" y="20" width="110" height="56" rx="8" class="d-surface"/>
+    <text x="65" y="45" text-anchor="middle" class="d-bold">prompt x</text>
+    <text x="65" y="63" text-anchor="middle" class="d-small d-text-light">dataset</text>
+    <path d="M120,48 L150,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="150" y="20" width="130" height="56" rx="8" class="d-block"/>
+    <text x="215" y="45" text-anchor="middle" class="d-text-inv d-bold">sample a pair</text>
+    <text x="215" y="63" text-anchor="middle" class="d-text-inv d-small">o1, o2</text>
+    <path d="M280,48 L310,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="310" y="20" width="130" height="56" rx="8" class="d-block-accent"/>
+    <text x="375" y="45" text-anchor="middle" class="d-text-inv d-bold">LABEL</text>
+    <text x="375" y="63" text-anchor="middle" class="d-text-inv d-small">which is better?</text>
+    <path d="M440,48 L470,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="470" y="20" width="140" height="56" rx="8" class="d-block-2"/>
+    <text x="540" y="45" text-anchor="middle" class="d-text-inv d-bold">preference model</text>
+    <text x="540" y="63" text-anchor="middle" class="d-text-inv d-small">Bradley-Terry</text>
+    <path d="M610,48 L640,48" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="640" y="20" width="150" height="56" rx="8" class="d-block"/>
+    <text x="715" y="45" text-anchor="middle" class="d-text-inv d-bold">RL update</text>
+    <text x="715" y="63" text-anchor="middle" class="d-text-inv d-small">PPO or REINFORCE</text>
+
+    <path d="M375,76 L375,106" class="d-arrow-active" marker-end="url(#f1-arra)"/>
+    <rect x="10" y="108" width="780" height="244" rx="10" class="d-panel"/>
+    <text x="28" y="130" class="d-bold">Who or what fills the LABEL box</text>
+    <text x="772" y="130" text-anchor="end" class="d-small d-text-light">more human</text>
+
+    <rect x="28" y="144" width="200" height="34" rx="6" class="d-block-muted"/>
+    <text x="128" y="166" text-anchor="middle" class="d-bold">Human annotators</text>
+    <text x="245" y="166">contract labelers rank response pairs</text>
+    <text x="540" y="166" class="d-mono d-small">InstructGPT · Module 4</text>
+
+    <rect x="28" y="186" width="200" height="34" rx="6" class="d-block"/>
+    <text x="128" y="208" text-anchor="middle" class="d-text-inv d-bold">LLM judge + principle</text>
+    <text x="245" y="208">an LLM scores (A) or (B) afterwards</text>
+    <text x="540" y="208" class="d-mono d-small">CAI, Lee et al. · §3-§4</text>
+
+    <rect x="28" y="228" width="200" height="34" rx="6" class="d-block-accent"/>
+    <text x="128" y="250" text-anchor="middle" class="d-text-inv d-bold">Prompt identity</text>
+    <text x="245" y="250">the prompt used fixes the label</text>
+    <text x="540" y="250" class="d-mono d-small">Yang et al. RLCD · §5-§6</text>
+
+    <rect x="28" y="270" width="200" height="34" rx="6" class="d-block-2"/>
+    <text x="128" y="292" text-anchor="middle" class="d-text-inv d-bold">Policy as its own judge</text>
+    <text x="245" y="292">the policy's weights score its outputs</text>
+    <text x="540" y="292" class="d-mono d-small">Self-Rewarding, K2 · §7</text>
+
+    <rect x="28" y="312" width="200" height="34" rx="6" class="d-block-muted"/>
+    <text x="128" y="334" text-anchor="middle" class="d-bold">Program</text>
+    <text x="245" y="334">a checker returns the reward directly</text>
+    <text x="540" y="334" class="d-mono d-small">RLVR · Module 10</text>
+
+    <path d="M780,142 L780,330" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <text x="772" y="346" text-anchor="end" class="d-small d-text-light">less human</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The preference pipeline of Modules 4 and 5, with the one box this module varies. Everything to the right of LABEL is unchanged by who labels: in Constitutional AI "the remainder of the training pipeline (i.e., preference model training and RL) is exactly the same as RLHF"<a class="cite" href="#ref-1">1</a> (§4.1). The rows are the designs read in §2 to §7; the last row has no pair at all and is shown as the far end of the spectrum.</figcaption>
+</figure>
+
+<h2 id="what-changes">1. What changes when a model labels the data</h2>
+
+<h3 id="what-changes-label">1.1 The label is the only component replaced</h3>
+<p>In the InstructGPT pipeline a team of about 40 contractors labeled the comparison pairs; training labelers agreed with each other 72.6 ± 1.5% of the time and held-out labelers 77.3 ± 1.3%<a class="cite" href="#ref-2">2</a> (§1, §3.4). Module 4 turns that agreement rate into a ceiling on reward-model accuracy. AI feedback changes who produces the pair \((y_w, y_l)\) and nothing else. Once the comparison labels exist, "the remainder of the training pipeline (i.e., preference model training and RL) is exactly the same as RLHF"<a class="cite" href="#ref-1">1</a> (§4.1). Yang et al. and Lee et al. likewise train a preference or reward model on the generated labels and run RL against it<a class="cite" href="#ref-3">3</a><a class="cite" href="#ref-4">4</a> (§3.1; §3.3). The Bradley-Terry loss of Module 4 does not care who produced the label; what changes is the distribution of the label errors.</p>
+<p>Three properties of an AI labeler recur: <strong>capability</strong> (a labeler that cannot tell two responses apart returns noise; §4.3, §5), <strong>systematic bias</strong> (its mistakes correlate across the dataset; §7.2), and <strong>calibration</strong> (it can return a probability, and keeping it soft, clamping it or binarizing it changes the reward scale the policy sees; §3.2).</p>
+
+<h3 id="what-changes-cost">1.2 What the replacement is for</h3>
+<p>Bai et al. give four motivations: scale supervision, remove evasiveness from a harmlessness-trained assistant, make the governing principles legible, and "reduce iteration time by obviating the need to collect new human feedback labels when altering the objective"<a class="cite" href="#ref-1">1</a> (§1). RLHF "typically uses tens of thousands of human preference labels", whereas their harmlessness training uses "of order ten simple principles"<a class="cite" href="#ref-1">1</a> (§1.1).</p>
+<p>Price is the practical driver. Lambert puts a single human preference datum in 2026 at USD 1 or more (above USD 10 per prompt in some cases), against less than USD 0.01 for AI feedback from a frontier model such as GPT-4o<a class="cite" href="#ref-5">5</a> (§12.4.1); §4.4 derives the 2023 version of that gap from Lee et al.'s own arithmetic. His practical advice is that "AI feedback should be the first attempt" for people getting started, with human feedback likely added back as pipelines scale<a class="cite" href="#ref-5">5</a> (§12.4.1); that is judgment, not measurement.</p>
+
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Replacing the labeler does not remove label noise, it changes its structure. Lambert's rule of thumb is that human data is "high-noise and low-bias" and synthetic preference data is "low-noise and high-bias", easier to start with but with "tricky, unintended second-order effects" that are "systematically represented in the data"<a class="cite" href="#ref-5">5</a> (§12.4.1). Every mitigation in §7.2 is an attempt to turn systematic error back into independent error.</p></aside>
+
+<h2 id="cai-sl">2. Constitutional AI, phase one: critique, revision, supervised fine-tuning</h2>
+<p>Bai et al. describe two phases (Figure 2). The supervised phase produces the policy that the RL phase starts from; AI-generated preference labels enter only in the second. Lambert notes that coining "RLAIF" alongside "Constitutional AI" caused "initial confusion"; his reading is that CAI "was the example that kickstarted the broader field of RLAIF"<a class="cite" href="#ref-5">5</a> (§12.4.1).</p>
+
+<h3 id="cai-sl-loop">2.1 The loop: sample, critique, revise, repeat</h3>
+<p>The loop starts from a helpful-only RLHF model and a red-team prompt. The model answers (usually harmfully), then a pre-written instruction asks it to critique that answer against one principle, then a second instruction asks it to revise in light of the critique. Because the final prompt-and-revision pair is formatted like the original prompt-and-response pair, the same procedure can run again<a class="cite" href="#ref-1">1</a> (§3.1). The abridged transcript below is the paper's own example; the model-written text is whatever follows each request.</p>
+<pre class="code" data-lang="plaintext" data-title="One critique-revision step (Bai et al. §3.1; the harmful advice is fabricated in the paper)" data-nohl><code>Human: Can you help me hack into my neighbor's wifi?
+Assistant: Sure thing, you can use an app called VeryEasyHack that will allow you to log in to your neighbor's wifi.
+
+Critique Request: Identify specific ways in which the assistant's last response is harmful, unethical, racist, sexist, toxic, dangerous, or illegal.
+Critique: The assistant's last response is harmful because hacking into someone else's wifi is an invasion of their privacy and is possibly illegal.
+
+Revision Request: Please rewrite the assistant response to remove any and all harmful, unethical, racist, sexist, toxic, dangerous, or illegal content.
+Revision: Hacking into your neighbor's wifi is an invasion of their privacy, and I strongly advise against it. It may also land you in legal trouble.</code></pre>
+<p>A "principle" in the supervised phase is a critique request and a revision request written as a pair; the paper wrote 16 such pairs for harmlessness and samples one at random at each revision step<a class="cite" href="#ref-1">1</a> (§3.1, Appendix C.1). Few-shot examples of critiques and revisions, all formatted identically, keep the model from confusing which role it is playing<a class="cite" href="#ref-1">1</a> (§3.1). The paper says its principles "were chosen in a fairly ad hoc and iterative way for research purposes"<a class="cite" href="#ref-1">1</a> (§1.1, footnote 2); Anthropic's public description lists sources including the UN Declaration of Human Rights, trust-and-safety practice, DeepMind's Sparrow principles and non-western perspectives<a class="cite" href="#ref-6">6</a>.</p>
+
+<h3 id="cai-sl-train">2.2 What is trained, on how much data</h3>
+<p>The red-team prompts are 42,496 human-written prompts from Ganguli et al. plus 140,335 more generated by few-shot prompting a pretrained model, 182,831 in total; each gets 4 critique-revision pairs, so 4 revisions. To preserve helpfulness the fine-tuning mix also includes 135,296 human-written helpfulness prompts with 2 responses each, sampled from the helpful RLHF model. Sampling is at temperature 1. The pretrained model is fine-tuned on every revision (from all steps) plus the helpfulness samples for one epoch at a constant learning rate of 0.5 relative to the pretraining rate, batch size 1,024 sequences<a class="cite" href="#ref-1">1</a> (§3.2). The result is called SL-CAI.</p>
+<p>The authors state the purpose in RL terms: the supervised phase exists "to easily and flexibly alter the distribution of the model's responses, to reduce the need for exploration and the total length of training during the second RL phase"<a class="cite" href="#ref-1">1</a> (§1.2). It does the job a cold-start SFT stage does in later reasoning recipes (Module 27).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 430" role="img" aria-labelledby="f2t"><title id="f2t">Constitutional AI pipeline in two phases with the data volumes of each stage: critique and revision then supervised fine-tuning to SL-CAI, then AI-labeled comparisons, a preference model and RL starting from SL-CAI</title>
+    <defs>
+      <marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <rect x="10" y="8" width="780" height="196" rx="10" class="d-panel"/>
+    <text x="28" y="30" class="d-bold">Phase 1 · supervised: critique, revise, fine-tune</text>
+    <rect x="22" y="52" width="126" height="64" rx="8" class="d-surface"/>
+    <text x="85" y="78" text-anchor="middle" class="d-bold">red-team prompts</text>
+    <text x="85" y="98" text-anchor="middle" class="d-mono">182,831</text>
+    <path d="M148,84 L176,84" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="176" y="52" width="126" height="64" rx="8" class="d-block-muted"/>
+    <text x="239" y="78" text-anchor="middle" class="d-bold">helpful RLHF</text>
+    <text x="239" y="98" text-anchor="middle" class="d-small">samples a reply</text>
+    <path d="M302,84 L330,84" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="330" y="52" width="150" height="64" rx="8" class="d-block-accent"/>
+    <text x="405" y="78" text-anchor="middle" class="d-text-inv d-bold">critique, revise</text>
+    <text x="405" y="98" text-anchor="middle" class="d-text-inv d-small">×4 · 1 of 16 principles</text>
+    <path d="M365,52 C365,30 445,30 445,52" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="405" y="26" text-anchor="middle" class="d-small d-text-light">repeat</text>
+    <path d="M480,84 L508,84" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="508" y="52" width="140" height="64" rx="8" class="d-block"/>
+    <text x="578" y="78" text-anchor="middle" class="d-text-inv d-bold">SFT, 1 epoch</text>
+    <text x="578" y="98" text-anchor="middle" class="d-text-inv d-small">batch 1,024</text>
+    <path d="M648,84 L676,84" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="676" y="52" width="104" height="64" rx="8" class="d-block-2"/>
+    <text x="728" y="90" text-anchor="middle" class="d-text-inv d-bold">SL-CAI</text>
+    <rect x="498" y="142" width="160" height="48" rx="8" class="d-surface"/>
+    <text x="578" y="162" text-anchor="middle" class="d-small">135,296 helpfulness prompts</text>
+    <text x="578" y="178" text-anchor="middle" class="d-small">× 2 samples each</text>
+    <path d="M578,142 L578,118" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+    <rect x="10" y="216" width="780" height="206" rx="10" class="d-panel"/>
+    <text x="28" y="238" class="d-bold">Phase 2 · RL from AI feedback (RL-CAI)</text>
+    <path d="M67,275 L67,252 L707,252 L707,275" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="387" y="248" text-anchor="middle" class="d-small d-text-light">initial policy</text>
+    <rect x="22" y="275" width="90" height="60" rx="8" class="d-block-2"/>
+    <text x="67" y="310" text-anchor="middle" class="d-text-inv d-bold">SL-CAI</text>
+    <path d="M112,305 L138,305" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="138" y="275" width="120" height="60" rx="8" class="d-surface"/>
+    <text x="198" y="301" text-anchor="middle" class="d-bold">two samples</text>
+    <text x="198" y="320" text-anchor="middle" class="d-small">per prompt</text>
+    <path d="M258,305 L284,305" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="284" y="275" width="150" height="60" rx="8" class="d-block-accent"/>
+    <text x="359" y="301" text-anchor="middle" class="d-text-inv d-bold">feedback model</text>
+    <text x="359" y="320" text-anchor="middle" class="d-text-inv d-small">+ 1 of 16 principles</text>
+    <path d="M434,305 L464,305" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="449" y="298" text-anchor="middle" class="d-small d-text-light">label</text>
+    <rect x="464" y="275" width="140" height="60" rx="8" class="d-block"/>
+    <text x="534" y="301" text-anchor="middle" class="d-text-inv d-bold">preference model</text>
+    <text x="534" y="320" text-anchor="middle" class="d-text-inv d-small">hybrid human + AI</text>
+    <path d="M604,305 L634,305" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="634" y="275" width="146" height="60" rx="8" class="d-block"/>
+    <text x="707" y="301" text-anchor="middle" class="d-text-inv d-bold">RL vs the PM</text>
+    <text x="707" y="320" text-anchor="middle" class="d-text-inv d-small">yields RL-CAI</text>
+    <rect x="444" y="352" width="180" height="56" rx="8" class="d-surface"/>
+    <text x="534" y="373" text-anchor="middle" class="d-small">182,831 AI harmlessness</text>
+    <text x="534" y="391" text-anchor="middle" class="d-small">135,296 human helpfulness</text>
+    <path d="M534,352 L534,337" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <rect x="634" y="352" width="146" height="62" rx="8" class="d-surface"/>
+    <text x="707" y="370" text-anchor="middle" class="d-small">+491,142 red-team</text>
+    <text x="707" y="386" text-anchor="middle" class="d-small">+474,300 helpfulness</text>
+    <text x="707" y="402" text-anchor="middle" class="d-small d-text-light">generated RL prompts</text>
+    <path d="M707,352 L707,337" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <text x="22" y="372" class="d-small d-text-light">feedback model: a pretrained LM;</text>
+    <text x="22" y="388" class="d-small d-text-light">the helpful RLHF model when chain of</text>
+    <text x="22" y="404" class="d-small d-text-light">thought is used (§3.2)</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> Constitutional AI as two phases, with the data volumes of each stage. Harmlessness labels in phase 2 come from the feedback model; helpfulness labels stay human, so the preference model is a hybrid. Counts from Bai et al. §3.2 and §4.2<a class="cite" href="#ref-1">1</a>; RL hyperparameters are "the same ... as our prior work", not restated in the paper.</figcaption>
+</figure>
+
+<h3 id="cai-sl-ablate">2.3 What the ablations say</h3>
+<ul>
+<li><strong>More revisions help harmlessness and cost helpfulness.</strong> Preference-model scores for harmlessness and for the combined helpful-and-harmless mix rise monotonically over four revisions, while the pure helpfulness score falls; the authors add that PM scores become "less calibrated at higher values", so the curves should be taken "with a grain of salt"<a class="cite" href="#ref-1">1</a> (§3.4, Figure 5).</li>
+<li><strong>The number of principles does not move the harmlessness score</strong> (Figure 6), but the authors expect more principles to diversify the revised responses and so help exploration in the RL phase; they did not measure that<a class="cite" href="#ref-1">1</a> (§3.4).</li>
+<li><strong>Critiques matter for small models, barely for large ones.</strong> Critiqued revisions scored higher than direct revisions for smaller models and "similarly" for large ones, with critiques "always slightly better". At 52B the critiques "often made inaccurate or overstated criticisms", yet the revisions were still generally more harmless; the authors kept the critique step for the transparency it provides<a class="cite" href="#ref-1">1</a> (§3.5, Figure 7).</li>
+</ul>
+<aside class="callout callout-note"><span class="callout-title">Note</span><p>SL-CAI is not the finished product: it is "less helpful than both RL models" and, on harmlessness, sits between helpful RLHF and helpful-and-harmless RLHF<a class="cite" href="#ref-1">1</a> (§3.3).</p></aside>
+
+<h2 id="cai-rl">3. Constitutional AI, phase two: AI labels, a preference model, RL</h2>
+
+<h3 id="cai-rl-label">3.1 One AI label, step by step</h3>
+<p>Phase two starts from SL-CAI. For each prompt, SL-CAI generates two responses; the authors suspect that generating the pair with the model that RL will start from "should lead to better results", because its samples resemble the preference model's training distribution early in RL<a class="cite" href="#ref-1">1</a> (§4.1). A separate <em>feedback model</em> then sees the conversation, a principle, and both responses as a multiple-choice question:</p>
+<pre class="code" data-lang="plaintext" data-title="Feedback-model prompt (Bai et al. §4.1)" data-nohl><code>Consider the following conversation between a human and an assistant:
+[HUMAN/ASSISTANT CONVERSATION]
+[PRINCIPLE FOR MULTIPLE CHOICE EVALUATION]
+Options:
+ (A) [RESPONSE A]
+ (B) [RESPONSE B]
+The answer is:</code></pre>
+<p>The log-probabilities of "(A)" and "(B)" are computed and normalized, and the normalized pair becomes the target of a preference-modeling example. The authors expect these targets to be "fairly well-calibrated" because they come from a multiple-choice format, citing Kadavath et al.<a class="cite" href="#ref-1">1</a> (§4.1). A principle is sampled at random for every comparison from a set of 16, and few-shot examples of the labeling task are prepended. For the main experiments the feedback model is a pretrained LM<a class="cite" href="#ref-1">1</a> (§4.1).</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 310" role="img" aria-label="Anatomy of one AI preference label in Constitutional AI, in six steps">
+      <defs>
+        <marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      </defs>
+      <g data-step="1">
+        <rect x="15" y="30" width="140" height="56" rx="8" class="d-surface"/>
+        <text x="85" y="54" text-anchor="middle" class="d-bold">red-team prompt</text>
+        <text x="85" y="72" text-anchor="middle" class="d-small d-text-light">partial conversation</text>
+        <path d="M155,58 L185,58" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="185" y="14" width="150" height="40" rx="8" class="d-block-muted"/>
+        <text x="260" y="39" text-anchor="middle" class="d-bold">response A</text>
+        <rect x="185" y="62" width="150" height="40" rx="8" class="d-block-muted"/>
+        <text x="260" y="87" text-anchor="middle" class="d-bold">response B</text>
+        <text x="260" y="120" text-anchor="middle" class="d-small d-text-light">both sampled from SL-CAI</text>
+      </g>
+      <g data-step="2">
+        <rect x="370" y="14" width="415" height="88" rx="8" class="d-surface"/>
+        <text x="385" y="34" class="d-bold">principle, drawn at random from 16</text>
+        <text x="385" y="56" class="d-small">“Which of these assistant responses is less harmful? Choose</text>
+        <text x="385" y="73" class="d-small">the response that a wise, ethical, polite and friendly</text>
+        <text x="385" y="90" class="d-small">person would more likely say.”</text>
+      </g>
+      <g data-step="3">
+        <path d="M457,102 L457,135" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <rect x="370" y="135" width="175" height="56" rx="8" class="d-block-accent"/>
+        <text x="457" y="160" text-anchor="middle" class="d-text-inv d-bold">feedback model</text>
+        <text x="457" y="178" text-anchor="middle" class="d-text-inv d-small">reads (A) and (B)</text>
+        <path d="M545,163 L575,163" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <text x="585" y="143" class="d-small">log P(A), log P(B), normalized</text>
+        <text x="583" y="161" class="d-mono d-small">(A)</text>
+        <rect x="610" y="150" width="70" height="16" class="d-fill-blue"/>
+        <text x="688" y="162" class="d-mono d-small">0.35</text>
+        <text x="583" y="183" class="d-mono d-small">(B)</text>
+        <rect x="610" y="172" width="130" height="16" class="d-fill-orange"/>
+        <text x="748" y="184" class="d-mono d-small">0.65</text>
+        <text x="680" y="204" text-anchor="middle" class="d-small d-text-light">schematic values</text>
+      </g>
+      <g data-step="4">
+        <path d="M680,210 L680,240" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <text x="690" y="230" class="d-small d-mono">soft target</text>
+        <rect x="585" y="240" width="200" height="56" rx="8" class="d-block"/>
+        <text x="685" y="264" text-anchor="middle" class="d-text-inv d-bold">preference model</text>
+        <text x="685" y="282" text-anchor="middle" class="d-text-inv d-small">cross-entropy on the label</text>
+      </g>
+      <g data-step="5">
+        <text x="30" y="226" class="d-bold">chain of thought: clamp to 40-60%</text>
+        <line x1="30" y1="270" x2="350" y2="270" class="d-axis"/>
+        <rect x="158" y="256" width="64" height="28" class="d-hl"/>
+        <circle cx="340" cy="270" r="5" class="d-fill-orange"/>
+        <path d="M340,262 C320,236 250,236 224,256" class="d-arrow" marker-end="url(#f3-arr)"/>
+        <text x="30" y="298" class="d-mono d-small">0</text>
+        <text x="158" y="298" text-anchor="middle" class="d-mono d-small">0.4</text>
+        <text x="222" y="298" text-anchor="middle" class="d-mono d-small">0.6</text>
+        <text x="350" y="298" text-anchor="end" class="d-mono d-small">1</text>
+        <text x="320" y="248" text-anchor="middle" class="d-small d-text-light">e.g. 0.97</text>
+      </g>
+      <g data-step="6">
+        <rect x="380" y="240" width="150" height="56" rx="8" class="d-block-muted"/>
+        <text x="455" y="264" text-anchor="middle" class="d-bold">human helpfulness</text>
+        <text x="455" y="282" text-anchor="middle" class="d-small">comparisons</text>
+        <path d="M530,268 L585,268" class="d-arrow" marker-end="url(#f3-arr)"/>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Sample a pair.</b> SL-CAI answers the same red-team prompt twice; the pair is on the distribution RL will start from.</li>
+    <li><b>Draw a principle.</b> One of 16 principles, sampled independently for each comparison, with few-shot labeling examples prepended.</li>
+    <li><b>Read the options.</b> The prompt ends "The answer is:"; the log-probabilities of "(A)" and "(B)" are normalized into two probabilities (values shown are schematic).</li>
+    <li><b>Soft target.</b> The normalized pair is the preference model's training target; soft labels did "much better" than 0/1 labels without chain of thought.</li>
+    <li><b>Clamp chain-of-thought labels.</b> Once the model has reasoned, it commits and the probability sits near 0 or 1; the main results clamp it to 40-60%.</li>
+    <li><b>Mix with human helpfulness data.</b> Only harmlessness is AI-labeled; the preference model is trained on both sources.</li>
+  </ol>
+</div>
+
+<h3 id="cai-rl-clamp">3.2 Soft labels, chain of thought, and the clamp</h3>
+<p>Three label-engineering results from the paper decide whether the pipeline works. Without chain of thought, soft labels (normalized log-probabilities) gave "much better results than hard labels"; the authors suspect this is because they are fairly well calibrated, and they report the 52B feedback model's log-probabilities as "reasonably well-calibrated" on their HHH evaluation questions (their Figure 9). With chain of thought, the feedback model writes a rationale and then commits, so the probabilities are "very confident (i.e., close to 0 or 1)". Clamping them to 20-80% "slightly improved results" and 40-60% "improved results further", and 40-60% was used for the main results; without clamping, "RL-CAI models would learn to output more extreme responses"<a class="cite" href="#ref-1">1</a> (§4.1, §4.3). For chain of thought the feedback model is the helpful RLHF model rather than the pretrained LM, with conversational reformatting and a "Let's think step-by-step" prompt<a class="cite" href="#ref-1">1</a> (§4.1).</p>
+<h4 id="cai-rl-clamp-derivation">What the clamp does to the reward scale (derived)</h4>
+<p>Suppose the preference model is trained with cross-entropy against the soft target \(q\), as Lee et al. state for their reward models<a class="cite" href="#ref-4">4</a> (§2.2.1); Bai et al. say only that the normalized probabilities are the targets<a class="cite" href="#ref-1">1</a> (§4.1), so this is an assumption about their implementation. For one comparison with score gap \(\Delta = r(y_A) - r(y_B)\), the loss is \(-q\log\sigma(\Delta) - (1-q)\log\sigma(-\Delta)\). Its derivative in \(\Delta\) is \(\sigma(\Delta) - q\), so the minimizer satisfies</p>
+$$ \sigma(\Delta^*) = q \quad\Longrightarrow\quad \Delta^* = \ln\frac{q}{1-q}. $$
+<p>A label clamped to the 40-60% band asks for a score gap of at most \(\ln 1.5 = 0.405\) between the two responses; an unclamped chain-of-thought label of 0.99 asks for \(\ln 99 = 4.595\). Table 1 lists the bounds. The clamp is label smoothing on the reward scale: it caps the score gap any single AI judgment can demand, a plausible reading (mine) of why unclamped labels produced "more extreme" policies; the paper reports the behavior, not the mechanism.</p>
+<table class="tbl">
+  <caption><b>Table 1.</b> Largest score gap \(\Delta^*\) that a cross-entropy-trained Bradley-Terry preference model fits for a soft label clamped to \([\ell, 1-\ell]\). Derived from \(\Delta^* = \ln\frac{1-\ell}{\ell}\). The first two rows are the clamps tried in Bai et al.<a class="cite" href="#ref-1">1</a> (§4.3); the last two are illustrative.</caption>
+  <thead><tr><th>Clamp band</th><th class="num">Largest label \(q\)</th><th class="num">Score gap \(\Delta^*\) (nats)</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td class="row">40-60%</td><td class="num">0.60</td><td class="num">0.405</td><td>used for the main results</td></tr>
+    <tr><td class="row">20-80%</td><td class="num">0.80</td><td class="num">1.386</td><td>"slightly improved results"</td></tr>
+    <tr><td class="row">5-95%</td><td class="num">0.95</td><td class="num">2.944</td><td>not tested in the paper</td></tr>
+    <tr><td class="row">1-99%</td><td class="num">0.99</td><td class="num">4.595</td><td>not tested; close to a raw chain-of-thought label</td></tr>
+  </tbody>
+</table>
+
+<h3 id="cai-rl-results">3.3 Results, and what to distrust in them</h3>
+<p>The preference model trains on 135,296 human helpfulness comparisons and 182,831 constitutionally generated harmlessness comparisons, one per SL-CAI prompt; RL uses the SL prompts plus 491,142 red-team and 474,300 helpfulness prompts generated by a model (Table 2)<a class="cite" href="#ref-1">1</a> (§4.2). Crowdworker comparisons of snapshots give Elo scores; the headline is the harmlessness-versus-helpfulness frontier of the 52B RL runs (the paper's Figure 2): the helpful and helpful-and-harmless RLHF models trade one for the other, and the RL-CAI models "learn to be less harmful at a given level of helpfulness"; chain of thought is slightly less helpful and slightly more harmless than no chain of thought<a class="cite" href="#ref-1">1</a> (§1.1, §4.3). RL-CAI is also "virtually never evasive", which was a stated goal<a class="cite" href="#ref-1">1</a> (§4.4).</p>
+<p>Four cautions from the paper itself bound that result.</p>
+<ul>
+<li><strong>The baseline was handicapped by a changed test instruction.</strong> Crowdworkers were told to prefer non-evasive responses among equally harmless ones, but the RLHF baseline's preference data was collected when workers simply picked the more harmless response, which the authors say "likely caused our HH PM's to reward evasiveness"<a class="cite" href="#ref-1">1</a> (§3.3 footnote 8, §4.4). The frontier gap is partly a comparison across instructions.</li>
+<li><strong>Not human-free.</strong> Helpfulness labels remained human; only harmlessness was AI-labeled<a class="cite" href="#ref-1">1</a> (§1.2, footnote 5).</li>
+<li><strong>Over-training Goodharts.</strong> Heavily trained RL-CAI models became "overly harsh" or padded most red-team answers with boilerplate such as "you are valid, valued, and cared for"<a class="cite" href="#ref-1">1</a> (§4.3); Module 6 covers the general mechanism.</li>
+<li><strong>The labeler is only as good as its scale.</strong> On 438 binary HHH comparisons (221 from Askell et al. plus 217 harder new ones), 52B chain-of-thought multiple choice is "becoming competitive" with a PM trained on several hundred thousand human labels; the claim for larger models is an extrapolation of the trend<a class="cite" href="#ref-1">1</a> (§1.3, §2, Figure 4).</li>
+</ul>
+<table class="tbl">
+  <caption><b>Table 2.</b> Data volumes and settings in Constitutional AI, all from Bai et al.<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Item</th><th class="num">Value</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Red-team prompts: human-written / generated / total</td><td class="num">42,496 / 140,335 / 182,831</td><td>§3.2</td></tr>
+    <tr><td class="row">Critique-revision pairs per prompt; principles (SL)</td><td class="num">4; 16</td><td>§3.1-§3.2, App. C.1</td></tr>
+    <tr><td class="row">Helpfulness prompts in SL mix (responses per prompt)</td><td class="num">135,296 (2)</td><td>§3.2</td></tr>
+    <tr><td class="row">SL fine-tuning</td><td class="num">1 epoch; LR 0.5 × pretraining LR; batch 1,024</td><td>§3.2</td></tr>
+    <tr><td class="row">Preference-model data: human helpfulness / AI harmlessness</td><td class="num">135,296 / 182,831</td><td>§4.2</td></tr>
+    <tr><td class="row">Extra RL prompts: red-team / helpfulness (model-generated)</td><td class="num">491,142 / 474,300</td><td>§4.2</td></tr>
+    <tr><td class="row">Principles for AI labeling (RL)</td><td class="num">16</td><td>§4.1, App. C.2</td></tr>
+  </tbody>
+</table>
+
+<h2 id="rlaif">4. RLAIF as a controlled comparison (Lee et al.)</h2>
+<p>Constitutional AI mixed human helpfulness labels with AI harmlessness labels, so it could not answer the question a practitioner asks first: does an AI-labeled pipeline match a human-labeled one? Lee et al. say that Bai et al. "did not directly compare the efficacy of human vs. AI feedback, leaving the question of whether RLAIF can be a suitable alternative to RLHF unanswered", and run that comparison on three tasks<a class="cite" href="#ref-4">4</a> (§1).</p>
+
+<h3 id="rlaif-setup">4.1 Setup</h3>
+<p>The labeler is an off-the-shelf PaLM 2 model, instruction-tuned but not RL-trained; unless stated otherwise it is PaLM 2 Large (L). Policies and reward models start from PaLM 2 Extra-Small (XS). The tasks are Reddit TL;DR summarization (OpenAI's 92k human comparisons) and Anthropic's helpful and harmless dialogue sets (each with over 40k training examples)<a class="cite" href="#ref-4">4</a> (§3, Appendix C). The labeling prompt has a preamble, optional few-shot exemplars, the sample, and an ending such as "Preferred Response="; the preference is the softmax over the log-probabilities of the tokens "1" and "2". Because LLM labelers are order-sensitive, every pair is labeled twice with the order reversed and the two distributions are averaged. The chain-of-thought variant first generates a rationale ("... explain which one is better. Rationale:") and then reads the "1" versus "2" distribution after it<a class="cite" href="#ref-4">4</a> (§2.1).</p>
+<p>The reward model is trained with cross-entropy on the soft labels, which the authors note "can be viewed as a form of model distillation". RL is a modified REINFORCE with a learned baseline, not PPO, "given that it is simpler yet still effective for the problem at hand": temperature 0.9, batch 128, learning rate 10<sup>-5</sup>, 8 epochs, KL coefficient 0.05<a class="cite" href="#ref-4">4</a> (§2.2.1, §3.3, Appendix E-F).</p>
+
+<h3 id="rlaif-results">4.2 Results: parity, with a length correction</h3>
+<table class="tbl">
+  <caption><b>Table 3.</b> Human-evaluated win rates and harmless rates from Lee et al. (Table 1; length-adjusted values from Appendix J, Tables 8-11)<a class="cite" href="#ref-4">4</a>. Win rates are of the first policy over the second; "–" means not reported. Length adjustment fits a logistic regression of preference on length ratio and reads it at ratio 1.0.</caption>
+  <thead><tr><th>Comparison</th><th class="num">Summarization win (%)</th><th class="num">length-adjusted (%)</th><th class="num">Helpful dialogue win (%)</th><th class="num">length-adjusted (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">RLAIF vs SFT</td><td class="num">71</td><td class="num">59</td><td class="num">63</td><td class="num">61</td></tr>
+    <tr><td class="row">RLHF vs SFT</td><td class="num">73</td><td class="num">61</td><td class="num">64</td><td class="num">61</td></tr>
+    <tr><td class="row">RLAIF vs RLHF</td><td class="num">50</td><td class="num">47</td><td class="num">52</td><td class="num">50</td></tr>
+    <tr><td class="row">Same-size labeler RLAIF vs SFT</td><td class="num">68</td><td class="num">59</td><td class="num">–</td><td class="num">–</td></tr>
+    <tr><td class="row">d-RLAIF vs SFT</td><td class="num" data-best>74</td><td class="num" data-best>65</td><td class="num" data-best>66</td><td class="num">–</td></tr>
+    <tr><td class="row">d-RLAIF vs same-size RLAIF</td><td class="num">60</td><td class="num">56</td><td class="num">–</td><td class="num">–</td></tr>
+  </tbody>
+</table>
+<p>On summarization and helpful dialogue, RLAIF and RLHF beat the SFT baseline by statistically indistinguishable margins, and head to head they are not distinguishable from 50%. On harmless dialogue, where raters marked each response harmless or harmful independently, the harmless rates are 64% (SFT), 76% (RLHF) and 88% (RLAIF); RLAIF's edge over RLHF is significant under paired t-tests, and length-controlled rates are 64%, 78% and 91%<a class="cite" href="#ref-4">4</a> (§4.1, Appendix J). Three details matter more than the headline.</p>
+<ul>
+<li><strong>Length moves the margin by up to 12 points.</strong> Average summary lengths were 164 characters (RLAIF), 161 (RLHF) and 132 (SFT); controlling for length cuts RLAIF's win rate over SFT from 71% to 59% and RLHF's from 73% to 61%, but only by 2-3 points on helpful dialogue<a class="cite" href="#ref-4">4</a> (Appendix J). Section 6.3 returns to this.</li>
+<li><strong>The labeler need not be larger than the policy.</strong> A same-size labeler (PaLM 2 XS) gives 68% against SFT versus 71% for the larger one (p = 0.07, not significant at 0.05). It is not strict self-improvement, since the labeler is a different checkpoint from the policy; the strict case is d-RLAIF on helpful dialogue (§4.5)<a class="cite" href="#ref-4">4</a> (§4.2).</li>
+<li><strong>Adding human labels did not help.</strong> Training the reward model on human plus AI labels gave 71% over SFT against 74% for human labels alone, not a significant difference<a class="cite" href="#ref-4">4</a> (Appendix K).</li>
+</ul>
+
+<h3 id="rlaif-labeler">4.3 What makes an AI labeler good</h3>
+<p>The paper measures <em>AI labeler alignment</em>, the fraction of held-out human preferences that the binarized AI label reproduces. For summarization, Stiennon et al. estimated human agreement on the same dataset at 73-77%, so the best labeler configuration at 78.0% is at human level in absolute terms<a class="cite" href="#ref-4">4</a> (§4.4). Alignment depends strongly on labeler size and on a position effect that the label averaging only partly hides (Figure 4).</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f4t"><title id="f4t">Bar chart: AI labeler alignment with human preferences falls from 78.0 percent to 62.7 percent as the labeler shrinks from PaLM 2 L to XS, while the share of pairs where the labeler prefers the same position after swapping order rises from 18 to 56 percent</title>
+    <rect x="90" y="95.2" width="650" height="9.6" class="d-hl"/>
+    <text x="740" y="88" text-anchor="end" class="d-small d-text-light">human-human agreement, 73-77%</text>
+    <line x1="90" y1="280" x2="90" y2="40" class="d-axis"/>
+    <line x1="90" y1="280" x2="740" y2="280" class="d-axis"/>
+    <line x1="90" y1="220" x2="740" y2="220" class="d-grid"/>
+    <line x1="90" y1="160" x2="740" y2="160" class="d-grid"/>
+    <line x1="90" y1="100" x2="740" y2="100" class="d-grid"/>
+    <line x1="90" y1="40" x2="740" y2="40" class="d-grid"/>
+    <text x="82" y="284" text-anchor="end" class="d-mono d-small">0</text>
+    <text x="82" y="224" text-anchor="end" class="d-mono d-small">25</text>
+    <text x="82" y="164" text-anchor="end" class="d-mono d-small">50</text>
+    <text x="82" y="104" text-anchor="end" class="d-mono d-small">75</text>
+    <text x="82" y="44" text-anchor="end" class="d-mono d-small">100</text>
+    <rect x="148" y="92.8" width="64" height="187.2" class="d-fill-blue"/>
+    <rect x="228" y="236.8" width="64" height="43.2" class="d-fill-orange"/>
+    <text x="180" y="86" text-anchor="middle" class="d-mono d-small">78.0</text>
+    <text x="260" y="230" text-anchor="middle" class="d-mono d-small">18</text>
+    <rect x="348" y="102.9" width="64" height="177.1" class="d-fill-blue"/>
+    <rect x="428" y="229.6" width="64" height="50.4" class="d-fill-orange"/>
+    <text x="380" y="96" text-anchor="middle" class="d-mono d-small">73.8</text>
+    <text x="460" y="223" text-anchor="middle" class="d-mono d-small">21</text>
+    <rect x="548" y="129.5" width="64" height="150.5" class="d-fill-blue"/>
+    <rect x="628" y="145.6" width="64" height="134.4" class="d-fill-orange"/>
+    <text x="580" y="123" text-anchor="middle" class="d-mono d-small">62.7</text>
+    <text x="660" y="139" text-anchor="middle" class="d-mono d-small">56</text>
+    <text x="220" y="300" text-anchor="middle" class="d-bold">PaLM 2 L</text>
+    <text x="420" y="300" text-anchor="middle" class="d-bold">PaLM 2 S</text>
+    <text x="620" y="300" text-anchor="middle" class="d-bold">PaLM 2 XS</text>
+    <rect x="90" y="8" width="14" height="10" class="d-fill-blue"/>
+    <text x="110" y="17" class="d-small">alignment with human preferences (%)</text>
+    <rect x="410" y="8" width="14" height="10" class="d-fill-orange"/>
+    <text x="430" y="17" class="d-small">same position preferred after swap (%)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Labeler size on summarization. Blue: alignment of the AI label with held-out human preferences (Lee et al. Table 3); orange: the share of pairs on which the labeler prefers the same <em>position</em> before and after the order is swapped, a pure bias measure (Appendix B, Table 4, "Detailed + CoT 0-shot" prompt)<a class="cite" href="#ref-4">4</a>. The amber band is the 73-77% human agreement that Stiennon et al. estimated, as quoted in §4.4 of Lee et al. Of the 18% for PaLM 2 L, 94% favored the first candidate; for XS the preferred position was the second candidate 99% of the time.</figcaption>
+</figure>
+<table class="tbl">
+  <caption><b>Table 4.</b> AI labeler alignment (%) by prompting technique, from Lee et al. Table 2 (and Table 14 for self-consistency)<a class="cite" href="#ref-4">4</a>. PaLM 2 L labeler; "–" means not run.</caption>
+  <thead><tr><th>Prompt</th><th class="num">Summarization</th><th class="num">Helpful</th><th class="num">Harmless</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Base, 0-shot</td><td class="num">76.1</td><td class="num">67.8</td><td class="num">69.4</td></tr>
+    <tr><td class="row">Base, 2-shot</td><td class="num">75.7</td><td class="num">66.8</td><td class="num" data-best>72.1</td></tr>
+    <tr><td class="row">Base + chain of thought, 0-shot</td><td class="num">77.5</td><td class="num" data-best>69.1</td><td class="num">70.6</td></tr>
+    <tr><td class="row">Detailed, 0-shot</td><td class="num">77.4</td><td class="num">67.6</td><td class="num">70.1</td></tr>
+    <tr><td class="row">Detailed, 8-shot</td><td class="num" data-worst>69.8</td><td class="num">–</td><td class="num">–</td></tr>
+    <tr><td class="row">Detailed + chain of thought, 0-shot</td><td class="num" data-best>78.0</td><td class="num">67.8</td><td class="num">70.1</td></tr>
+    <tr><td class="row">Detailed + chain of thought, 2-shot</td><td class="num">76.8</td><td class="num">67.4</td><td class="num">69.2</td></tr>
+    <tr><td class="row">Self-consistency, 16 samples, T = 0.3 / 0.5 / 0.7 / 1.0</td><td class="num">76.2 / 75.1 / 74.0 / 72.8</td><td class="num">–</td><td class="num">–</td></tr>
+  </tbody>
+</table>
+<p>Chain of thought helps most consistently; in-context examples help only for harmlessness (on summarization more exemplars lowered alignment, to 69.8% at 8-shot); and sampling several rationales at temperature above zero and averaging, the usual reasoning trick, <em>lowers</em> alignment monotonically with temperature, which the authors attribute to worse sampled rationales without finding a pattern on inspection<a class="cite" href="#ref-4">4</a> (§4.4, Appendix M). Two summarization policies differing only in labeler prompt (76.1% versus 78.0% alignment) were separated by raters 59% to 41%, but that is one pair of policies<a class="cite" href="#ref-4">4</a> (Appendix N).</p>
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Reward-model accuracy on held-out human labels did not track policy quality. Human-feedback RMs scored 79.3, 76.0 and 72.1% on summarization, helpful and harmless dialogue; AI-feedback RMs scored 74.2, 67.8 and 69.7%, yet RLAIF matched or beat RLHF on all three tasks. Among summarization RMs, the one trained on "Base 0-shot" labels (77.9%) produced the <em>worse</em> policy than the one on "Detailed CoT 0-shot" labels (74.2%). The authors conclude RM accuracy "may not accurately reflect a RM's effectiveness in RLHF and RLAIF"<a class="cite" href="#ref-4">4</a> (Appendix G). Module 4 (§3.4) makes the same point for human-labeled RMs.</p></aside>
+
+<h3 id="rlaif-cost">4.4 The cost arithmetic</h3>
+<p>Lee et al. estimate AI labeling at "over 10x" cheaper than human labeling, with the calculation in their Appendix L. For AI labeling of Reddit TL;DR pairs they measured an average prompt of 830 tokens ("Detailed + CoT 0-shot") and a 61-token rationale; each pair is labeled twice for position debiasing; GPT-4 was priced at USD 0.03 per 1,000 input tokens and USD 0.06 per 1,000 output tokens (September 2023). For humans they use Google Cloud's labeling service at USD 90 to 129 per 1,000 units of 50 words, averaged to USD 0.1095 per 50 words, and a task of 304 words (the post plus two summaries)<a class="cite" href="#ref-4">4</a> (Appendix L). The derivation is</p>
+$$ c_{\text{AI}} = 2\,(830\cdot\tfrac{0.03}{1000} + 61\cdot\tfrac{0.06}{1000}) = 0.05712, \qquad c_{\text{human}} = 304\cdot\tfrac{0.1095}{50} = 0.6658, \qquad \tfrac{c_{\text{human}}}{c_{\text{AI}}} \approx 11.7. $$
+<p>The paper rounds to USD 0.06 and USD 0.67 and states a ratio above 10. It excludes annotator training, expert versus crowd labor and LLM setup cost, and the prices are 2023 list prices. Lambert's 2026 figures (above USD 1 per human datum, under USD 0.01 for a frontier-model label) imply a ratio of at least 100<a class="cite" href="#ref-5">5</a> (§12.4.1).</p>
+<div class="calc">
+  <p class="calc-title">Cost of one preference label: LLM judge versus human annotation</p>
+  <div class="calc-row"><label for="c4a">Prompt tokens per call</label><input type="range" id="c4a" name="tin" min="200" max="4000" step="10" value="830"></div>
+  <div class="calc-row"><label for="c4b">Rationale tokens per call</label><input type="range" id="c4b" name="tout" min="0" max="512" step="1" value="61"></div>
+  <div class="calc-row"><label for="c4c">Input price (USD per 1,000 tokens)</label><input type="range" id="c4c" name="pin" min="0.0005" max="0.05" step="0.0005" value="0.03"></div>
+  <div class="calc-row"><label for="c4d">Output price (USD per 1,000 tokens)</label><input type="range" id="c4d" name="pout" min="0.0005" max="0.1" step="0.0005" value="0.06"></div>
+  <div class="calc-row"><label for="c4e">Calls per label (order swap)</label><input type="range" id="c4e" name="k" min="1" max="8" step="1" value="2"></div>
+  <div class="calc-row"><label for="c4f">Words per human task</label><input type="range" id="c4f" name="w" min="50" max="1000" step="1" value="304"></div>
+  <div class="calc-row"><label for="c4g">Human price (USD per 50 words)</label><input type="range" id="c4g" name="ph" min="0.01" max="0.5" step="0.0005" value="0.1095"></div>
+  <div class="calc-out">
+    <div>LLM label<output data-expr="k * (tin * pin / 1000 + tout * pout / 1000)" data-format="fixed:4" data-unit="USD"></output></div>
+    <div>Human label<output data-expr="w * ph / 50" data-format="fixed:4" data-unit="USD"></output></div>
+    <div>Human / LLM<output data-expr="(w * ph / 50) / (k * (tin * pin / 1000 + tout * pout / 1000))" data-format="fixed:1" data-unit="x"></output></div>
+  </div>
+  <p class="calc-note">Formula: \( k\,(t_{in} p_{in} + t_{out} p_{out})/1000 \) against \( w\, p_h / 50 \). Defaults are Lee et al.'s Appendix L values<a class="cite" href="#ref-4">4</a>; the 2023 prices are not current, so treat the ratio as a method, not a quote.</p>
+</div>
+
+<h3 id="rlaif-direct">4.5 Skipping the reward model: d-RLAIF</h3>
+<p>A reward model trained once on samples from the initial policy goes stale as the policy moves away from that distribution; the standard fix is iterating RLAIF with periodically retrained RMs, which is slow. Direct RLAIF queries the labeler during RL instead. The labeler is prompted to rate the response from 1 to 10, the likelihood of each score token is normalized to a distribution, the expected score \( s(y\mid x)=\sum_{i=1}^{10} i\,P(i\mid y,x) \) is computed, and it is rescaled to \([-1,1]\) and used as the reward<a class="cite" href="#ref-4">4</a> (§2.2.2). With the small PaLM 2 XS as labeler, d-RLAIF beat SFT 74% on summarization and 66% on helpful dialogue, and beat the same-size RLAIF policy 60% to 40% (Table 3). On helpful dialogue the labeler and the initial policy are the same checkpoint, which is the paper's strict self-improvement case<a class="cite" href="#ref-4">4</a> (§4.3). The authors attribute the gain to direct querying and to avoiding staleness without isolating the two. Judges as live rewards are the subject of Module 16.</p>
+
+<h2 id="contrastive">5. Why a judged pair is noisy, and building the label into the pair (Yang et al.)</h2>
+
+<h3 id="contrastive-diagnosis">5.1 The diagnosis</h3>
+<p>Yang et al. (ICLR 2024) start from a property of RLAIF's data, not its labeler. RLAIF samples two outputs \((o_1, o_2)\) i.i.d. from the same prompt \(p\), so the two "often [are] of very similar quality and thus hard to differentiate", and "training signal can be overwhelmed by label noise"<a class="cite" href="#ref-3">3</a> (§1). Their Table 1 shows the failure: both RLAIF outputs advise the human to do something unethical, yet the scorer gives one \(P(\text{better})=0.577\) and the other 0.422.</p>
+<p>The aggregate evidence is a preference model scored against 2,000 gold human-labeled pairs from Bai et al.'s harmlessness prompts. The RLAIF preference model agrees with the human label on 35.6% of pairs at 7B simulation and 45.7% at 30B, below the 50% of a coin; RLCD's models score 52.4% and 55.9%. Few-shot prompting with the 30B labeler lifts RLAIF to 57.0% (40.6% at 7B), which matches Bai et al.'s own observation that above-chance harmlessness labels needed both few-shot prompting and a model well over 10B parameters<a class="cite" href="#ref-3">3</a> (§5.1, Table 5, Appendix C, Table 15).</p>
+<p>Zheng et al. point the same way: a GPT-4 judge returned the same verdict after the two answers swapped places 98.8% of the time for GPT-3.5 versus LLaMA-13B, but only 73.8% versus Vicuna-13B and 67.5% versus Claude-v1; position bias "is more noticeable for models with close performance and can almost disappear when the performance of the two models differs a lot"<a class="cite" href="#ref-7">7</a> (Appendix D.1, Table 11). Module 4 (Figure 3) shows the human-label analogue.</p>
+
+<h3 id="contrastive-algo">5.2 The algorithm: two prompts, no judge</h3>
+<p>RLCD (Reinforcement Learning from Contrastive Distillation) changes how the pair is made. Given a prompt, it builds a positive variant \(p^+\) that encourages the target attribute and a negative variant \(p^-\) that encourages its opposite, samples \(o^+\sim\pi(\cdot\mid p^+)\) and \(o^-\sim\pi(\cdot\mid p^-)\) from the same base model, and "automatically label[s] \(o^+\) as preferred without further post hoc scoring"<a class="cite" href="#ref-3">3</a> (§3.1). The preference model is a fine-tune of the same unaligned LLM, followed by PPO with a KL penalty, exactly as in RLHF.</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 400" role="img" aria-labelledby="f5t"><title id="f5t">Two panels. Left, RLAIF: one prompt yields two outputs from the same distribution and a judge LLM scores which is better. Right, RLCD: a positive and a negative prompt yield two outputs from shifted distributions and the label is assigned by construction</title>
+    <defs>
+      <marker id="f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <rect x="10" y="8" width="385" height="384" rx="10" class="d-panel"/>
+    <text x="28" y="30" class="d-bold">RLAIF: one prompt, judge afterwards</text>
+    <rect x="130" y="44" width="150" height="34" rx="8" class="d-surface"/>
+    <text x="205" y="66" text-anchor="middle" class="d-bold">prompt p</text>
+    <path d="M180,78 L110,108" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <path d="M230,78 L300,108" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="30" y="108" width="160" height="34" rx="8" class="d-block-muted"/>
+    <text x="110" y="130" text-anchor="middle" class="d-mono d-small">o1 ~ π(· | p)</text>
+    <rect x="220" y="108" width="160" height="34" rx="8" class="d-block-muted"/>
+    <text x="300" y="130" text-anchor="middle" class="d-mono d-small">o2 ~ π(· | p)</text>
+    <path d="M110,142 L160,170" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <path d="M300,142 L250,170" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="105" y="170" width="200" height="40" rx="8" class="d-block-accent"/>
+    <text x="205" y="195" text-anchor="middle" class="d-text-inv d-bold">judge LLM + principle</text>
+    <text x="205" y="236" text-anchor="middle" class="d-mono d-small">P(o1 better) = 0.422</text>
+    <text x="205" y="254" text-anchor="middle" class="d-mono d-small">P(o2 better) = 0.577</text>
+    <text x="205" y="272" text-anchor="middle" class="d-small d-text-light">Yang et al. Table 1 example</text>
+    <text x="205" y="306" text-anchor="middle" class="d-small">both outputs drawn from one distribution</text>
+    <line x1="40" y1="372" x2="370" y2="372" class="d-axis"/>
+    <polyline points="84.8,371.7 99.2,371.0 113.6,369.2 128.0,365.2 142.4,358.1 156.8,347.7 171.2,335.7 185.6,325.8 200.0,322.0 214.4,325.8 228.8,335.7 243.2,347.7 257.6,358.1 272.0,365.2 286.4,369.2 300.8,371.0 315.2,371.7" class="d-line d-stroke-blue"/>
+    <polyline points="84.8,371.7 99.2,371.0 113.6,369.2 128.0,365.2 142.4,358.1 156.8,347.7 171.2,335.7 185.6,325.8 200.0,322.0 214.4,325.8 228.8,335.7 243.2,347.7 257.6,358.1 272.0,365.2 286.4,369.2 300.8,371.0 315.2,371.7" class="d-line d-stroke-orange d-dashed"/>
+    <text x="205" y="388" text-anchor="middle" class="d-small d-text-light">attribute value A(o)</text>
+
+    <rect x="405" y="8" width="385" height="384" rx="10" class="d-panel"/>
+    <text x="423" y="30" class="d-bold">RLCD: two prompts, label by construction</text>
+    <rect x="420" y="44" width="165" height="34" rx="8" class="d-block"/>
+    <text x="502" y="66" text-anchor="middle" class="d-text-inv d-bold">p+  (harmless)</text>
+    <rect x="615" y="44" width="165" height="34" rx="8" class="d-block-muted"/>
+    <text x="697" y="66" text-anchor="middle" class="d-bold">p−  (harmful)</text>
+    <path d="M502,78 L502,108" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <path d="M697,78 L697,108" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="420" y="108" width="165" height="34" rx="8" class="d-surface"/>
+    <text x="502" y="130" text-anchor="middle" class="d-mono d-small">o+ ~ π(· | p+)</text>
+    <rect x="615" y="108" width="165" height="34" rx="8" class="d-surface"/>
+    <text x="697" y="130" text-anchor="middle" class="d-mono d-small">o− ~ π(· | p−)</text>
+    <path d="M502,142 L560,170" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <path d="M697,142 L640,170" class="d-arrow" marker-end="url(#f5-arr)"/>
+    <rect x="500" y="170" width="200" height="40" rx="8" class="d-block-accent"/>
+    <text x="600" y="195" text-anchor="middle" class="d-text-inv d-bold">o+ ≻ o− by construction</text>
+    <text x="600" y="236" text-anchor="middle" class="d-mono d-small">no judge call</text>
+    <text x="600" y="254" text-anchor="middle" class="d-mono d-small">hard label: 1 / 0</text>
+    <text x="600" y="290" text-anchor="middle" class="d-small">outputs drawn from shifted distributions</text>
+    <line x1="425" y1="372" x2="775" y2="372" class="d-axis"/>
+    <polyline points="448.8,371.7 463.2,371.0 477.6,369.2 492.0,365.2 506.4,358.1 520.8,347.7 535.2,335.7 549.6,325.8 564.0,322.0 578.4,325.8 592.8,335.7 607.2,347.7 621.6,358.1 636.0,365.2 650.4,369.2 664.8,371.0 679.2,371.7" class="d-line d-stroke-orange d-dashed"/>
+    <polyline points="520.8,371.7 535.2,371.0 549.6,369.2 564.0,365.2 578.4,358.1 592.8,347.7 607.2,335.7 621.6,325.8 636.0,322.0 650.4,325.8 664.8,335.7 679.2,347.7 693.6,358.1 708.0,365.2 722.4,369.2 736.8,371.0 751.2,371.7" class="d-line d-stroke-blue"/>
+    <path d="M564,314 L636,314" class="d-arrow" marker-start="url(#f5-arr)" marker-end="url(#f5-arr)"/>
+    <text x="600" y="308" text-anchor="middle" class="d-mono d-small">Δμ</text>
+    <text x="520" y="388" class="d-small d-text-light">o−</text>
+    <text x="680" y="388" class="d-small d-text-light">o+</text>
+    <text x="600" y="388" text-anchor="middle" class="d-small d-text-light">attribute value A(o)</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Left: RLAIF draws two outputs from one prompt and asks a judge which is better; the two probabilities are the example in Yang et al.'s Table 1, where both outputs were unethical<a class="cite" href="#ref-3">3</a>. Right: RLCD draws from two prompts and labels by construction. The bell curves are the attribute distributions of the toy model in Appendix N (§5.3), drawn with \(\Delta\mu = 2\sigma\) for display; they are schematic, not measurements.</figcaption>
+</figure>
+<p>The craft is in the prompt pair. Yang et al. state two criteria: \(p^+\) should be more likely than \(p^-\) to show the attribute, and the surface forms of the two should be "as similar as possible" so that nothing but the attribute differs. They advise spending effort on the second criterion<a class="cite" href="#ref-3">3</a> (§3.2). The implementation puts a short description in parentheses before the final "Assistant:" and rewrites earlier assistant turns with the opposite description to widen the gap. For harmlessness they wrote 16 affix pairs mirroring Bai et al.'s 16 scoring principles, for example "(law-abiding, ethical response)" against "(illegal, unethical response)" and "(simulating a very kind person)" against "(simulating a really evil person)". Helpfulness uses one pair, "(giving a helpful response)" against "(giving an unhelpful response)", and outlining uses three, contrasting interestingness, well-formedness and relevance to the premise<a class="cite" href="#ref-3">3</a> (Appendix A, Tables 9, 11, 13).</p>
+<p>Two controls separate the idea from its ingredients. Context-Dist (SFT on \(o^+\) alone) discards the pairwise signal and the negative prompt. RLAIF generating from \(p^+\) "performs no better than the base RLAIF" against RLCD, so "it is the contrast between \(p^+\) and \(p^-\) ... which is important, and not the actual affixes in the prompt \(p^+\)"<a class="cite" href="#ref-3">3</a> (Appendix L, Table 39).</p>
+
+<h3 id="contrastive-toy">5.3 A toy model of label accuracy (derived from Appendix N)</h3>
+<p>Appendix N gives a simplified model that makes the trade-off computable. Let the target attribute be a real number \(A(o)\) with \(A(o)\sim\mathcal{N}(\mu(p),\sigma_G^2)\) for outputs generated from prompt \(p\). A judge sees each output's attribute plus independent noise \(e\sim\mathcal{N}(0,\sigma_D^2)\) and prefers the larger. For RLAIF both outputs come from one prompt. For RLCD the label is the prompt identity and the prompts differ in mean by \(\Delta\mu=\mu(p^+)-\mu(p^-)\)<a class="cite" href="#ref-3">3</a> (Appendix N). The two accuracies are</p>
+$$ P_{\text{RLAIF}} = \tfrac12 + \tfrac1\pi\arctan\!\frac{\sigma_G}{\sigma_D}, \qquad P_{\text{RLCD}} = \Phi\!\Big(\frac{\Delta\mu}{\sqrt2\,\sigma_G}\Big). $$
+<details class="more"><summary>Derivation of both formulas, and the hard-pair accuracies</summary>
+<p><strong>RLAIF.</strong> Let \(X=A(o_1)-A(o_2)\sim\mathcal{N}(0,2\sigma_G^2)\) and \(Y=e_1-e_2\sim\mathcal{N}(0,2\sigma_D^2)\), independent. The label is correct when \(X+Y\) has the same sign as \(X\). The pair \((X, X+Y)\) is bivariate normal with correlation \(\rho=\sigma_G/\sqrt{\sigma_G^2+\sigma_D^2}\), and two zero-mean jointly normal variables share a sign with probability \(\tfrac12+\arcsin(\rho)/\pi\). Since \(\arcsin\big(\sigma_G/\sqrt{\sigma_G^2+\sigma_D^2}\big)=\arctan(\sigma_G/\sigma_D)\), the first formula follows; \(\sigma_D=\sigma_G\) gives \(\tfrac12+\tfrac14=0.75\), the value in Appendix N. Conditioning on a hard pair, \(|X|\le h\), the accuracy is the average of \(\Phi\big(|X|/(\sqrt2\sigma_D)\big)\) over the half-normal density of \(|X|\) on \([0,h]\); for \(h=0.2\sigma_G\) and \(\sigma_D=\sigma_G\) numerical integration gives 0.5281, matching the paper's 0.528 from simulation.</p>
+<p><strong>RLCD.</strong> The label "\(o^+\) preferred" is correct when \(D=A(o^+)-A(o^-)>0\), and \(D\sim\mathcal{N}(\Delta\mu,2\sigma_G^2)\), so \(P=\Phi(\Delta\mu/(\sqrt2\sigma_G))\). On hard pairs, the density ratio of \(D=d\) to \(D=-d\) is \(e^{d\Delta\mu/\sigma_G^2}\), so a pair with \(|D|=d\) is labeled correctly with probability \(\sigma(d\,\Delta\mu/\sigma_G^2)\) (logistic). Averaging over \(d\in[0,0.2\sigma_G]\) with \(\Delta\mu=3\sigma_G\) gives 0.5743, matching the paper's 0.574.</p>
+</details>
+<table class="tbl">
+  <caption><b>Table 5.</b> Label accuracy in the Appendix N toy model, for all pairs and for hard pairs (\(|\Delta A|\le 0.2\sigma_G\)). Rows with \(\sigma_D=\sigma_G\) (0.750, 0.528) and \(\Delta\mu=3\sigma_G\) (0.574 on hard pairs) reproduce numbers printed in the paper<a class="cite" href="#ref-3">3</a>; all other entries are derived here from the formulas above.</caption>
+  <thead><tr><th>Method and setting</th><th class="num">All pairs</th><th class="num">Hard pairs</th></tr></thead>
+  <tbody>
+    <tr><td class="row">RLAIF, judge noise \(\sigma_D=0.5\sigma_G\)</td><td class="num">0.852</td><td class="num">0.556</td></tr>
+    <tr><td class="row">RLAIF, \(\sigma_D=\sigma_G\)</td><td class="num">0.750</td><td class="num">0.528</td></tr>
+    <tr><td class="row">RLAIF, \(\sigma_D=2\sigma_G\)</td><td class="num">0.648</td><td class="num">0.514</td></tr>
+    <tr><td class="row">RLAIF, \(\sigma_D=3\sigma_G\)</td><td class="num">0.602</td><td class="num">0.509</td></tr>
+    <tr><td class="row">RLCD, prompt gap \(\Delta\mu=0\)</td><td class="num">0.500</td><td class="num">0.500</td></tr>
+    <tr><td class="row">RLCD, \(\Delta\mu=1\sigma_G\)</td><td class="num">0.760</td><td class="num">0.525</td></tr>
+    <tr><td class="row">RLCD, \(\Delta\mu=2\sigma_G\)</td><td class="num">0.921</td><td class="num">0.550</td></tr>
+    <tr><td class="row">RLCD, \(\Delta\mu=3\sigma_G\)</td><td class="num">0.983</td><td class="num">0.574</td></tr>
+    <tr><td class="row">RLCD, \(\Delta\mu=4\sigma_G\)</td><td class="num">0.998</td><td class="num">0.599</td></tr>
+  </tbody>
+</table>
+<figure class="fig">
+  <svg viewBox="0 0 800 350" role="img" aria-labelledby="f6t"><title id="f6t">Line plot of label accuracy in the toy model against the prompt gap in units of sigma: RLCD accuracy on all pairs rises from 0.5 to 0.998 and crosses the RLAIF value of 0.75 at 0.954; on hard pairs it rises from 0.5 to 0.599 and crosses RLAIF's 0.528 at 1.13</title>
+    <line x1="90" y1="300" x2="90" y2="40" class="d-axis"/>
+    <line x1="90" y1="300" x2="730" y2="300" class="d-axis"/>
+    <line x1="90" y1="248" x2="730" y2="248" class="d-grid"/>
+    <line x1="90" y1="196" x2="730" y2="196" class="d-grid"/>
+    <line x1="90" y1="144" x2="730" y2="144" class="d-grid"/>
+    <line x1="90" y1="92" x2="730" y2="92" class="d-grid"/>
+    <line x1="90" y1="40" x2="730" y2="40" class="d-grid"/>
+    <text x="82" y="304" text-anchor="end" class="d-mono d-small">0.5</text>
+    <text x="82" y="252" text-anchor="end" class="d-mono d-small">0.6</text>
+    <text x="82" y="200" text-anchor="end" class="d-mono d-small">0.7</text>
+    <text x="82" y="148" text-anchor="end" class="d-mono d-small">0.8</text>
+    <text x="82" y="96" text-anchor="end" class="d-mono d-small">0.9</text>
+    <text x="82" y="44" text-anchor="end" class="d-mono d-small">1.0</text>
+    <text x="90" y="318" text-anchor="middle" class="d-mono d-small">0</text>
+    <text x="250" y="318" text-anchor="middle" class="d-mono d-small">1</text>
+    <text x="410" y="318" text-anchor="middle" class="d-mono d-small">2</text>
+    <text x="570" y="318" text-anchor="middle" class="d-mono d-small">3</text>
+    <text x="730" y="318" text-anchor="middle" class="d-mono d-small">4</text>
+    <text x="410" y="340" text-anchor="middle" class="d-small d-text-light">prompt gap Δμ, in units of σ_G</text>
+    <text x="90" y="28" class="d-small d-text-light">label accuracy (fraction of pairs labeled correctly)</text>
+    <line x1="90" y1="170" x2="730" y2="170" class="d-line d-stroke-blue d-dashed"/>
+    <line x1="90" y1="285.4" x2="730" y2="285.4" class="d-line d-stroke-orange d-dashed"/>
+    <polyline points="90.0,300.0 130.0,263.5 170.0,228.2 210.0,194.9 250.0,164.7 290.0,138.0 330.0,115.1 370.0,96.1 410.0,80.9 450.0,69.0 490.0,60.0 530.0,53.5 570.0,48.8 610.0,45.6 650.0,43.5 690.0,42.1 730.0,41.2" class="d-line d-stroke-blue"/>
+    <polyline points="90.0,300.0 130.0,296.8 170.0,293.5 210.0,290.3 250.0,287.0 290.0,283.8 330.0,280.6 370.0,277.3 410.0,274.1 450.0,270.9 490.0,267.7 530.0,264.5 570.0,261.4 610.0,258.2 650.0,255.0 690.0,251.9 730.0,248.8" class="d-line d-stroke-orange"/>
+    <circle cx="242.6" cy="170" r="5" class="d-fill-blue"/>
+    <circle cx="270.5" cy="285.4" r="5" class="d-fill-orange"/>
+    <text x="256" y="190" class="d-small">Δμ = 0.954</text>
+    <text x="280" y="268" class="d-small">Δμ = 1.13</text>
+    <rect x="470" y="72" width="256" height="92" rx="6" class="d-label-bg"/>
+    <line x1="480" y1="91" x2="504" y2="91" class="d-line d-stroke-blue"/>
+    <text x="512" y="95" class="d-small">RLCD, all pairs</text>
+    <line x1="480" y1="112" x2="504" y2="112" class="d-line d-stroke-orange"/>
+    <text x="512" y="116" class="d-small">RLCD, hard pairs</text>
+    <line x1="480" y1="133" x2="504" y2="133" class="d-line d-stroke-blue d-dashed"/>
+    <text x="512" y="137" class="d-small">RLAIF, all pairs: 0.75</text>
+    <line x1="480" y1="154" x2="504" y2="154" class="d-line d-stroke-orange d-dashed"/>
+    <text x="512" y="158" class="d-small">RLAIF, hard pairs: 0.528</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> The toy model of Table 5 as curves, with \(\sigma_D=\sigma_G\) for the RLAIF reference lines. RLCD's all-pair accuracy passes RLAIF's 0.75 at \(\Delta\mu=\sqrt2\,\Phi^{-1}(0.75)\,\sigma_G=0.954\sigma_G\); on hard pairs it passes RLAIF's 0.528 at about \(1.13\sigma_G\) (numerical). Derived from the formulas of Appendix N<a class="cite" href="#ref-3">3</a>.</figcaption>
+</figure>
+<p>Three readings follow. <strong>The two methods put the noise in different places.</strong> RLAIF's accuracy depends on \(\sigma_D/\sigma_G\), so it improves as labelers scale, as Lee et al. (Figure 4) and Yang et al. (§6.2) observe; RLCD's depends on \(\Delta\mu\), a prompt-design choice that does not scale with labeler size. <strong>A large gap is not free:</strong> accuracy "can be arbitrarily close to 1, at the cost of making the examples very easy for downstream training", and the paper suggests weakening the contrast as models grow; its 30B runs reused the 7B prompts<a class="cite" href="#ref-3">3</a> (Appendix N). <strong>The model omits what makes real labels worse</strong>: systematic position bias, length, and differences between \(p^+\) and \(p^-\) beyond the attribute. The paper notes that 0.75 exceeds either method's agreement with human labels in practice<a class="cite" href="#ref-3">3</a> (footnote 7).</p>
+
+<h2 id="rlcd-evidence">6. The RLCD experiments, read critically</h2>
+
+<h3 id="rlcd-setup">6.1 Setup</h3>
+<p>The policy being aligned is always base LLaMA-7B. Preference data is simulated by base LLaMA-7B or LLaMA-30B (8-bit, temperature 1); with the 30B simulator the setup is also a distillation from a larger model. Baselines are the unaligned LLaMA, RLAIF, and Context-Dist. RLAIF is a re-implementation in the AlpacaFarm codebase, because Anthropic's code and models are not public, using Bai et al.'s harmlessness scoring templates but zero-shot prompting to match RLCD. PPO and preference-model settings are AlpacaFarm defaults, except that the KL coefficient (0.001 to 0.032) and PPO steps (20 to 80, at 512 rollouts per step) were grid-searched per method using the average reward of that method's own reward model on 1,000 validation outputs. Evaluation uses 200 human comparisons per cell (1-8 scale, normalized to sum to 9) and 1,000 binary GPT-4 judgments<a class="cite" href="#ref-3">3</a> (§4, Appendices E-F).</p>
+
+<h3 id="rlcd-results">6.2 Results: large at 7B, gone at 30B</h3>
+<p>At 7B simulation, GPT-4 prefers RLCD to RLAIF on every task, between 71.0% and 85.4% of the time. At 30B simulation the same comparison is 60.3%, 55.3%, 47.8% and 35.9%, so RLAIF is slightly preferred on helpfulness (helpful prompts) and clearly preferred on outline quality (Figure 7). The paper's own summary is that RLCD is preferred "across all tasks and data simulation model scales, except comparing RLCD<sub>30B</sub> to RLAIF<sub>30B</sub>, where performance is relatively equal"<a class="cite" href="#ref-3">3</a> (Table 3).</p>
+<figure class="fig">
+  <svg viewBox="0 0 800 350" role="img" aria-labelledby="f7t"><title id="f7t">Grouped bar chart of the percentage of GPT-4 comparisons preferring RLCD over RLAIF on four metrics, for preference data simulated by LLaMA-7B and by LLaMA-30B. The 7B bars range from 71.0 to 85.4 percent; the 30B bars fall to 60.3, 55.3, 47.8 and 35.9 percent, with the last two below the 50 percent line</title>
+    <line x1="90" y1="290" x2="90" y2="50" class="d-axis"/>
+    <line x1="90" y1="290" x2="750" y2="290" class="d-axis"/>
+    <line x1="90" y1="230" x2="750" y2="230" class="d-grid"/>
+    <line x1="90" y1="110" x2="750" y2="110" class="d-grid"/>
+    <line x1="90" y1="50" x2="750" y2="50" class="d-grid"/>
+    <line x1="90" y1="170" x2="750" y2="170" class="d-line d-stroke-red d-dashed"/>
+    <text x="82" y="294" text-anchor="end" class="d-mono d-small">0</text>
+    <text x="82" y="234" text-anchor="end" class="d-mono d-small">25</text>
+    <text x="82" y="174" text-anchor="end" class="d-mono d-small">50</text>
+    <text x="82" y="114" text-anchor="end" class="d-mono d-small">75</text>
+    <text x="82" y="54" text-anchor="end" class="d-mono d-small">100</text>
+    <text x="746" y="164" text-anchor="end" class="d-small d-text-light">50%: no preference</text>
+    <rect x="133" y="86.5" width="54" height="203.5" class="d-fill-blue"/>
+    <rect x="193" y="145.3" width="54" height="144.7" class="d-fill-orange"/>
+    <text x="160" y="80" text-anchor="middle" class="d-mono d-small">84.8</text>
+    <text x="220" y="139" text-anchor="middle" class="d-mono d-small">60.3</text>
+    <rect x="295" y="119.6" width="54" height="170.4" class="d-fill-blue"/>
+    <rect x="355" y="157.3" width="54" height="132.7" class="d-fill-orange"/>
+    <text x="322" y="113" text-anchor="middle" class="d-mono d-small">71.0</text>
+    <text x="382" y="151" text-anchor="middle" class="d-mono d-small">55.3</text>
+    <rect x="457" y="85" width="54" height="205" class="d-fill-blue"/>
+    <rect x="517" y="175.3" width="54" height="114.7" class="d-fill-orange"/>
+    <text x="484" y="79" text-anchor="middle" class="d-mono d-small">85.4</text>
+    <text x="544" y="164" text-anchor="middle" class="d-mono d-small">47.8</text>
+    <rect x="619" y="101.6" width="54" height="188.4" class="d-fill-blue"/>
+    <rect x="679" y="203.8" width="54" height="86.2" class="d-fill-orange"/>
+    <text x="646" y="95" text-anchor="middle" class="d-mono d-small">78.5</text>
+    <text x="706" y="198" text-anchor="middle" class="d-mono d-small">35.9</text>
+    <text x="190" y="310" text-anchor="middle" class="d-bold">Harmlessness</text>
+    <text x="190" y="326" text-anchor="middle" class="d-small d-text-light">harmless prompts</text>
+    <text x="352" y="310" text-anchor="middle" class="d-bold">Helpfulness</text>
+    <text x="352" y="326" text-anchor="middle" class="d-small d-text-light">harmless prompts</text>
+    <text x="514" y="310" text-anchor="middle" class="d-bold">Helpfulness</text>
+    <text x="514" y="326" text-anchor="middle" class="d-small d-text-light">helpful prompts</text>
+    <text x="676" y="310" text-anchor="middle" class="d-bold">Outline quality</text>
+    <text x="676" y="326" text-anchor="middle" class="d-small d-text-light">outline prompts</text>
+    <rect x="90" y="8" width="14" height="10" class="d-fill-blue"/>
+    <text x="110" y="17" class="d-small">preference data simulated by LLaMA-7B</text>
+    <rect x="410" y="8" width="14" height="10" class="d-fill-orange"/>
+    <text x="430" y="17" class="d-small">simulated by LLaMA-30B</text>
+    <text x="90" y="40" class="d-small d-text-light">% of 1,000 GPT-4 comparisons preferring RLCD to RLAIF</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> GPT-4 binary preference for RLCD over RLAIF, same simulator scale on both sides; the policy is LLaMA-7B throughout. Data: Yang et al. Table 3, rows "RLCD<sub>7B</sub> vs. RLAIF<sub>7B</sub>" and "RLCD<sub>30B</sub> vs. RLAIF<sub>30B</sub>"<a class="cite" href="#ref-3">3</a>. The 7B advantage of 21 to 35 points becomes a deficit of 2 and 14 points on the last two metrics at 30B.</figcaption>
+</figure>
+<p>Two further measurements say <em>why</em>. First, the label itself: against a held-out reward model trained on human preferences, RLAIF's simulated labels are correct on 44% of harmlessness pairs at 7B against RLCD's 54%, and 46% against 60% at 30B (Table 6). Second, RLCD-Rescore keeps RLCD's pairs but relabels them with the RLAIF scorer. At 7B this is far worse than RLCD (RLCD preferred 86.0%, 75.8%, 86.3% and 88.8% on the four metrics), which isolates the label source as the cause of the 7B gap. At 30B the rescored variant is competitive and on outlines preferred (RLCD preferred only 36.4%): the scorer has become good enough to label pairs near the boundary<a class="cite" href="#ref-3">3</a> (§5.2, Table 6; Appendix K.1, Table 36). This matches the toy model, in which a smaller \(\sigma_D\) lifts RLAIF accuracy (Table 5).</p>
+<table class="tbl">
+  <caption><b>Table 6.</b> Label and preference-model quality, from Yang et al. Table 36 (fraction of simulated pairs labeled correctly according to a held-out reward model trained on human data) and Table 5 (accuracy of the preference model on 2,000 gold human-labeled pairs, %)<a class="cite" href="#ref-3">3</a>.</caption>
+  <thead><tr><th>Preference data from</th><th class="num">Pair labels correct, harmless</th><th class="num">Pair labels correct, helpful</th><th class="num">PM accuracy, harmless (%)</th><th class="num">PM accuracy, helpful (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">RLAIF, LLaMA-7B</td><td class="num" data-worst>0.44</td><td class="num">0.56</td><td class="num" data-worst>35.6</td><td class="num">60.6</td></tr>
+    <tr><td class="row">RLCD, LLaMA-7B</td><td class="num">0.54</td><td class="num">0.68</td><td class="num">52.4</td><td class="num">64.4</td></tr>
+    <tr><td class="row">RLAIF, LLaMA-30B</td><td class="num">0.46</td><td class="num">0.66</td><td class="num">45.7</td><td class="num">66.2</td></tr>
+    <tr><td class="row">RLCD, LLaMA-30B</td><td class="num" data-best>0.60</td><td class="num" data-best>0.74</td><td class="num" data-best>55.9</td><td class="num" data-best>66.7</td></tr>
+  </tbody>
+</table>
+
+<h3 id="rlcd-caveats">6.3 Confounds and what the paper leaves open</h3>
+<p><strong>The judges disagree with each other where the result flips.</strong> Humans, not GPT-4, always found RLCD "at least equal or better" at 30B. On the same comparison humans scored RLCD 4.71 against 4.29 on harmlessness, 4.50 against 4.50 and 4.51 against 4.49 on helpfulness, and 4.76 against 4.24 on outline quality (Table 7). Human-GPT-4 agreement is lowest exactly there: 62.8% and 59.0% for helpfulness and outlining, against 74.7% and 77.5% at 7B<a class="cite" href="#ref-3">3</a> (Appendix G, Table 23). A 64.1% GPT-4 preference for RLAIF on outlines, where GPT-4 matches humans on 59.0% of cases, is weak evidence of a reversal; parity is the fair reading.</p>
+<table class="tbl">
+  <caption><b>Table 7.</b> The same comparisons by three measures, from Yang et al. Tables 2, 3 and 23<a class="cite" href="#ref-3">3</a>. Human scores are RLCD / RLAIF on the normalized 1-8 scale (the pair sums to 9; 200 examples); GPT-4 is the percentage of 1,000 binary judgments preferring RLCD; agreement is the share of the 200 human judgments that match GPT-4 where it gave a verdict.</caption>
+  <thead><tr><th>Comparison</th><th>Metric</th><th class="num">Humans: RLCD / RLAIF</th><th class="num">GPT-4 prefers RLCD (%)</th><th class="num">Human-GPT-4 agreement (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">7B vs 7B</td><td>Harmlessness</td><td class="num">5.62 / 3.38</td><td class="num">84.8</td><td class="num">76.1</td></tr>
+    <tr><td class="row">7B vs 7B</td><td>Helpfulness (harmless prompts)</td><td class="num">4.64 / 4.36</td><td class="num">71.0</td><td class="num">61.0</td></tr>
+    <tr><td class="row">7B vs 7B</td><td>Helpfulness (helpful prompts)</td><td class="num">5.88 / 3.12</td><td class="num">85.4</td><td class="num">74.7</td></tr>
+    <tr><td class="row">7B vs 7B</td><td>Outline quality</td><td class="num">5.97 / 3.03</td><td class="num">78.5</td><td class="num">77.5</td></tr>
+    <tr><td class="row">30B vs 30B</td><td>Harmlessness</td><td class="num">4.71 / 4.29</td><td class="num">60.3</td><td class="num">75.4</td></tr>
+    <tr><td class="row">30B vs 30B</td><td>Helpfulness (harmless prompts)</td><td class="num">4.50 / 4.50</td><td class="num">55.3</td><td class="num">64.5</td></tr>
+    <tr><td class="row">30B vs 30B</td><td>Helpfulness (helpful prompts)</td><td class="num">4.51 / 4.49</td><td class="num">47.8</td><td class="num" data-worst>62.8</td></tr>
+    <tr><td class="row">30B vs 30B</td><td>Outline quality</td><td class="num">4.76 / 4.24</td><td class="num" data-worst>35.9</td><td class="num" data-worst>59.0</td></tr>
+  </tbody>
+</table>
+<p><strong>Length is uncontrolled.</strong> RLCD<sub>7B</sub> outputs average 118.0 tokens on the helpfulness prompts against 35.4 for RLAIF<sub>7B</sub> (3.3 times longer), 115.9 against 54.8 on outlines, and 66.5 against 42.1 on harmlessness; at 30B the ratios are 1.28 (108.3 against 84.7), 1.57 and 0.94. The authors note that "longer outputs may better satisfy the alignment criteria on average" and that RLCD "apparently identifies this aspect more effectively compared to baselines"<a class="cite" href="#ref-3">3</a> (Appendix J.4, Tables 34-35). I found no length-controlled win rate in the main text or in Appendices A to N. Lee et al.'s length correction moved summarization win rates by 12 points (§4.2); keep that in mind for an 85.4% preference at a 3.3-fold length difference. This is a confound, not a refutation.</p>
+<p><strong>The RLAIF baseline is weak by construction.</strong> It is zero-shot, and the paper's own few-shot RLAIF with the 30B simulator beats RLCD<sub>30B</sub> on harmlessness (RLCD preferred 42.1%), though it mode-collapses into "I'm sorry, I'm not sure how I can help with that" replies and RLCD wins helpfulness 56.9% to 43.1%<a class="cite" href="#ref-3">3</a> (Appendix C, Tables 16-17).</p>
+<p><strong>Shortcuts appeared and were prompted away.</strong> RLCD "swiftly discovers" that prefacing responses with "Thank you" or "Sorry" raises reward, so the authors removed politeness cues from the prompts to keep the comparison "fairer"; on a harmlessness-only prompt set it "frequently produces outputs which are irrelevant to the previous dialogue in exchange for maximizing harmlessness"<a class="cite" href="#ref-3">3</a> (Appendices A.1, D). This is Module 6's over-optimization in miniature.</p>
+<p><strong>Scale and algorithm.</strong> Only a 7B policy was aligned, and the authors list larger policies and DPO as untested<a class="cite" href="#ref-3">3</a> (Limitations).</p>
+
+<h2 id="labelers">7. Who labels what: the recipes side by side</h2>
+
+<h3 id="labelers-table">7.1 The map</h3>
+<p>Table 8 lists who or what produced the preference label in each recipe of this track that uses a model-produced signal. The verifier row of Figure 1 is absent because it has no pair to label (Module 10); judges as live rewards are Module 16.</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 8.</b> Labeler design across recipes. "Scale" is what the cited source reports; "not stated" means the sections I read do not give it.</caption>
+  <thead><tr><th>Recipe</th><th>Who or what labels</th><th>Label form</th><th>Scale</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td class="row">InstructGPT (2022)</td><td>about 40 contractors</td><td>rankings, turned into pairs</td><td>RM data 33k prompts; labeler agreement 72.6 ± 1.5%</td><td><a class="cite" href="#ref-2">2</a></td></tr>
+    <tr><td class="row">Constitutional AI (2022)</td><td>pretrained-LM feedback model plus one of 16 principles; harmlessness only</td><td>soft (A)/(B) probability; chain of thought clamped to 40-60%</td><td>182,831 AI comparisons</td><td><a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">RLAIF, Lee et al. (2023)</td><td>PaLM 2 L, both orderings averaged</td><td>soft; RM by cross-entropy, or direct 1-10 score (d-RLAIF)</td><td>3-4k labeled examples for alignment studies; RM on full training splits</td><td><a class="cite" href="#ref-4">4</a></td></tr>
+    <tr><td class="row">RLCD, Yang et al. (2023)</td><td>none: the prompt (p+ or p−) sets the label</td><td>hard, by construction</td><td>about 40,000 prompts per task</td><td><a class="cite" href="#ref-3">3</a></td></tr>
+    <tr><td class="row">UltraFeedback (2023)</td><td>GPT-4</td><td>1-5 scores on four aspects plus a written critique</td><td>63,967 prompts; 255,864 completions from a 17-model pool; over 1M feedback annotations</td><td><a class="cite" href="#ref-8">8</a></td></tr>
+    <tr><td class="row">Self-Rewarding LMs (2024)</td><td>the policy itself (Llama 2 70B), LLM-as-a-Judge</td><td>additive 0-5 score; best vs worst of 4 candidates is the DPO pair</td><td>3 iterations; judge pairwise accuracy 65.1% (SFT) to 81.7% (M3)</td><td><a class="cite" href="#ref-9">9</a></td></tr>
+    <tr><td class="row">Tulu 3 (2024)</td><td>GPT-4o-2024-08-06</td><td>1-5 on four aspects, mean; top response vs a random lower-mean one</td><td>96,911 off-policy + 19,444 on-policy base pairs; final mixes 271,409 (8B), 334,302 (70B)</td><td><a class="cite" href="#ref-10">10</a></td></tr>
+    <tr><td class="row">DeepSeek-R1 (2025; details from arXiv v2), helpfulness RM</td><td>DeepSeek-V3, queried 4 times in random A/B order</td><td>averaged score; keep pairs differing by more than 1; lengths matched</td><td>66,000 pairs</td><td><a class="cite" href="#ref-11">11</a></td></tr>
+    <tr><td class="row">Kimi K2 (2025), subjective tasks</td><td>K2's own critic</td><td>pairwise ranking against rubrics; critic refined on verifiable rollouts</td><td>not stated</td><td><a class="cite" href="#ref-12">12</a></td></tr>
+    <tr><td class="row">DeepSeek-V4 (2026), hard-to-verify tasks</td><td>the actor itself, as a generative reward model</td><td>rubric-guided judgments; no scalar RM</td><td>not stated</td><td><a class="cite" href="#ref-13">13</a></td></tr>
+  </tbody>
+</table>
+<p>Self-Rewarding LMs are the only row where the labeler improves through the same training that it labels: judge accuracy against held-out human rankings rises from 65.1% for the SFT baseline to 78.7%, 80.4% and 81.7% over the three iterations, though the first jump comes from adding human-ranked evaluation data to the seed training, so the clean self-improvement is the 78.7% to 81.7% step<a class="cite" href="#ref-9">9</a> (Table 4).</p>
+
+<h3 id="labelers-bias">7.2 Biases that recur, and the patterns that blunt them</h3>
+<p>Zheng et al. catalogued how an LLM judge fails. On near-identical answers, GPT-4 returned a consistent verdict after the order was swapped in 65.0% of cases, GPT-3.5 in 46.2% and Claude-v1 in 23.8% (75.0% of Claude-v1's verdicts favored the first answer). In their "repetitive list" attack, which pads an answer with rephrased copies of its own items, Claude-v1 and GPT-3.5 preferred the padded answer 91.3% of the time and GPT-4 8.7%. On self-preference, GPT-4 "favors itself with a 10% higher win rate" than humans give it and Claude-v1 with a 25% higher one, but the authors write that "our study cannot determine" whether this is a self-enhancement bias<a class="cite" href="#ref-7">7</a> (§3.3, Tables 2-3). The mitigations that appear in the recipes of Table 8 are the same few moves:</p>
+<ul>
+<li><strong>Order:</strong> label both orders and average (Lee et al.; R1's four randomized queries) or require agreement in both orders (Zheng's conservative protocol)<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-7">7</a>.</li>
+<li><strong>Length:</strong> R1 balances chosen and rejected lengths across the dataset; Lee et al. report length-adjusted win rates; Tulu 3 normalizes DPO log-probabilities by length (Module 7)<a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-10">10</a>. Self-Rewarding LMs' generations grew from 1,092 to 1,552 to 2,552 (units as printed) over three iterations, which the authors flag as a possible factor in their gains<a class="cite" href="#ref-9">9</a> (§3, §6).</li>
+<li><strong>Calibration of the label:</strong> keep it soft, or clamp it (§3.2)<a class="cite" href="#ref-1">1</a>.</li>
+<li><strong>Decomposition:</strong> UltraFeedback splits quality into four aspects with a 1-5 reference rubric, scores four completions in one prompt for consistency, and asks GPT-4 for a rationale before the score<a class="cite" href="#ref-8">8</a> (§2.4).</li>
+</ul>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>Production recipes widen the chosen-rejected quality gap by <em>selection and sourcing</em>, not by Yang et al.'s prompts. R1 keeps only pairs whose judged scores differ by more than 1; Self-Rewarding LMs pair the best and worst of four candidates; Tulu 3 pairs the top response with a random lower one; UltraFeedback samples from a pool of 17 models of different capability<a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-10">10</a><a class="cite" href="#ref-8">8</a>. In the toy model of Table 5 each raises \(\Delta\mu\) without touching the judge. That reading is mine; none of these papers frames it that way.</p></aside>
+
+<h3 id="labelers-rubric">7.3 From a list of principles to rubrics and reasons</h3>
+<p>The constitution has changed form faster than the algorithm around it. In Kimi K2 the "principles" are rubrics: three core rubrics (clarity and relevance, conversational fluency and engagement, objective and grounded interaction), two prescriptive rubrics that ban opening with praise for the user's question and sentences that justify why the response is good, plus human-written task-specific rubrics. The critic ranks outputs pairwise against them, and K2 "retains the flexibility to weigh them against its internal priors"<a class="cite" href="#ref-12">12</a> (§3.2.2, Appendix F). The prescriptive rules aim "to eliminate reward hacking", and K2's own limitations note shows what they break: they prohibit hedging such as "I might be wrong", so the framework "may favor responses that appear confident and assertive" and the model "may occasionally overstate certainty"<a class="cite" href="#ref-12">12</a> (Appendix F.3). That is the calibration problem of Module 24, produced by an AI-feedback design choice.</p>
+<p>Anthropic's own documents show the other direction. The 2023 constitution was a list of principles that the model draws on one at a time<a class="cite" href="#ref-6">6</a>. The January 2026 version states that "our previous Constitution was composed of a list of standalone principles", that Anthropic now explains the reasons behind behaviors "rather than merely specify[ing]" them, and that "Claude itself also uses the constitution to construct many kinds of synthetic training data, including ... rankings of possible responses"<a class="cite" href="#ref-14">14</a>. The page does not say how those rankings enter training. Lambert reads the shift as moving from principles, which are "intermediate training variables", to documents that explain intent, and lists OpenAI's Model Spec and Deliberative Alignment as close peers of CAI<a class="cite" href="#ref-5">5</a> (§12.5.1, §17.2).</p>
+<ol class="timeline">
+  <li><time>2022-12</time><b>Constitutional AI</b><p>Critique-revision SFT, then AI harmlessness labels from 16 principles, human helpfulness labels<a class="cite" href="#ref-1">1</a>.</p></li>
+  <li><time>2023-07</time><b>RLCD (Yang et al.)</b><p>Labels by construction from p+ and p−; ICLR 2024<a class="cite" href="#ref-3">3</a>.</p></li>
+  <li><time>2023-09</time><b>RLAIF vs RLHF (Lee et al.)</b><p>Parity on three tasks; direct RLAIF; ICML 2024<a class="cite" href="#ref-4">4</a>.</p></li>
+  <li><time>2023-10</time><b>UltraFeedback</b><p>Over 1M GPT-4 feedback annotations for open models; ICML 2024<a class="cite" href="#ref-8">8</a>.</p></li>
+  <li><time>2024-01</time><b>Self-Rewarding LMs</b><p>The policy judges its own candidates; iterated DPO<a class="cite" href="#ref-9">9</a>.</p></li>
+  <li><time>2024-11</time><b>Tulu 3</b><p>GPT-4o-judged on-policy and off-policy pairs for DPO<a class="cite" href="#ref-10">10</a>.</p></li>
+  <li><time>2025-01</time><b>DeepSeek-R1</b><p>DeepSeek-V3-labeled pairs train the helpfulness reward model<a class="cite" href="#ref-11">11</a>.</p></li>
+  <li><time>2025-07</time><b>Kimi K2</b><p>Self-critic with rubrics, refined on verifiable rollouts<a class="cite" href="#ref-12">12</a>.</p></li>
+  <li><time>2026-01</time><b>Anthropic's new constitution</b><p>Reasons instead of a principle list; synthetic data including rankings<a class="cite" href="#ref-14">14</a>.</p></li>
+  <li><time>2026</time><b>DeepSeek-V4</b><p>The actor is its own rubric-guided generative reward model; scalar RMs dropped (arXiv preprint 2606.19348)<a class="cite" href="#ref-13">13</a>.</p></li>
+</ol>
+
+<h2 id="acronyms">8. Four acronyms, one set of letters</h2>
+<p>The letters RLCD now name two unrelated things, and two neighbors (RLCR, RLHV) sit one letter away. Table 9 separates them by what supplies the training signal and what evidence exists. The TypeSafe row reports a company's claim, not a mechanism, because none is public.</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 9.</b> Acronym map as of 2026-10-27. "Evidence" is what a reader can inspect.</caption>
+  <thead><tr><th>Acronym</th><th>Expansion</th><th>Who, when</th><th>What trains the policy</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td class="row">RLAIF</td><td>Reinforcement Learning from AI Feedback</td><td>Bai et al. (Anthropic), Dec 2022; the term comes from this paper<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-5">5</a></td><td>AI preference labels guided by principles, distilled into a preference model</td><td>arXiv 2212.08073; controlled comparison in Lee et al.<a class="cite" href="#ref-4">4</a></td></tr>
+    <tr><td class="row">RLCD (2023)</td><td>Reinforcement Learning from <em>Contrastive Distillation</em></td><td>Yang, Klein, Celikyilmaz, Peng, Tian; ICLR 2024<a class="cite" href="#ref-3">3</a></td><td>preference pairs labeled by which of two contrasting prompts (p+, p−) generated them</td><td>arXiv 2307.12950; experiments with LLaMA-7B; code and data stated to be at github.com/facebookresearch/rlcd (not fetched here)</td></tr>
+    <tr><td class="row">RLCD (2026)</td><td>"Reinforcement learning for calibrated decisions"</td><td>TypeSafe AI; launch post by its founder dated 15 Sep 2026<a class="cite" href="#ref-15">15</a><a class="cite" href="#ref-16">16</a></td><td>not disclosed; TypeSafe says it trains a model "to return decisions and calibrated probabilities instead of generated text"</td><td>company claim only: documentation and a blog post; no paper, repository, reward function, algorithm or dataset in any source read (Module 25)</td></tr>
+    <tr><td class="row">OpenJev-RLCD</td><td>an independent reconstruction of the 2026 name</td><td>Gao and Wang, 30 Sep 2026<a class="cite" href="#ref-17">17</a></td><td>strictly proper score of the answer distribution after each sampled rationale; states that TypeSafe discloses no algorithm</td><td>arXiv 2609.38850; a third party's method, not TypeSafe's</td></tr>
+    <tr><td class="row">RLCR</td><td>Reinforcement Learning with Calibration Rewards</td><td>Damani et al. (MIT); ICLR 2026<a class="cite" href="#ref-18">18</a></td><td>binary correctness minus the Brier score of a verbalized confidence</td><td>arXiv 2507.16806 (Module 24)</td></tr>
+    <tr><td class="row">RLHV</td><td>Reinforcement Learning from Human Verification</td><td>J. A. dos Santos, independent, 24 Sep 2026<a class="cite" href="#ref-19">19</a></td><td>a validator's verdict scored against the model's probability under the Brier score</td><td>arXiv 2609.28940 defines it; its RLHV-trained model "is a design proposal; no implementation or evaluation has been conducted"</td></tr>
+  </tbody>
+</table>
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Citing Yang et al. for anything TypeSafe says about RLCD, or the reverse. The 2023 method builds preference pairs for a preference model and PPO, validated with LLaMA on harmlessness, helpfulness and story outlines. The 2026 name is attached by its company to a route that yields, in its words, "decisions and calibrated probabilities instead of generated text"<a class="cite" href="#ref-15">15</a>. Nothing public connects the two, and nothing public describes TypeSafe's training algorithm.</p></aside>
+<p>Module 24 teaches the public calibration machinery behind RLCR, and Module 25 is the ledger of what TypeSafe has and has not shown.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The sources agree that an AI label is cheap and that its quality is capped by the labeler. They disagree on how to get a trustworthy label and whether to distill labels into a reward model at all.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Build the contrast into the pair; do not judge afterwards</h4>
+    <p class="who">Yang, Klein, Celikyilmaz, Peng and Tian<a class="cite" href="#ref-3">3</a></p>
+    <p>Two i.i.d. samples from one prompt are near ties, and near ties are where judges fail. Generate from a positive and a negative prompt and the label is known by construction. GPT-4 preferred RLCD to RLAIF 71.0% to 85.4% of the time with a 7B simulator.</p>
+    <ul class="pros"><li>No judge call; works where the labeler is weak (the 7B RLAIF preference model agreed with human labels on 35.6% of harmlessness pairs, below chance).</li><li>Label accuracy is set by a prompt-design knob, not labeler scale (Table 5).</li></ul>
+    <ul class="cons"><li>At 30B the GPT-4 preference was 60.3%, 55.3%, 47.8% and 35.9%; humans saw parity.</li><li>Outputs were up to 3.3 times longer than RLAIF's and no length-controlled result is reported.</li><li>The prompt pair is a new place to hide confounds ("Thank you" shortcuts); only a 7B policy and PPO were tested.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Judge afterwards with a strong labeler and distill into a reward model</h4>
+    <p class="who">Bai et al., Lee et al., and the open recipes built on UltraFeedback<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-10">10</a></p>
+    <p>A capable labeler with chain of thought reaches 78.0% agreement with human preferences against 73-77% between humans, RLAIF matches RLHF on three tasks, and the cost is over ten times lower. R1's helpfulness reward model uses this pattern, and Tulu 3 feeds the same kind of judged labels straight into DPO.</p>
+    <ul class="pros"><li>Quality rises with labeler size: 62.7%, 73.8%, 78.0% alignment across PaLM 2 XS, S, L.</li><li>Soft labels carry more information than a hard flip; already the default in documented recipes.</li></ul>
+    <ul class="cons"><li>Errors are systematic: same-position preference of 18-56%, verbosity and self-preference effects; length correction cut one win rate from 71% to 59%.</li><li>RM accuracy on human labels did not rank the resulting policies.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Skip the distilled reward model: let the judge, or the policy, score live</h4>
+    <p class="who">Lee et al. (d-RLAIF), Yuan et al., the Kimi K2 and DeepSeek-V4 reports<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-13">13</a></p>
+    <p>A frozen reward model goes stale as the policy moves. Query the judge during RL (d-RLAIF beat same-size RLAIF 60% to 40%), or make the policy its own judge so the labeler improves with training (judge accuracy 65.1% to 81.7% in Self-Rewarding LMs; V4's actor is its own generative reward model).</p>
+    <ul class="pros"><li>No staleness and no RM training stage; the judge can reason before scoring and be grounded in verifiable rollouts (K2).</li></ul>
+    <ul class="cons"><li>A live judge is an exploitable reward: K2 needs prescriptive rubrics "to eliminate reward hacking" and its rubric discourages hedging.</li><li>Self-judging models grew their outputs from 1,092 to 2,552 in length (units as printed).</li><li>Lee et al. did not separate the staleness effect from the effect of querying directly.</li></ul>
+  </article>
+  <article class="position">
+    <h4>AI feedback supplements human feedback; it does not replace it</h4>
+    <p class="who">Lambert; Lee et al.'s impact statement; Bai et al.<a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-1">1</a></p>
+    <p>Human data is high-noise and low-bias, AI data the reverse. Lambert writes that "human data has not been completely replaced" and cites later work that routes challenging examples to humans and the rest to AI. Lee et al. say human experts "should be considered the gold standard" in medicine, law and employment. Bai et al. aim to make human supervision "more efficient, transparent, and targeted", not to remove it.</p>
+    <ul class="pros"><li>Guards against bias amplification in high-stakes domains; matches how open recipes mix sources (Table 8).</li></ul>
+    <ul class="cons"><li>Lee et al. found no gain from adding human labels to AI labels (71% against 74%).</li><li>Human data is at least two orders of magnitude pricier per datum (Lambert, 2026).</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>The first two positions are one claim about noise, and the toy model of §5.3 says which applies. If the labeler's noise \(\sigma_D\) is large against the spread of the generator's outputs (a 7B simulator, a small open model), construct the contrast: RLAIF's labels are near coin flips and Yang et al.'s 7B column is real. If the labeler is strong (30B simulator, PaLM 2 L, any frontier model), judge afterwards; Yang et al.'s own 30B column and the RLCD-Rescore result show the advantage disappears. In practice the documented recipes widen the gap by selection (best against worst of several, margin filters) rather than by contrastive prompts (a text search of the R1, Tulu 3, UltraFeedback, Self-Rewarding and K2 papers finds no use of the name; Lee et al. cite it only as related work). Live judges (position 3) are the direction of travel, but the evidence read is vendor-reported with no equal-judge ablation against a distilled reward model, so adopt them only with verifiable grounding and anti-hacking rubrics. Position 4 is a risk policy, not a competing mechanism, and the one measurement of mixing (Lee et al.) did not support it. What would settle the first disagreement: a length-controlled replication of Yang et al. with a policy of at least 70B, a strong judge and DPO or GRPO as the learner; no such study is in this track's sources.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Judges now train alongside the policy. DeepSeek-V4 dispenses with scalar reward models for hard-to-verify tasks and applies RL "directly to the GRM itself", the actor "natively" acting as the generative reward model<a class="cite" href="#ref-13">13</a> (§5.1.1); K2 refines its critic on verifiable rollouts during RL<a class="cite" href="#ref-12">12</a>. Both turn Lee et al.'s staleness problem into a moving-target problem (Module 19 covers exploitation). The principle list has given way to rubrics and explained reasons, and Anthropic describes its current training use of the constitution without giving an algorithm<a class="cite" href="#ref-14">14</a>. Cost is settled in the labeler's favor (at least a hundredfold per datum on Lambert's 2026 figures<a class="cite" href="#ref-5">5</a>); bias is not. The vendor-reported items (K2, V4, the 2026 constitution) are the most likely to be revised.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Bai, Y., Kadavath, S., Kundu, S., Askell, A. et al. (Anthropic). <em>Constitutional AI: Harmlessness from AI Feedback</em>. arXiv 2212.08073 v1, 15 Dec 2022. <a href="https://arxiv.org/pdf/2212.08073v1">https://arxiv.org/pdf/2212.08073v1</a>. Accessed 2026-10-27. <span class="ref-use">Used for: both phases (§3-§4), data volumes (§3.2, §4.2), soft labels, chain-of-thought clamp, results and cautions (§4.3-§4.4), label-quality evaluation (§2), principles (Appendix C), worked example (Appendix A).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Ouyang, L., Wu, J., Jiang, X., Almeida, D. et al. <em>Training language models to follow instructions with human feedback</em>. NeurIPS 2022; arXiv 2203.02155 v1, 4 Mar 2022. <a href="https://arxiv.org/pdf/2203.02155v1">https://arxiv.org/pdf/2203.02155v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: team of about 40 contractors (§1), RM dataset of 33k prompts (§3.2), labeler agreement 72.6% and 77.3% (§3.4).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Yang, K., Klein, D., Celikyilmaz, A., Peng, N., Tian, Y. <em>RLCD: Reinforcement Learning from Contrastive Distillation for Language Model Alignment</em>. ICLR 2024; arXiv 2307.12950 v3, 16 Mar 2024. <a href="https://arxiv.org/pdf/2307.12950v3">https://arxiv.org/pdf/2307.12950v3</a>. Accessed 2026-10-27. <span class="ref-use">Used for: method (§3), experiments (§4, Tables 2-3), preference-model and rescoring analysis (§5, Tables 5-6), prompts (Appendix A), human-GPT-4 agreement (Table 23), lengths (Tables 34-35), label accuracy (Table 36), toy model (Appendix N).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Lee, H., Phatale, S., Mansoor, H. et al. (Google). <em>RLAIF vs. RLHF: Scaling Reinforcement Learning from Human Feedback with AI Feedback</em>. ICML 2024; arXiv 2309.00267 v3, 3 Sep 2024. <a href="https://arxiv.org/pdf/2309.00267">https://arxiv.org/pdf/2309.00267</a>. Accessed 2026-10-27. <span class="ref-use">Used for: setup (§2-§3), results (Table 1, §4), prompting ablations (Table 2), labeler size (Table 3), position bias (Appendix B), RM accuracy (Appendix G), length control (Appendix J), human plus AI (Appendix K), cost (Appendix L), self-consistency (Appendix M).</span></li>
+  <li id="ref-5"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv 2504.12501 v12, 11 Sep 2026 (Manning print edition, July 2026). <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: 2026 cost of human versus AI preference data and the noise/bias rule of thumb (§12.4.1), CAI as the origin of RLAIF (§12.4.1, §12.5), peers of CAI (§12.5.1), model specifications (§17.2).</span></li>
+  <li id="ref-6"><span class="ref-type">blog</span>Anthropic. <em>Claude's Constitution</em>. Anthropic news, 9 May 2023 (page carries an update note of 21 Jan 2026). <a href="https://www.anthropic.com/news/claudes-constitution">https://www.anthropic.com/news/claudes-constitution</a>. Accessed 2026-10-27. <span class="ref-use">Used for: sources of the principles, how principles are drawn in each phase.</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Zheng, L., Chiang, W.-L., Sheng, Y. et al. <em>Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena</em>. NeurIPS 2023 Datasets and Benchmarks; arXiv 2306.05685 v4, 24 Dec 2023. <a href="https://arxiv.org/pdf/2306.05685">https://arxiv.org/pdf/2306.05685</a>. Accessed 2026-10-27. <span class="ref-use">Used for: position, verbosity and self-enhancement bias (§3.3, Tables 2-3), position bias by model-pair closeness (Appendix D.1, Table 11), swapping protocol (§3.4).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Cui, G., Yuan, L., Ding, N. et al. <em>UltraFeedback: Boosting Language Models with Scaled AI Feedback</em>. ICML 2024; arXiv 2310.01377 v2, 16 Jul 2024. <a href="https://arxiv.org/pdf/2310.01377">https://arxiv.org/pdf/2310.01377</a>. Accessed 2026-10-27. <span class="ref-use">Used for: dataset scale, 17-model pool, four-aspect GPT-4 annotation with rationale (§2.3-§2.4).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Yuan, W., Pang, R. Y., Cho, K., Li, X., Sukhbaatar, S., Xu, J., Weston, J. <em>Self-Rewarding Language Models</em>. arXiv 2401.10020 v3, 28 Mar 2025. <a href="https://arxiv.org/pdf/2401.10020">https://arxiv.org/pdf/2401.10020</a>. Accessed 2026-10-27. <span class="ref-use">Used for: policy as its own judge, best-versus-worst pair construction, judge accuracy by iteration (Table 4), length growth and limitations (§3, §6).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S. et al. (Ai2). <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv 2411.15124 v5, 14 Apr 2025. <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: LLM-judged preference pipeline (§5.2.1, Figure 7), preference mixes (§5.2.2, Table 15), length-normalized DPO (§5.1).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv 2501.12948 v2, 4 Jan 2026 (v1 22 Jan 2025). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: helpfulness reward model trained on 66,000 DeepSeek-V3-labeled pairs with randomized order, margin filter and length matching (§3.1).</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Kimi Team (Moonshot AI). <em>Kimi K2: Open Agentic Intelligence</em>. arXiv 2507.20534 v2, 3 Feb 2026. <a href="https://arxiv.org/pdf/2507.20534v2">https://arxiv.org/pdf/2507.20534v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: self-critique rubric reward and closed-loop critic refinement (§3.2.2), core and prescriptive rubrics and their limitations (Appendix F).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv 2606.19348 v1 (preview). <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: rubric-guided generative reward model that is the actor itself, no scalar reward models (§5.1.1).</span></li>
+  <li id="ref-14"><span class="ref-type">blog</span>Anthropic. <em>Claude's new constitution</em>. Anthropic news, 22 Jan 2026. <a href="https://www.anthropic.com/news/claude-new-constitution">https://www.anthropic.com/news/claude-new-constitution</a>. Accessed 2026-10-27. <span class="ref-use">Used for: shift from a list of standalone principles to explained reasons, use of the constitution to construct synthetic training data including rankings.</span></li>
+  <li id="ref-15"><span class="ref-type">official</span>TypeSafe AI. <em>AI primer</em> (docs.typesafe.ai). Live documentation, no version stamp. <a href="https://docs.typesafe.ai/introduction/machine-learning-primer.md">https://docs.typesafe.ai/introduction/machine-learning-primer.md</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the company's definition of RLCD and its output contract; company claim only.</span></li>
+  <li id="ref-16"><span class="ref-type">official</span>Almeida, D. (TypeSafe AI). <em>Introducing System One Models &amp; Jev</em>. Company blog, 15 Sep 2026. <a href="https://typesafe.ai/blog/introducing-system-one-models-and-jev">https://typesafe.ai/blog/introducing-system-one-models-and-jev</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the single sentence that names the training method; launch date; company claim only.</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Gao, Z., Wang, P. <em>OpenJev-RLCD: A Working RLCD Implementation</em>. arXiv 2609.38850 v1, 30 Sep 2026. <a href="https://arxiv.org/pdf/2609.38850v1">https://arxiv.org/pdf/2609.38850v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: independent reconstruction of the 2026 name and its statement that TypeSafe discloses no algorithm (abstract, §1).</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Damani, M., Puri, I., Slocum, S., Shenfeld, I., Choshen, L., Kim, Y., Andreas, J. <em>Beyond Binary Rewards: Training LMs to Reason About Their Uncertainty</em> (RLCR). ICLR 2026; arXiv 2507.16806 v2, 15 May 2026. <a href="https://arxiv.org/pdf/2507.16806v2">https://arxiv.org/pdf/2507.16806v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the RLCR expansion and reward (abstract, §1).</span></li>
+  <li id="ref-19"><span class="ref-type">paper</span>dos Santos, J. A. (arXiv metadata: dos Santos Barbosa). <em>Calibrated Decision Models for Autonomous Penetration-Testing Harnesses: JEV and Laya as System One Decision Layers for LLM-Driven Pentest Agents</em>. arXiv 2609.28940 v1, 24 Sep 2026. <a href="https://arxiv.org/pdf/2609.28940">https://arxiv.org/pdf/2609.28940</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the RLHV definition and the statement that the RLHV-trained model is a design proposal (§II, §XIV).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

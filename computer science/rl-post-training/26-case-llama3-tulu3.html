@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Case Study: Llama 3 and Tulu 3 (2024) · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Reads two 2024 post-training recipes stage by stage: Meta's six-round loop of rejection sampling, SFT and DPO for Llama 3, and Ai2's SFT, length-normalized DPO and PPO-on-verifiers recipe for Tulu 3, with data counts, hyperparameters, GPU-hours, stage effects, the PPO-versus-DPO decision each report records, and what the later GRPO-style RLVR recipes changed.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 26</p>
+  <h1>Case Study: Llama 3 and Tulu 3 (2024): DPO-First Post-Training, the PPO Comparison, and the Birth of RLVR</h1>
+  <p class="lede">Two 2024 reports built on the same Llama 3.1 base models both chose DPO over PPO for preference tuning, and differed on almost everything else. Meta ran six rounds of human-annotated data, rejection sampling and DPO; Ai2 published its data and added a last PPO stage against programmatic checkers, which it named RLVR. This module reads each recipe stage by stage, with data counts, hyperparameters, GPU-hours and measured stage effects. Afterwards you can say what each recipe optimized, what its numbers do and do not show, and which of its choices the 2025 GRPO-style recipes kept or replaced.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>50 min</b> read</span>
+    <span class="chip"><b>9</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 5</b>, <b>Module 7</b>, <b>Module 10</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 376" role="img" aria-labelledby="f1t"><title id="f1t">Llama 3 and Tulu 3 as two lanes of stages, coloured by where each stage's training samples come from</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f1-arra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+    </defs>
+    <text x="20" y="22" class="d-title d-bold">Llama 3 (Meta): one loop, run six times</text>
+    <rect x="20" y="34" width="170" height="78" rx="8" class="d-block-muted"/>
+    <text x="105" y="60" text-anchor="middle" class="d-text-inv d-bold">Preference data + RM</text>
+    <text x="105" y="80" text-anchor="middle" class="d-text-inv d-small">human pairs, 4 strengths</text>
+    <text x="105" y="96" text-anchor="middle" class="d-text-inv d-small">RM on all data so far</text>
+    <path d="M190,73 L225,73" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="225" y="34" width="170" height="78" rx="8" class="d-block-2"/>
+    <text x="310" y="60" text-anchor="middle" class="d-text-inv d-bold">Rejection sampling</text>
+    <text x="310" y="80" text-anchor="middle" class="d-text-inv d-small">K = 10–30 per prompt</text>
+    <text x="310" y="96" text-anchor="middle" class="d-text-inv d-small">RM picks the best</text>
+    <path d="M395,73 L430,73" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="430" y="34" width="165" height="78" rx="8" class="d-block"/>
+    <text x="512" y="60" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+    <text x="512" y="80" text-anchor="middle" class="d-text-inv d-small">lr 1e-5, 8.5K–9K steps</text>
+    <text x="512" y="96" text-anchor="middle" class="d-text-inv d-small">RS + synthetic + human</text>
+    <path d="M595,73 L630,73" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="630" y="34" width="150" height="78" rx="8" class="d-block"/>
+    <text x="705" y="60" text-anchor="middle" class="d-text-inv d-bold">DPO</text>
+    <text x="705" y="80" text-anchor="middle" class="d-text-inv d-small">β 0.1, NLL 0.2</text>
+    <text x="705" y="96" text-anchor="middle" class="d-text-inv d-small">newest batches only</text>
+    <path d="M705,112 L705,138 L105,138 L105,114" class="d-arrow-active" marker-end="url(#f1-arra)"/>
+    <text x="405" y="156" text-anchor="middle" class="d-small d-text-light">best model of the round samples the next round's data</text>
+
+    <text x="20" y="200" class="d-title d-bold">Tulu 3 (Ai2): three stages, run once</text>
+    <rect x="20" y="212" width="170" height="78" rx="8" class="d-block-muted"/>
+    <text x="105" y="238" text-anchor="middle" class="d-text-inv d-bold">Prompt pool</text>
+    <text x="105" y="258" text-anchor="middle" class="d-text-inv d-small">23,327,961 prompts</text>
+    <text x="105" y="274" text-anchor="middle" class="d-text-inv d-small">8-gram decontaminated</text>
+    <path d="M190,251 L225,251" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="225" y="212" width="170" height="78" rx="8" class="d-block"/>
+    <text x="310" y="238" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+    <text x="310" y="258" text-anchor="middle" class="d-text-inv d-small">939,344 prompts</text>
+    <text x="310" y="274" text-anchor="middle" class="d-text-inv d-small">2 epochs, lr 5e-6 / 2e-6</text>
+    <path d="M395,251 L430,251" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="430" y="212" width="165" height="78" rx="8" class="d-block"/>
+    <text x="512" y="238" text-anchor="middle" class="d-text-inv d-bold">Length-normalized DPO</text>
+    <text x="512" y="258" text-anchor="middle" class="d-text-inv d-small">271,409 / 334,302 pairs</text>
+    <text x="512" y="274" text-anchor="middle" class="d-text-inv d-small">GPT-4o-judged, β 5</text>
+    <path d="M595,251 L630,251" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="630" y="212" width="150" height="78" rx="8" class="d-block-accent"/>
+    <text x="705" y="238" text-anchor="middle" class="d-text-inv d-bold">RLVR (PPO)</text>
+    <text x="705" y="258" text-anchor="middle" class="d-text-inv d-small">29,946 prompts</text>
+    <text x="705" y="274" text-anchor="middle" class="d-text-inv d-small">verifier reward, α 10</text>
+
+    <rect x="20" y="318" width="14" height="14" rx="3" class="d-block"/>
+    <text x="42" y="330" class="d-small">offline update on fixed data</text>
+    <rect x="270" y="318" width="14" height="14" rx="3" class="d-block-2"/>
+    <text x="292" y="330" class="d-small">sampled once from an earlier checkpoint, then fixed</text>
+    <rect x="20" y="344" width="14" height="14" rx="3" class="d-block-accent"/>
+    <text x="42" y="356" class="d-small">sampled online from the policy being trained</text>
+    <rect x="400" y="344" width="14" height="14" rx="3" class="d-block-muted"/>
+    <text x="422" y="356" class="d-small">data or a model that is not updated</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The two recipes as lanes. Colour marks where each stage's training samples come from, the property that sets its cost (Module 1): only Tulu 3's last stage samples from the policy it updates. Llama 3 repeats its loop six times, with the best model of one round producing the data of the next; Tulu 3 runs each stage once. Counts: Llama 3 §4.1-§4.2 and Figure 7<a class="cite" href="#ref-1">1</a>; Tulu 3 Tables 7, 11, 15, 20 and 22<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<h2 id="two-reports">1. Two reports, one model family, two objectives</h2>
+
+<h3 id="two-reports-base">1.1 Same base models, different harnesses</h3>
+<p>Llama 3 is Meta's report on its 8B, 70B and 405B dense models (arXiv v1 31 Jul 2024, v3 23 Nov 2024), and says that all of its results are for the Llama 3.1 models<a class="cite" href="#ref-1">1</a> (§1). Tulu 3 is Ai2's report (v1 22 Nov 2024, v5 14 Apr 2025) on post-training those same three Llama 3.1 base models, with Llama 3.1 Instruct among its main baselines<a class="cite" href="#ref-2">2</a> (§1, §2.4). That shared base is what makes the pair useful as a case study: two recipes, one starting point.</p>
+<p>It does not make their numbers comparable. Table 1 lists benchmarks on which both reports score Llama 3.1 405B Instruct, the same released model, in their own harnesses. The gap is 1.4 points on GSM8K, where the nominal setting matches, and 7.2 and 6.9 points on MATH and HumanEval, where the settings differ and the direction flips (derived). Everything below therefore compares the recipes by stage structure, cost and within-report deltas, and uses a cross-report number only where it says so.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> One model, two harnesses: Llama 3.1 405B Instruct as scored in Meta's Table 2<a class="cite" href="#ref-1">1</a> and in Ai2's Table 4<a class="cite" href="#ref-2">2</a>. Scores are percent; the settings are as printed in each table.</caption>
+  <thead><tr><th>Benchmark</th><th>Meta's setting</th><th class="num">Meta (%)</th><th>Ai2's setting</th><th class="num">Ai2 (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">GSM8K</td><td>8-shot, CoT</td><td class="num">96.8</td><td>8-shot, CoT</td><td class="num">95.4</td></tr>
+    <tr><td class="row">MATH</td><td>0-shot, CoT</td><td class="num">73.8</td><td>4-shot, CoT, flex match</td><td class="num">66.6</td></tr>
+    <tr><td class="row">IFEval</td><td>mean of prompt and instruction level, strict and loose</td><td class="num">88.6</td><td>prompt level, loose</td><td class="num">88.4</td></tr>
+    <tr><td class="row">HumanEval</td><td>0-shot</td><td class="num">89.0</td><td>pass@10</td><td class="num">95.9</td></tr>
+    <tr><td class="row">MMLU</td><td>5-shot</td><td class="num">87.3</td><td>5-shot, CoT</td><td class="num">88.0</td></tr>
+  </tbody>
+</table>
+
+<h3 id="two-reports-objective">1.2 What each recipe was steering by</h3>
+<p>Under the lever it calls "managing complexity", Llama 3 chose a "relatively simple post-training procedure based on supervised finetuning (SFT), rejection sampling (RS), and direct preference optimization (DPO)" over "more complex reinforcement learning algorithms" that "tend to be less stable and harder to scale"<a class="cite" href="#ref-1">1</a> (§1). Human comparison is the steering signal: annotators' pairs train the reward model, the reward model selects the rejection-sampled SFT data, and the newest pairs are the DPO data (Section 2).</p>
+<p>Tulu 3 steers by a measurement instrument. It lists the core skills it wants, builds a development suite of 12 evaluations and a held-out suite of 7 (counted from its Tables 3, 6 and 33), and states that it "did not examine scores on our unseen set when developing our models", so that the gap between the two shows how far its choices overfit<a class="cite" href="#ref-2">2</a> (§2.2). Data mixes, algorithms and checkpoints are all selected on the development average. Neither recipe optimizes one reward; both optimize a data mix and a stage order against a selection signal. Table 2 sets them side by side; mechanism details are in Modules 4, 5, 7 and 10.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> The two recipes side by side. Llama 3 figures are for the 405B model unless noted. Sources: Llama 3 §4.1-§4.2<a class="cite" href="#ref-1">1</a>; Tulu 3 §4-§6, Tables 11, 15, 20, 21<a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th>Item</th><th>Llama 3 (Meta)</th><th>Tulu 3 (Ai2)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Stages</td><td>reward model, rejection sampling, SFT, DPO; six rounds</td><td>SFT, DPO, RLVR; one pass</td></tr>
+    <tr><td class="row">Preference signal</td><td>human annotators: two responses from two models, four strength levels, optional edit</td><td>GPT-4o-2024-08-06 rates four responses 1 to 5 on four aspects; best versus a random lower-mean response</td></tr>
+    <tr><td class="row">SFT settings</td><td>lr 1e-5, 8.5K to 9K steps</td><td>lr 5e-6 (8B) and 2e-6 (70B), batch 128, 2 epochs, sum loss</td></tr>
+    <tr><td class="row">DPO settings</td><td>β 0.1, lr 1e-5, NLL term 0.2, formatting tokens masked; no length normalization stated</td><td>length-normalized, β 5, lr 5e-7 (8B) and 2e-7 (70B), batch 128, 1 epoch; Table 20 lists no NLL term</td></tr>
+    <tr><td class="row">RL stage</td><td>none in the recipe; PPO explored, no numbers published</td><td>PPO against a verifier; α = 10; β 0.05 (8B), 0.07 (70B)</td></tr>
+    <tr><td class="row">Reward model's job</td><td>picks the best of K samples; quality-filters SFT data</td><td>initializes the RLVR value model; used in the PPO-versus-DPO test</td></tr>
+  </tbody>
+</table>
+
+<h2 id="llama3">2. Llama 3: a six-round data engine with DPO at the end</h2>
+
+<h3 id="llama3-round">2.1 One round, five operations</h3>
+<p>The report's backbone is "a reward model and a language model"<a class="cite" href="#ref-1">1</a> (§4.1). Each round runs SFT and then DPO on data "collected either via human annotations or generated synthetically", and the whole procedure is applied "in six rounds", collecting "new preference annotations and SFT data, sampling synthetic data from the latest models" in each (§4, §4.1.6). Figure 2 steps through one round. The reward model never appears in the DPO loss; its jobs are selecting the best of K samples for SFT data and scoring data quality (Section 2.3).</p>
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 236" role="img" aria-label="Stepper over one Llama 3 post-training round: annotate, fit the reward model, rejection-sample, SFT, DPO and average, then the best model feeds the next round">
+      <defs>
+        <marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+      </defs>
+      <g data-step="1">
+        <rect x="14" y="12" width="170" height="30" rx="6" class="d-block-muted"/><text x="99" y="32" text-anchor="middle" class="d-text-inv d-bold">Annotate</text>
+        <rect x="194" y="12" width="566" height="30" rx="6" class="d-surface"/><text x="204" y="32" class="d-small">two responses from two models of the last round; 4 strength levels; optional edit</text>
+      </g>
+      <g data-step="2">
+        <rect x="14" y="48" width="170" height="30" rx="6" class="d-block-muted"/><text x="99" y="68" text-anchor="middle" class="d-text-inv d-bold">Reward model</text>
+        <rect x="194" y="48" width="566" height="30" rx="6" class="d-surface"/><text x="204" y="68" class="d-small">fit on all preference data so far, similar pairs dropped; margin term removed</text>
+      </g>
+      <g data-step="3">
+        <rect x="14" y="84" width="170" height="30" rx="6" class="d-block-2"/><text x="99" y="104" text-anchor="middle" class="d-text-inv d-bold">Rejection sampling</text>
+        <rect x="194" y="84" width="566" height="30" rx="6" class="d-surface"/><text x="204" y="104" class="d-small">K = 10–30 samples per prompt from the best checkpoint; the RM keeps the best</text>
+      </g>
+      <g data-step="4">
+        <rect x="14" y="120" width="170" height="30" rx="6" class="d-block"/><text x="99" y="140" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+        <rect x="194" y="120" width="566" height="30" rx="6" class="d-surface"/><text x="204" y="140" class="d-small">RS data + synthetic + human-curated; prompt tokens masked; lr 1e-5; 8.5K–9K steps</text>
+      </g>
+      <g data-step="5">
+        <rect x="14" y="156" width="170" height="30" rx="6" class="d-block"/><text x="99" y="176" text-anchor="middle" class="d-text-inv d-bold">DPO + averaging</text>
+        <rect x="194" y="156" width="566" height="30" rx="6" class="d-surface"/><text x="204" y="176" class="d-small">newest batches only; β 0.1; NLL 0.2; formatting tokens masked; models averaged</text>
+        <path d="M760,171 L782,171 L782,27 L762,27" class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <text x="782" y="210" text-anchor="end" class="d-small d-text-light">best model of this round annotates and samples the next</text>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Annotate.</b> Annotators compare two responses sampled from two different models, which "can be trained with different data mixes and alignment recipes", so capability strengths differ by pair. They mark one of four preference strengths and may edit the chosen response, which gives edited &gt; chosen &gt; rejected for some prompts. Prompt complexity is raised each round "to target areas where the model lags"<a class="cite" href="#ref-1">1</a> (§4.2.1). Module 4 covers the strength labels.</li>
+    <li><b>Fit the reward model.</b> The model starts from the pre-trained checkpoint and trains on "all of our preference data" after similar pairs are filtered out. The loss is Llama 2's without the margin term, "as we observe diminishing improvements after data scaling", and two or three ranked responses share one row, which improved training efficiency "without a loss in accuracy" in the authors' ablations (§4.1.2).</li>
+    <li><b>Rejection-sample.</b> For each annotation prompt the team samples K outputs, "typically between 10 and 30", from the latest chat policy (usually the best checkpoint of the previous iteration, or the best for one capability) and keeps the reward model's top pick. Later rounds add system prompts that steer tone and format (§4.2.2).</li>
+    <li><b>SFT.</b> Cross-entropy on the target tokens with prompt tokens masked, over rejection-sampled responses, synthetic capability data and small human-curated sets. The largest models use a learning rate of 10<sup>-5</sup> for 8.5K to 9K steps, a setting the authors found to "work well across different rounds and data mixes" (§4.1.3).</li>
+    <li><b>DPO and averaging.</b> DPO uses "the most recent batches of preference data collected using the best performing models from the previous alignment rounds", with only pairs labeled significantly better or better; checkpoints from different data versions or hyperparameters are averaged at each of the RM, SFT and DPO stages (§4.1.4, §4.1.5, §4.2.1). Module 7 (Sections 3 and 6.2) covers the DPO settings and the on-policy argument.</li>
+  </ol>
+</div>
+<p><b>Figure 2.</b> One Llama 3 round, stepped. Grey rows are the preference data and the reward model, cyan is sampling once from an earlier checkpoint, blue is an offline update of the policy. Source: Llama 3 §4.1-§4.2 and Figure 7<a class="cite" href="#ref-1">1</a>.</p>
+
+<h3 id="llama3-data">2.2 What the loop is fed</h3>
+<p>Table 3 puts the report's two data tables side by side. The preference set is overwhelmingly general English (81.99% of comparisons), with responses of 284.0 tokens on average. The SFT set is a different mix, 52.66% general English, 21.19% reasoning and tools and 14.89% code, and the report notes that "SFT and preference data contain overlapping domains" but "are curated differently". The long-context rows are a case where example counts mislead: they are 0.11% of SFT examples but average 38,135.6 tokens each, about 5% of all SFT tokens (derived from Table 7). The report found that mixing 0.1% of synthetic long-context data into the short-context SFT data "optimizes the performance across both short-context and long-context benchmarks", and that DPO on short-context data alone did not hurt long-context ability, which the authors suspect is because the DPO recipe "has fewer optimizer steps than SFT" (§4.3.4).</p>
+
+<table class="tbl tbl-dense">
+  <caption><b>Table 3.</b> Llama 3 post-training data statistics. Preference columns are from the report's Table 6 (human comparisons, split to the turn level); SFT columns are from its Table 7. Tokens are averages per example; "context" is all turns before the final response. A dash means the category does not appear in that table. Source: Llama 3 §4.2.1-§4.2.2<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Category</th><th class="num">Pref. share (%)</th><th class="num">Pref. response (tokens)</th><th class="num">SFT share (%)</th><th class="num">SFT turns</th><th class="num">SFT context (tokens)</th><th class="num">SFT final response (tokens)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">General English</td><td class="num">81.99</td><td class="num">271.2</td><td class="num">52.66</td><td class="num">6.3</td><td class="num">656.7</td><td class="num">317.1</td></tr>
+    <tr><td class="row">Code</td><td class="num">6.93</td><td class="num">462.9</td><td class="num">14.89</td><td class="num">2.7</td><td class="num">378.8</td><td class="num">374.5</td></tr>
+    <tr><td class="row">Multilingual</td><td class="num">5.19</td><td class="num">420.9</td><td class="num">3.01</td><td class="num">2.7</td><td class="num">230.8</td><td class="num">289.7</td></tr>
+    <tr><td class="row">Reasoning and tools</td><td class="num">5.89</td><td class="num">129.9</td><td class="num">21.19</td><td class="num">3.1</td><td class="num">359.8</td><td class="num">301.9</td></tr>
+    <tr><td class="row">Exam-like</td><td class="num">-</td><td class="num">-</td><td class="num">8.14</td><td class="num">2.3</td><td class="num">124.4</td><td class="num">173.4</td></tr>
+    <tr><td class="row">Long context</td><td class="num">-</td><td class="num">-</td><td class="num">0.11</td><td class="num">6.7</td><td class="num">37,395.2</td><td class="num">740.5</td></tr>
+    <tr><td class="row">Total</td><td class="num">100</td><td class="num">284.0</td><td class="num">100</td><td class="num">4.7</td><td class="num">535.7</td><td class="num">310.4</td></tr>
+  </tbody>
+</table>
+
+<p>Because most of the data is model-generated, the report spends a subsection on quality control (§4.2.3). Rule-based cleaning removes patterns such as excess emoji and exclamation marks and rebalances overused apology phrases. Model-based pruning then applies four tools: a Llama 3 8B topic classifier; a quality score that keeps examples in the top quartile of reward-model scores <em>or</em> at the maximum of a Llama-based rating, taking the union because the two signals "have high disagreement rates"; a difficulty score from Instag intention counts and a Llama rating; and semantic deduplication that clusters dialogs with RoBERTa embeddings and greedily keeps examples in order of quality times difficulty under a similarity threshold. The last two steps show the intent: the loop does not only drop bad data, it prioritizes the complex examples that remain.</p>
+
+<h3 id="llama3-rs">2.3 Rejection sampling is the policy-improvement step</h3>
+<p>Algorithmically, rejection sampling followed by SFT is a one-step best-of-K operator: sample K outputs, keep the highest-scoring, train on it with cross-entropy. In DeepSeekMath's unified view it is the member of the PPO and GRPO family whose gradient coefficient is a binary keep-or-drop on sampled outputs, where PPO uses a graded advantage<a class="cite" href="#ref-3">3</a> (§5.2.1; Module 7, Section 7). The reward model's scores never enter a gradient, so the stage runs on an ordinary inference stack; what it costs is generation, K samples per prompt from a 405B model, repeated each round.</p>
+<p>Meta's inference-side answer is PagedAttention. To remove swap-out when the cache fills, it defines a maximum output length and admits a request only if memory can hold an output of that length; it also shares a prompt's key-value pages across all of that prompt's outputs. "Together, this leads to a throughput improvement of over 2× during rejection sampling"<a class="cite" href="#ref-1">1</a> (§4.2.2). The report does not split the 2× among dynamic allocation, admission control and prompt sharing; the sharing part can be bounded from its own tables.</p>
+
+<details class="more"><summary>Derivation: how much key-value memory prompt sharing saves per prompt</summary>
+<p>Llama 3 405B has 126 layers, 8 key-value heads and a head dimension of 128 (model dimension 16,384 over 128 heads)<a class="cite" href="#ref-1">1</a> (Table 3). The cache dtype is not stated; assume BF16, 2 bytes. Per token:</p>
+$$ 2 \times 126 \times 8 \times 128 \times 2\ \text{B} = 516{,}096\ \text{B} \approx 0.52\ \text{MB}. $$
+<p>Take Table 7's SFT averages as stand-ins for a rejection-sampling prompt (context \(c = 535.7\) tokens, response \(r = 310.4\) tokens; the report gives no lengths for those prompts). With \(K\) samples per prompt:</p>
+$$ \text{unshared: } K(c+r) \qquad \text{shared: } c + K r \qquad \text{ratio} = \frac{K(c+r)}{c+Kr} \xrightarrow{K\to\infty} \frac{c+r}{r} = \frac{846.1}{310.4} = 2.73. $$
+<p>At \(K=30\), the top of the report's range, unshared is 25,383 tokens (13.10 GB) and shared 9,847.7 tokens (5.08 GB), a ratio of 2.58; at \(K=10\), 4.37 GB against 1.88 GB, 2.32 (derived). The ratio cannot pass \((c+r)/r\), because the responses themselves are never shared. It is a footprint ratio, not a throughput, of the same order as the report's measured "over 2×" and no more than that.</p>
+</details>
+
+<div class="calc">
+  <p class="calc-title">Rejection-sampling KV footprint per prompt, Llama 3 405B</p>
+  <div class="calc-row"><label for="f2k">Samples per prompt K</label><input type="range" id="f2k" name="K" min="2" max="64" step="1" value="30"></div>
+  <div class="calc-row"><label for="f2c">Context tokens</label><input type="range" id="f2c" name="ctx" min="64" max="4096" step="1" value="536"></div>
+  <div class="calc-row"><label for="f2r">Response tokens</label><input type="range" id="f2r" name="resp" min="32" max="2048" step="1" value="310"></div>
+  <div class="calc-row"><label for="f2b">KV dtype</label><select id="f2b" name="b"><option value="2">BF16 (2 B)</option><option value="1">FP8 (1 B)</option></select><span></span></div>
+  <div class="calc-out">
+    <div>KV per token<output data-expr="2 * 126 * 8 * 128 * b" data-format="bytes10"></output></div>
+    <div>K separate copies<output data-expr="K * (ctx + resp) * 2 * 126 * 8 * 128 * b" data-format="bytes10"></output></div>
+    <div>Prompt pages shared<output data-expr="(ctx + K * resp) * 2 * 126 * 8 * 128 * b" data-format="bytes10"></output></div>
+    <div>Footprint ratio<output data-expr="K * (ctx + resp) / (ctx + K * resp)" data-format="fixed:2" data-unit="×"></output></div>
+  </div>
+  <p class="calc-note">Formula: KV bytes per token = \( 2 L H_{kv} d\, b \) with \( L = 126 \), \( H_{kv} = 8 \), \( d = 128 \) (Llama 3 Table 3); shared footprint \( (c + K r)\) tokens, unshared \( K (c + r) \). Defaults are Table 7's average context and response, rounded to integers; the cache dtype is an assumption, not a report figure.</p>
+</div>
+
+<h3 id="llama3-capabilities">2.4 Where a checkable signal enters: filters on SFT data</h3>
+<p>The capability sections (§4.3) are where Llama 3 comes closest to verifiable rewards. The motivating observation is blunt: "training Llama 3 405B on its own generated data is not helpful (and can even degrade performance)", so the team "introduced execution feedback as a source of truth"<a class="cite" href="#ref-1">1</a> (§4.3.1). Parsers, linters, unit tests run in containers, final-answer checks and learned outcome and stepwise reward models decide which generated dialogs survive into SFT (Table 4). About 20% of the roughly one million execution-checked coding dialogs "were initially incorrect but self-corrected".</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> Capability pipelines in Llama 3 and the point where a checkable or learned signal acts. In every row the signal selects or repairs SFT data; none is a reward in a policy-gradient loop. Source: Llama 3 §4.3<a class="cite" href="#ref-1">1</a>.</caption>
+  <thead><tr><th>Capability</th><th>Signal that decides what survives</th><th>What it produces</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Code, execution feedback</td><td>parser and linter; model-written unit tests in containers; failures revised from stdout, stderr and return code</td><td>about 1M coding dialogs</td></tr>
+    <tr><td class="row">Code, rejection-sampled</td><td>an earlier Llama 3 as judge, 0 or 1 for correctness and style; keep 2 of 2; hardest examples revised until they pass</td><td>SFT data; the strict filter first cost score by removing hard prompts</td></tr>
+    <tr><td class="row">Code, translation and back-translation</td><td>parse, compile, execute; or the model scores round-trip faithfulness</td><td>about 1.2M back-translated dialogs; over 2.7M synthetic code examples in all</td></tr>
+    <tr><td class="row">Math and reasoning</td><td>final-answer match, self-verification, outcome and stepwise RMs, MCTS with stepwise RMs on hard prompts, code execution</td><td>filtered and generated reasoning traces</td></tr>
+    <tr><td class="row">Factuality</td><td>judge scores answers against the source snippet; refusals written where answers are consistently informative and wrong</td><td>SFT data that refuses what the model does not know</td></tr>
+    <tr><td class="row">Tool use</td><td>message-level human preference or edit; no rejection sampling, since "we did not observe gains in our tool benchmarks"</td><td>preference data and SFT</td></tr>
+    <tr><td class="row">Multilingual</td><td>language-match checks before RM selection; temperature fixed at 0.6 in the final round</td><td>rejection-sampled data, 18.8% of the multilingual mix</td></tr>
+  </tbody>
+</table>
+
+<p>The pattern is the point: each row is a checker used as an offline filter. Tulu 3's contribution, taken up in Section 3.4, is to put a checker of the same kind in the reward slot of an online loop. Two details bear on later modules. For reasoning data Llama 3 trains "outcome and stepwise reward models" and runs Monte Carlo tree search with step-level reward models on hard prompts, and DeepSeek-R1 would later list process reward models and tree search among its failed attempts for RL<a class="cite" href="#ref-4">4</a> (Supplementary G.2; Module 4, Section 4.5, and Module 27); the contexts differ, since Llama 3 uses them to curate data and R1 tried them as a training signal. And the factuality recipe, which turns consistently wrong answers into refusals, is an SFT-time attempt at the abstain-when-unsure behavior that binary RL rewards do not teach (Module 24).</p>
+
+<h3 id="llama3-unpublished">2.5 What the report does not publish</h3>
+<p>The post-training section gives recipes, not ablations. In §4 and §5.2 it publishes no PPO numbers, no benchmark score per round, no separation of rejection-sampling SFT from DPO, no reward-model size, and no example count for either Table 6 or Table 7, only percentages and averages<a class="cite" href="#ref-1">1</a> (§4.1-§4.2). Its end result is Table 2 of the report: for the 405B model, IFEval 88.6, GSM8K 96.8, MATH 73.8, HumanEval 89.0 and GPQA 51.1, in Meta's harness (see Table 1 above for what that harness does to comparisons). What the DPO stage contributed on top of rejection-sampling SFT is not recoverable from the report; Tulu 3, which publishes per-stage scores, is the better evidence for that question (Section 3.5).</p>
+
+<h2 id="tulu3">3. Tulu 3: evaluation first, three stages, one verifier stage</h2>
+
+<h3 id="tulu3-eval">3.1 The measuring instrument and the prompt pool</h3>
+<p>Ai2's first deliverable is the evaluation. The development suite covers knowledge (MMLU, PopQA, TruthfulQA), reasoning (BBH, DROP), math (GSM8K, MATH), code (HumanEval, HumanEval+), instruction following (IFEval, AlpacaEval 2) and a safety average. The held-out suite covers the same skills, except safety, with MMLU-Pro, GPQA, AGIEval, DeepMind Mathematics, BigCodeBench, HREF and IFEval-OOD, whose constraint set is disjoint from IFEval's<a class="cite" href="#ref-2">2</a> (Tables 3 and 24, §7.3). The prompt pool has 23,327,961 prompts; 939,344 are used in SFT and 425,145 appear in the DPO column (Table 7).</p>
+<p>Contamination is handled before training. Ai2 chose 8-gram matching over full-string and embedding matching, because embeddings made it "difficult to distinguish mere distributional similarity from actual paraphrasing". A test instance overlaps a training instance if more than 50% of its tokens sit in shared 8-grams, and a training set is contaminated if its instances overlap more than 2% of any evaluation's instances; datasets contaminated against the held-out suite were dropped, and for the development suite either the whole dataset or the matched instances (§3.2). Table 8 shows the removals: 11.3% of NuminaMath-TIR, 5.4% of the WildChat GPT-4 subset, 3.5% of Evol CodeAlpaca, 1.1% of WildGuardMix and 0.7% of WildJailbreak. The RLVR prompts are the GSM8K and MATH training splits plus constraint prompts built from the Tulu 2 SFT mix (§6.1); the decontamination section does not mention them separately, and Module 20 (Section 6) covers what contamination does to RL measurements.</p>
+
+<h3 id="tulu3-sft">3.2 SFT: a mix built from per-skill upper bounds</h3>
+<p>The mix was built backwards from ceilings. For each lagging skill the team trained a specialist on skill-specific data, which approximates the best that evaluation can reach, then mixed datasets until one model came close to every ceiling, adding, removing, decontaminating and downsampling along the way (§4.1.2). Synthetic diversity came from persona prompting: about 250K personas steer GPT-4o to write prompts for instruction following, math and code. The instruction-following set starts from 33 seeds covering 25 IFEval constraint types and yields 29,980 verifiable instruction-response pairs; the math and code sets total about 220K and 35K instances (§3.1.2).</p>
+<p>Table 10's ablations on the 8B SFT model show what each slice bought (differences are removal minus the full mix). Dropping math data cuts GSM8K from 76.2 to 64.1 and MATH from 31.5 to 23.5; dropping persona data cuts IFEval from 72.8 to 53.6; dropping WildChat cuts AlpacaEval 2 from 12.4 to 7.5; dropping safety data cuts the safety average from 93.1 to 74.7 and leaves other skills within 2 points (derived), under the report's heading "Safety is Orthogonal"<a class="cite" href="#ref-2">2</a> (§4.2). Training is two epochs at batch size 128 and 4,096 tokens, learning rate 5e-6 at 8B and 2e-6 at 70B, on 32 GPUs for 6 hours and 64 GPUs for 50 hours (Table 11, §4.3). The checkpoints average 60.1 (8B) and 72.6 (70B) against 48.3 and 63.6 for the Tulu 2 mix (Table 9). One caution: the same 8B SFT checkpoint is scored 62.1 on MMLU in Table 9 and 65.9 in Table 6, with no explanation, so take deltas within one table.</p>
+<p>Two training details transfer to RL. First, Ai2's SFT gap to TPU-trained baselines traced to loss aggregation: averaging over tokens within a batch weights tokens equally, while per-sample averaging under gradient accumulation weights examples equally, and the two differ whenever lengths differ. Ai2 switched to a sum loss, which weights tokens equally (§4.3.2); Module 11 shows the same choice reappearing in GRPO. Second, seed noise is large next to the effects compared: five 8B seeds span 59.8 to 60.1 and three 70B seeds span 70.0 to 72.6 (Table 14), and model soups did not reliably beat the best single run (60.2 and 72.5 against 60.1 and 72.6), so Ai2 shipped single runs. Llama 3 averages models at every stage (Section 2.1) and reports no comparison with a single run.</p>
+
+<h3 id="tulu3-preference">3.3 Preference data: a pipeline, and what its ablations found</h3>
+<p>The preference pipeline adapts UltraFeedback. For each prompt, four responses are drawn from a pool of 22 models, with one taken from the Tulu 3 SFT model on a subset to make the pair on-policy; GPT-4o-2024-08-06 rates each from 1 to 5 on helpfulness, instruction following, honesty and truthfulness; the best mean rating is chosen and a random lower-mean response is rejected<a class="cite" href="#ref-2">2</a> (§5.2.1). The SFT prompts alone give 96,911 off-policy and 19,444 on-policy instances; the final mixes add unused prompts, WildChat, UltraFeedback and instruction-following sets for 271,409 pairs at 8B and 334,302 at 70B (Table 15). Module 8 (Section 7) compares this labeler with the other recipes and Module 7 (Section 3.4) covers pair construction.</p>
+<p>The report's ablations (§5.3) are unusually specific about what moved the DPO result.</p>
+<ul>
+<li><b>Unique prompts, not duplicated ones.</b> Average score rose as unique prompts grew from 5% to 100% of the pool, but expanding UltraFeedback's 64k prompts into 180k and 383k pairs by recombining responses gave no better average than 64k.</li>
+<li><b>New prompts and on-policy responses.</b> Prompts unused by SFT beat reused SFT prompts slightly, the best mix used both, and adding on-policy SFT responses improved the aggregate over a fully off-policy set.</li>
+<li><b>The judge mattered little.</b> DPO models trained on annotations from five judges averaged 57.3 (GPT-4o), 57.2 (Llama 3.1 405B), 57.0 (GPT-4 Turbo), 56.9 (GPT-4o mini) and 56.6 (Llama 3.1 70B), a 0.7-point spread (derived); Ai2 chose GPT-4o for cost, ease of use and the Batch API (Table 17).</li>
+<li><b>Verifiers as data filters.</b> Persona-IF pairs rewrite a prompt to relax one constraint and use the response to the relaxed prompt as the rejected answer to the original; of three persona sets only IF helped its target. A second IF set ran chosen completions through constraint verifiers, cutting more than 66k instances to about 26k (39%), and improved IFEval by only 1 point at a small cost to the average, so the unverified set stayed (Figures 13-14).</li>
+</ul>
+<p>The algorithm choice rests on Table 18, an early SFT checkpoint with UltraFeedback: of DPO, SimPO and length-normalized DPO, only the last beat the SFT base (57.3 against 55.7 at β = 5, one epoch), and it moved by 10.5 points across settings. Module 7 (Section 4.6 and Figure 6) plots every row. Final settings are in Table 2 above; the 8B run took 10 hours on 8 H100 GPUs and the 70B run 19 hours on 64, using cached reference log-probabilities and separate chosen and rejected forward passes to cut peak GPU memory (§5.4). The verifier-filtered IF pairs are the nearest thing to RLVR inside the DPO stage, and the next stage reuses the same constraint verifiers as a reward.</p>
+
+<h3 id="tulu3-rlvr">3.4 RLVR: a small last stage with a checker in the reward slot</h3>
+<p>Stage three swaps the reward model for a program. Tulu 3 defines RLVR as the RLHF objective "with the reward model replaced by a verification function", with reward α = 10 if the completion verifies and 0 otherwise<a class="cite" href="#ref-2">2</a> (§6, Eq. 7-8). Module 10 (Section 1) covers the definition and the name; Module 5 (Section 8) covers the PPO configuration, the value-model and KL ablations, and the infrastructure (asynchronous PPO, dedicated vLLM GPUs placed by Ray). This section keeps only what bears on the recipe's order and size, and Figure 3 puts the whole pipeline in one place.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 372" role="img" aria-labelledby="f3t"><title id="f3t">Tulu 3 stage pipeline with data, method, derived GPU-hours and average score per stage</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <text x="72" y="88.0" text-anchor="end" class="d-small d-text-light">data</text>
+    <text x="72" y="168.0" text-anchor="end" class="d-small d-text-light">method</text>
+    <text x="72" y="244.0" text-anchor="end" class="d-small d-text-light">GPU-hours</text>
+    <text x="72" y="313.0" text-anchor="end" class="d-small d-text-light">avg score</text>
+    <rect x="80" y="10" width="160" height="34" rx="8" class="d-block-muted"/>
+    <text x="160.0" y="32" text-anchor="middle" class="d-text-inv d-bold">Prompt pool</text>
+    <path d="M240,27 L262,27" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <rect x="80" y="54" width="160" height="60" rx="6" class="d-surface"/>
+    <text x="160.0" y="72" text-anchor="middle" class="d-small">23,327,961 prompts</text>
+    <text x="160.0" y="88" text-anchor="middle" class="d-small">in the pool (Table 7)</text>
+    <rect x="80" y="122" width="160" height="84" rx="6" class="d-surface"/>
+    <text x="160.0" y="140" text-anchor="middle" class="d-small">8-gram match; a dataset</text>
+    <text x="160.0" y="156" text-anchor="middle" class="d-small">is dropped if more than</text>
+    <text x="160.0" y="172" text-anchor="middle" class="d-small">2% of an eval overlaps</text>
+    <text x="160.0" y="188" text-anchor="middle" class="d-small">(unseen evals: always)</text>
+    <rect x="80" y="214" width="160" height="52" rx="6" class="d-hl"/>
+    <text x="160.0" y="236" text-anchor="middle" class="d-small d-mono">no training</text>
+    <rect x="80" y="274" width="160" height="70" rx="6" class="d-panel"/>
+    <text x="160.0" y="300" text-anchor="middle" class="d-small d-text-light">Llama 3.1 Instruct</text>
+    <text x="160.0" y="324" text-anchor="middle" class="d-mono d-bold">62.9 / 74.1</text>
+    <rect x="262" y="10" width="160" height="34" rx="8" class="d-block"/>
+    <text x="342.0" y="32" text-anchor="middle" class="d-text-inv d-bold">SFT</text>
+    <path d="M422,27 L444,27" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <rect x="262" y="54" width="160" height="60" rx="6" class="d-surface"/>
+    <text x="342.0" y="72" text-anchor="middle" class="d-small">939,344 prompts</text>
+    <text x="342.0" y="88" text-anchor="middle" class="d-small">persona-driven synthetic</text>
+    <text x="342.0" y="104" text-anchor="middle" class="d-small">plus public datasets</text>
+    <rect x="262" y="122" width="160" height="84" rx="6" class="d-surface"/>
+    <text x="342.0" y="140" text-anchor="middle" class="d-small">cross-entropy, sum loss</text>
+    <text x="342.0" y="156" text-anchor="middle" class="d-small">2 epochs, batch 128</text>
+    <text x="342.0" y="172" text-anchor="middle" class="d-small">lr 5e-6 (8B), 2e-6 (70B)</text>
+    <text x="342.0" y="188" text-anchor="middle" class="d-small">best seed, no soup</text>
+    <rect x="262" y="214" width="160" height="52" rx="6" class="d-hl"/>
+    <text x="342.0" y="234" text-anchor="middle" class="d-small d-mono">8B: 32 x 6 h = 192</text>
+    <text x="342.0" y="250" text-anchor="middle" class="d-small d-mono">70B: 64 x 50 h = 3,200</text>
+    <rect x="262" y="274" width="160" height="70" rx="6" class="d-panel"/>
+    <text x="342.0" y="300" text-anchor="middle" class="d-small d-text-light">SFT</text>
+    <text x="342.0" y="324" text-anchor="middle" class="d-mono d-bold">60.6 / 72.6</text>
+    <rect x="444" y="10" width="160" height="34" rx="8" class="d-block"/>
+    <text x="524.0" y="32" text-anchor="middle" class="d-text-inv d-bold">DPO</text>
+    <path d="M604,27 L626,27" class="d-arrow" marker-end="url(#f3-arr)"/>
+    <rect x="444" y="54" width="160" height="60" rx="6" class="d-surface"/>
+    <text x="524.0" y="72" text-anchor="middle" class="d-small">271,409 pairs (8B)</text>
+    <text x="524.0" y="88" text-anchor="middle" class="d-small">334,302 pairs (70B)</text>
+    <text x="524.0" y="104" text-anchor="middle" class="d-small">GPT-4o-judged</text>
+    <rect x="444" y="122" width="160" height="84" rx="6" class="d-surface"/>
+    <text x="524.0" y="140" text-anchor="middle" class="d-small">length-normalized, β 5</text>
+    <text x="524.0" y="156" text-anchor="middle" class="d-small">1 epoch, batch 128</text>
+    <text x="524.0" y="172" text-anchor="middle" class="d-small">lr 5e-7 (8B), 2e-7 (70B)</text>
+    <text x="524.0" y="188" text-anchor="middle" class="d-small">cached ref. log-probs</text>
+    <rect x="444" y="214" width="160" height="52" rx="6" class="d-hl"/>
+    <text x="524.0" y="234" text-anchor="middle" class="d-small d-mono">8B: 8 x 10 h = 80</text>
+    <text x="524.0" y="250" text-anchor="middle" class="d-small d-mono">70B: 64 x 19 h = 1,216</text>
+    <rect x="444" y="274" width="160" height="70" rx="6" class="d-panel"/>
+    <text x="524.0" y="300" text-anchor="middle" class="d-small d-text-light">DPO</text>
+    <text x="524.0" y="324" text-anchor="middle" class="d-mono d-bold">64.7 / 76.2</text>
+    <rect x="626" y="10" width="160" height="34" rx="8" class="d-block-accent"/>
+    <text x="706.0" y="32" text-anchor="middle" class="d-text-inv d-bold">RLVR (PPO)</text>
+    <rect x="626" y="54" width="160" height="60" rx="6" class="d-surface"/>
+    <text x="706.0" y="72" text-anchor="middle" class="d-small">29,946 prompts</text>
+    <text x="706.0" y="88" text-anchor="middle" class="d-small">7,473 GSM8K, 7,500 MATH</text>
+    <text x="706.0" y="104" text-anchor="middle" class="d-small">14,973 IF constraints</text>
+    <rect x="626" y="122" width="160" height="84" rx="6" class="d-surface"/>
+    <text x="706.0" y="140" text-anchor="middle" class="d-small">α = 10 if verified</text>
+    <text x="706.0" y="156" text-anchor="middle" class="d-small">β 0.05 (8B), 0.07 (70B)</text>
+    <text x="706.0" y="172" text-anchor="middle" class="d-small">value model from a RM</text>
+    <text x="706.0" y="188" text-anchor="middle" class="d-small">async, vLLM on Ray</text>
+    <rect x="626" y="214" width="160" height="52" rx="6" class="d-hl"/>
+    <text x="706.0" y="234" text-anchor="middle" class="d-small d-mono">8B: 8 x 65 h = 520</text>
+    <text x="706.0" y="250" text-anchor="middle" class="d-small d-mono">70B: 48 x 60 h = 2,880</text>
+    <rect x="626" y="274" width="160" height="70" rx="6" class="d-panel"/>
+    <text x="706.0" y="300" text-anchor="middle" class="d-small d-text-light">RLVR</text>
+    <text x="706.0" y="324" text-anchor="middle" class="d-mono d-bold">65.1 / 76.2</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The Tulu 3 pipeline, stage by stage. The amber row is derived GPU-hours (GPUs times hours from the report's prose; Section 3.6). The bottom row is each stage's average score on the 12-benchmark development suite, 8B / 70B, with Llama 3.1 Instruct as the same-harness baseline. Sources: Tulu 3 Tables 5-7, 11, 15, 20-22, §4.3, §5.4, §6.3<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<p>RLVR starts from the best DPO checkpoint. At 8B the team tried the best overall DPO model and the best one with Persona-IF data; at 70B, the best overall one (§6.4). The prompt set is 29,946 prompts: 7,473 GSM8K and 7,500 MATH training questions, with exact match against an extracted answer, and 14,973 instruction-following prompts with prompt-specific verifiers (Table 22). Ablation runs used 100,000 episodes, about 13 passes over GSM8K's 7,473 prompts, and the final 70B run 400,000 episodes at batch 640 and learning rate 1e-7 (Table 21, §6.2, §6.4). One discrepancy matters when you reproduce it: the §6.4 text gives the final 70B run β = 0.7 and a warm-up ratio of 0.1, while the Table 21 caption gives β = 0.07 and ω = 0.07. This module uses the caption's 0.07, as Modules 5 and 6 do; the sweeps in the report run from 0.001 to 0.15, which makes 0.7 the odd value.</p>
+<p>The result is a targeted stage. At 8B, RLVR moves GSM8K from 84.3 to 87.6, MATH from 42.0 to 43.7 and IFEval from 81.1 to 82.4; at 70B, GSM8K stays at 93.5, which the report calls close to saturation, MATH moves 62.3 to 63.0 and IFEval 82.6 to 83.2 (Table 23). Final checkpoints were picked on the development suite for the best overall MATH and IFEval; some 8B runs reached 89.4% GSM8K and 84.8% IFEval but lowered the other metrics and the average (§6.4). Lambert reads this as RL "done surgically", with a narrow prompt distribution that does not squash general capability<a class="cite" href="#ref-5">5</a> (§3.1.6). Section 3.5 asks what the held-out suite says about that. A caution on secondary summaries: Lambert's book describes the recipe as about 1M SFT examples, about 1M preference pairs and about 10K RLVR prompts<a class="cite" href="#ref-5">5</a> (§3.2.2), while the report's own tables give 939,344, 271,409 (8B) or 334,302 (70B), and 29,946; use the report's counts.</p>
+
+<h3 id="tulu3-stages">3.5 What each stage added, and what the held-out suite says</h3>
+<p>The report's summary tables (4, 5 and 6) give each stage's average, which Figure 4 plots. DPO is where the aggregate moves: +4.1 points over SFT at 8B, +3.6 at 70B and +2.7 at 405B (derived; the 405B average excludes safety). RLVR adds +0.4, +0.0 and +1.0. The same-base Instruct model sits between the SFT and DPO checkpoints at all three sizes, and the final models lead it on the development average by 2.2, 2.1 and 1.9 points (derived). For scale, three seeds of the 70B SFT run differed by up to 2.6 points on the report's average (Table 14).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f4t"><title id="f4t">Average score after SFT, DPO and RLVR for Tulu 3 at 8B, 70B and 405B against Llama 3.1 Instruct, three panels with truncated axes</title>
+    <text x="156.0" y="24" text-anchor="middle" class="d-bold">8B (Table 6)</text>
+    <line x1="56" y1="250.0" x2="256" y2="250.0" class="d-grid"/>
+    <text x="50" y="254.0" text-anchor="end" class="d-mono d-small">58</text>
+    <line x1="56" y1="210.0" x2="256" y2="210.0" class="d-grid"/>
+    <text x="50" y="214.0" text-anchor="end" class="d-mono d-small">60</text>
+    <line x1="56" y1="170.0" x2="256" y2="170.0" class="d-grid"/>
+    <text x="50" y="174.0" text-anchor="end" class="d-mono d-small">62</text>
+    <line x1="56" y1="130.0" x2="256" y2="130.0" class="d-grid"/>
+    <text x="50" y="134.0" text-anchor="end" class="d-mono d-small">64</text>
+    <line x1="56" y1="90.0" x2="256" y2="90.0" class="d-grid"/>
+    <text x="50" y="94.0" text-anchor="end" class="d-mono d-small">66</text>
+    <line x1="56" y1="50.0" x2="256" y2="50.0" class="d-grid"/>
+    <text x="50" y="54.0" text-anchor="end" class="d-mono d-small">68</text>
+    <line x1="56" y1="50" x2="56" y2="250" class="d-axis"/>
+    <line x1="56" y1="152.0" x2="256" y2="152.0" class="d-line d-stroke-amber d-dashed"/>
+    <polyline points="91.0,198.0 156.0,116.0 221.0,108.0" class="d-line d-stroke-blue"/>
+    <circle cx="91.0" cy="198.0" r="6" class="d-fill-blue"/>
+    <text x="91" y="186.99999999999997" text-anchor="middle" class="d-mono d-small">60.6</text>
+    <text x="91" y="268" text-anchor="middle" class="d-small">SFT</text>
+    <circle cx="156.0" cy="116.0" r="6" class="d-fill-cyan"/>
+    <text x="156" y="104.99999999999994" text-anchor="middle" class="d-mono d-small">64.7</text>
+    <text x="156" y="268" text-anchor="middle" class="d-small">DPO</text>
+    <circle cx="221.0" cy="108.0" r="6" class="d-fill-orange"/>
+    <text x="221" y="97.00000000000011" text-anchor="middle" class="d-mono d-small">65.1</text>
+    <text x="221" y="268" text-anchor="middle" class="d-small">RLVR</text>
+    <text x="254" y="168.00000000000003" text-anchor="end" class="d-small d-text-light">Llama 3.1 Instruct</text>
+    <text x="416.0" y="24" text-anchor="middle" class="d-bold">70B (Table 5)</text>
+    <line x1="316" y1="250.0" x2="516" y2="250.0" class="d-grid"/>
+    <text x="310" y="254.0" text-anchor="end" class="d-mono d-small">70</text>
+    <line x1="316" y1="210.0" x2="516" y2="210.0" class="d-grid"/>
+    <text x="310" y="214.0" text-anchor="end" class="d-mono d-small">72</text>
+    <line x1="316" y1="170.0" x2="516" y2="170.0" class="d-grid"/>
+    <text x="310" y="174.0" text-anchor="end" class="d-mono d-small">74</text>
+    <line x1="316" y1="130.0" x2="516" y2="130.0" class="d-grid"/>
+    <text x="310" y="134.0" text-anchor="end" class="d-mono d-small">76</text>
+    <line x1="316" y1="90.0" x2="516" y2="90.0" class="d-grid"/>
+    <text x="310" y="94.0" text-anchor="end" class="d-mono d-small">78</text>
+    <line x1="316" y1="50.0" x2="516" y2="50.0" class="d-grid"/>
+    <text x="310" y="54.0" text-anchor="end" class="d-mono d-small">80</text>
+    <line x1="316" y1="50" x2="316" y2="250" class="d-axis"/>
+    <line x1="316" y1="168.0" x2="516" y2="168.0" class="d-line d-stroke-amber d-dashed"/>
+    <polyline points="351.0,198.0 416.0,126.0 481.0,126.0" class="d-line d-stroke-blue"/>
+    <circle cx="351.0" cy="198.0" r="6" class="d-fill-blue"/>
+    <text x="351" y="187.0000000000001" text-anchor="middle" class="d-mono d-small">72.6</text>
+    <text x="351" y="268" text-anchor="middle" class="d-small">SFT</text>
+    <circle cx="416.0" cy="126.0" r="6" class="d-fill-cyan"/>
+    <text x="416" y="114.99999999999993" text-anchor="middle" class="d-mono d-small">76.2</text>
+    <text x="416" y="268" text-anchor="middle" class="d-small">DPO</text>
+    <circle cx="481.0" cy="126.0" r="6" class="d-fill-orange"/>
+    <text x="481" y="114.99999999999993" text-anchor="middle" class="d-mono d-small">76.2</text>
+    <text x="481" y="268" text-anchor="middle" class="d-small">RLVR</text>
+    <text x="514" y="184.0000000000001" text-anchor="end" class="d-small d-text-light">Llama 3.1 Instruct</text>
+    <text x="676.0" y="24" text-anchor="middle" class="d-bold">405B, no safety (Table 4)</text>
+    <line x1="576" y1="250.0" x2="776" y2="250.0" class="d-grid"/>
+    <text x="570" y="254.0" text-anchor="end" class="d-mono d-small">74</text>
+    <line x1="576" y1="210.0" x2="776" y2="210.0" class="d-grid"/>
+    <text x="570" y="214.0" text-anchor="end" class="d-mono d-small">76</text>
+    <line x1="576" y1="170.0" x2="776" y2="170.0" class="d-grid"/>
+    <text x="570" y="174.0" text-anchor="end" class="d-mono d-small">78</text>
+    <line x1="576" y1="130.0" x2="776" y2="130.0" class="d-grid"/>
+    <text x="570" y="134.0" text-anchor="end" class="d-mono d-small">80</text>
+    <line x1="576" y1="90.0" x2="776" y2="90.0" class="d-grid"/>
+    <text x="570" y="94.0" text-anchor="end" class="d-mono d-small">82</text>
+    <line x1="576" y1="50.0" x2="776" y2="50.0" class="d-grid"/>
+    <text x="570" y="54.0" text-anchor="end" class="d-mono d-small">84</text>
+    <line x1="576" y1="50" x2="576" y2="250" class="d-axis"/>
+    <line x1="576" y1="168.0" x2="776" y2="168.0" class="d-line d-stroke-amber d-dashed"/>
+    <polyline points="611.0,204.0 676.0,150.0 741.0,130.0" class="d-line d-stroke-blue"/>
+    <circle cx="611.0" cy="204.0" r="6" class="d-fill-blue"/>
+    <text x="611" y="193.00000000000006" text-anchor="middle" class="d-mono d-small">76.3</text>
+    <text x="611" y="268" text-anchor="middle" class="d-small">SFT</text>
+    <circle cx="676.0" cy="150.0" r="6" class="d-fill-cyan"/>
+    <text x="676" y="139.0" text-anchor="middle" class="d-mono d-small">79.0</text>
+    <text x="676" y="268" text-anchor="middle" class="d-small">DPO</text>
+    <circle cx="741.0" cy="130.0" r="6" class="d-fill-orange"/>
+    <text x="741" y="119.0" text-anchor="middle" class="d-mono d-small">80.0</text>
+    <text x="741" y="268" text-anchor="middle" class="d-small">RLVR</text>
+    <text x="774" y="184.0000000000001" text-anchor="end" class="d-small d-text-light">Llama 3.1 Instruct</text>
+    <text x="400" y="306" text-anchor="middle" class="d-small d-text-light">each axis starts above zero and spans 10 points; dashed amber line = Llama 3.1 Instruct in Ai2's harness</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Development-suite average after each Tulu 3 stage, with Llama 3.1 Instruct as the dashed reference line. The 8B and 70B panels average 12 benchmarks including safety; the 405B panel is the report's "average without safety". Data: Tables 6, 5 and 4<a class="cite" href="#ref-2">2</a>. Axes are truncated and each spans 10 points, so slopes are comparable across panels.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> What RLVR changed, by skill, on the development benchmark and on the held-out benchmark of the same skill: final model minus DPO checkpoint, in points (derived from Table 31 of the report<a class="cite" href="#ref-2">2</a>). The last row averages the five development and five held-out columns as the report does. Single runs; the report gives no intervals.</caption>
+  <thead><tr><th>Skill (development → held-out)</th><th class="num">8B dev</th><th class="num">8B held-out</th><th class="num">70B dev</th><th class="num">70B held-out</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Knowledge (MMLU → GPQA)</td><td class="num">-0.5</td><td class="num">+4.5</td><td class="num">-0.2</td><td class="num">0.0</td></tr>
+    <tr><td class="row">Reasoning (BBH → AGIEval)</td><td class="num">+0.2</td><td class="num">-2.5</td><td class="num">+0.2</td><td class="num">0.0</td></tr>
+    <tr><td class="row">Math (MATH → DeepMind Math)</td><td class="num" data-best>+1.7</td><td class="num" data-best>+2.4</td><td class="num">+0.7</td><td class="num">+0.4</td></tr>
+    <tr><td class="row">Code (HumanEval → BigCodeBench)</td><td class="num">0.0</td><td class="num" data-worst>-2.1</td><td class="num">0.0</td><td class="num" data-worst>-1.4</td></tr>
+    <tr><td class="row">Instruction following (IFEval → IFEval-OOD)</td><td class="num">+1.3</td><td class="num">+0.4</td><td class="num">+0.6</td><td class="num">+1.4</td></tr>
+    <tr><td class="row">Average</td><td class="num">+0.5</td><td class="num">+0.5</td><td class="num">+0.2</td><td class="num">0.0</td></tr>
+  </tbody>
+</table>
+
+<p>Table 5 supports a narrow reading. RLVR trained on GSM8K, MATH and IFEval-style constraints, and those two skills rise on both the development and the held-out benchmark at both sizes, by small amounts: held-out math +2.4 and +0.4, held-out instruction following +0.4 and +1.4. The constraint types in training are the 25 shared with IFEval, so the IFEval gain is in distribution, and at 8B it shrinks from +1.3 to +0.4 on IFEval-OOD. Held-out code falls at both sizes. The 8B GPQA jump of 4.5 points against zero at 70B is single-run movement that the report does not explain.</p>
+<p>The held-out suite also qualifies the headline comparison. Table 6 sets Tulu 3 against Llama 3.1 Instruct on benchmarks Tulu 3 did not tune against. Llama 3.1 Instruct leads the held-out average at both sizes, by 2.2 points at 8B and 4.1 at 70B (derived), the reverse of the development lead in Figure 4; Tulu 3 wins only on GPQA. The report calls its results "generally comparable" to the other models, "often falling between" them, and cannot verify that the other models did not train on these benchmarks<a class="cite" href="#ref-2">2</a> (§7.4.2). Its reading of IFEval is that "models generally overfit to IFEval": every model scores far lower on IFEval-OOD, whose constraint set is disjoint. A recipe selected on a development average will look best on that average; the held-out suite is the fairer test.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 6.</b> Held-out suite, Tulu 3 against Llama 3.1 Instruct on the same base, in the report's harness. Higher is better; the best of each pair is marked. Source: Tulu 3 Table 33<a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th>Held-out benchmark</th><th class="num">Llama 3.1 8B Inst.</th><th class="num">Tulu 3 8B</th><th class="num">Llama 3.1 70B Inst.</th><th class="num">Tulu 3 70B</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Average (7 benchmarks)</td><td class="num" data-best>36.4</td><td class="num">34.2</td><td class="num" data-best>51.3</td><td class="num">47.2</td></tr>
+    <tr><td class="row">GPQA, 0-shot CoT</td><td class="num">28.8</td><td class="num" data-best>35.7</td><td class="num">43.8</td><td class="num" data-best>48.0</td></tr>
+    <tr><td class="row">MMLU-Pro, 0-shot CoT</td><td class="num" data-best>49.1</td><td class="num">44.3</td><td class="num" data-best>68.3</td><td class="num">65.8</td></tr>
+    <tr><td class="row">AGIEval English, 0-shot CoT</td><td class="num" data-best>64.2</td><td class="num">59.3</td><td class="num" data-best>77.8</td><td class="num">75.0</td></tr>
+    <tr><td class="row">DeepMind Mathematics, 0-shot CoT</td><td class="num" data-best>39.3</td><td class="num">35.4</td><td class="num" data-best>62.4</td><td class="num">49.8</td></tr>
+    <tr><td class="row">BigCodeBench-Hard, pass@10</td><td class="num" data-best>15.5</td><td class="num">7.4</td><td class="num" data-best>26.4</td><td class="num">21.6</td></tr>
+    <tr><td class="row">IFEval-OOD, prompt loose</td><td class="num" data-best>26.1</td><td class="num">24.3</td><td class="num" data-best>34.5</td><td class="num">27.8</td></tr>
+    <tr><td class="row">HREF, win rate</td><td class="num" data-best>38.5</td><td class="num">32.7</td><td class="num" data-best>45.6</td><td class="num">42.3</td></tr>
+  </tbody>
+</table>
+
+<h3 id="tulu3-compute">3.6 What the stages cost</h3>
+<p>The report gives wall-clock and GPU counts for most stages, enough to derive GPU-hours (Figure 5). At 8B: SFT 32 GPUs for 6 hours, DPO 8 for 10, RLVR 8 for 65, plus a 9-hour, 8-GPU reward model. At 70B: SFT 64 for 50, DPO 64 for 19, RLVR 48 for 60. The three stages sum to 792 GPU-hours at 8B and 7,296 at 70B, and RLVR is 65.7% of the 8B total but 39.5% of the 70B total, where SFT is the largest line at 43.9% (all derived from §4.3, §5.4.1 and §6.3)<a class="cite" href="#ref-2">2</a>. The 405B RLVR run is 256 GPUs for 46 hours, 11,776 GPU-hours, 4.1 times the 70B run for MATH-only prompts; the report gives no GPU-hours for 405B SFT or DPO.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f5t"><title id="f5t">Derived GPU-hours per Tulu 3 stage at 8B and 70B, and the controlled PPO versus DPO comparison</title>
+    <text x="270" y="24" text-anchor="middle" class="d-bold">Final-run GPU-hours per stage (derived)</text>
+    <line x1="56" y1="260.0" x2="526" y2="260.0" class="d-grid"/>
+    <text x="50" y="264.0" text-anchor="end" class="d-mono d-small">0</text>
+    <line x1="56" y1="230.0" x2="526" y2="230.0" class="d-grid"/>
+    <text x="50" y="234.0" text-anchor="end" class="d-mono d-small">500</text>
+    <line x1="56" y1="200.0" x2="526" y2="200.0" class="d-grid"/>
+    <text x="50" y="204.0" text-anchor="end" class="d-mono d-small">1,000</text>
+    <line x1="56" y1="170.0" x2="526" y2="170.0" class="d-grid"/>
+    <text x="50" y="174.0" text-anchor="end" class="d-mono d-small">1,500</text>
+    <line x1="56" y1="140.0" x2="526" y2="140.0" class="d-grid"/>
+    <text x="50" y="144.0" text-anchor="end" class="d-mono d-small">2,000</text>
+    <line x1="56" y1="110.0" x2="526" y2="110.0" class="d-grid"/>
+    <text x="50" y="114.0" text-anchor="end" class="d-mono d-small">2,500</text>
+    <line x1="56" y1="80.0" x2="526" y2="80.0" class="d-grid"/>
+    <text x="50" y="84.0" text-anchor="end" class="d-mono d-small">3,000</text>
+    <line x1="56" y1="50.0" x2="526" y2="50.0" class="d-grid"/>
+    <text x="50" y="54.0" text-anchor="end" class="d-mono d-small">3,500</text>
+    <line x1="56" y1="50" x2="56" y2="260" class="d-axis"/>
+    <rect x="80" y="248.5" width="44" height="11.5" rx="3" class="d-fill-blue"/>
+    <text x="102.0" y="242.48" text-anchor="middle" class="d-mono d-small">192</text>
+    <text x="102.0" y="276" text-anchor="middle" class="d-small">SFT</text>
+    <rect x="140" y="255.2" width="44" height="4.8" rx="3" class="d-fill-cyan"/>
+    <text x="162.0" y="249.2" text-anchor="middle" class="d-mono d-small">80</text>
+    <text x="162.0" y="276" text-anchor="middle" class="d-small">DPO</text>
+    <rect x="200" y="228.8" width="44" height="31.2" rx="3" class="d-fill-orange"/>
+    <text x="222.0" y="222.8" text-anchor="middle" class="d-mono d-small">520</text>
+    <text x="222.0" y="276" text-anchor="middle" class="d-small">RLVR</text>
+    <rect x="326" y="68.0" width="44" height="192.0" rx="3" class="d-fill-blue"/>
+    <text x="348.0" y="62.0" text-anchor="middle" class="d-mono d-small">3,200</text>
+    <text x="348.0" y="276" text-anchor="middle" class="d-small">SFT</text>
+    <rect x="386" y="187.0" width="44" height="73.0" rx="3" class="d-fill-cyan"/>
+    <text x="408.0" y="181.04000000000002" text-anchor="middle" class="d-mono d-small">1,216</text>
+    <text x="408.0" y="276" text-anchor="middle" class="d-small">DPO</text>
+    <rect x="446" y="87.2" width="44" height="172.8" rx="3" class="d-fill-orange"/>
+    <text x="468.0" y="81.20000000000002" text-anchor="middle" class="d-mono d-small">2,880</text>
+    <text x="468.0" y="276" text-anchor="middle" class="d-small">RLVR</text>
+    <text x="170" y="296" text-anchor="middle" class="d-bold d-small">8B (792 total)</text>
+    <text x="418" y="296" text-anchor="middle" class="d-bold d-small">70B (7,296 total)</text>
+    <text x="690" y="24" text-anchor="middle" class="d-bold">Controlled PPO vs DPO test</text>
+    <text x="690" y="40" text-anchor="middle" class="d-small d-text-light">(derived GPU-hours)</text>
+    <line x1="600" y1="260.0" x2="770" y2="260.0" class="d-grid"/>
+    <text x="594" y="264.0" text-anchor="end" class="d-mono d-small">0</text>
+    <line x1="600" y1="218.0" x2="770" y2="218.0" class="d-grid"/>
+    <text x="594" y="222.0" text-anchor="end" class="d-mono d-small">100</text>
+    <line x1="600" y1="176.0" x2="770" y2="176.0" class="d-grid"/>
+    <text x="594" y="180.0" text-anchor="end" class="d-mono d-small">200</text>
+    <line x1="600" y1="134.0" x2="770" y2="134.0" class="d-grid"/>
+    <text x="594" y="138.0" text-anchor="end" class="d-mono d-small">300</text>
+    <line x1="600" y1="92.0" x2="770" y2="92.0" class="d-grid"/>
+    <text x="594" y="96.0" text-anchor="end" class="d-mono d-small">400</text>
+    <line x1="600" y1="50.0" x2="770" y2="50.0" class="d-grid"/>
+    <text x="594" y="54.0" text-anchor="end" class="d-mono d-small">500</text>
+    <line x1="600" y1="50" x2="600" y2="260" class="d-axis"/>
+    <rect x="620" y="71.8" width="50" height="188.2" rx="3" class="d-fill-orange"/>
+    <text x="645.0" y="65.84" text-anchor="middle" class="d-mono d-small">448</text>
+    <text x="645.0" y="276" text-anchor="middle" class="d-small">PPO</text>
+    <text x="645.0" y="292" text-anchor="middle" class="d-small d-text-light">28 h, 2 nodes</text>
+    <rect x="700" y="246.6" width="50" height="13.4" rx="3" class="d-fill-cyan"/>
+    <text x="725.0" y="240.56" text-anchor="middle" class="d-mono d-small">32</text>
+    <text x="725.0" y="276" text-anchor="middle" class="d-small">DPO</text>
+    <text x="725.0" y="292" text-anchor="middle" class="d-small d-text-light">4 h, 1 node</text>
+    <text x="690" y="312" text-anchor="middle" class="d-bold d-small">14x GPU-hours, 7x wall-clock</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Left: derived GPU-hours per stage of the final Tulu 3 runs (GPUs × wall-clock hours; the report names H100 GPUs for SFT, DPO and the reward model, and does not name the RLVR GPU type). The reward model's 72 GPU-hours are not in the totals. Right: the controlled PPO-versus-DPO test (28 hours on two nodes, 4 hours on one), converted at 8 GPUs per node, which is the node size the report states for SFT. Sources: Tulu 3 §4.3, §5.4.1, §6.3<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<p>Two caveats limit these numbers. The report says that for all of the RL runs "we took an earlier than final checkpoint from the run", so the delivered models used fewer GPU-hours than listed (§6.3). And these are final runs only: Lambert's book says that developing a recipe "can easily be 10X to 100X the compute of the final few training runs" and that the Tulu 3 team "ran on the order of thousands of experiments/evaluations at the 7B scale before having the final model"<a class="cite" href="#ref-5">5</a> (Appendix C.1). For scale against Section 5, R1-Zero's run is 101,376 GPU-hours on H800 GPUs<a class="cite" href="#ref-4">4</a> (Supplementary B.4.4, Table 7), 8.6 times the 405B RLVR run and 35 times the 70B one (derived; different hardware and response lengths). Module 1 (Section 5.2) analyzes the 405B phase times.</p>
+
+<h3 id="tulu3-405b">3.7 Scaling to 405B, and what the MATH-only run did</h3>
+<p>Scaling to 405B needed 32 nodes. The report lists "NCCL timeout and synchronization issues that required meticulous monitoring and intervention (especially with RL training)", restarts after hardware failures, and "limited" hyperparameter tuning<a class="cite" href="#ref-2">2</a> (§8.1). The RLVR data changed: GSM8K was removed because SFT and DPO had saturated it, the constraint prompts "did not help much in initial RLVR runs", and the final run used the MATH training set only, with an 8B value model. "Even with as few as 25 RLVR steps, MATH performance improved by over 5 points, and continued to increase with more training"; the run stopped at 75 steps because of the "challenges of scaling the asynchronous RL infrastructure".</p>
+<p>The 405B hyperparameter table, labelled Table 35 in the PDF text and jumbled there, gives learning rate 1e-7, batch size 1,856, response length 1,024, β = 0.05 and 300,000 total episodes; its caption describes the general-reward-model run while its column header reads 405B RLVR, so the caption looks misplaced. Seventy-five steps at batch 1,856 is 139,200 episodes (derived), 46% of the printed 300,000 (Figure 6). The report's Figure 25 marks the final checkpoint near that point on its episode axis, with the curves continuing somewhat past it (read from the plot); the report does not explain the gap.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 270" role="img" aria-labelledby="f6t"><title id="f6t">Tulu 3 405B MATH score by stage against reference models, and the step axis of the 405B RLVR run</title>
+    <text x="215" y="22" text-anchor="middle" class="d-bold">MATH, 4-shot flex (Table 4)</text>
+    <line x1="170.0" y1="36" x2="170.0" y2="214" class="d-grid"/>
+    <text x="170.0" y="232" text-anchor="middle" class="d-mono d-small">55</text>
+    <line x1="232.5" y1="36" x2="232.5" y2="214" class="d-grid"/>
+    <text x="232.5" y="232" text-anchor="middle" class="d-mono d-small">60</text>
+    <line x1="295.0" y1="36" x2="295.0" y2="214" class="d-grid"/>
+    <text x="295.0" y="232" text-anchor="middle" class="d-mono d-small">65</text>
+    <line x1="357.5" y1="36" x2="357.5" y2="214" class="d-grid"/>
+    <text x="357.5" y="232" text-anchor="middle" class="d-mono d-small">70</text>
+    <line x1="420.0" y1="36" x2="420.0" y2="214" class="d-grid"/>
+    <text x="420.0" y="232" text-anchor="middle" class="d-mono d-small">75</text>
+    <text x="162" y="58" text-anchor="end" class="d-small">Tulu 3 405B SFT</text>
+    <line x1="170.0" y1="54" x2="275.0" y2="54" class="d-axis"/>
+    <circle cx="275.0" cy="54" r="6" class="d-fill-blue"/>
+    <text x="286.0" y="58" class="d-mono d-small">63.4</text>
+    <text x="162" y="86" text-anchor="end" class="d-small">Tulu 3 405B DPO</text>
+    <line x1="170.0" y1="82" x2="231.2" y2="82" class="d-axis"/>
+    <circle cx="231.2" cy="82" r="6" class="d-fill-cyan"/>
+    <text x="242.25" y="86" class="d-mono d-small">59.9</text>
+    <text x="162" y="114" text-anchor="end" class="d-small">Tulu 3 405B RLVR</text>
+    <line x1="170.0" y1="110" x2="323.8" y2="110" class="d-axis"/>
+    <circle cx="323.8" cy="110" r="6" class="d-fill-orange"/>
+    <text x="334.75" y="114" class="d-mono d-small">67.3</text>
+    <text x="162" y="142" text-anchor="end" class="d-small">Llama 3.1 405B Instruct</text>
+    <line x1="170.0" y1="138" x2="315.0" y2="138" class="d-axis"/>
+    <circle cx="315.0" cy="138" r="6" class="d-fill-amber"/>
+    <text x="325.99999999999994" y="142" class="d-mono d-small">66.6</text>
+    <text x="162" y="170" text-anchor="end" class="d-small">GPT-4o (11-24)</text>
+    <line x1="170.0" y1="166" x2="342.5" y2="166" class="d-axis"/>
+    <circle cx="342.5" cy="166" r="6" class="d-fill-amber"/>
+    <text x="353.5" y="170" class="d-mono d-small">68.8</text>
+    <text x="162" y="198" text-anchor="end" class="d-small">DeepSeek V3</text>
+    <line x1="170.0" y1="194" x2="388.8" y2="194" class="d-axis"/>
+    <circle cx="388.8" cy="194" r="6" class="d-fill-amber"/>
+    <text x="399.75" y="198" class="d-mono d-small">72.5</text>
+    <text x="300" y="258" text-anchor="middle" class="d-small d-text-light">axis starts at 55</text>
+    <text x="650" y="22" text-anchor="middle" class="d-bold">405B RLVR run, in optimizer steps</text>
+    <rect x="520" y="70" width="120.7" height="30" rx="4" class="d-fill-orange-soft d-stroke-orange"/>
+    <rect x="640.7" y="70" width="139.3" height="30" rx="4" class="d-outline d-dashed"/>
+    <line x1="560.2" y1="64" x2="560.2" y2="106" class="d-line d-stroke-blue"/>
+    <text x="560.2227722772277" y="58" text-anchor="middle" class="d-mono d-small">25</text>
+    <text x="640.6683168316831" y="58" text-anchor="middle" class="d-mono d-small">75</text>
+    <text x="780" y="58" text-anchor="end" class="d-mono d-small">161.6</text>
+    <text x="520" y="58" text-anchor="middle" class="d-mono d-small">0</text>
+    <text x="560.2227722772277" y="124" text-anchor="middle" class="d-small">25 steps = 46,400 episodes</text>
+    <text x="560.2227722772277" y="140" text-anchor="middle" class="d-small d-text-light">MATH up by more than 5</text>
+    <text x="670.6683168316831" y="170" text-anchor="middle" class="d-small">75 steps run = 139,200 episodes</text>
+    <text x="670.6683168316831" y="186" text-anchor="middle" class="d-small d-text-light">stopped for compute and infra limits</text>
+    <text x="780" y="214" text-anchor="end" class="d-small d-text-light">300,000 episodes printed in the 405B</text>
+    <text x="780" y="230" text-anchor="end" class="d-small d-text-light">hyperparameter table = 161.6 steps</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Left: MATH at 405B after each Tulu 3 stage, against reference models in the same harness; the axis starts at 55. Right: the 405B RLVR run on a step axis; the dashed segment is the part of the printed 300,000-episode budget that was not run (derived). Data: Tulu 3 Table 4, §8.1 and the 405B table labelled Table 35<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 7.</b> Tulu 3 405B after each stage (percent; the report's harness). The RLVR stage trained on MATH only; every other column moved without being in the reward. Source: Tulu 3 Table 4<a class="cite" href="#ref-2">2</a>. Single run; "Δ" is RLVR minus DPO (derived).</caption>
+  <thead><tr><th>Benchmark</th><th class="num">SFT</th><th class="num">DPO</th><th class="num">RLVR</th><th class="num">Δ (RLVR − DPO)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">MATH, 4-shot flex (in the reward)</td><td class="num">63.4</td><td class="num">59.9</td><td class="num">67.3</td><td class="num" data-best>+7.4</td></tr>
+    <tr><td class="row">GSM8K, 8-shot CoT</td><td class="num">93.6</td><td class="num">94.2</td><td class="num">95.5</td><td class="num">+1.3</td></tr>
+    <tr><td class="row">IFEval, prompt loose</td><td class="num">82.4</td><td class="num">85.0</td><td class="num">86.0</td><td class="num">+1.0</td></tr>
+    <tr><td class="row">AlpacaEval 2, LC win rate</td><td class="num">30.4</td><td class="num">49.8</td><td class="num">51.4</td><td class="num">+1.6</td></tr>
+    <tr><td class="row">MMLU, 5-shot CoT</td><td class="num">84.4</td><td class="num">86.6</td><td class="num">87.0</td><td class="num">+0.4</td></tr>
+    <tr><td class="row">BigBenchHard, 0-shot CoT</td><td class="num">88.0</td><td class="num">88.8</td><td class="num">88.6</td><td class="num">-0.2</td></tr>
+    <tr><td class="row">HumanEval, pass@10</td><td class="num">95.7</td><td class="num">97.2</td><td class="num">95.9</td><td class="num" data-worst>-1.3</td></tr>
+    <tr><td class="row">HumanEval+, pass@10</td><td class="num">93.3</td><td class="num">93.9</td><td class="num">92.9</td><td class="num" data-worst>-1.0</td></tr>
+    <tr><td class="row">Safety, 6-task average</td><td class="num">87.7</td><td class="num">85.5</td><td class="num">86.7</td><td class="num">+1.2</td></tr>
+    <tr><td class="row">Average without safety</td><td class="num">76.3</td><td class="num">79.0</td><td class="num">80.0</td><td class="num">+1.0</td></tr>
+  </tbody>
+</table>
+
+<p>Table 7 shows two things the smaller runs could not. At 405B the DPO stage lowered MATH by 3.5 points against SFT (63.4 to 59.9), the opposite of 8B (31.5 to 42.0) and 70B (53.7 to 62.3), and the report does not say why; MATH-only RLVR recovered it and went 3.9 points past SFT (derived). And a reward on MATH alone moved GSM8K and IFEval up and HumanEval pass@10 down, which is consistent with RL on a narrow prompt set transferring to neighbouring skills, but is one run with no interval and an untested mechanism. Against the same-harness baselines, Tulu 3 405B's MATH of 67.3 is above Llama 3.1 405B Instruct (66.6) and below GPT-4o (68.8) and DeepSeek V3 (72.5).</p>
+
+<h3 id="tulu3-dropped">3.8 What Tulu 3 tried and dropped</h3>
+<p>Section 8.2 of the report lists two methods that did not make the recipe, and both are central to someone else's.</p>
+<p><b>Rejection sampling.</b> Ai2 used a model trained on its initial SFT and preference mixes to generate n responses per SFT prompt, ranked them with the original response using a reward model or an LLM judge, kept the best as SFT data and made chosen-rejected pairs from the rest. It "found that for our setup the performance gains were minimal for the amount of compute required". Two findings qualify that: "strong judges are vital, and publicly available models can struggle to choose the best response", and including the original response among the candidates "performed much better"<a class="cite" href="#ref-2">2</a> (§8.2). Llama 3 used Meta's own reward model, trained on its human preference data (Section 2.3), which is consistent with the judge-quality point; neither report tests it.</p>
+<p><b>Online DPO.</b> The recipe samples two responses from the current policy, scores them with a reward model to make a pair, and applies the DPO loss. Ai2 trained an RM on 82K Skywork preference pairs, continued it on synthetic on-policy math preferences, and ran 200K episodes on math prompts from a Tulu 3 DPO checkpoint. It found "no or little improvement on GSM8K and degradation on MATH performance" across temperatures and KL coefficients and dropped it (§8.2). In Figure 7 (Section 6) it sits in the online column with a learned scorer, beside the PPO runs of Section 4.</p>
+
+<h2 id="ppo-decision">4. The PPO decision, as each report records it</h2>
+<p>Both reports tried PPO for preference tuning, found it more expensive, and kept DPO. The evidence is thin by design: one report publishes no numbers, and the other says its PPO was untuned. Table 8 separates what was run from what was concluded; Module 5 (Section 9) and Module 7 (Section 8) hold the ledgers that set these two against studies that found PPO ahead.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 8.</b> The PPO decision in the two reports. Sources: Llama 3 §1, §4.1.4<a class="cite" href="#ref-1">1</a>; Tulu 3 §2.3, §5.4.1, Tables 18 and 21, Figure 16<a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th>Report</th><th>What was run</th><th>What is published</th><th>Reason given</th><th>Outcome</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Llama 3</td><td>PPO "explored"; model size and setup not stated</td><td>no scores, no costs</td><td>DPO "required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval"</td><td>no RL algorithm in the recipe</td></tr>
+    <tr><td class="row">Tulu 3, early exploration (Table 18)</td><td>PPO with an UltraFeedback reward model, lr 1e-6, batch 64, β 0.0325 and 0.05, early SFT checkpoint</td><td>averages 54.5 and 55.5; SFT base 55.7, DPO 55.2, best length-normalized DPO 57.3</td><td>"more costly investigations into RL-based methods, such as PPO"</td><td>length-normalized DPO throughout development</td></tr>
+    <tr><td class="row">Tulu 3, controlled comparison (§5.4.1, Figure 16)</td><td>reward model trained once and untuned on the anchored DPO mix; PPO sweep over β 0.01 to 0.05 and warm-up 0 or 0.1</td><td>plotted only; "comparable ... (albeit slightly lower)"; 28 hours on two nodes against 4 on one</td><td>"limited resources and the subtlety in RM evaluation"</td><td>DPO for preference tuning; PPO "primarily for RLVR"</td></tr>
+  </tbody>
+</table>
+
+<p>Two experiments are easy to conflate. Per-run PPO scores are printed only in Table 18, the early exploration, where both PPO runs (54.5 and 55.5) finish below the SFT base (55.7) and below the best length-normalized DPO setting (57.3). The later controlled comparison, the source of the 28-hour and 4-hour figures, is a plot of average score against steps (Figure 16) with no numbers in the text; its SFT and DPO baselines (about 57 and 61, read from the plot) are not Table 18's, so it is a different experiment. In it the better PPO runs end between the two baselines, which is the report's "slightly lower". At 8 GPUs per node the cost is 448 against 32 GPU-hours, 14 times, and 7 times in wall-clock (derived; Figure 5, right).</p>
+<p>Ai2's reason has two parts: cost, and "the subtlety in RM evaluation". A reward model that scores well on a reward-model benchmark "does not necessarily translate to better downstream performance for PPO", so Ai2 trained its RM once and did not tune it<a class="cite" href="#ref-2">2</a> (§5.4.1). A verifier changes that, because its reward is exact for the property it checks (it fails in other ways; Modules 10 and 19), and the report adopts PPO for RLVR in the next sentence. In the writer's reading, PPO's cost did not fall between the two decisions; the reward stopped being the thing nobody could evaluate. Tulu 3's own 405B run shows where the cost lands (Section 3.7), and in the writer's reading Meta's "less stable and harder to scale" is a claim about 2024 infrastructure as much as about the algorithm: the 2025 reports that run RL at larger scale spend many pages on stability and rollout-trainer mismatch (Modules 13 and 14).</p>
+<p>Neither report runs the comparison that would settle the preference-tuning question: tuned PPO against DPO on matched data at the same scale. Xu et al. report PPO ahead on every testbed, including code competitions<a class="cite" href="#ref-6">6</a>; Ivison et al., from the lab and several of the authors behind Tulu 3, find it ahead by up to 2.5% in math and 1.2% in general domains, while ranking data quality first, then the algorithm, then the reward model<a class="cite" href="#ref-7">7</a>. Tulu 3 cites that study, and the reason it states for choosing DPO is cost. Since data quality ranks above the algorithm, the sharper test holds the data fixed, which Tulu 3's controlled comparison does, with an untuned PPO and an untuned reward model.</p>
+
+<h2 id="to-grpo">5. From a DPO-first recipe to GRPO-style RLVR</h2>
+
+<h3 id="to-grpo-open">5.1 What Tulu 3 left open</h3>
+<p>The report names its own limits. The critic is an 8B model standing in for a 405B policy, and "future works can benefit from exploring larger value models or alternate value model-free RL algorithms such as GRPO"<a class="cite" href="#ref-2">2</a> (§8.1). GRPO was already public: DeepSeekMath introduced it in February 2024, nine months earlier, as a PPO variant that "foregoes the critic model, instead estimating the baseline from group scores"<a class="cite" href="#ref-3">3</a> (abstract). The verifiers are the simplest kind, exact match on an extracted answer and per-constraint checks, with "more complex verifiers" left to future work (§6.1); responses are capped at 1,024 or 2,048 tokens (Table 21); checkpoints are selected on the development suite (§6.4). It is the list of dials the next recipes turned.</p>
+
+<h3 id="to-grpo-changed">5.2 What the 2025 reasoning recipes changed</h3>
+<p>Table 9 sets Tulu 3's RLVR stage beside R1-Zero and OlmoRL, the RL stage of Ai2's later Olmo 3. No source in the course says one recipe was derived from another, so the table compares design points, not influence. The dials that turned are the critic, the KL term and the response length. The one that did not is the reward: a program that checks the answer.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 9.</b> Tulu 3's RLVR stage against R1-Zero and OlmoRL. Derived ratios are marked. Sources: Tulu 3 §6, Tables 21-22<a class="cite" href="#ref-2">2</a>; R1 §2.1 and Supplementary B.4.4<a class="cite" href="#ref-4">4</a>; Olmo 3 §4.4<a class="cite" href="#ref-8">8</a>.</caption>
+  <thead><tr><th>Choice</th><th>Tulu 3 RLVR (Nov 2024)</th><th>R1-Zero (Jan 2025)</th><th>OlmoRL (Olmo 3, Dec 2025)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Algorithm</td><td>PPO with a value model initialized from a reward model</td><td>GRPO, no critic</td><td>GRPO with zero-gradient filtering, active sampling, token-level loss, clip-higher, truncated importance sampling, no std normalization</td></tr>
+    <tr><td class="row">Starting point</td><td>best DPO checkpoint</td><td>DeepSeek-V3-Base, no SFT first</td><td>after SFT and DPO: the Think models train "via SFT, DPO, and RLVR"</td></tr>
+    <tr><td class="row">KL to the reference</td><td>β 0.05 (8B), 0.07 (70B)</td><td>coefficient 0.001</td><td>no KL loss</td></tr>
+    <tr><td class="row">Longest response</td><td>1,024 to 2,048 tokens</td><td>32,768, then 65,536 from step 8.2k (16× to 32× Tulu 3's cap, derived)</td><td>rollouts up to 32K tokens</td></tr>
+    <tr><td class="row">Reward</td><td>α = 10 if verified; adding RM scores added noise</td><td>accuracy plus format, equal weight, no neural reward model</td><td>programmatic verifiers (Module 10, Section 1.2)</td></tr>
+    <tr><td class="row">Final-run size</td><td>520 / 2,880 / 11,776 GPU-hours (8B / 70B / 405B, derived)</td><td>101,376 GPU-hours on H800 (Module 1)</td><td>see Module 31</td></tr>
+  </tbody>
+</table>
+
+<p>The critic left first, for reasons already on the table. DeepSeekMath's case against PPO's value model is that it is "another model of comparable size" to the policy, a "substantial memory and computational burden", and hard to train when the reward arrives only on the last token<a class="cite" href="#ref-3">3</a> (§4.1.1); Tulu 3's 8B stand-in at 405B is the same pressure seen from the other side (Module 9 covers when a critic still wins). The KL term left next: Tulu 3's sweeps showed that more KL did not reliably buy verifiable reward and eventually cost the average score, one reading of why later reports with exact rewards dropped it (Module 13). Length grew by more than an order of magnitude with long chain-of-thought tasks, which shifts the cost toward generation (Olmo 3's average step was 1,000 seconds, of which 125 were training<a class="cite" href="#ref-8">8</a>; Module 1) and brings the rollout-trainer mismatch of Module 14 with it.</p>
+
+<h3 id="to-grpo-kept">5.3 What survived</h3>
+<p>Three things carried through. The reward stayed programmatic, which is the RLVR idea itself: R1-Zero's accuracy and format rewards are the same construction at a larger scale, and Lambert credits R1 with popularizing RLVR, not inventing it<a class="cite" href="#ref-5">5</a> (p. 14; Module 10, Section 1). RL stayed a late stage for the skills that have answers: R1's pipeline adds stages around it, and Olmo 3 keeps Tulu 3's order of SFT, then DPO, then RL<a class="cite" href="#ref-8">8</a> (§1). And for chat behavior, where there is no checker, the reports in this course still use preference signals: DPO in Olmo 3, a preference reward model in R1's last 400 RL steps<a class="cite" href="#ref-4">4</a> (§3.2.2). What did not survive is the premise that RL algorithms are too unstable to use: for verifiable domains the 2025 reports run online RL as the main stage (Module 10, Section 6). No Meta report after Llama 3 is in the course's source map, so whether Meta's own stance changed is not documented here.</p>
+
+<h2 id="two-axes">6. The two recipes on two axes</h2>
+<p>Two properties set a stage's cost and its failure modes: where its training samples come from (a fixed source, an earlier checkpoint sampled once, or the policy being trained) and what scores them (nothing, preference pairs, a learned reward model, a program). Figure 7 places every stage of both recipes on those axes, together with the stages Tulu 3 tried and left out.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 410" role="img" aria-labelledby="f7t"><title id="f7t">Where each stage of Llama 3 and Tulu 3 sits by source of its training samples and by what scores them</title>
+    <text x="256.0" y="22" text-anchor="middle" class="d-bold d-small">Other models or humans</text>
+    <text x="256.0" y="38" text-anchor="middle" class="d-small d-text-light">(fixed data)</text>
+    <text x="466.0" y="22" text-anchor="middle" class="d-bold d-small">An earlier checkpoint,</text>
+    <text x="466.0" y="38" text-anchor="middle" class="d-small d-text-light">sampled once</text>
+    <text x="676.0" y="22" text-anchor="middle" class="d-bold d-small">The policy being trained</text>
+    <text x="676.0" y="38" text-anchor="middle" class="d-small d-text-light">(online)</text>
+    <text x="142" y="86.0" text-anchor="end" class="d-bold d-small">no score</text>
+    <text x="142" y="101.0" text-anchor="end" class="d-small d-text-light">(demonstrations)</text>
+    <text x="142" y="156.0" text-anchor="end" class="d-bold d-small">preference pairs</text>
+    <text x="142" y="171.0" text-anchor="end" class="d-small d-text-light">(human or LLM judge)</text>
+    <text x="142" y="226.0" text-anchor="end" class="d-bold d-small">learned reward</text>
+    <text x="142" y="241.0" text-anchor="end" class="d-small d-text-light">model</text>
+    <text x="142" y="296.0" text-anchor="end" class="d-bold d-small">verifier</text>
+    <text x="142" y="311.0" text-anchor="end" class="d-small d-text-light">(a program)</text>
+    <rect x="156" y="56" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="366" y="56" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="576" y="56" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="156" y="126" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="366" y="126" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="576" y="126" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="156" y="196" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="366" y="196" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="576" y="196" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="156" y="266" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="366" y="266" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="576" y="266" width="200" height="64" rx="6" class="d-panel"/>
+    <rect x="162" y="62" width="188" height="24" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="256.0" y="78" text-anchor="middle" class="d-small">Llama 3 human-curated SFT</text>
+    <rect x="162" y="91" width="188" height="24" rx="6" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="256.0" y="107" text-anchor="middle" class="d-small">Tulu 3 SFT</text>
+    <rect x="372" y="132" width="188" height="24" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="466.0" y="148" text-anchor="middle" class="d-small">Llama 3 DPO</text>
+    <rect x="372" y="161" width="188" height="24" rx="6" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="466.0" y="177" text-anchor="middle" class="d-small">Tulu 3 DPO</text>
+    <rect x="372" y="202" width="188" height="24" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="466.0" y="218" text-anchor="middle" class="d-small">Llama 3 rejection sampling</text>
+    <rect x="372" y="231" width="188" height="24" rx="6" class="d-outline d-dashed"/>
+    <text x="466.0" y="247" text-anchor="middle" class="d-small">Tulu 3 RS (dropped)</text>
+    <rect x="372" y="272" width="188" height="24" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="466.0" y="288" text-anchor="middle" class="d-small">Llama 3 execution filters</text>
+    <rect x="582" y="202" width="188" height="24" rx="6" class="d-outline d-dashed"/>
+    <text x="676.0" y="218" text-anchor="middle" class="d-small">Tulu 3 PPO vs RM (not shipped)</text>
+    <rect x="582" y="231" width="188" height="24" rx="6" class="d-outline d-dashed"/>
+    <text x="676.0" y="247" text-anchor="middle" class="d-small">Tulu 3 online DPO (dropped)</text>
+    <rect x="582" y="272" width="188" height="24" rx="6" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="676.0" y="288" text-anchor="middle" class="d-small">Tulu 3 RLVR</text>
+    <rect x="582" y="301" width="188" height="24" rx="6" class="d-block-muted"/>
+    <text x="676.0" y="317" text-anchor="middle" class="d-small d-text-inv">2025 reasoning RL (Mod. 9, 27)</text>
+    <rect x="156" y="350" width="18" height="14" rx="4" class="d-fill-blue-soft d-stroke-blue"/>
+    <text x="180" y="361" class="d-small">Llama 3, in the recipe</text>
+    <rect x="340" y="350" width="18" height="14" rx="4" class="d-fill-orange-soft d-stroke-orange"/>
+    <text x="364" y="361" class="d-small">Tulu 3, in the recipe</text>
+    <rect x="520" y="350" width="18" height="14" rx="4" class="d-outline d-dashed"/>
+    <text x="544" y="361" class="d-small">tried and left out</text>
+    <text x="156" y="388" class="d-small d-text-light">Only the right column needs a generation engine inside the training loop (Module 1).</text>
+    <text x="156" y="404" class="d-small d-text-light">The empty cells are the ones neither report used: online sampling scored by preference pairs.</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> Stages of Llama 3 (blue) and Tulu 3 (orange) by sampling source and scorer; dashed chips are stages the report tried or explored and did not ship. Placement is the writer's reading of the stage descriptions in Llama 3 §4.1-§4.3 and Tulu 3 §4-§6 and §8.2<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<p>Three readings follow. First, cost follows the columns: the left and middle columns need no generation engine inside the training loop (Llama 3 pays for generation in rejection sampling, but as a batch job ahead of training; Section 2.3), and only the right column carries the memory bill of Module 1 (Section 7). Second, both recipes ship almost everything in the left and middle columns, and Tulu 3's one right-column stage has a program as its scorer; the right-column cells with a learned scorer are where Tulu 3 tried PPO and online DPO and shipped neither, and where Llama 3 explored PPO without publishing results. Third, the verifier row is filled at two prices. Llama 3 runs its checkers once, as filters on samples from an earlier checkpoint, and trains on what passed. Tulu 3 runs them as the reward for the policy being trained, which costs a generation engine and a value model and puts a gradient on the checked property, including a push away from failures: the keep-or-drop versus graded-coefficient distinction of Section 2.3.</p>
+<p>Nothing in the figure says one cell is better than another; it says which cells each report paid for. The right-column cell with a learned reward model is where classical PPO-RLHF lives (Module 5), and both reports declined to ship it. The disagreement below is partly whether that cell is worth its price. How the stages are chained, gated and registered is System Design Module 36 (Post-Training Pipelines); rollout infrastructure is Modules 37 and 38.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Four questions run through these reports. Two are the course's standing disputes, applied here: whether preference tuning needs online RL, and whether PPO's critic earns its cost. Two are internal to the pair: the reports disagree about rejection sampling, and they differ on the value model. Each card states one side; the cons carry the other.</p>
+<div class="positions">
+  <article class="position">
+    <h4>Offline DPO in rounds is enough for preference tuning</h4>
+    <p class="who">Llama 3 team<a class="cite" href="#ref-1">1</a> (§1, §4.1.4); Tulu 3 authors<a class="cite" href="#ref-2">2</a> (§5.4.1)</p>
+    <p>Llama 3 chose SFT, rejection sampling and DPO over RL algorithms that "tend to be less stable and harder to scale", and tried PPO. Tulu 3 measured PPO at about 28 hours on two nodes against 4 on one for a comparable average, and reserved PPO "primarily for RLVR".</p>
+    <ul class="pros">
+      <li>The cost gap is measured: 14 times the GPU-hours and 7 times the wall-clock (derived, Figure 5).</li>
+      <li>No reward-model loop, generation engine or value model in the optimizer; used at 405B across six rounds.</li>
+    </ul>
+    <ul class="cons">
+      <li>Llama 3 publishes no PPO numbers; Tulu 3's PPO had an untuned reward model, and "it is entirely possible that we can push up the PPO's performance even higher".</li>
+      <li>Data quality ranks above the algorithm<a class="cite" href="#ref-7">7</a>, so a DPO-versus-PPO gap on one data set may be a data effect.</li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Tuned online PPO is stronger, and RL is worth its infrastructure</h4>
+    <p class="who">Xu et al.<a class="cite" href="#ref-6">6</a> (abstract); Ivison et al.<a class="cite" href="#ref-7">7</a> (abstract); Lambert<a class="cite" href="#ref-5">5</a> (§3.1.6)</p>
+    <p>Xu et al. report PPO ahead of the other methods in all their testbeds, including code competitions. Ivison et al. find it ahead by up to 2.5% in math and 1.2% in general domains. Lambert argues that "despite the simplicity of alternatives, RL-based methods continue to win out", at a far larger infrastructure cost.</p>
+    <ul class="pros">
+      <li>Controlled studies, one from Tsinghua and OpenPsi and one from Ai2 and UW, the Tulu 3 lab (full-text details in Module 5, Section 9).</li>
+      <li>Tulu 3's RLVR lifted its targeted benchmarks on a narrow prompt set, which Lambert reads as RL done "surgically" (Section 3.4).</li>
+    </ul>
+    <ul class="cons">
+      <li>Margins are small next to the data-quality effect in the same Ivison et al. abstract.</li>
+      <li>Tulu 3's 405B PPO run needed a 16-GPU inference group, a 240-GPU learner and an 8B critic, and stopped at 75 steps (Section 3.7).</li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>Rejection sampling with a strong reward model is the core of the data engine</h4>
+    <p class="who">Llama 3 team<a class="cite" href="#ref-1">1</a> (§4.2.2); opposed by Tulu 3<a class="cite" href="#ref-2">2</a> (§8.2)</p>
+    <p>Llama 3 samples 10 to 30 outputs per prompt from the latest policy and trains on the reward model's pick, as the loop of its Figure 7 shows, and engineered generation for over 2× throughput. Tulu 3 tried the idea and "found that for our setup the performance gains were minimal for the amount of compute required".</p>
+    <ul class="pros">
+      <li>Cheap next to online RL: a batch job with no gradient through the reward model.</li>
+      <li>Composes with capability experts, system prompts and execution or answer checks (Table 4).</li>
+    </ul>
+    <ul class="cons">
+      <li>Llama 3's §4 gives no ablation of rejection sampling against none.</li>
+      <li>Tulu 3 found public judges "can struggle to choose the best response", so the result depends on reward-model quality; it did not test a Meta-grade one.</li>
+    </ul>
+  </article>
+  <article class="position">
+    <h4>A learned value model is worth keeping for RLVR</h4>
+    <p class="who">Tulu 3<a class="cite" href="#ref-2">2</a> (§6.2.1, §8.1); against it, DeepSeekMath<a class="cite" href="#ref-3">3</a> (§4.1.1) and Ahmadian et al.<a class="cite" href="#ref-9">9</a> (§1)</p>
+    <p>Tulu 3 found that initializing the value function from a general reward model gave the best GSM8K score and a higher average, and concluded that "the value function plays an important role". DeepSeekMath and Ahmadian et al. argue the critic is a policy-sized cost that last-token rewards do not justify.</p>
+    <ul class="pros">
+      <li>A measured ablation on the recipe's own prompts, with a clear ordering of the initializations tried.</li>
+      <li>Module 9 (Section 8) records controlled comparisons in which a tuned critic-based PPO beats critic-free methods.</li>
+    </ul>
+    <ul class="cons">
+      <li>The ablation compares value initializations, not a critic against no critic; the report has no GRPO run.</li>
+      <li>At 405B the critic was 8B, and the 2025 reasoning recipes dropped it (Table 9).</li>
+    </ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>On preference tuning the cost claim is settled and the quality claim is not. DPO in rounds is a defensible default when the signal is a reward model you cannot evaluate, when you can run only one inference stack, and when the budget goes to data iteration, which both reports treat as the main lever. A tuned PPO plausibly buys a point or two, inside the range that data choices move, on evidence from studies below 405B scale. A matched-data, matched-compute study at 70B or above, with tuned PPO, held-out evaluations and seed intervals, would settle it; the course's source map has none. On rejection sampling the reports test different judges, not different ideas, and an ablation that fixes a strong reward model and removes the sampling stage is the missing evidence. On the critic the answer is conditional (Module 9): Tulu 3 shows initialization matters if you keep one, the 2025 recipes show that dropping it works at long lengths where it is most expensive, and no report in the source map runs PPO against GRPO at Tulu 3's settings with both tuned. For verifiable skills the field has moved to online RL regardless; what remains open is how much of preference tuning will follow (Section 5).</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>As of 2026-10-27 the course's source map holds no Meta post-training report after Llama 3, so whether the DPO-first loop persists inside Meta is not documented here. Ai2's line is visible: Olmo 3's RL stage, OlmoRL, is a GRPO variant without a KL loss or a critic where Tulu 3 used PPO<a class="cite" href="#ref-8">8</a> (§4.4.1), and Olmo 3 keeps DPO before RL. Lambert's book (arXiv v12, 11 Sep 2026) argues that RL keeps winning and, in its 2026 recipe survey, notes that multi-teacher on-policy distillation has become a popular final stage in several large reports while "labs are far from unanimous" on it<a class="cite" href="#ref-5">5</a> (§3.2.4; Modules 21 and 22). Three things to watch: a matched PPO-versus-GRPO ablation at Tulu 3's prompt mix; whether chat-quality tuning moves from DPO to on-policy distillation; and any report that publishes a Llama 3-style multi-round loop with the ablations Meta's did not include.</p>
+
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Grattafiori, A., Dubey, A., Jauhri, A., et al. (Llama Team, AI @ Meta). <em>The Llama 3 Herd of Models</em>. arXiv 2407.21783 v3, 23 Nov 2024 (v1 31 Jul 2024). <a href="https://arxiv.org/pdf/2407.21783v3">https://arxiv.org/pdf/2407.21783v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: design stance and the claim that RL algorithms are less stable and harder to scale (§1); post-training loop and Figure 7 (§4); RM and SFT settings (§4.1.2-§4.1.3); DPO settings and the PPO comparison (§4.1.4); six rounds (§4.1.6); preference and SFT data statistics (Tables 6-7, §4.2.1); rejection sampling and PagedAttention (§4.2.2); data quality control (§4.2.3); capability pipelines (§4.3); benchmark results (Table 2); architecture (Table 3).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S., Ivison, H., et al. (Allen Institute for AI and University of Washington). <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv 2411.15124 v5, 14 Apr 2025 (v1 22 Nov 2024). <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: recipe overview and result tables (§2, Tables 2-6); prompt pool and decontamination (§3, Tables 7-8); SFT (§4, Tables 9-14); preference data and DPO (§5, Tables 15-20, Figures 7-17); RLVR (§6, Tables 21-23); held-out evaluation (§7.4, Tables 31-33); 405B scaling and negative results (§8, Tables 34-35, Figures 16 and 25 read from the page images); related work (§9.2).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv 2402.03300 v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: GRPO as a critic-free PPO variant (abstract, §4.1.1) and the unified view in which rejection-sampling fine-tuning is a special case (§5.2.1).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv 2501.12948 v2 (expanded Nature version, 4 Jan 2026); v1 22 Jan 2025. <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: R1-Zero settings (§2.1: GRPO, KL coefficient 0.001, 32,768 then 65,536 maximum length, 10,400 steps); the 101,376 GPU-hour run (Supplementary B.4.4, Table 7); process reward models and tree search as failed attempts (Supplementary G.2); the stage structure and the last-400-step preference reward (§3.2).</span></li>
+  <li id="ref-5"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv 2504.12501 v12, 11 Sep 2026; web edition last built 14 Oct 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: RL done surgically and the argument that RL keeps winning (§3.1.6); R1 popularizing RLVR (p. 14); multi-teacher on-policy distillation and the lack of unanimity among labs (§3.2.4); the cost of developing a recipe (Appendix C.1); the rounded Tulu 3 counts (§3.2.2).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Xu, S., Fu, W., Gao, J., Ye, W., Liu, W., Mei, Z., Wang, G., Yu, C., Wu, Y. <em>Is DPO Superior to PPO for LLM Alignment? A Comprehensive Study</em>. ICML 2024; arXiv 2404.10719 v3. <a href="https://arxiv.org/abs/2404.10719">https://arxiv.org/abs/2404.10719</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the abstract-level claim that PPO surpasses other alignment methods in all of its testbeds, including code competitions (full-text numbers are in Module 5 §9).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Ivison, H., Wang, Y., Liu, J., Wu, Z., Pyatkin, V., Lambert, N., Smith, N. A., Choi, Y., Hajishirzi, H. <em>Unpacking DPO and PPO: Disentangling Best Practices for Learning from Preference Feedback</em>. NeurIPS 2024; arXiv 2406.09279 v2. <a href="https://arxiv.org/abs/2406.09279">https://arxiv.org/abs/2406.09279</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the ranking of factors (data quality, then algorithm, then reward model, then extra prompts) and the margins by which PPO beat DPO (abstract).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Olmo Team. <em>Olmo 3</em>. arXiv 2512.13961 v2, 14 Apr 2026 (v1 15 Dec 2025). <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Olmo 3 Think trained via SFT, DPO and RLVR (§1); OlmoRL as GRPO with the listed changes (§4.4.1); the 1,000-second average step of which 125 seconds was training (§4.4.3, footnote 41).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Ahmadian, A., Cremer, C., Gallé, M., Fadaee, M., Kreutzer, J., Pietquin, O., Üstün, A., Hooker, S. <em>Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs</em>. ACL 2024; arXiv 2402.14740 v2. <a href="https://arxiv.org/pdf/2402.14740v2">https://arxiv.org/pdf/2402.14740v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the argument that PPO is over-engineered for pre-trained LLMs and the RLOO baseline (§1, §2.3).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,964 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evaluating What RL Did: pass@1 versus pass@k, Spurious Rewards, Contamination, and the Sharpen-or-Expand Debate · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="How to tell whether an RL run added capability or only reshaped the sampling distribution: the pass@1, pass@k and Maj@k estimators, the DeepSeekMath, Yue et al., ProRL and Qwen3 evidence, the Spurious Rewards and contamination controls, and an evaluation protocol that separates sharpening from expansion.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 20</p>
+  <h1>Evaluating What RL Did: pass@1 versus pass@k, Spurious Rewards, Contamination, and the Sharpen-or-Expand Debate</h1>
+  <p class="lede">A reported RL gain is a pass@1 number measured on one base model, one prompt template and one benchmark, and each of those three can supply the gain without any new capability. This module derives the estimators, puts the pass@k, random-reward, template and contamination evidence side by side, and ends with a measurement that separates a sharpened sampling distribution from a larger set of solvable problems.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>50 min</b> read</span>
+    <span class="chip"><b>18</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Module 10</b>, <b>Module 13</b>, <b>Module 19</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+<svg viewBox="0 0 800 478" role="img" aria-labelledby="f1t"><title id="f1t">Measurement flow for a reported RL gain: five gates in order (same protocol, beyond seed noise, beats a random-reward control, clean benchmark, pass@k at large k); failing the first four leads to protocol artifact, noise, prior amplification or contamination; passing all five splits into expansion if pass@k at large k is higher and sharpening if it is flat or lower</title>
+<defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+<rect x="60" y="10" width="300" height="42" rx="8" class="d-block-muted"/>
+<text x="210" y="36" text-anchor="middle" class="d-text-inv d-bold">Reported gain: pass@1 goes up</text>
+<path d="M210,52 L210,78" class="d-arrow" marker-end="url(#f1-arr)"/>
+<rect x="60" y="80" width="300" height="50" rx="8" class="d-block"/>
+<text x="210" y="101" text-anchor="middle" class="d-text-inv d-bold">1. Same protocol?</text>
+<text x="210" y="119" text-anchor="middle" class="d-text-inv d-small">prompt, T, top-p, k, version</text>
+<path d="M362,105.0 L462,105.0" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="412" y="99" text-anchor="middle" class="d-small d-text-light">no</text>
+<rect x="466" y="87" width="300" height="36" rx="6" class="d-fill-red-soft d-stroke-red"/>
+<text x="480" y="110" text-anchor="start" class="d-bold">protocol artifact</text>
+<path d="M210,130 L210,150" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="222" y="145" text-anchor="start" class="d-small d-text-light">yes</text>
+<rect x="60" y="152" width="300" height="50" rx="8" class="d-block"/>
+<text x="210" y="173" text-anchor="middle" class="d-text-inv d-bold">2. Beyond seed noise?</text>
+<text x="210" y="191" text-anchor="middle" class="d-text-inv d-small">paired test, 30+ seeds</text>
+<path d="M362,177.0 L462,177.0" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="412" y="171" text-anchor="middle" class="d-small d-text-light">no</text>
+<rect x="466" y="159" width="300" height="36" rx="6" class="d-fill-red-soft d-stroke-red"/>
+<text x="480" y="182" text-anchor="start" class="d-bold">noise</text>
+<path d="M210,202 L210,222" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="222" y="217" text-anchor="start" class="d-small d-text-light">yes</text>
+<rect x="60" y="224" width="300" height="50" rx="8" class="d-block"/>
+<text x="210" y="245" text-anchor="middle" class="d-text-inv d-bold">3. Beats random reward?</text>
+<text x="210" y="263" text-anchor="middle" class="d-text-inv d-small">format and random controls</text>
+<path d="M362,249.0 L462,249.0" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="412" y="243" text-anchor="middle" class="d-small d-text-light">no</text>
+<rect x="466" y="231" width="300" height="36" rx="6" class="d-fill-red-soft d-stroke-red"/>
+<text x="480" y="254" text-anchor="start" class="d-bold">prior amplification</text>
+<path d="M210,274 L210,294" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="222" y="289" text-anchor="start" class="d-small d-text-light">yes</text>
+<rect x="60" y="296" width="300" height="50" rx="8" class="d-block"/>
+<text x="210" y="317" text-anchor="middle" class="d-text-inv d-bold">4. Clean benchmark?</text>
+<text x="210" y="335" text-anchor="middle" class="d-text-inv d-small">post-cutoff or decontaminated</text>
+<path d="M362,321.0 L462,321.0" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="412" y="315" text-anchor="middle" class="d-small d-text-light">no</text>
+<rect x="466" y="303" width="300" height="36" rx="6" class="d-fill-red-soft d-stroke-red"/>
+<text x="480" y="326" text-anchor="start" class="d-bold">contamination</text>
+<path d="M210,346 L210,366" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="222" y="361" text-anchor="start" class="d-small d-text-light">yes</text>
+<rect x="60" y="368" width="300" height="50" rx="8" class="d-block"/>
+<text x="210" y="390" text-anchor="middle" class="d-text-inv d-bold">5. pass@k at large k?</text>
+<text x="210" y="408" text-anchor="middle" class="d-text-inv d-small">per-problem solved sets</text>
+<path d="M362,382 L462,366" class="d-arrow" marker-end="url(#f1-arr)"/>
+<path d="M362,404 L462,434" class="d-arrow" marker-end="url(#f1-arr)"/>
+<text x="404" y="356" text-anchor="middle" class="d-small d-text-light">higher</text>
+<text x="404" y="432" text-anchor="middle" class="d-small d-text-light">flat or lower</text>
+<rect x="466" y="344" width="300" height="44" rx="6" class="d-fill-green-soft d-stroke-green"/>
+<text x="480" y="362" text-anchor="start" class="d-bold">expansion</text>
+<text x="580" y="362" text-anchor="start" class="d-small d-text-light">new problems solved</text>
+<rect x="466" y="414" width="300" height="44" rx="6" class="d-fill-blue-soft d-stroke-blue"/>
+<text x="480" y="432" text-anchor="start" class="d-bold">sharpening</text>
+<text x="580" y="432" text-anchor="start" class="d-small d-text-light">same problems, higher odds</text>
+</svg>
+  <figcaption><b>Figure 1.</b> The measurement flow this module builds toward (a schematic, not a result). Gate 5 is the pass@k test of Yue et al.<a class="cite" href="#ref-1">1</a>; gate 3 is the reward-control ladder of Shao et al.<a class="cite" href="#ref-2">2</a>; gate 4 combines the partial-prompt contamination audit of Wu et al.<a class="cite" href="#ref-3">3</a> with the random-reward negative control that Olmo 3 ran on a decontaminated base<a class="cite" href="#ref-4">4</a>; gates 1 and 2 come from the variance findings of Hochlehnert et al.<a class="cite" href="#ref-5">5</a>. Failing a gate does not make a training run useless; it means the measured number cannot be attributed to the RL signal.</figcaption>
+</figure>
+
+<h2 id="metrics">1. What each metric measures</h2>
+<p>An RL report quotes one or more of four numbers for the same benchmark, and they answer different questions. All of them are statistics of one object: the probability \(\rho_x\) that a single sample from the model, at the evaluation decoding settings, is verified correct on problem \(x\). Temperature, top-p and maximum length are part of the definition of \(\rho_x\); change them and you are measuring a different distribution (Section 8.1).</p>
+
+<h3 id="metrics-pass1">1.1 pass@1 and its aliases</h3>
+<p>pass@1 is \(\mathbb{E}_x[\rho_x]\), the mean accuracy over problems. It is estimated by sampling k responses per problem and averaging their correctness. DeepSeek-R1 defines \(\text{pass@1}=\frac1k\sum_{i=1}^{k}p_i\) with k = 64 for AIME and GPQA, 16 for MATH and Codeforces, and 8 for LiveCodeBench, at temperature 0.6 and top-p 0.95. It avoids greedy decoding because greedy decoding of long-output reasoning models "results in higher repetition rates and significant variability across different checkpoints"<a class="cite" href="#ref-6">6</a> (Supplementary D.1). DAPO reports the same estimator as avg@32: the AIME set is repeated 32 times at temperature 1.0 and top-p 0.7<a class="cite" href="#ref-7">7</a> (§4.1). "pass@1", "avg@k" and "mean@k" are one statistic under three names; what differs between reports is k, temperature and top-p, and those change the value.</p>
+
+<h3 id="metrics-passk">1.2 pass@k and the unbiased estimator</h3>
+<p>pass@k is the fraction of problems for which at least one of k samples is correct: per problem \(1-(1-\rho_x)^k\), averaged over problems. The estimator in use comes from the Codex paper<a class="cite" href="#ref-8">8</a>. Draw \(n\ge k\) samples per problem, count the \(c\) that pass, and compute
+$$\widehat{\text{pass@}k}=\mathbb{E}_x\!\left[1-\frac{\binom{n-c}{k}}{\binom{n}{k}}\right],$$
+the complement of the probability that k samples drawn without replacement from the n are all wrong (Eq. 1). The tempting plug-in \(1-(1-c/n)^k\) is biased low, and the gap does not close even for \(n>5k\) (Appendix A, Figure 13). The numerically stable form is the running product \(1-\prod_{i=n-c+1}^{n}(1-k/i)\) (their Figure 3), which the calculator evaluates. Yue et al. set n to the largest k on each curve: 128, 256 or 1,024 depending on the benchmark and model<a class="cite" href="#ref-1">1</a> (Appendix A.2).</p>
+
+<div class="calc">
+  <p class="calc-title">pass@k for one problem: unbiased estimator versus plug-in</p>
+  <div class="calc-row"><label for="m20-n">Samples drawn n</label><input type="range" id="m20-n" name="n" min="8" max="1024" step="8" value="64"></div>
+  <div class="calc-row"><label for="m20-c">Correct samples c</label><input type="range" id="m20-c" name="c" min="0" max="64" step="1" value="4"></div>
+  <div class="calc-row"><label for="m20-k">Budget k</label><input type="range" id="m20-k" name="k" min="1" max="256" step="1" value="32"></div>
+  <div class="calc-out">
+    <div>Unbiased pass@k<output data-expr="(function(){var C=min(c,n),K=min(k,n),p=1;for(var i=n-C+1;i&lt;=n;i++){p*=1-K/i;}return 1-p;})()" data-format="pct"></output></div>
+    <div>Plug-in 1-(1-c/n)^k<output data-expr="1-pow(1-min(c,n)/n,min(k,n))" data-format="pct"></output></div>
+    <div>Plug-in error<output data-expr="100*((1-pow(1-min(c,n)/n,min(k,n)))-(function(){var C=min(c,n),K=min(k,n),p=1;for(var i=n-C+1;i&lt;=n;i++){p*=1-K/i;}return 1-p;})())" data-format="fixed:1" data-unit="points"></output></div>
+  </div>
+  <p class="calc-note">Formulas from Chen et al. (Eq. 1 and Figure 3)<a class="cite" href="#ref-8">8</a>; c and k are clamped to n. At the defaults, n = 64, c = 4, k = 32, the unbiased value is 94.3% and the plug-in 87.3%.</p>
+</div>
+
+<p>The error is largest for problems solved a few times in n samples, which decide the large-k end of a curve: n = 256, c = 2, k = 128 gives 75.1% unbiased and 63.4% plug-in (derived). At \(k=n\) the estimator collapses to the indicator "at least one of the n samples passed", so the rightmost point of a curve built with n equal to its largest k is a single Bernoulli draw per problem.</p>
+
+<h3 id="metrics-maj">1.3 Maj@k and cons@k</h3>
+<p>Majority voting asks a different question: is the most frequent final answer among k samples the correct one? It needs an answer extractor and a canonicalization rule, and it measures how strongly the answer distribution concentrates on the right answer rather than whether the right answer is reachable. DeepSeekMath plots Maj@K and Pass@K side by side for K up to 64<a class="cite" href="#ref-9">9</a> (Figure 7); R1 calls it cons@64<a class="cite" href="#ref-6">6</a>. For any model Maj@k cannot exceed pass@k, because a correct majority contains a correct sample, and pass@k never decreases with k. R1's own numbers on AIME 2024 sit in that order.</p>
+
+<div class="kpis">
+  <div class="kpi"><b>79.8%</b><span>R1 pass@1, AIME 2024<a class="cite" href="#ref-6">6</a></span></div>
+  <div class="kpi kpi-cyan"><b>86.7%</b><span>R1 majority vote over 64 samples<a class="cite" href="#ref-6">6</a></span></div>
+  <div class="kpi kpi-green"><b>90.0%</b><span>R1 pass@64, AIME 2024<a class="cite" href="#ref-6">6</a></span></div>
+</div>
+<p class="small muted">Supplementary E.4 of the v2 report. AIME 2024 has 30 problems<a class="cite" href="#ref-5">5</a>, so 86.7% and 90.0% are 26 and 27 problems (derived); 79.8% is a mean over samples and need not be a multiple of 3.33 points.</p>
+
+<p>Each metric matches a deployment: pass@1 is a single-shot product, Maj@k is sampling without a verifier, pass@k is sampling with a checker such as a test suite. Brown et al. show coverage (their name for pass@k) growing log-linearly over four orders of magnitude of samples, and on SWE-bench Lite DeepSeek-Coder-V2-Instruct goes from 15.9% with one sample to 56% with 250<a class="cite" href="#ref-10">10</a> (abstract). If your stack can afford k samples and a checker, pass@k at that k predicts product quality, so a run that raises pass@1 while lowering pass@256 moves the best operating point.</p>
+
+<h3 id="metrics-derivation">1.4 Worked derivation: pass@k as a functional of the pass-rate distribution</h3>
+<p>Because \(\text{pass@}k=\mathbb{E}_x[1-(1-\rho_x)^k]\), the whole curve is fixed by the distribution of \(\rho_x\) across problems, and two models with the same pass@1 can have very different curves. Small k weights the mean. Large k weights the lower tail: \(1-(1-\rho)^k\) saturates at 1 once \(\rho k\gg 1\) and stays near \(\rho k\) while \(\rho k\ll 1\). One identity makes the effect of concentration explicit. Since \(\mathbb{E}[(1-\rho)^2]=(1-\mu)^2+\sigma^2\) with \(\mu=\mathbb{E}\rho_x\) and \(\sigma^2=\operatorname{Var}(\rho_x)\),
+$$\text{pass@}2 = 1-\big[(1-\mu)^2+\sigma^2\big],$$
+and for \(k>2\) Jensen's inequality makes the same expression an upper bound, \(\text{pass@}k\le 1-[(1-\mu)^2+\sigma^2]^{k/2}\). Dang et al. derived this bound and ProRL quotes it<a class="cite" href="#ref-11">11</a> (§4.4). At fixed mean accuracy, more variance across problems, meaning more problems pinned at 0 and at 1, gives lower pass@k.</p>
+<p>Table 1 builds a constructed population to show the effect. It is arithmetic, not data. The "after RL" pass rates imitate the pattern Yue et al. report: RL raises the share of problems near accuracy 1.0 and also raises the share stuck at 0<a class="cite" href="#ref-1">1</a> (Figure 5, §4.1).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> Constructed population of 100 problems (illustrative arithmetic, not measured). Per-class pass rate \(\rho\) before and after RL, and pass@256 per class from \(1-(1-\rho)^{256}\).</caption>
+  <thead><tr><th>Class</th><th class="num">Problems</th><th class="num">\(\rho\) base</th><th class="num">\(\rho\) after RL</th><th class="num">pass@256 base (%)</th><th class="num">pass@256 after RL (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Easy</td><td class="num">40</td><td class="num">0.60</td><td class="num">0.97</td><td class="num">100.0</td><td class="num">100.0</td></tr>
+    <tr><td class="row">Medium</td><td class="num">30</td><td class="num">0.15</td><td class="num">0.35</td><td class="num">100.0</td><td class="num">100.0</td></tr>
+    <tr><td class="row">Hard</td><td class="num">20</td><td class="num">0.01</td><td class="num">0.001</td><td class="num" data-best>92.4</td><td class="num" data-worst>22.6</td></tr>
+    <tr><td class="row">Near zero</td><td class="num">10</td><td class="num">0.0001</td><td class="num">0</td><td class="num" data-best>2.5</td><td class="num" data-worst>0.0</td></tr>
+    <tr><td class="row">Whole population</td><td class="num">100</td><td class="num">pass@1 28.7%</td><td class="num">pass@1 49.3%</td><td class="num">88.7</td><td class="num">74.5</td></tr>
+  </tbody>
+</table>
+
+<p>The model that is 20.6 points better at k = 1 is 14.2 points worse at k = 256, and the curves cross at k = 16 (70.8% against 70.3%; at k = 15 they are tied, 70.19% against 70.25%). The variances are 0.068 before and 0.170 after, so pass@2 is 42.3% and 57.3%. Had the RL model reached its mean of 0.493 with the base model's variance, pass@2 would be 67.5%; polarization costs it 10.1 points at k = 2, and at k = 256 the loss comes from the hard and near-zero classes.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 340" role="img" aria-labelledby="f2t"><title id="f2t">Constructed pass@k curves: the RL-sharpened model is higher at k from 1 to 8, the base model is higher from k of 16, reaching 88.7 versus 74.5 percent at k of 256</title>
+<line x1="90" y1="290" x2="730" y2="290" class="d-grid"/>
+<text x="82" y="294" text-anchor="end" class="d-small d-mono d-text-light">0</text>
+<line x1="90" y1="227.5" x2="730" y2="227.5" class="d-grid"/>
+<text x="82" y="231.5" text-anchor="end" class="d-small d-mono d-text-light">25</text>
+<line x1="90" y1="165" x2="730" y2="165" class="d-grid"/>
+<text x="82" y="169" text-anchor="end" class="d-small d-mono d-text-light">50</text>
+<line x1="90" y1="102.5" x2="730" y2="102.5" class="d-grid"/>
+<text x="82" y="106.5" text-anchor="end" class="d-small d-mono d-text-light">75</text>
+<line x1="90" y1="40" x2="730" y2="40" class="d-grid"/>
+<text x="82" y="44" text-anchor="end" class="d-small d-mono d-text-light">100</text>
+<line x1="90" y1="40" x2="90" y2="290" class="d-axis"/>
+<line x1="90" y1="290" x2="730" y2="290" class="d-axis"/>
+<line x1="90" y1="290" x2="90" y2="295" class="d-axis"/>
+<text x="90" y="309" text-anchor="middle" class="d-small d-mono d-text-light">1</text>
+<line x1="154" y1="290" x2="154" y2="295" class="d-axis"/>
+<text x="154" y="309" text-anchor="middle" class="d-small d-mono d-text-light">2</text>
+<line x1="218" y1="290" x2="218" y2="295" class="d-axis"/>
+<text x="218" y="309" text-anchor="middle" class="d-small d-mono d-text-light">4</text>
+<line x1="282" y1="290" x2="282" y2="295" class="d-axis"/>
+<text x="282" y="309" text-anchor="middle" class="d-small d-mono d-text-light">8</text>
+<line x1="346" y1="290" x2="346" y2="295" class="d-axis"/>
+<text x="346" y="309" text-anchor="middle" class="d-small d-mono d-text-light">16</text>
+<line x1="410" y1="290" x2="410" y2="295" class="d-axis"/>
+<text x="410" y="309" text-anchor="middle" class="d-small d-mono d-text-light">32</text>
+<line x1="474" y1="290" x2="474" y2="295" class="d-axis"/>
+<text x="474" y="309" text-anchor="middle" class="d-small d-mono d-text-light">64</text>
+<line x1="538" y1="290" x2="538" y2="295" class="d-axis"/>
+<text x="538" y="309" text-anchor="middle" class="d-small d-mono d-text-light">128</text>
+<line x1="602" y1="290" x2="602" y2="295" class="d-axis"/>
+<text x="602" y="309" text-anchor="middle" class="d-small d-mono d-text-light">256</text>
+<line x1="666" y1="290" x2="666" y2="295" class="d-axis"/>
+<text x="666" y="309" text-anchor="middle" class="d-small d-mono d-text-light">512</text>
+<line x1="730" y1="290" x2="730" y2="295" class="d-axis"/>
+<text x="730" y="309" text-anchor="middle" class="d-small d-mono d-text-light">1024</text>
+<text x="410" y="330" text-anchor="middle" class="d-small d-text-light">samples per problem k (log scale)</text>
+<text x="24" y="165" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 24 165)">pass@k, % of problems</text>
+<rect x="282" y="40" width="64" height="250" class="d-fill-amber-soft"/>
+<polyline points="90,218.2 154,184.2 218,154.7 282,131.6 346,113.1 410,101.6 474,91.1 538,78.5 602,68.2 666,64 730,62.6" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<polyline points="90,166.7 154,146.7 218,128.2 282,117 346,114.3 410,113.4 474,111.9 538,109 602,103.7 666,95 730,82.9" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+<circle cx="90" cy="218.2" r="3.5" class="d-fill-blue"/>
+<circle cx="90" cy="166.7" r="3.5" class="d-fill-orange"/>
+<circle cx="154" cy="184.2" r="3.5" class="d-fill-blue"/>
+<circle cx="154" cy="146.7" r="3.5" class="d-fill-orange"/>
+<circle cx="218" cy="154.7" r="3.5" class="d-fill-blue"/>
+<circle cx="218" cy="128.2" r="3.5" class="d-fill-orange"/>
+<circle cx="282" cy="131.6" r="3.5" class="d-fill-blue"/>
+<circle cx="282" cy="117" r="3.5" class="d-fill-orange"/>
+<circle cx="346" cy="113.1" r="3.5" class="d-fill-blue"/>
+<circle cx="346" cy="114.3" r="3.5" class="d-fill-orange"/>
+<circle cx="410" cy="101.6" r="3.5" class="d-fill-blue"/>
+<circle cx="410" cy="113.4" r="3.5" class="d-fill-orange"/>
+<circle cx="474" cy="91.1" r="3.5" class="d-fill-blue"/>
+<circle cx="474" cy="111.9" r="3.5" class="d-fill-orange"/>
+<circle cx="538" cy="78.5" r="3.5" class="d-fill-blue"/>
+<circle cx="538" cy="109" r="3.5" class="d-fill-orange"/>
+<circle cx="602" cy="68.2" r="3.5" class="d-fill-blue"/>
+<circle cx="602" cy="103.7" r="3.5" class="d-fill-orange"/>
+<circle cx="666" cy="64" r="3.5" class="d-fill-blue"/>
+<circle cx="666" cy="95" r="3.5" class="d-fill-orange"/>
+<circle cx="730" cy="62.6" r="3.5" class="d-fill-blue"/>
+<circle cx="730" cy="82.9" r="3.5" class="d-fill-orange"/>
+<text x="94" y="236.2" text-anchor="start" class="d-small d-mono">28.7</text>
+<text x="94" y="157.7" text-anchor="start" class="d-small d-mono">49.3</text>
+<text x="598" y="58.2" text-anchor="middle" class="d-small d-mono">88.7</text>
+<text x="598" y="121.7" text-anchor="middle" class="d-small d-mono">74.5</text>
+<text x="728" y="52.6" text-anchor="middle" class="d-small d-mono">91.0</text>
+<text x="728" y="100.9" text-anchor="middle" class="d-small d-mono">82.8</text>
+<text x="314" y="54" text-anchor="middle" class="d-small d-bold">crossover</text>
+<text x="314" y="67" text-anchor="middle" class="d-small d-mono">k = 8 to 16</text>
+<rect x="480" y="212" width="215" height="56" rx="6" class="d-label-bg"/>
+<line x1="490" y1="230" x2="514" y2="230" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<text x="521" y="234" text-anchor="start" class="d-small">base model</text>
+<line x1="490" y1="252" x2="514" y2="252" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+<text x="521" y="256" text-anchor="start" class="d-small">after RL (sharpened)</text>
+</svg>
+  <figcaption><b>Figure 2.</b> Schematic pass@k curves for the constructed population of Table 1 (computed from \(1-(1-\rho)^k\); not measured). The RL-sharpened model leads for k up to 15, the base model leads from k = 16, and at k = 256 the order is 88.7% against 74.5%. The shape, not the numbers, is what Yue et al. measure on real models<a class="cite" href="#ref-1">1</a> (Figure 2).</figcaption>
+</figure>
+
+<h2 id="sharpening">2. The sharpening evidence</h2>
+
+<h3 id="sharpening-deepseekmath">2.1 DeepSeekMath saw it first</h3>
+<p>The sharpen-or-expand question was visible in the paper that introduced GRPO. DeepSeekMath compared the instruction-tuned 7B model with its GRPO-trained successor on GSM8K and MATH at temperature 0.7, for K up to 64, and found that "RL enhances Maj@K's performance but not Pass@K". The authors read this as RL "rendering the output distribution more robust": the improvement "is attributed to boosting the correct response from TopK rather than the enhancement of fundamental capabilities"<a class="cite" href="#ref-9">9</a> (§5.2.2, Figure 7). They also name a possible cause that is a property of their pipeline rather than of RL: the RL data were questions from the instruction-tuning stage, sampled with plain nucleus sampling, which they suspect is "a potential reason that our RL pipeline only improves the Maj@K performance"<a class="cite" href="#ref-9">9</a> (§5.2.3). That is one model and two benchmarks<a class="cite" href="#ref-1">1</a> (§6). Module 9 covers the GRPO objective itself.</p>
+
+<h3 id="sharpening-yue">2.2 Yue et al.: pass@k at large k</h3>
+<p>Yue et al. test the claim at scale<a class="cite" href="#ref-1">1</a>. For math they take released zero-RL checkpoints (GRPO from a base model with a correctness reward only, SimpleRLZoo on GSM8K and MATH) for Qwen2.5-7B, 14B and 32B and LLaMA-3.1-8B, plus Oat-Zero-7B and DAPO-32B, and they add released code and vision models (§3). Base and RL models share the same zero-shot prompt, with no few-shot examples for the base, and sampling uses temperature 0.6, top-p 0.95 and up to 16,384 generated tokens (§3). The pattern is the same in every family: the RL model wins at small k, and "as k increases, with steeper curves, base models consistently catch up to and eventually surpass RL-trained models". On Minerva with a 32B model the base is about 9 points ahead at k = 128; Oat-Zero and DAPO start nearly 30 points ahead of their base and are eventually passed by it (§3.1). Code and visual benchmarks behave the same way (§3.2, §3.3).</p>
+<p>Two details matter. Base models "often produce unformatted or non-sensical responses" without few-shot prompts, yet with enough samples they produce correctly formatted, correct answers (§3). Part of an early pass@1 gain is therefore the model learning the expected answer form, while pass@k at large k looks through format failures to what is reachable. And because math checking is answer-only, Yue et al. read chains of thought by hand: of 25 GSM8K problems the base solved at accuracy between 0 and 5%, 24 had at least one correct chain (23 of 25 for the RL model), and on low-accuracy AIME 2024 problems the base had a correct chain in 5 of the 6 cases they could judge (§3.1).</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 342" role="img" aria-labelledby="f3t"><title id="f3t">Qwen2.5-7B under GRPO: pass@1 on Omni-MATH train rises from 9.9 to 42.5 over 450 steps while pass@256 falls from 67.2 to 64.3; the test split goes from 10.2 to 28.3 and from 69.1 to 63.9</title>
+<line x1="80" y1="270" x2="380" y2="270" class="d-grid"/>
+<text x="74" y="274" text-anchor="end" class="d-small d-mono d-text-light">0</text>
+<line x1="80" y1="228" x2="380" y2="228" class="d-grid"/>
+<text x="74" y="232" text-anchor="end" class="d-small d-mono d-text-light">10</text>
+<line x1="80" y1="186" x2="380" y2="186" class="d-grid"/>
+<text x="74" y="190" text-anchor="end" class="d-small d-mono d-text-light">20</text>
+<line x1="80" y1="144" x2="380" y2="144" class="d-grid"/>
+<text x="74" y="148" text-anchor="end" class="d-small d-mono d-text-light">30</text>
+<line x1="80" y1="102" x2="380" y2="102" class="d-grid"/>
+<text x="74" y="106" text-anchor="end" class="d-small d-mono d-text-light">40</text>
+<line x1="80" y1="60" x2="380" y2="60" class="d-grid"/>
+<text x="74" y="64" text-anchor="end" class="d-small d-mono d-text-light">50</text>
+<line x1="80" y1="60" x2="80" y2="270" class="d-axis"/>
+<line x1="80" y1="270" x2="380" y2="270" class="d-axis"/>
+<line x1="110" y1="270" x2="110" y2="275" class="d-axis"/>
+<text x="110" y="289" text-anchor="middle" class="d-small d-mono d-text-light">base</text>
+<line x1="190" y1="270" x2="190" y2="275" class="d-axis"/>
+<text x="190" y="289" text-anchor="middle" class="d-small d-mono d-text-light">150</text>
+<line x1="270" y1="270" x2="270" y2="275" class="d-axis"/>
+<text x="270" y="289" text-anchor="middle" class="d-small d-mono d-text-light">300</text>
+<line x1="350" y1="270" x2="350" y2="275" class="d-axis"/>
+<text x="350" y="289" text-anchor="middle" class="d-small d-mono d-text-light">450</text>
+<text x="230" y="308" text-anchor="middle" class="d-small d-text-light">GRPO training step</text>
+<text x="230" y="38" text-anchor="middle" class="d-title d-bold">pass@1 rises</text>
+<polyline points="110,228.4 190,160.4 270,128.9 350,91.5" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<circle cx="110" cy="228.4" r="3.5" class="d-fill-blue"/>
+<text x="110" y="219.4" text-anchor="middle" class="d-small d-mono">9.9</text>
+<circle cx="190" cy="160.4" r="3.5" class="d-fill-blue"/>
+<text x="190" y="151.4" text-anchor="middle" class="d-small d-mono">26.1</text>
+<circle cx="270" cy="128.9" r="3.5" class="d-fill-blue"/>
+<text x="270" y="119.9" text-anchor="middle" class="d-small d-mono">33.6</text>
+<circle cx="350" cy="91.5" r="3.5" class="d-fill-blue"/>
+<text x="350" y="82.5" text-anchor="middle" class="d-small d-mono">42.5</text>
+<polyline points="110,227.2 190,164.6 270,156.2 350,151.1" class="d-line d-stroke-cyan" style="stroke-width:2.5"/>
+<circle cx="110" cy="227.2" r="3.5" class="d-fill-cyan"/>
+<text x="110" y="243.2" text-anchor="middle" class="d-small d-mono">10.2</text>
+<circle cx="190" cy="164.6" r="3.5" class="d-fill-cyan"/>
+<text x="190" y="180.6" text-anchor="middle" class="d-small d-mono">25.1</text>
+<circle cx="270" cy="156.2" r="3.5" class="d-fill-cyan"/>
+<text x="270" y="172.2" text-anchor="middle" class="d-small d-mono">27.1</text>
+<circle cx="350" cy="151.1" r="3.5" class="d-fill-cyan"/>
+<text x="350" y="167.1" text-anchor="middle" class="d-small d-mono">28.3</text>
+<line x1="470" y1="270" x2="770" y2="270" class="d-grid"/>
+<text x="464" y="274" text-anchor="end" class="d-small d-mono d-text-light">60</text>
+<line x1="470" y1="235" x2="770" y2="235" class="d-grid"/>
+<text x="464" y="239" text-anchor="end" class="d-small d-mono d-text-light">62</text>
+<line x1="470" y1="200" x2="770" y2="200" class="d-grid"/>
+<text x="464" y="204" text-anchor="end" class="d-small d-mono d-text-light">64</text>
+<line x1="470" y1="165" x2="770" y2="165" class="d-grid"/>
+<text x="464" y="169" text-anchor="end" class="d-small d-mono d-text-light">66</text>
+<line x1="470" y1="130" x2="770" y2="130" class="d-grid"/>
+<text x="464" y="134" text-anchor="end" class="d-small d-mono d-text-light">68</text>
+<line x1="470" y1="95" x2="770" y2="95" class="d-grid"/>
+<text x="464" y="99" text-anchor="end" class="d-small d-mono d-text-light">70</text>
+<line x1="470" y1="60" x2="770" y2="60" class="d-grid"/>
+<text x="464" y="64" text-anchor="end" class="d-small d-mono d-text-light">72</text>
+<line x1="470" y1="60" x2="470" y2="270" class="d-axis"/>
+<line x1="470" y1="270" x2="770" y2="270" class="d-axis"/>
+<line x1="500" y1="270" x2="500" y2="275" class="d-axis"/>
+<text x="500" y="289" text-anchor="middle" class="d-small d-mono d-text-light">base</text>
+<line x1="580" y1="270" x2="580" y2="275" class="d-axis"/>
+<text x="580" y="289" text-anchor="middle" class="d-small d-mono d-text-light">150</text>
+<line x1="660" y1="270" x2="660" y2="275" class="d-axis"/>
+<text x="660" y="289" text-anchor="middle" class="d-small d-mono d-text-light">300</text>
+<line x1="740" y1="270" x2="740" y2="275" class="d-axis"/>
+<text x="740" y="289" text-anchor="middle" class="d-small d-mono d-text-light">450</text>
+<text x="620" y="308" text-anchor="middle" class="d-small d-text-light">GRPO training step</text>
+<text x="620" y="38" text-anchor="middle" class="d-title d-bold">pass@256 falls</text>
+<polyline points="500,144 580,159.8 660,177.3 740,194.8" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<circle cx="500" cy="144" r="3.5" class="d-fill-blue"/>
+<text x="500" y="160" text-anchor="middle" class="d-small d-mono">67.2</text>
+<circle cx="580" cy="159.8" r="3.5" class="d-fill-blue"/>
+<circle cx="660" cy="177.3" r="3.5" class="d-fill-blue"/>
+<circle cx="740" cy="194.8" r="3.5" class="d-fill-blue"/>
+<text x="740" y="185.8" text-anchor="middle" class="d-small d-mono">64.3</text>
+<polyline points="500,110.8 580,124.8 660,154.5 740,201.8" class="d-line d-stroke-cyan" style="stroke-width:2.5"/>
+<circle cx="500" cy="110.8" r="3.5" class="d-fill-cyan"/>
+<text x="500" y="101.8" text-anchor="middle" class="d-small d-mono">69.1</text>
+<circle cx="580" cy="124.8" r="3.5" class="d-fill-cyan"/>
+<circle cx="660" cy="154.5" r="3.5" class="d-fill-cyan"/>
+<circle cx="740" cy="201.8" r="3.5" class="d-fill-cyan"/>
+<text x="740" y="217.8" text-anchor="middle" class="d-small d-mono">63.9</text>
+<text x="620" y="332" text-anchor="middle" class="d-small d-text-light">right panel: axis starts at 60, not 0</text>
+<rect x="95" y="66" width="150" height="40" rx="6" class="d-label-bg"/>
+<line x1="103" y1="80" x2="125" y2="80" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<text x="131" y="84" text-anchor="start" class="d-small">Omni-MATH train</text>
+<line x1="103" y1="98" x2="125" y2="98" class="d-line d-stroke-cyan" style="stroke-width:2.5"/>
+<text x="131" y="102" text-anchor="start" class="d-small">Omni-MATH test</text>
+</svg>
+  <figcaption><b>Figure 3.</b> The controlled run in Yue et al.: Qwen2.5-7B trained with GRPO on Omni-MATH-Rule (2,000 training problems, 8 samples per prompt, 8,192-token rollouts, temperature 1.0, no KL term), evaluated at pass@1 and pass@256<a class="cite" href="#ref-1">1</a> (§4.3-§4.4, Table 4). Over 450 steps train pass@1 rises 4.3-fold (9.9 to 42.5) while train pass@256 falls 2.9 points (67.2 to 64.3); the in-domain test split moves 10.2 to 28.3 and 69.1 to 63.9.</figcaption>
+</figure>
+
+<p>The controlled experiment in Figure 3 isolates training duration. The same trend shows up per problem. Yue et al. partition problems by whether the base model, the RL model, both or neither solved them at least once, with k = 1,024 for AIME 2024 and k = 128 for MATH-500 (Table 2 of the paper, Figure 4 here). The RL model solved almost nothing the base could not: the RL-only slices are 0.0% of AIME 2024 and 1.0% of MATH-500 (about 5 problems), and the base solves all of those with 1,024 samples (Appendix C.7). Perplexity gives a second view. They score RL-model responses under the base model (median over 32 samples, averaged over 10 problems); the perplexity falls from 1.244 at the base through 1.219 and 1.176 to 1.159 at the end of training (Figure 15). The RL model increasingly writes what the base already considers likely, which is what "sharpening" means operationally.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 275" role="img" aria-labelledby="f4t"><title id="f4t">Share of problems solved at least once by the base model, the RL model, both or neither: on AIME24 at k of 1,024, 63.3 percent both, 13.3 percent only the base, 0.0 percent only RL, 23.3 percent neither; on MATH-500 at k of 128, 92.4, 3.6, 1.0 and 3.0</title>
+<text x="178" y="92" text-anchor="end" class="d-small d-bold">AIME24, k = 1,024</text>
+<text x="178" y="108" text-anchor="end" class="d-small d-text-light">30 problems</text>
+<rect x="190" y="70" width="329.2" height="34" class="d-fill-blue"/>
+<text x="354.6" y="92" text-anchor="middle" class="d-small d-mono d-text-inv">63.3</text>
+<rect x="519.2" y="70" width="69.2" height="34" class="d-fill-orange"/>
+<text x="553.7" y="92" text-anchor="middle" class="d-small d-mono d-text-inv">13.3</text>
+<rect x="588.3" y="70" width="121.2" height="34" class="d-fill-amber-soft"/>
+<text x="648.9" y="92" text-anchor="middle" class="d-small d-mono">23.3</text>
+<text x="178" y="182" text-anchor="end" class="d-small d-bold">MATH-500, k = 128</text>
+<text x="178" y="198" text-anchor="end" class="d-small d-text-light">500 problems</text>
+<rect x="190" y="160" width="480.5" height="34" class="d-fill-blue"/>
+<text x="430.2" y="182" text-anchor="middle" class="d-small d-mono d-text-inv">92.4</text>
+<rect x="670.5" y="160" width="18.7" height="34" class="d-fill-orange"/>
+<text x="679.8" y="182" text-anchor="middle" class="d-small d-mono d-text-inv">3.6</text>
+<rect x="689.2" y="160" width="5.2" height="34" class="d-fill-green"/>
+<rect x="694.4" y="160" width="15.6" height="34" class="d-fill-amber-soft"/>
+<text x="702.2" y="182" text-anchor="middle" class="d-small d-mono">3</text>
+<text x="710" y="62" text-anchor="end" class="d-small d-mono d-text-light">100%</text>
+<text x="190" y="62" text-anchor="start" class="d-small d-mono d-text-light">0%</text>
+<rect x="105" y="240" width="16" height="16" class="d-fill-blue"/>
+<text x="127" y="253" text-anchor="start" class="d-small">both solve</text>
+<rect x="255" y="240" width="16" height="16" class="d-fill-orange"/>
+<text x="277" y="253" text-anchor="start" class="d-small">only base solves</text>
+<rect x="405" y="240" width="16" height="16" class="d-fill-green"/>
+<text x="427" y="253" text-anchor="start" class="d-small">only RL solves</text>
+<rect x="555" y="240" width="16" height="16" class="d-fill-amber-soft"/>
+<text x="577" y="253" text-anchor="start" class="d-small">neither</text>
+<text x="450" y="222" text-anchor="middle" class="d-small d-text-light">RL-only slice: 0.0 percent on AIME24, 1.0 percent on MATH-500</text>
+</svg>
+  <figcaption><b>Figure 4.</b> Share of problems solved at least once by the base model, the RL model, both or neither, from Table 2 of Yue et al.<a class="cite" href="#ref-1">1</a>. AIME 2024 has 30 problems, so the slices are 19, 4, 0 and 7 problems (derived: 63.3, 13.3, 0.0 and 23.3 percent of 30). Base solves 23 problems at k = 1,024, the RL model 19.</figcaption>
+</figure>
+
+<h3 id="sharpening-algorithms">2.3 The algorithm does not change the picture</h3>
+<p>Yue et al. re-implemented six RLVR algorithms in one framework (PPO, GRPO, Reinforce++, RLOO, ReMax and DAPO; KL removed, constant learning rate \(10^{-6}\), 8 responses per prompt) and compared pass@1 and pass@256 on the same Omni-MATH split<a class="cite" href="#ref-1">1</a> (§4.3, Table 3). Their summary is that all six "perform similarly and remain far from optimal". Table 2 reproduces the numbers and adds one derived column: the sampling-efficiency gap \(\Delta_{SE}\) as the paper defines it, the base model's pass@256 minus the RL model's pass@1.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Qwen2.5-7B and six RLVR algorithms on Omni-MATH (percent). Source: Yue et al. Table 3<a class="cite" href="#ref-1">1</a>. The last column is derived here as 69.1 minus the algorithm's test pass@1.</caption>
+  <thead><tr><th>Model</th><th class="num">Train pass@1</th><th class="num">Train pass@256</th><th class="num">Test pass@1</th><th class="num">Test pass@256</th><th class="num">\(\Delta_{SE}\) on test</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Qwen2.5-7B (base)</td><td class="num">9.9</td><td class="num">67.2</td><td class="num">10.2</td><td class="num">69.1</td><td class="num">n/a</td></tr>
+    <tr><td class="row">GRPO</td><td class="num">26.1</td><td class="num">66.3</td><td class="num">25.1</td><td class="num">68.3</td><td class="num">44.0</td></tr>
+    <tr><td class="row">PPO</td><td class="num">27.2</td><td class="num">65.8</td><td class="num">26.8</td><td class="num">69.2</td><td class="num">42.3</td></tr>
+    <tr><td class="row">ReMax</td><td class="num">24.4</td><td class="num">65.5</td><td class="num">23.8</td><td class="num">67.5</td><td class="num" data-worst>45.3</td></tr>
+    <tr><td class="row">RLOO</td><td class="num">28.6</td><td class="num">66.4</td><td class="num">28.1</td><td class="num">69.2</td><td class="num" data-best>41.0</td></tr>
+    <tr><td class="row">Reinforce++</td><td class="num">28.2</td><td class="num" data-best>67.7</td><td class="num">28.0</td><td class="num" data-best>69.7</td><td class="num">41.1</td></tr>
+    <tr><td class="row">DAPO</td><td class="num" data-best>31.4</td><td class="num">66.1</td><td class="num">26.5</td><td class="num">67.0</td><td class="num">42.6</td></tr>
+  </tbody>
+</table>
+<p>The spread between algorithms in pass@1 is 7 points on the training split (24.4 to 31.4) and the spread in pass@256 is 2.2 points (65.5 to 67.7), against a base model at 67.2. The paper's text quotes \(\Delta_{SE}\) of 43.9 for GRPO and 42.6 for RLOO on the test split; recomputing from its Table 3 gives 44.0 for GRPO (rounding) and 41.0 for RLOO, while 42.6 is DAPO's, so use the table. Modules 11 and 15 argue that loss and normalization choices move efficiency more than the ceiling; this is the same observation from the pass@k side, on one base model and one benchmark. Other choices did not rescue the boundary: a KL term at 0.001 gave similar pass@1 and a much lower pass@128, 32 rollouts per prompt instead of 8 helped a little, and raising the RL model's temperature to match the base's entropy did not close the gap (§4.4-§4.5).</p>
+
+<h3 id="sharpening-replications">2.4 Independent checks</h3>
+<p>Hochlehnert et al. re-evaluated open RL checkpoints under one standardized stack and report "a minor diversity collapse": DeepScaleR-1.5B and FastCuRL-1.5B trained from DeepSeek-R1-Distill-1.5B were below their starting point in pass@k for k up to 128 on AIME24, AMC23 and MATH500, with every \(\Delta\)pass@k negative<a class="cite" href="#ref-5">5</a> (§5.2, Figure 12). The same study found significant pass@1 gains for DeepScaleR and FastCuRL and robust gains for Nemotron-RR, which by its name is ProRL's released model<a class="cite" href="#ref-5">5</a> (§4.3). Pass@1 gains and a shrinking boundary are compatible, and several of those recipes show both.</p>
+<p>The Invisible Leash study (first author Fang Wu; v5 of 14 October 2026) tracks outcomes question by question instead of averaging<a class="cite" href="#ref-12">12</a>. It defines the empirical support of a model as the set of questions with at least one verified success in n samples, and records for each question whether RL preserved, expanded or shrank access to a verified solution. In the benchmark aggregates it evaluated, "more questions lose a verified success than gain one at the stated sampling budgets", alongside gains in pass@1; on AIME25 and Minerva coverage rose at intermediate checkpoints and ended below the initial level, so expansion can be temporary; and some RLVR models raised average token-level entropy while lowering final-answer entropy<a class="cite" href="#ref-12">12</a> (abstract, §1). Qwen3's on-policy distillation experiment, which found pass@64 flat under RL, is in Section 7<a class="cite" href="#ref-13">13</a>.</p>
+<p>A training-free result points the same way. Karan and Du sample from a sharpened version of the base model's own likelihood with an MCMC-inspired procedure, with no training, data or verifier, and report boosts that "nearly match and even outperform" RL on single-shot MATH500, HumanEval and GPQA without RL's diversity collapse<a class="cite" href="#ref-14">14</a> (abstract). If reweighting base likelihoods reproduces most of the single-shot gain, that gain is a property of the base distribution; it does not show RL does nothing else.</p>
+
+<h2 id="prorl">3. The expansion claim: ProRL</h2>
+
+<h3 id="prorl-claim">3.1 The claim and the recipe</h3>
+<p>ProRL's authors argue that conclusions like Yue et al.'s "may stem from methodological constraints rather than fundamental limitations of RL": earlier studies leaned on math, where models are heavily trained in both pre-training and post-training, and stopped RL after "no more than hundreds of steps"<a class="cite" href="#ref-11">11</a> (§1). Their recipe is GRPO with DAPO's decoupled clipping (\(\epsilon_{low}=0.2\), \(\epsilon_{high}=0.4\)) and dynamic sampling that drops prompts with accuracy 0 or 1, plus a KL penalty to a reference policy that is hard-reset, together with the optimizer state, to a recent snapshot of the policy when validation stagnates (§2.3, §3.2-§3.3). The run starts from DeepSeek-R1-Distill-Qwen-1.5B and trains on 136K problems from five domains (math, code, STEM, logic puzzles, instruction following) with 16 rollouts per prompt at temperature 1.2, a 256-prompt batch, and about 16,000 H100 GPU-hours, for more than 2,000 steps (§3.1-§3.3).</p>
+
+<h3 id="prorl-results">3.2 What it measured</h3>
+<p>Single-sample gains are large and not in dispute (Figure 5): the average over math benchmarks goes from 44.45 to 60.14, code from 23.08 to 37.49, GPQA Diamond from 15.86 to 41.78, IFEval from 44.05 to 66.02, and the Reasoning Gym logic-puzzle reward from 4.24 to 59.06 (Tables 1-3; pass@1 from 16 samples for math, code and GPQA, mean verifier reward for IFEval and the puzzles; temperature 0.6, top-p 0.95, 32K tokens). One reporting inconsistency: the introduction gives average gains of 14.7 (math), 13.9 (code), 25.1 (STEM) and 18.1 (instruction following); the body gives 15.7, 14.4, 25.9 and 22.0, and the tables agree with the body (60.14 minus 44.45 is 15.69; 37.49 minus 23.08 is 14.41; 41.78 minus 15.86 is 25.92; 66.02 minus 44.05 is 21.97, derived). All are absolute points. Module 13 quotes the introduction's figures.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 330" role="img" aria-labelledby="f5t"><title id="f5t">ProRL pass@1 or average reward before and after prolonged RL on a 1.5B model: math 44.45 to 60.14, code 23.08 to 37.49, GPQA 15.86 to 41.78, IFEval 44.05 to 66.02, logic puzzles 4.24 to 59.06, and held-out tasks acre 5.99 to 58.57, boxnet 0.00 to 7.91, game 3.49 to 52.29</title>
+<line x1="70" y1="270" x2="780" y2="270" class="d-grid"/>
+<text x="64" y="274" text-anchor="end" class="d-small d-mono d-text-light">0</text>
+<line x1="70" y1="238.6" x2="780" y2="238.6" class="d-grid"/>
+<text x="64" y="242.6" text-anchor="end" class="d-small d-mono d-text-light">10</text>
+<line x1="70" y1="207.1" x2="780" y2="207.1" class="d-grid"/>
+<text x="64" y="211.1" text-anchor="end" class="d-small d-mono d-text-light">20</text>
+<line x1="70" y1="175.7" x2="780" y2="175.7" class="d-grid"/>
+<text x="64" y="179.7" text-anchor="end" class="d-small d-mono d-text-light">30</text>
+<line x1="70" y1="144.3" x2="780" y2="144.3" class="d-grid"/>
+<text x="64" y="148.3" text-anchor="end" class="d-small d-mono d-text-light">40</text>
+<line x1="70" y1="112.9" x2="780" y2="112.9" class="d-grid"/>
+<text x="64" y="116.9" text-anchor="end" class="d-small d-mono d-text-light">50</text>
+<line x1="70" y1="81.4" x2="780" y2="81.4" class="d-grid"/>
+<text x="64" y="85.4" text-anchor="end" class="d-small d-mono d-text-light">60</text>
+<line x1="70" y1="50" x2="780" y2="50" class="d-grid"/>
+<text x="64" y="54" text-anchor="end" class="d-small d-mono d-text-light">70</text>
+<line x1="70" y1="50" x2="70" y2="270" class="d-axis"/>
+<line x1="70" y1="270" x2="780" y2="270" class="d-axis"/>
+<rect x="86.4" y="130.3" width="26" height="139.7" class="d-fill-blue"/>
+<rect x="116.4" y="81" width="26" height="189" class="d-fill-orange"/>
+<text x="99.4" y="125.3" text-anchor="middle" class="d-small d-mono">44.5</text>
+<text x="129.4" y="76" text-anchor="middle" class="d-small d-mono">60.1</text>
+<text x="114.4" y="287" text-anchor="middle" class="d-small">Math avg</text>
+<rect x="175.1" y="197.5" width="26" height="72.5" class="d-fill-blue"/>
+<rect x="205.1" y="152.2" width="26" height="117.8" class="d-fill-orange"/>
+<text x="188.1" y="192.5" text-anchor="middle" class="d-small d-mono">23.1</text>
+<text x="218.1" y="147.2" text-anchor="middle" class="d-small d-mono">37.5</text>
+<text x="203.1" y="287" text-anchor="middle" class="d-small">Code avg</text>
+<rect x="263.9" y="220.2" width="26" height="49.8" class="d-fill-blue"/>
+<rect x="293.9" y="138.7" width="26" height="131.3" class="d-fill-orange"/>
+<text x="276.9" y="215.2" text-anchor="middle" class="d-small d-mono">15.9</text>
+<text x="306.9" y="133.7" text-anchor="middle" class="d-small d-mono">41.8</text>
+<text x="291.9" y="287" text-anchor="middle" class="d-small">GPQA</text>
+<rect x="352.6" y="131.6" width="26" height="138.4" class="d-fill-blue"/>
+<rect x="382.6" y="62.5" width="26" height="207.5" class="d-fill-orange"/>
+<text x="365.6" y="126.6" text-anchor="middle" class="d-small d-mono">44.0</text>
+<text x="395.6" y="57.5" text-anchor="middle" class="d-small d-mono">66.0</text>
+<text x="380.6" y="287" text-anchor="middle" class="d-small">IFEval</text>
+<rect x="441.4" y="256.7" width="26" height="13.3" class="d-fill-blue"/>
+<rect x="471.4" y="84.4" width="26" height="185.6" class="d-fill-orange"/>
+<text x="454.4" y="251.7" text-anchor="middle" class="d-small d-mono">4.2</text>
+<text x="484.4" y="79.4" text-anchor="middle" class="d-small d-mono">59.1</text>
+<text x="469.4" y="287" text-anchor="middle" class="d-small">Logic puzzles</text>
+<rect x="530.1" y="251.2" width="26" height="18.8" class="d-fill-blue"/>
+<rect x="560.1" y="85.9" width="26" height="184.1" class="d-fill-orange"/>
+<text x="543.1" y="246.2" text-anchor="middle" class="d-small d-mono">6.0</text>
+<text x="573.1" y="80.9" text-anchor="middle" class="d-small d-mono">58.6</text>
+<text x="558.1" y="287" text-anchor="middle" class="d-small">acre</text>
+<rect x="618.9" y="270" width="26" height="0" class="d-fill-blue"/>
+<rect x="648.9" y="245.1" width="26" height="24.9" class="d-fill-orange"/>
+<text x="631.9" y="265" text-anchor="middle" class="d-small d-mono">0.0</text>
+<text x="661.9" y="240.1" text-anchor="middle" class="d-small d-mono">7.9</text>
+<text x="646.9" y="287" text-anchor="middle" class="d-small">boxnet</text>
+<rect x="707.6" y="259" width="26" height="11" class="d-fill-blue"/>
+<rect x="737.6" y="105.7" width="26" height="164.3" class="d-fill-orange"/>
+<text x="720.6" y="254" text-anchor="middle" class="d-small d-mono">3.5</text>
+<text x="750.6" y="100.7" text-anchor="middle" class="d-small d-mono">52.3</text>
+<text x="735.6" y="287" text-anchor="middle" class="d-small">game</text>
+<line x1="76" y1="296" x2="507.8" y2="296" class="d-axis"/>
+<text x="291.9" y="312" text-anchor="middle" class="d-small d-text-light">trained domains</text>
+<line x1="519.8" y1="296" x2="774" y2="296" class="d-axis"/>
+<text x="646.9" y="312" text-anchor="middle" class="d-small d-text-light">held-out Reasoning Gym tasks</text>
+<rect x="90" y="14" width="14" height="14" class="d-fill-blue"/>
+<text x="110" y="26" text-anchor="start" class="d-small">DeepSeek-R1-Distill-Qwen-1.5B (base)</text>
+<rect x="420" y="14" width="14" height="14" class="d-fill-orange"/>
+<text x="440" y="26" text-anchor="start" class="d-small">after ProRL (final)</text>
+</svg>
+  <figcaption><b>Figure 5.</b> ProRL pass@1 (math, code, GPQA) or mean rule-based reward (IFEval, logic puzzles and the three held-out tasks) before and after prolonged RL on a 1.5B model<a class="cite" href="#ref-11">11</a> (Tables 1-3). The base is DeepSeek-R1-Distill-Qwen-1.5B. The held-out tasks (acre, boxnet, game of life halting) are Reasoning Gym tasks not seen in training.</figcaption>
+</figure>
+
+<p>The boundary evidence comes from pass@k. ProRL re-evaluates with 256 samples on 18 of the 96 Reasoning Gym tasks plus the other benchmarks and finds a strong negative relationship between the base model's pass@128 on a task and the gain in pass@128 after RL: tasks the base already solves show "minimal or even negative gains in reasoning breadth", and tasks where it struggles gain most (§4.1, Figure 3). Per task the curves fall into three regimes (§4.2, Figure 4): diminish (math, LiveCodeBench, letter counting, where pass@128 often declines while pass@1 rises), plateau (GPQA Diamond, maze, palindrome, where the final checkpoint adds nothing), and sustained gains (Codecontests, TACO, dice). On the held-out boxnet task the base model "exhibits no capability of solving the task" and the final model does (§4.3). ProRL's own math results therefore agree with Yue et al.; a claim of expansion rests on code and logic tasks where the base starts weak, and on the Creativity Index, which measures how much a response overlaps a pretraining corpus (Dolma in the per-task analysis) and rises with training (§1, §4.1, Figure 1).</p>
+
+<h3 id="prorl-arithmetic">3.3 Why expansion needs a signal to start from</h3>
+<p>RL can only reinforce what it samples. Dr. GRPO: if a base policy "cannot even sample a single trajectory that leads to the correct final answer, it is impossible for RL to improve the policy because there is no reward signal"<a class="cite" href="#ref-15">15</a> (§2.1). The ProRL budget lets you put numbers on it (derived here). A batch of 256 prompts for about 2,000 steps is 512,000 prompt slots against 136,000 problems, about 3.8 visits per problem on average before dynamic sampling removes prompts. With 16 rollouts per visit, a problem whose pass rate under the training policy is \(\rho\) yields at least one correct rollout with probability \(1-(1-\rho)^{16}\):</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 3.</b> Chance that one visit with 16 rollouts contains a correct rollout, and expected visits before the first one (derived from \(1-(1-\rho)^{16}\)).</caption>
+  <thead><tr><th class="num">Pass rate \(\rho\)</th><th class="num">P(at least one correct in 16)</th><th class="num">Expected visits to first correct</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0.001</td><td class="num">1.6%</td><td class="num">63.0</td></tr>
+    <tr><td class="num">0.01</td><td class="num">14.9%</td><td class="num">6.7</td></tr>
+    <tr><td class="num">0.05</td><td class="num">56.0%</td><td class="num">1.8</td></tr>
+    <tr><td class="num">0.2</td><td class="num">97.2%</td><td class="num">1.0</td></tr>
+  </tbody>
+</table>
+<p>A problem at \(\rho=0.001\) needs about 63 visits to supply its first reward, roughly 17 times the average number of visits it gets. Direct reinforcement therefore reaches problems the starting policy already solves about 1% of the time or more; a problem near zero can only improve through transfer from other problems. That fits ProRL's finding that gains track base-model weakness without being zero, and Yue et al.'s tiny RL-only slice. It does not decide whether transfer can lift near-zero problems.</p>
+
+<h3 id="prorl-setup">3.4 Not a matched comparison</h3>
+<p>Both studies report real measurements; they differ in at least six ways, so neither isolates a cause.</p>
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 4.</b> Setup differences between Yue et al.<a class="cite" href="#ref-1">1</a> and ProRL<a class="cite" href="#ref-11">11</a>, from their stated settings.</caption>
+  <thead><tr><th>Attribute</th><th>Yue et al.</th><th>ProRL</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Starting checkpoint</td><td>Base Qwen2.5 (7B, 14B, 32B), LLaMA-3.1-8B for math; instruct or distilled models for code and vision</td><td>DeepSeek-R1-Distill-Qwen-1.5B, already fine-tuned on R1 reasoning traces</td></tr>
+    <tr><td class="row">Training length</td><td>Released checkpoints; controlled run to 450 steps</td><td>More than 2,000 steps, about 16,000 GPU-hours</td></tr>
+    <tr><td class="row">Training tasks</td><td>One domain per run (GSM8K and MATH, Omni-MATH, code, geometry)</td><td>One run on 136K problems in five domains</td></tr>
+    <tr><td class="row">KL term</td><td>Removed; a 0.001 KL ablation lowered pass@128</td><td>Kept, with periodic reference and optimizer resets</td></tr>
+    <tr><td class="row">Rollouts and temperature</td><td>8 per prompt, temperature 1.0, 8,192 tokens (controlled run)</td><td>16 per prompt, temperature 1.2, 8k tokens (16k at the end)</td></tr>
+    <tr><td class="row">Evaluation</td><td>Temperature 0.6, top-p 0.95, 16,384 tokens; k to 256 or 1,024</td><td>Temperature 0.6, top-p 0.95, 32K tokens; pass@k with 256 samples on a subset of tasks</td></tr>
+  </tbody>
+</table>
+<p>One difference is conceptual. ProRL's baseline is a distilled model that has already absorbed teacher traces, which Yue et al. find can expand the boundary<a class="cite" href="#ref-1">1</a> (§4.2). Expansion relative to a distilled start does not contradict a bound set by the pre-distillation base, so name the base in every claim. The camps also overlap: Ximing Lu, Mingjie Liu, Yi Dong and Yejin Choi are authors of both ProRL and the Invisible Leash study<a class="cite" href="#ref-11">11</a><a class="cite" href="#ref-12">12</a>, whose v5 finds shrinkage outweighing expansion in aggregate.</p>
+
+<h3 id="prorl-summary">3.5 The evidence on one page</h3>
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 5.</b> What each study measured about the boundary, in the authors' own scope. "Large k" is the largest k the study reports.</caption>
+  <thead><tr><th>Study</th><th>Start and recipe</th><th>Measure</th><th>Result at large k</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DeepSeekMath<a class="cite" href="#ref-9">9</a></td><td>DeepSeekMath-Instruct 7B, GRPO on instruction-tuning questions</td><td>Maj@K, Pass@K, K up to 64</td><td>Maj@K up, Pass@K not</td></tr>
+    <tr><td class="row">Yue et al.<a class="cite" href="#ref-1">1</a></td><td>Base models of several families, six algorithms</td><td>pass@k to 256 or 1,024</td><td>Base ahead; RL-only slice 1.0% on MATH-500</td></tr>
+    <tr><td class="row">Hochlehnert et al.<a class="cite" href="#ref-5">5</a></td><td>R1-Distill-1.5B to DeepScaleR, FastCuRL</td><td>pass@k to 128</td><td>Every \(\Delta\)pass@k negative</td></tr>
+    <tr><td class="row">Invisible Leash<a class="cite" href="#ref-12">12</a></td><td>Several models, benchmarks and checkpoints</td><td>Per-question support</td><td>More questions lost than gained</td></tr>
+    <tr><td class="row">Qwen3<a class="cite" href="#ref-13">13</a></td><td>Qwen3-8B after off-policy distillation, then RL</td><td>pass@64, AIME 2024 and 2025</td><td>Unchanged: 90.0 and 83.3</td></tr>
+    <tr><td class="row">ProRL<a class="cite" href="#ref-11">11</a></td><td>R1-Distill-1.5B, more than 2,000 steps, KL resets</td><td>pass@k to 128 or 256, per task</td><td>Diminish on math, sustained on code and logic</td></tr>
+    <tr><td class="row">Olmo 3 RL-Zero<a class="cite" href="#ref-4">4</a></td><td>Fully open 7B base, decontaminated data</td><td>pass@32, AIME 2024 and 2025</td><td>"Decent improvement" (figure only; no numbers in the text)</td></tr>
+  </tbody>
+</table>
+
+<h2 id="two-phase">4. The two-phase reconciliation</h2>
+<p>Yao et al. (Renmin University of China, Ant Group and Xiamen University; arXiv v1, 5 October 2025) argue that both camps are partly right because policy-gradient updates move probability mass through two stages<a class="cite" href="#ref-16">16</a>. It is a theory with a toy demonstration and a short empirical test by the authors; treat it as an interpretation, not a finding.</p>
+
+<h3 id="two-phase-theory">4.1 The update rule and what it implies</h3>
+<p>For a softmax policy over logits \(z\), if action \(v\) is sampled with advantage \(\hat A(v)\), the logits move by \(\Delta z_v=\eta\hat A(v)(1-\pi(v))\) for the sampled action and \(\Delta z_u=-\eta\hat A(v)\pi(u)\) for every other action (Lemma 1). Averaging over a group of samples, Theorem 1 gives the expected update
+$$\mathbb{E}[\Delta z_v]=\eta\,\pi(v)\Big[(1-\pi(v))\hat A(v)-\sum_{u\ne v}\pi(u)\hat A(u)\Big].$$
+If the advantage is centered on the exact mean reward, then \(\sum_u\pi(u)\hat A(u)=0\) and the bracket collapses to \(\hat A(v)\), so \(\mathbb{E}[\Delta z_v]=\eta\,\pi(v)\hat A(v)\) (derived here from the theorem; it is the standard softmax policy gradient in logit space). Two consequences carry the argument. A logit moves in proportion to its own action's probability, so a rare action is slow to change whatever its advantage. And while the common action has positive advantage, its growth pushes the rare action down, because mass is conserved.</p>
+<p>The authors read this as two stages (§3.1, Remark 3). In the exploitation stage the policy samples the explored high-reward action and the low-reward one, mass flows to the former, and the rare but better action's probability "remains largely unchanged" or even falls, which they connect to boundary shrinkage. In the exploration stage the common action saturates (\(1-\pi\to0\)), the rare action, when sampled, has positive advantage while the formerly good action becomes the relative negative, and the rare action's probability rises, which they connect to expansion. In pass@k terms they say raising the probability of at least one correct action above \(1/k\) expands the boundary.</p>
+
+<h3 id="two-phase-toy">4.2 The toy, computed</h3>
+<p>The paper's toy has three actions: \(a_1\) explored with reward 0.85, \(a_2\) rare with reward 1.0, and \(a_3\) with reward 0 (§3.2). Its own runs sample groups of two with \(\eta=0.1\) over thousands of steps. Figure 6 is the noiseless version computed here from the expected update above, with initial probabilities \(\pi=(0.55,0.05,0.40)\) that I chose.</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 355" role="img" aria-labelledby="f6t"><title id="f6t">Three-action toy policy under the expected policy-gradient update: the explored action a1 takes over within the first thousand steps while the rare better action a2 falls to a minimum of about 0.017, then a2 recovers and exceeds 0.5 near step 4,800 and is above 0.99 by step 10,000</title>
+<line x1="90" y1="300" x2="740" y2="300" class="d-grid"/>
+<text x="82" y="304" text-anchor="end" class="d-small d-mono d-text-light">0.00</text>
+<line x1="90" y1="243.8" x2="740" y2="243.8" class="d-grid"/>
+<text x="82" y="247.8" text-anchor="end" class="d-small d-mono d-text-light">0.25</text>
+<line x1="90" y1="187.5" x2="740" y2="187.5" class="d-grid"/>
+<text x="82" y="191.5" text-anchor="end" class="d-small d-mono d-text-light">0.50</text>
+<line x1="90" y1="131.2" x2="740" y2="131.2" class="d-grid"/>
+<text x="82" y="135.2" text-anchor="end" class="d-small d-mono d-text-light">0.75</text>
+<line x1="90" y1="75" x2="740" y2="75" class="d-grid"/>
+<text x="82" y="79" text-anchor="end" class="d-small d-mono d-text-light">1.00</text>
+<line x1="90" y1="75" x2="90" y2="300" class="d-axis"/>
+<line x1="90" y1="300" x2="740" y2="300" class="d-axis"/>
+<line x1="90" y1="300" x2="90" y2="305" class="d-axis"/>
+<text x="90" y="319" text-anchor="middle" class="d-small d-mono d-text-light">1</text>
+<line x1="235.2" y1="300" x2="235.2" y2="305" class="d-axis"/>
+<text x="235.2" y="319" text-anchor="middle" class="d-small d-mono d-text-light">10</text>
+<line x1="380.4" y1="300" x2="380.4" y2="305" class="d-axis"/>
+<text x="380.4" y="319" text-anchor="middle" class="d-small d-mono d-text-light">100</text>
+<line x1="525.5" y1="300" x2="525.5" y2="305" class="d-axis"/>
+<text x="525.5" y="319" text-anchor="middle" class="d-small d-mono d-text-light">1,000</text>
+<line x1="670.7" y1="300" x2="670.7" y2="305" class="d-axis"/>
+<text x="670.7" y="319" text-anchor="middle" class="d-small d-mono d-text-light">10,000</text>
+<text x="415" y="340" text-anchor="middle" class="d-small d-text-light">optimization step (log scale, η = 0.1)</text>
+<text x="24" y="187.5" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 24 187.5)">policy probability</text>
+<rect x="90" y="75" width="446.8" height="225" class="d-fill-blue-soft"/>
+<rect x="536.8" y="75" width="134" height="225" class="d-fill-orange-soft"/>
+<text x="313.4" y="91" text-anchor="middle" class="d-small d-bold">phase 1: exploit</text>
+<text x="603.8" y="91" text-anchor="middle" class="d-small d-bold">phase 2: explore</text>
+<polyline points="90,174.2 133.7,172.2 159.3,170.3 191.5,166.4 212.7,162.7 235.2,157.4 260.7,149.4 278.9,142.3 304.5,130.8 336.7,115.6 357.9,106.7 380.4,98.9 405.9,92.3 424.1,88.8 449.6,85.3 481.8,82.4 503.1,81.2 525.5,80.4 551.1,79.9 569.3,80 594.8,81.4 613,88.5 627,253.2 648.2,296.5 670.7,298.7 696.3,299.4 714.4,299.6 740,299.8" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<polyline points="90,288.7 133.7,288.7 159.3,288.8 191.5,288.8 212.7,288.8 235.2,288.9 260.7,289.1 278.9,289.3 304.5,289.8 336.7,290.8 357.9,291.7 380.4,292.6 405.9,293.6 424.1,294.3 449.6,295 481.8,295.7 503.1,296 525.5,296.2 551.1,296.2 569.3,295.9 594.8,294.2 613,287.2 627,122.6 648.2,78.6 670.7,76.4 696.3,75.7 714.4,75.5 740,75.3" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+<polyline points="90,212 133.7,214 159.3,216 191.5,219.8 212.7,223.5 235.2,228.7 260.7,236.5 278.9,243.4 304.5,254.4 336.7,268.6 357.9,276.7 380.4,283.5 405.9,289.1 424.1,291.9 449.6,294.7 481.8,296.9 503.1,297.7 525.5,298.4 551.1,298.9 569.3,299.1 594.8,299.3 613,299.3 627,299.3 648.2,299.8 670.7,299.9 696.3,300 714.4,300 740,300" class="d-line d-stroke-red" style="stroke-width:2.5"/>
+<circle cx="536.8" cy="296.3" r="4.5" class="d-fill-orange"/>
+<text x="544.8" y="287.3" text-anchor="start" class="d-small d-mono">min 0.0166 at step 1,195</text>
+<circle cx="624.4" cy="187.5" r="4.5" class="d-fill-orange"/>
+<text x="615.4" y="185.5" text-anchor="end" class="d-small d-mono">0.5 at step 4,799</text>
+<line x1="90" y1="16" x2="114" y2="16" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<text x="120" y="20" text-anchor="start" class="d-small">a1: reward 0.85, explored</text>
+<line x1="300" y1="16" x2="324" y2="16" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+<text x="330" y="20" text-anchor="start" class="d-small">a2: reward 1.0, rare</text>
+<line x1="480" y1="16" x2="504" y2="16" class="d-line d-stroke-red" style="stroke-width:2.5"/>
+<text x="510" y="20" text-anchor="start" class="d-small">a3: reward 0</text>
+</svg>
+  <figcaption><b>Figure 6.</b> Expected-update dynamics of the three-action toy of Yao et al.<a class="cite" href="#ref-16">16</a>, computed here (rewards 0.85, 1.0, 0; \(\eta=0.1\); initial probabilities 0.55, 0.05, 0.40 chosen by me; no sampling noise). The explored action \(a_1\) reaches 0.976 by step 1,000 while the rare better action \(a_2\) falls from 0.05 to a minimum of 0.0166 at step 1,195; then \(a_2\) recovers, passes 0.5 at step 4,799 and reaches 0.994 by step 10,000. Shading marks the authors' two stages, split at the minimum.</figcaption>
+</figure>
+
+<p>The toy exposes a scaling the paper does not state. When \(a_1\) has saturated, \(\bar r\to r_1\), so \(a_2\)'s logit grows at about \(\eta\,\pi_2\,\Delta r\) with \(\Delta r=r_2-r_1=0.15\). The escape time is then of order \(1/(\eta\,\Delta r\,\pi_{2,\min})\), which is \(1/(0.1\times0.15\times0.0166)\approx4{,}000\) steps against 4,799 measured to reach 0.5 (derived; an order-of-magnitude fit, not an exact law). The exploration stage lasts as long as the inverse of the probability that the exploitation stage left behind: more over-exploitation means a longer wait. In the same toy with \(\pi_0=(0.6,0.02,0.38)\) the minimum is 0.0023 and the recovery takes about 33,500 steps to cross 0.5.</p>
+<p>A caveat, also derived: the exploration stage exists only because \(r_2>r_1\). With two equally rewarded routes, \(r_1=r_2=1\), the same update gives \(\mathrm{d}(z_2-z_1)/\mathrm{d}t=\eta(\pi_2-\pi_1)\pi_3\), which is negative while \(\pi_1>\pi_2\); in a run from \(\pi_0=(0.6,0.01,0.39)\) the rare route falls from 0.01 to 0.0002 by step 50,000 and does not return. The paper says its binary setting gets differences among positive rewards from the importance ratio (footnote 3). For a binary verifier the stage structure therefore says little about problems where both routes are correct; it speaks to cases where the signal ranks correct routes, such as graded rewards.</p>
+
+<h3 id="two-phase-test">4.3 What the paper tested</h3>
+<p>The empirical part trains Qwen2.5-Math-7B and Llama-3.2-3B-Instruct on the 7,500 MATH training problems with GRPO, GSPO and variants that keep only the relative negative gradients (GRPO-N, GSPO-N), with a uniform chat prompt, KL 0.001, an entropy bonus of \(10^{-4}\), and 256 samples per problem at temperature 0.6 for evaluation (§4, Appendix C.2)<a class="cite" href="#ref-16">16</a>. The training curves in its Figure 2 run to step 42. Plain GRPO lets test entropy fall, while GRPO-N, GSPO and GSPO-N dip and then rise. On Qwen2.5-Math-7B (Table 1), every RL variant lifts AIME 2024 pass@256 from the base 66.7 to 73.3, which is 2 of 30 problems, and GRPO-N lifts AIME 2025 pass@256 from 46.7 to 66.7, which is 6 of 30. That is a short run on the model family where prompts and priors matter most (Section 5), against a base under a chat template, and Dr. GRPO's Table 1 shows chat-style templates are not the best prompt for this model: its Qwen-Math template gives an average of 26.5 against 38.2 with no template<a class="cite" href="#ref-15">15</a>. Whether the AIME gains are expansion or recovery from a poorly matched prompt cannot be separated from the text, and the prolonged-training half of the theory is untested at ProRL scale.</p>
+
+<h2 id="spurious-rewards">5. Spurious rewards</h2>
+<p>Module 19 (§2) gives the taxonomy of documented reward exploits. Spurious rewards are a different failure, and a measurement control, so they are covered in full here. The question is how much of an RL gain survives when the reward carries little or no information about correctness.</p>
+
+<h3 id="spurious-ladder">5.1 The reward ladder</h3>
+<p>Shao et al. (University of Washington, Allen Institute for AI and Berkeley; arXiv v2, 25 February 2026) run GRPO on Qwen2.5-Math models with the DeepScaleR training data and replace the ground-truth reward with weaker ones, holding everything else fixed<a class="cite" href="#ref-2">2</a> (§2.1-§2.2). The rewards are binary (Module 10). The ladder, from most to least informative: <em>ground truth</em>; <em>majority vote</em>, where the label is the majority answer of 64 samples from the pre-RL model; <em>format</em>, which rewards any response containing a non-empty <code>\boxed{}</code> whatever it contains; <em>incorrect label</em>, which rewards matching a majority-voted label that is known to be wrong; and <em>random</em>, which gives reward 1 with probability \(\gamma=0.5\) independent of the response (\(\gamma=0\) yields zero gradient, as expected). They report MATH-500 pass@1 and AMC average@8 after 300 steps, and say the weak and spurious rewards are "proposed purely for analytical purposes".</p>
+
+<h3 id="spurious-results">5.2 What it did</h3>
+<p>On Qwen2.5-Math-7B, random rewards improved MATH-500 by 21.4 points against 29.1 for ground truth, and incorrect labels by 24.1<a class="cite" href="#ref-2">2</a> (Figure 1). On AIME 2024 the same model gains 15.3 with ground truth and 10.2 with both incorrect and random rewards; on AIME 2025, whose questions postdate every model's knowledge cutoff, ground truth has "a clear advantage" and the other rewards give between -0.4 and +4.5 (§2.2, Appendix D). The effect is model-dependent (§3): all non-random rewards, even incorrect ones, help the Qwen2.5 models, OLMo2-7B gains only with ground truth, and each weak or spurious reward fails on at least one non-Qwen model. Smaller models benefit less, and models already RL post-trained, such as Qwen2.5-Math-7B-Instruct, gain little under any reward including ground truth (Appendix J).</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 345" role="img" aria-labelledby="f7t"><title id="f7t">MATH-500 gain after 300 GRPO steps under ground-truth, incorrect-label and random rewards: Qwen2.5-Math-7B plus 29.1, 24.1 and 21.4; Qwen2.5-7B plus 34.4, 27.8 and 16.4; Llama3.1-8B-Instruct plus 7.4, minus 6.3 and minus 11.5; OLMo2-7B plus 15.5, minus 6.4 and minus 8.3</title>
+<line x1="80" y1="276.4" x2="780" y2="276.4" class="d-grid"/>
+<text x="74" y="280.4" text-anchor="end" class="d-small d-mono d-text-light">-10</text>
+<line x1="80" y1="229.1" x2="780" y2="229.1" class="d-axis"/>
+<text x="74" y="233.1" text-anchor="end" class="d-small d-mono d-text-light">0</text>
+<line x1="80" y1="181.8" x2="780" y2="181.8" class="d-grid"/>
+<text x="74" y="185.8" text-anchor="end" class="d-small d-mono d-text-light">+10</text>
+<line x1="80" y1="134.5" x2="780" y2="134.5" class="d-grid"/>
+<text x="74" y="138.5" text-anchor="end" class="d-small d-mono d-text-light">+20</text>
+<line x1="80" y1="87.3" x2="780" y2="87.3" class="d-grid"/>
+<text x="74" y="91.3" text-anchor="end" class="d-small d-mono d-text-light">+30</text>
+<line x1="80" y1="40" x2="780" y2="40" class="d-grid"/>
+<text x="74" y="44" text-anchor="end" class="d-small d-mono d-text-light">+40</text>
+<line x1="80" y1="40" x2="80" y2="300" class="d-axis"/>
+<rect x="110.5" y="91.5" width="34" height="137.6" class="d-fill-blue"/>
+<text x="127.5" y="86.5" text-anchor="middle" class="d-small d-mono">+29.1</text>
+<rect x="150.5" y="115.2" width="34" height="113.9" class="d-fill-amber"/>
+<text x="167.5" y="110.2" text-anchor="middle" class="d-small d-mono">+24.1</text>
+<rect x="190.5" y="127.9" width="34" height="101.2" class="d-fill-red"/>
+<text x="207.5" y="122.9" text-anchor="middle" class="d-small d-mono">+21.4</text>
+<text x="167.5" y="318" text-anchor="middle" class="d-small d-bold">Qwen2.5-Math-7B</text>
+<text x="167.5" y="333" text-anchor="middle" class="d-small d-mono d-text-light">base 49.4</text>
+<rect x="285.5" y="66.5" width="34" height="162.6" class="d-fill-blue"/>
+<text x="302.5" y="61.5" text-anchor="middle" class="d-small d-mono">+34.4</text>
+<rect x="325.5" y="97.7" width="34" height="131.4" class="d-fill-amber"/>
+<text x="342.5" y="92.7" text-anchor="middle" class="d-small d-mono">+27.8</text>
+<rect x="365.5" y="151.6" width="34" height="77.5" class="d-fill-red"/>
+<text x="382.5" y="146.6" text-anchor="middle" class="d-small d-mono">+16.4</text>
+<text x="342.5" y="318" text-anchor="middle" class="d-small d-bold">Qwen2.5-7B</text>
+<text x="342.5" y="333" text-anchor="middle" class="d-small d-mono d-text-light">base 41.6</text>
+<rect x="460.5" y="194.1" width="34" height="35" class="d-fill-blue"/>
+<text x="477.5" y="189.1" text-anchor="middle" class="d-small d-mono">+7.4</text>
+<rect x="500.5" y="229.1" width="34" height="29.8" class="d-fill-amber"/>
+<text x="517.5" y="272.9" text-anchor="middle" class="d-small d-mono">-6.3</text>
+<rect x="540.5" y="229.1" width="34" height="54.4" class="d-fill-red"/>
+<text x="557.5" y="297.5" text-anchor="middle" class="d-small d-mono">-11.5</text>
+<text x="517.5" y="318" text-anchor="middle" class="d-small d-bold">Llama3.1-8B-Instruct</text>
+<text x="517.5" y="333" text-anchor="middle" class="d-small d-mono d-text-light">base 36.8</text>
+<rect x="635.5" y="155.8" width="34" height="73.3" class="d-fill-blue"/>
+<text x="652.5" y="150.8" text-anchor="middle" class="d-small d-mono">+15.5</text>
+<rect x="675.5" y="229.1" width="34" height="30.3" class="d-fill-amber"/>
+<text x="692.5" y="273.3" text-anchor="middle" class="d-small d-mono">-6.4</text>
+<rect x="715.5" y="229.1" width="34" height="39.2" class="d-fill-red"/>
+<text x="732.5" y="282.3" text-anchor="middle" class="d-small d-mono">-8.3</text>
+<text x="692.5" y="318" text-anchor="middle" class="d-small d-bold">OLMo2-7B</text>
+<text x="692.5" y="333" text-anchor="middle" class="d-small d-mono d-text-light">base 9.0</text>
+<text x="24" y="170" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 24 170)">MATH-500 gain after 300 steps, points</text>
+<rect x="110" y="14" width="14" height="14" class="d-fill-blue"/>
+<text x="130" y="26" text-anchor="start" class="d-small">ground-truth reward</text>
+<rect x="340" y="14" width="14" height="14" class="d-fill-amber"/>
+<text x="360" y="26" text-anchor="start" class="d-small">incorrect-label reward</text>
+<rect x="570" y="14" width="14" height="14" class="d-fill-red"/>
+<text x="590" y="26" text-anchor="start" class="d-small">random reward</text>
+</svg>
+  <figcaption><b>Figure 7.</b> MATH-500 gain in points after 300 GRPO steps under three of the five rewards, for four models<a class="cite" href="#ref-2">2</a> (Figure 1; base accuracy under each name). The Qwen models gain under every reward; Llama and OLMo lose under incorrect-label and random rewards.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 6.</b> MATH-500 accuracy before RL (percent) and gain in points after 300 steps for each reward, from Shao et al. Figure 1<a class="cite" href="#ref-2">2</a>. The last column, ground-truth gain minus random-reward gain, is derived here.</caption>
+  <thead><tr><th>Model</th><th class="num">Before RL</th><th class="num">Ground truth</th><th class="num">Majority vote</th><th class="num">Format</th><th class="num">Incorrect label</th><th class="num">Random</th><th class="num">GT minus random</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Qwen2.5-Math-7B</td><td class="num">49.4</td><td class="num">+29.1</td><td class="num">+27.1</td><td class="num">+13.8</td><td class="num">+24.1</td><td class="num">+21.4</td><td class="num">7.7</td></tr>
+    <tr><td class="row">Qwen2.5-7B</td><td class="num">41.6</td><td class="num">+34.4</td><td class="num">+31.9</td><td class="num">+16.7</td><td class="num">+27.8</td><td class="num">+16.4</td><td class="num">18.0</td></tr>
+    <tr><td class="row">Llama3.1-8B-Instruct</td><td class="num">36.8</td><td class="num">+7.4</td><td class="num">+7.2</td><td class="num">-1.3</td><td class="num">-6.3</td><td class="num">-11.5</td><td class="num">18.9</td></tr>
+    <tr><td class="row">OLMo2-7B</td><td class="num">9.0</td><td class="num">+15.5</td><td class="num">-6.4</td><td class="num">+0.4</td><td class="num">-6.4</td><td class="num">-8.3</td><td class="num">23.8</td></tr>
+  </tbody>
+</table>
+<p>The last column estimates the gain that an uninformative reward does not reproduce: 7.7 points for the model where the prior does most of the work, 18 to 24 for the others. It bounds what the verifier's information explains only if gains add, which the study does not test.</p>
+
+<h3 id="spurious-clipping">5.3 Mechanism one: clipping bias</h3>
+<p>Random rewards have zero mean advantage, so the expected policy gradient should vanish. Shao et al. show it does not, because of the clip<a class="cite" href="#ref-2">2</a> (§4, Appendix B). They ablate three ways of removing the clipping effect (disabling it, making the minibatch the full rollout, or using one gradient update per rollout so the ratio stays 1) and find that random rewards then give no consistent gain, while with clipping on they give stable gains (Figure 4). Their Eq. 2 says that, for random advantages, the expected gradient is \(+\nabla\log\pi\) when the ratio \(R&lt;1-\epsilon\), zero inside the band, and \(-\nabla\log\pi\) when \(R>1+\epsilon\). Read directly: above the band only negative-advantage samples keep their gradient, so the net push is down; below it only positive-advantage samples do, so the net push is up. The clip is a restoring force toward \(R=1\).</p>
+<p>The force is asymmetric because probabilities cannot exceed 1. The upper clip triggers when \(\pi_\theta>(1+\epsilon)\pi_{old}\), which is unreachable once \((1+\epsilon)\pi_{old}\ge1\), that is for \(\pi_{old}\ge1/(1+\epsilon)=0.833\) at \(\epsilon=0.2\) (derived). A token with \(\pi_{old}=0.85\) has its upper threshold at 1.02 and is never pushed back down, while a token with \(\pi_{old}=0.02\) is clipped once \(\pi_\theta\) passes 0.024 and is pushed back (the paper's own example). Under noise, probability mass drifts toward tokens that were already likely: "clipping bias asymmetrically suppresses low-probability tokens and reinforces high-probability ones". DAPO's \(\epsilon_{high}=0.28\) moves the threshold to 0.781 and delays the push-back on rare tokens (Module 13).</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 350" role="img" aria-labelledby="f8t"><title id="f8t">The probability a token must reach under the new policy before the upper PPO clip triggers, as a function of its old probability: it is the old probability times one plus epsilon, so for tokens above 0.833 at epsilon 0.2 it exceeds 1 and is never reached</title>
+<line x1="90" y1="300" x2="90" y2="305" class="d-axis"/>
+<text x="90" y="319" text-anchor="middle" class="d-small d-mono d-text-light">0.00</text>
+<line x1="250" y1="300" x2="250" y2="305" class="d-axis"/>
+<text x="250" y="319" text-anchor="middle" class="d-small d-mono d-text-light">0.25</text>
+<line x1="410" y1="300" x2="410" y2="305" class="d-axis"/>
+<text x="410" y="319" text-anchor="middle" class="d-small d-mono d-text-light">0.50</text>
+<line x1="570" y1="300" x2="570" y2="305" class="d-axis"/>
+<text x="570" y="319" text-anchor="middle" class="d-small d-mono d-text-light">0.75</text>
+<line x1="730" y1="300" x2="730" y2="305" class="d-axis"/>
+<text x="730" y="319" text-anchor="middle" class="d-small d-mono d-text-light">1.00</text>
+<line x1="90" y1="300" x2="730" y2="300" class="d-grid"/>
+<text x="84" y="304" text-anchor="end" class="d-small d-mono d-text-light">0.0</text>
+<line x1="90" y1="200" x2="730" y2="200" class="d-grid"/>
+<text x="84" y="204" text-anchor="end" class="d-small d-mono d-text-light">0.5</text>
+<line x1="90" y1="100" x2="730" y2="100" class="d-grid"/>
+<text x="84" y="104" text-anchor="end" class="d-small d-mono d-text-light">1.0</text>
+<line x1="90" y1="40" x2="90" y2="300" class="d-axis"/>
+<line x1="90" y1="300" x2="730" y2="300" class="d-axis"/>
+<text x="410" y="340" text-anchor="middle" class="d-small d-text-light">probability of the token under the old policy, π_old</text>
+<text x="24" y="170" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 24 170)">π_θ where the upper clip starts</text>
+<rect x="90" y="40" width="640" height="60" class="d-fill-red-soft"/>
+<text x="104" y="58" text-anchor="start" class="d-small d-bold">unreachable: probabilities cannot exceed 1</text>
+<line x1="90" y1="100" x2="730" y2="100" class="d-line d-stroke-red" style="stroke-width:1.5"/>
+<polyline points="90,300 93.2,298.8 96.4,297.6 99.6,296.4 102.8,295.2 106,294 109.2,292.8 112.4,291.6 115.6,290.4 118.8,289.2 122,288 125.2,286.8 128.4,285.6 131.6,284.4 134.8,283.2 138,282 141.2,280.8 144.4,279.6 147.6,278.4 150.8,277.2 154,276 157.2,274.8 160.4,273.6 163.6,272.4 166.8,271.2 170,270 173.2,268.8 176.4,267.6 179.6,266.4 182.8,265.2 186,264 189.2,262.8 192.4,261.6 195.6,260.4 198.8,259.2 202,258 205.2,256.8 208.4,255.6 211.6,254.4 214.8,253.2 218,252 221.2,250.8 224.4,249.6 227.6,248.4 230.8,247.2 234,246 237.2,244.8 240.4,243.6 243.6,242.4 246.8,241.2 250,240 253.2,238.8 256.4,237.6 259.6,236.4 262.8,235.2 266,234 269.2,232.8 272.4,231.6 275.6,230.4 278.8,229.2 282,228 285.2,226.8 288.4,225.6 291.6,224.4 294.8,223.2 298,222 301.2,220.8 304.4,219.6 307.6,218.4 310.8,217.2 314,216 317.2,214.8 320.4,213.6 323.6,212.4 326.8,211.2 330,210 333.2,208.8 336.4,207.6 339.6,206.4 342.8,205.2 346,204 349.2,202.8 352.4,201.6 355.6,200.4 358.8,199.2 362,198 365.2,196.8 368.4,195.6 371.6,194.4 374.8,193.2 378,192 381.2,190.8 384.4,189.6 387.6,188.4 390.8,187.2 394,186 397.2,184.8 400.4,183.6 403.6,182.4 406.8,181.2 410,180 413.2,178.8 416.4,177.6 419.6,176.4 422.8,175.2 426,174 429.2,172.8 432.4,171.6 435.6,170.4 438.8,169.2 442,168 445.2,166.8 448.4,165.6 451.6,164.4 454.8,163.2 458,162 461.2,160.8 464.4,159.6 467.6,158.4 470.8,157.2 474,156 477.2,154.8 480.4,153.6 483.6,152.4 486.8,151.2 490,150 493.2,148.8 496.4,147.6 499.6,146.4 502.8,145.2 506,144 509.2,142.8 512.4,141.6 515.6,140.4 518.8,139.2 522,138 525.2,136.8 528.4,135.6 531.6,134.4 534.8,133.2 538,132 541.2,130.8 544.4,129.6 547.6,128.4 550.8,127.2 554,126 557.2,124.8 560.4,123.6 563.6,122.4 566.8,121.2 570,120 573.2,118.8 576.4,117.6 579.6,116.4 582.8,115.2 586,114 589.2,112.8 592.4,111.6 595.6,110.4 598.8,109.2 602,108 605.2,106.8 608.4,105.6 611.6,104.4 614.8,103.2 618,102 621.2,100.8 624.4,99.6 627.6,98.4 630.8,97.2 634,96 637.2,94.8 640.4,93.6 643.6,92.4 646.8,91.2 650,90 653.2,88.8 656.4,87.6 659.6,86.4 662.8,85.2 666,84 669.2,82.8 672.4,81.6 675.6,80.4 678.8,79.2 682,78 685.2,76.8 688.4,75.6 691.6,74.4 694.8,73.2 698,72 701.2,70.8 704.4,69.6 707.6,68.4 710.8,67.2 714,66 717.2,64.8 720.4,63.6 723.6,62.4 726.8,61.2 730,60" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<polyline points="90,300 93.2,298.7 96.4,297.4 99.6,296.2 102.8,294.9 106,293.6 109.2,292.3 112.4,291 115.6,289.8 118.8,288.5 122,287.2 125.2,285.9 128.4,284.6 131.6,283.4 134.8,282.1 138,280.8 141.2,279.5 144.4,278.2 147.6,277 150.8,275.7 154,274.4 157.2,273.1 160.4,271.8 163.6,270.6 166.8,269.3 170,268 173.2,266.7 176.4,265.4 179.6,264.2 182.8,262.9 186,261.6 189.2,260.3 192.4,259 195.6,257.8 198.8,256.5 202,255.2 205.2,253.9 208.4,252.6 211.6,251.4 214.8,250.1 218,248.8 221.2,247.5 224.4,246.2 227.6,245 230.8,243.7 234,242.4 237.2,241.1 240.4,239.8 243.6,238.6 246.8,237.3 250,236 253.2,234.7 256.4,233.4 259.6,232.2 262.8,230.9 266,229.6 269.2,228.3 272.4,227 275.6,225.8 278.8,224.5 282,223.2 285.2,221.9 288.4,220.6 291.6,219.4 294.8,218.1 298,216.8 301.2,215.5 304.4,214.2 307.6,213 310.8,211.7 314,210.4 317.2,209.1 320.4,207.8 323.6,206.6 326.8,205.3 330,204 333.2,202.7 336.4,201.4 339.6,200.2 342.8,198.9 346,197.6 349.2,196.3 352.4,195 355.6,193.8 358.8,192.5 362,191.2 365.2,189.9 368.4,188.6 371.6,187.4 374.8,186.1 378,184.8 381.2,183.5 384.4,182.2 387.6,181 390.8,179.7 394,178.4 397.2,177.1 400.4,175.8 403.6,174.6 406.8,173.3 410,172 413.2,170.7 416.4,169.4 419.6,168.2 422.8,166.9 426,165.6 429.2,164.3 432.4,163 435.6,161.8 438.8,160.5 442,159.2 445.2,157.9 448.4,156.6 451.6,155.4 454.8,154.1 458,152.8 461.2,151.5 464.4,150.2 467.6,149 470.8,147.7 474,146.4 477.2,145.1 480.4,143.8 483.6,142.6 486.8,141.3 490,140 493.2,138.7 496.4,137.4 499.6,136.2 502.8,134.9 506,133.6 509.2,132.3 512.4,131 515.6,129.8 518.8,128.5 522,127.2 525.2,125.9 528.4,124.6 531.6,123.4 534.8,122.1 538,120.8 541.2,119.5 544.4,118.2 547.6,117 550.8,115.7 554,114.4 557.2,113.1 560.4,111.8 563.6,110.6 566.8,109.3 570,108 573.2,106.7 576.4,105.4 579.6,104.2 582.8,102.9 586,101.6 589.2,100.3 592.4,99 595.6,97.8 598.8,96.5 602,95.2 605.2,93.9 608.4,92.6 611.6,91.4 614.8,90.1 618,88.8 621.2,87.5 624.4,86.2 627.6,85 630.8,83.7 634,82.4 637.2,81.1 640.4,79.8 643.6,78.6 646.8,77.3 650,76 653.2,74.7 656.4,73.4 659.6,72.2 662.8,70.9 666,69.6 669.2,68.3 672.4,67 675.6,65.8 678.8,64.5 682,63.2 685.2,61.9 688.4,60.6 691.6,59.4 694.8,58.1 698,56.8 701.2,55.5 704.4,54.2 707.6,53 710.8,51.7 714,50.4 717.2,49.1 720.4,47.8 723.6,46.6 726.8,45.3 730,44" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+<circle cx="102.8" cy="295.2" r="4.5" class="d-fill-blue"/>
+<text x="112.8" y="287.2" text-anchor="start" class="d-small d-mono">0.02 to 0.024</text>
+<circle cx="634" cy="96" r="4.5" class="d-fill-blue"/>
+<text x="626" y="87" text-anchor="end" class="d-small d-mono">0.85 to 1.02</text>
+<text x="623.3" y="116" text-anchor="middle" class="d-small d-mono">1/1.2 = 0.833</text>
+<text x="590" y="130" text-anchor="middle" class="d-small d-mono">1/1.28 = 0.781</text>
+<rect x="450" y="222" width="210" height="52" rx="6" class="d-label-bg"/>
+<line x1="458" y1="240" x2="482" y2="240" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+<text x="488" y="244" text-anchor="start" class="d-small">clip ε = 0.2</text>
+<line x1="458" y1="262" x2="482" y2="262" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+<text x="488" y="266" text-anchor="start" class="d-small">clip ε_high = 0.28</text>
+</svg>
+  <figcaption><b>Figure 8.</b> The new-policy probability at which the upper clip starts, \((1+\epsilon)\pi_{old}\), against the old probability (derived from the clip definition and the worked example of Shao et al.<a class="cite" href="#ref-2">2</a>, §4). Above \(1/(1+\epsilon)\) the threshold exceeds 1 and is never reached, so likely tokens get no restoring push. DAPO's \(\epsilon_{high}=0.28\) is shown for comparison<a class="cite" href="#ref-7">7</a>.</figcaption>
+</figure>
+
+<h3 id="spurious-code">5.4 Mechanism two: an existing behavior gets amplified</h3>
+<p>Clipping bias says why random rewards sharpen; the next question is what they sharpen toward. For Qwen2.5-Math-7B the answer is writing Python without running it. The model does this in 65.0% of MATH-500 solutions, with no interpreter attached, and answers that do are far more accurate: 60.9% against 35.0% for the rest (Table 1 of the paper; its introduction says 28.0% for the rest, and I use the table)<a class="cite" href="#ref-2">2</a>. Under weak or spurious rewards code frequency rises to about 90% within 15 steps, and to 95.6% under random rewards, tracking the accuracy gain; under ground-truth rewards it rises and later declines as natural-language reasoning improves (§5.2, Figure 6). The behavior is a lever, not just a correlate: forcing the first sentence "Let's solve this using Python." lifts MATH-500 by 15.0 points on Qwen2.5-Math-7B and by 24.2 on the 1.5B model, and rewarding the string "python" alone pushes code frequency above 99% within 20 steps (§5.3, Figure 7). The same intervention hurts the models that lack effective code reasoning.</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 7.</b> MATH-500 accuracy (percent) with and without forcing the first sentence "Let's solve this using Python.", from Shao et al. Table 2<a class="cite" href="#ref-2">2</a>. Differences are absolute points.</caption>
+  <thead><tr><th>Model</th><th class="num">Original</th><th class="num">Code-forced</th><th class="num">Difference</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Qwen2.5-Math-1.5B</td><td class="num">36.2</td><td class="num">60.4</td><td class="num" data-best>+24.2</td></tr>
+    <tr><td class="row">Qwen2.5-Math-7B</td><td class="num">49.4</td><td class="num">64.4</td><td class="num">+15.0</td></tr>
+    <tr><td class="row">Qwen2.5-1.5B</td><td class="num">3.0</td><td class="num">13.0</td><td class="num">+10.0</td></tr>
+    <tr><td class="row">Qwen2.5-7B</td><td class="num">41.6</td><td class="num">22.2</td><td class="num">-19.4</td></tr>
+    <tr><td class="row">Llama3.2-3B-Instruct</td><td class="num">36.8</td><td class="num">8.2</td><td class="num" data-worst>-28.6</td></tr>
+    <tr><td class="row">Llama3.1-8B-Instruct</td><td class="num">36.8</td><td class="num">15.2</td><td class="num">-21.6</td></tr>
+    <tr><td class="row">OLMo2-7B</td><td class="num">9.0</td><td class="num">7.8</td><td class="num">-1.2</td></tr>
+    <tr><td class="row">OLMo2-7B-SFT</td><td class="num">21.4</td><td class="num">18.6</td><td class="num">-2.8</td></tr>
+  </tbody>
+</table>
+
+<h3 id="spurious-prompt">5.5 The baseline moves as much as the RL gain</h3>
+<p>The "before RL" number is not fixed either. Shao et al. evaluate Qwen2.5-Math-7B under five prompts: the Qwen default gives 49.4% on MATH-500 with 78.9% of answers parsable, a "MathProblem:" prompt 55.8%, SimpleRL-Zoo's prompt 63.2%, the Sober Reasoning prompt 61.6% (93.1% parsable), and a block of LaTeX lorem-ipsum text with no task content 68.8% (84.1% parsable)<a class="cite" href="#ref-2">2</a> (Table 5, Appendix I). The best accuracy does not come from the best parse rate or from task-relevant words. Hochlehnert et al. could not fully reproduce the magnitude but found the same effect on Qwen2.5 models<a class="cite" href="#ref-5">5</a> (§5.3). A 19.4-point swing (49.4 to 68.8, derived) from a prompt with no content is the size of the 21.4-point gain from random-reward RL. Models trained under three of the prompts converged to similar performance after RL, which the authors take to suggest that what a prompt elicits is a subset of what RL elicits (Appendix I).</p>
+
+<h3 id="spurious-meaning">5.6 What this does and does not establish</h3>
+<p>It establishes that for Qwen2.5-Math, a large part of the MATH-500, AMC and AIME 2024 gain needs no information about correctness: any signal that sharpens the policy toward an existing behavior produces it, and "reasoning patterns instilled during pretraining heavily impact the behavior of downstream RLVR training"<a class="cite" href="#ref-2">2</a>. It does not establish that ground-truth RL gains are spurious: ground truth beats random by 7.7 points on the most favorable model, by 18 to 24 on the others, and clearly on post-cutoff AIME 2025. The authors' instruction is to test reward signals on more than one model family and to include format and random rewards as dummy baselines<a class="cite" href="#ref-2">2</a> (§1, §2.2). Section 6 covers the competing explanation.</p>
+
+<h2 id="contamination">6. Contamination and the baseline</h2>
+<p>Wu et al. (Fudan University and collaborators; arXiv v3, 17 December 2025) explain the Qwen results of Section 5 differently: the benchmark problems leaked into pretraining, and a spurious reward lets GRPO retrieve memorized answers<a class="cite" href="#ref-3">3</a>. Their audit gives the model the first 40, 60 or 80% of a problem and scores the continuation (greedy decoding, no chat template). Given the first 60% of each MATH-500 problem, Qwen2.5-Math-7B regenerates the remaining 40% with 54.60% exact match and answers 53.6% of the truncated problems correctly; Llama3.1-8B manages 3.8% and 2.4%. On LiveMathBench (version 202505), which postdates Qwen2.5, Qwen's completion rate falls to 0.0% and its truncated-problem accuracy to 2.0% (Llama: 0.0% and 1.0%) (Table 2, §1).</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 330" role="img" aria-labelledby="f9t"><title id="f9t">Exact-match rate when each model is given the first 60 percent of a benchmark problem and asked to continue: Qwen2.5-Math-7B reproduces 54.6 percent of MATH-500, 42.2 percent of AMC and 20.0 percent of AIME 2024 but 0.0 percent of AIME 2025 and LiveMathBench; Llama3.1-8B reproduces 3.8 percent of MATH-500 and 0.0 percent of the rest</title>
+<line x1="70" y1="270" x2="780" y2="270" class="d-grid"/>
+<text x="64" y="274" text-anchor="end" class="d-small d-mono d-text-light">0</text>
+<line x1="70" y1="233.3" x2="780" y2="233.3" class="d-grid"/>
+<text x="64" y="237.3" text-anchor="end" class="d-small d-mono d-text-light">10</text>
+<line x1="70" y1="196.7" x2="780" y2="196.7" class="d-grid"/>
+<text x="64" y="200.7" text-anchor="end" class="d-small d-mono d-text-light">20</text>
+<line x1="70" y1="160" x2="780" y2="160" class="d-grid"/>
+<text x="64" y="164" text-anchor="end" class="d-small d-mono d-text-light">30</text>
+<line x1="70" y1="123.3" x2="780" y2="123.3" class="d-grid"/>
+<text x="64" y="127.3" text-anchor="end" class="d-small d-mono d-text-light">40</text>
+<line x1="70" y1="86.7" x2="780" y2="86.7" class="d-grid"/>
+<text x="64" y="90.7" text-anchor="end" class="d-small d-mono d-text-light">50</text>
+<line x1="70" y1="50" x2="780" y2="50" class="d-grid"/>
+<text x="64" y="54" text-anchor="end" class="d-small d-mono d-text-light">60</text>
+<line x1="70" y1="50" x2="70" y2="270" class="d-axis"/>
+<line x1="70" y1="270" x2="780" y2="270" class="d-axis"/>
+<rect x="105" y="69.8" width="34" height="200.2" class="d-fill-orange"/>
+<text x="122" y="64.8" text-anchor="middle" class="d-small d-mono">54.6</text>
+<rect x="143" y="256.1" width="34" height="13.9" class="d-fill-blue"/>
+<text x="160" y="251.1" text-anchor="middle" class="d-small d-mono">3.8</text>
+<text x="141" y="287" text-anchor="middle" class="d-small">MATH-500</text>
+<rect x="247" y="115.4" width="34" height="154.6" class="d-fill-orange"/>
+<text x="264" y="110.4" text-anchor="middle" class="d-small d-mono">42.2</text>
+<text x="302" y="265" text-anchor="middle" class="d-small d-mono">0.0</text>
+<text x="283" y="287" text-anchor="middle" class="d-small">AMC</text>
+<rect x="389" y="196.7" width="34" height="73.3" class="d-fill-orange"/>
+<text x="406" y="191.7" text-anchor="middle" class="d-small d-mono">20.0</text>
+<text x="444" y="265" text-anchor="middle" class="d-small d-mono">0.0</text>
+<text x="425" y="287" text-anchor="middle" class="d-small">AIME 2024</text>
+<text x="548" y="265" text-anchor="middle" class="d-small d-mono">0.0</text>
+<text x="586" y="265" text-anchor="middle" class="d-small d-mono">0.0</text>
+<text x="567" y="287" text-anchor="middle" class="d-small">AIME 2025</text>
+<text x="690" y="265" text-anchor="middle" class="d-small d-mono">0.0</text>
+<text x="728" y="265" text-anchor="middle" class="d-small d-mono">0.0</text>
+<text x="709" y="287" text-anchor="middle" class="d-small">LiveMathBench</text>
+<text x="24" y="160" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 24 160)">exact match, % of problems</text>
+<rect x="450" y="56" width="300" height="56" rx="6" class="d-label-bg"/>
+<rect x="460" y="66" width="14" height="14" class="d-fill-orange"/>
+<text x="480" y="78" text-anchor="start" class="d-small">Qwen2.5-Math-7B</text>
+<rect x="460" y="88" width="14" height="14" class="d-fill-blue"/>
+<text x="480" y="100" text-anchor="start" class="d-small">Llama3.1-8B</text>
+</svg>
+  <figcaption><b>Figure 9.</b> Exact-match rate when a model is given the first 60% of a benchmark problem and asked to continue, Qwen2.5-Math-7B against Llama3.1-8B<a class="cite" href="#ref-3">3</a> (Table 2, greedy decoding, no template). Qwen reproduces more than half of MATH-500, 42.2% of AMC and 20.0% of AIME 2024, and nothing of AIME 2025 or LiveMathBench; Llama is near zero throughout.</figcaption>
+</figure>
+
+<p>They then build a clean benchmark, RandomCalculation: automatically generated arithmetic expressions of 1 to 20 steps, 1,000 problems per sub-dataset, created after Qwen's release, with a continuous reward because exact answers are long decimals. On the 5-step and 10-step sets, correct rewards improve Qwen2.5-Math-7B steadily and beyond the initial model's Max@16, random and incorrect rewards give unstable or no gains, and inverted rewards collapse performance (§4.3). Output similarity before and after RL points the same way: ROUGE-L between pre- and post-RL responses under random reward is 0.601 on MATH-500 but 0.247 and 0.251 on the 5- and 10-step RandomCalculation sets (Table 3), which they read as retrieval of stored answers.</p>
+<p>The two accounts agree that no new capability is created and differ on what is amplified, a behavior (Shao et al.: code reasoning) or a memorized item set (Wu et al.). They are not exclusive, and neither paper contains the other's decisive test: Shao et al. do not report their ladder on a decontaminated Qwen-scale set, and Wu et al. do not rule out a behavioral prior. The fully open base of Olmo 3 gives a partial test. Its RL-Zero setup decontaminates the RL data against pretraining and midtraining data and then runs a negative control, random binary rewards on the same data, which "does not improve performance on any of our benchmark evaluations"; performance stays flat or degrades<a class="cite" href="#ref-4">4</a> (§6.2, Figure 27). Olmo 3 reads this as evidence that its decontamination removed overlap between the base and the evaluation data. It shows this base gives random rewards nothing to amplify; it does not choose between the two accounts of the Qwen result (my reading).</p>
+<p>The prompt is the other half of the baseline. Module 10 §6.2 tabulates Dr. GRPO's template results: the R1 template takes Qwen2.5-Math-7B to 0.0 average, no template gives 38.2<a class="cite" href="#ref-15">15</a>. Olmo 3 reports the same pattern from the other side: simple templates beat post-training templates on a base mid-trained without special formatting<a class="cite" href="#ref-4">4</a> (§6.1). The evaluation rule that follows is to score the base under its best prompt as well as under the RL prompt, and to report both.</p>
+
+<h2 id="distillation-test">7. Distillation as a second boundary test</h2>
+<p>Yue et al. find that distilling R1 into Qwen2.5-Math-7B puts the pass@k curve consistently above the base model's at every k, unlike RL, which they say is bounded by the base<a class="cite" href="#ref-1">1</a> (§4.2, Figure 7). Qwen3 supplies a controlled version, and Module 21 covers its cost and mechanism. Both arms start from the same off-policy-distilled Qwen3-8B checkpoint and use math and code queries; one continues with RL, the other with on-policy distillation from a stronger teacher<a class="cite" href="#ref-13">13</a> (§4.7, Table 21).</p>
+
+<figure class="fig">
+<svg viewBox="0 0 800 330" role="img" aria-labelledby="f10t"><title id="f10t">Qwen3-8B on AIME 2024 and 2025: RL raises pass@1 from 55.0 to 67.6 and from 42.8 to 55.5 but leaves pass@64 at 90.0 and 83.3; on-policy distillation reaches pass@1 74.4 and 65.5 and pass@64 93.3 and 86.7</title>
+<line x1="70" y1="270" x2="780" y2="270" class="d-grid"/>
+<text x="64" y="274" text-anchor="end" class="d-small d-mono d-text-light">0</text>
+<line x1="70" y1="226" x2="780" y2="226" class="d-grid"/>
+<text x="64" y="230" text-anchor="end" class="d-small d-mono d-text-light">20</text>
+<line x1="70" y1="182" x2="780" y2="182" class="d-grid"/>
+<text x="64" y="186" text-anchor="end" class="d-small d-mono d-text-light">40</text>
+<line x1="70" y1="138" x2="780" y2="138" class="d-grid"/>
+<text x="64" y="142" text-anchor="end" class="d-small d-mono d-text-light">60</text>
+<line x1="70" y1="94" x2="780" y2="94" class="d-grid"/>
+<text x="64" y="98" text-anchor="end" class="d-small d-mono d-text-light">80</text>
+<line x1="70" y1="50" x2="780" y2="50" class="d-grid"/>
+<text x="64" y="54" text-anchor="end" class="d-small d-mono d-text-light">100</text>
+<line x1="70" y1="50" x2="70" y2="270" class="d-axis"/>
+<line x1="70" y1="270" x2="780" y2="270" class="d-axis"/>
+<rect x="92.8" y="149" width="40" height="121" class="d-fill-blue"/>
+<text x="112.8" y="144" text-anchor="middle" class="d-small d-mono">55.0</text>
+<rect x="138.8" y="121.3" width="40" height="148.7" class="d-fill-orange"/>
+<text x="158.8" y="116.3" text-anchor="middle" class="d-small d-mono">67.6</text>
+<rect x="184.8" y="106.3" width="40" height="163.7" class="d-fill-green"/>
+<text x="204.8" y="101.3" text-anchor="middle" class="d-small d-mono">74.4</text>
+<text x="158.8" y="287" text-anchor="middle" class="d-small d-bold">AIME24 pass@1</text>
+<rect x="270.2" y="72" width="40" height="198" class="d-fill-blue"/>
+<text x="290.2" y="67" text-anchor="middle" class="d-small d-mono">90.0</text>
+<rect x="316.2" y="72" width="40" height="198" class="d-fill-orange"/>
+<text x="336.2" y="67" text-anchor="middle" class="d-small d-mono">90.0</text>
+<rect x="362.2" y="64.7" width="40" height="205.3" class="d-fill-green"/>
+<text x="382.2" y="59.7" text-anchor="middle" class="d-small d-mono">93.3</text>
+<text x="336.2" y="287" text-anchor="middle" class="d-small d-bold">AIME24 pass@64</text>
+<text x="336.2" y="303" text-anchor="middle" class="d-small d-mono d-text-light">27 / 27 / 28 of 30</text>
+<rect x="447.8" y="175.8" width="40" height="94.2" class="d-fill-blue"/>
+<text x="467.8" y="170.8" text-anchor="middle" class="d-small d-mono">42.8</text>
+<rect x="493.8" y="147.9" width="40" height="122.1" class="d-fill-orange"/>
+<text x="513.8" y="142.9" text-anchor="middle" class="d-small d-mono">55.5</text>
+<rect x="539.8" y="125.9" width="40" height="144.1" class="d-fill-green"/>
+<text x="559.8" y="120.9" text-anchor="middle" class="d-small d-mono">65.5</text>
+<text x="513.8" y="287" text-anchor="middle" class="d-small d-bold">AIME25 pass@1</text>
+<rect x="625.2" y="86.7" width="40" height="183.3" class="d-fill-blue"/>
+<text x="645.2" y="81.7" text-anchor="middle" class="d-small d-mono">83.3</text>
+<rect x="671.2" y="86.7" width="40" height="183.3" class="d-fill-orange"/>
+<text x="691.2" y="81.7" text-anchor="middle" class="d-small d-mono">83.3</text>
+<rect x="717.2" y="79.3" width="40" height="190.7" class="d-fill-green"/>
+<text x="737.2" y="74.3" text-anchor="middle" class="d-small d-mono">86.7</text>
+<text x="691.2" y="287" text-anchor="middle" class="d-small d-bold">AIME25 pass@64</text>
+<text x="691.2" y="303" text-anchor="middle" class="d-small d-mono d-text-light">25 / 25 / 26 of 30</text>
+<text x="24" y="160" text-anchor="middle" class="d-small d-text-light" transform="rotate(-90 24 160)">accuracy, %</text>
+<rect x="95" y="14" width="14" height="14" class="d-fill-blue"/>
+<text x="115" y="26" text-anchor="start" class="d-small">off-policy distilled start</text>
+<rect x="295" y="14" width="14" height="14" class="d-fill-orange"/>
+<text x="315" y="26" text-anchor="start" class="d-small">+ RL (17,920 GPU-h)</text>
+<rect x="485" y="14" width="14" height="14" class="d-fill-green"/>
+<text x="505" y="26" text-anchor="start" class="d-small">+ on-policy distillation (1,800 GPU-h)</text>
+</svg>
+  <figcaption><b>Figure 10.</b> Qwen3-8B on AIME 2024 and 2025 from one off-policy-distilled start, then RL or on-policy distillation<a class="cite" href="#ref-13">13</a> (Table 21). RL raises pass@1 by 12.6 and 12.7 points and leaves pass@64 at 90.0 and 83.3; on-policy distillation raises pass@1 by 19.4 and 22.7 and pass@64 to 93.3 and 86.7, at 1,800 GPU-hours against 17,920. Problem counts are derived from 30 problems per benchmark.</figcaption>
+</figure>
+
+<p>The paper's reading is that distillation "enables the student model to expand its exploration space" while "reinforcement learning does not lead to any improvement in pass@64 scores". The arithmetic puts a scale on that. AIME has 30 problems<a class="cite" href="#ref-5">5</a>, so 90.0% and 93.3% are 27 and 28 problems, and 83.3% and 86.7% are 25 and 26 (derived). The "expansion" from distillation is exactly one extra problem on each benchmark, and the "no improvement" under RL is the same count before and after, which need not be the same problems. The passage reports no seeds, no intervals and no statement of how pass@64 was estimated. Read it as a direction that agrees with Yue et al., not as a magnitude; the 12 to 23 point pass@1 movements are the robust part. R1's final model itself shows the headroom this metric exposes, 79.8% pass@1 against 90.0% pass@64 on AIME 2024 (Section 1.3). For measurement, the useful question about any teacher-driven gain is whether the newly solved problems lie in the teacher's solved set, which a per-problem partition answers (Section 8.5).</p>
+
+<h2 id="protocol">8. A protocol that separates sharpening from expansion</h2>
+<p>Each gate of Figure 1 matches a documented failure; this section turns the gates into measurements.</p>
+
+<h3 id="protocol-sampling">8.1 Match the sampling protocol</h3>
+<p>Reports do not share one. R1, DAPO, Yue et al., ProRL and Olmo 3 differ in temperature, top-p, token cap and sample count (Table 8), so cross-report comparisons such as DAPO's 50 AIME points against 47 for R1-Zero-Qwen-32B<a class="cite" href="#ref-7">7</a> compare different protocols as well as different recipes. Hochlehnert et al. measured the cost: across nine models and three benchmarks, temperature alone moves accuracy by up to 15%, top-p by up to 8%, and hardware and framework differences leave 2 to 5% even under stringent controls<a class="cite" href="#ref-5">5</a> (Figures 4 and 5, §3.4).</p>
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 8.</b> Evaluation protocols as stated in five reports and one standardization study. "n/s" means not stated in the passage read.</caption>
+  <thead><tr><th>Report</th><th>Metric</th><th class="num">Temperature</th><th class="num">top-p</th><th class="num">Max tokens</th><th>Samples</th></tr></thead>
+  <tbody>
+    <tr><td class="row">R1 v2<a class="cite" href="#ref-6">6</a></td><td>pass@1 as mean of k; cons@64</td><td class="num">0.6</td><td class="num">0.95</td><td class="num">32,768</td><td>k = 64 AIME and GPQA, 16 MATH and Codeforces, 8 LiveCodeBench</td></tr>
+    <tr><td class="row">DAPO<a class="cite" href="#ref-7">7</a></td><td>avg@32 on AIME</td><td class="num">1.0</td><td class="num">0.7</td><td class="num">n/s</td><td>AIME set repeated 32 times</td></tr>
+    <tr><td class="row">Yue et al.<a class="cite" href="#ref-1">1</a></td><td>pass@k</td><td class="num">0.6</td><td class="num">0.95</td><td class="num">16,384</td><td>n up to 1,024</td></tr>
+    <tr><td class="row">ProRL<a class="cite" href="#ref-11">11</a></td><td>pass@1; pass@k</td><td class="num">0.6</td><td class="num">0.95</td><td class="num">32K</td><td>16; 256 on a task subset</td></tr>
+    <tr><td class="row">Olmo 3 RL-Zero<a class="cite" href="#ref-4">4</a></td><td>pass@1; pass@32</td><td class="num">1.0</td><td class="num">n/s</td><td class="num">32K</td><td>n/s</td></tr>
+    <tr><td class="row">Hochlehnert et al.<a class="cite" href="#ref-5">5</a></td><td>pass@1, sensitivity runs</td><td class="num">0.8</td><td class="num">0.9</td><td class="num">32,768</td><td>10 seeds (AIME, AMC), 3 (MATH-500)</td></tr>
+  </tbody>
+</table>
+
+<h3 id="protocol-resolution">8.2 Know the resolution of the benchmark</h3>
+<p>AIME 2024 has 30 problems and AMC 2023 has 40, so one problem moves pass@1 by 3.33 and 2.5 points; Hochlehnert et al. report seed-to-seed standard deviations of 5 to 15 percentage points, worst on AIME 2024 and AMC 2023, and recommend at least 30 seeds, paired significance tests and per-model tuned decoding<a class="cite" href="#ref-5">5</a> (§3.2, §4.1). Miller's statistics explain why more samples per problem do not fix this<a class="cite" href="#ref-17">17</a>. The variance of a benchmark mean is \(\operatorname{Var}(\hat\mu)=(\operatorname{Var}(x)+\mathbb{E}[\sigma_i^2])/n\): the variance of true per-problem pass rates, which resampling cannot shrink, plus the mean within-problem variance, which divides by the number of samples K (§3.1). His uniform-difficulty example has \(\operatorname{Var}(x)=1/12\) and \(\mathbb{E}[\sigma_i^2]=1/6\); with \(n=30\), going from one sample to 32 cuts the standard error from 9.13 to 5.43 points, and no number of samples gets below 5.27 (derived). Under that difficulty distribution, an avg@32 comparison of two unpaired models on AIME 2024 cannot resolve a 5-point gap. Scoring both models on the same problems and using question-level differences removes shared difficulty and is Miller's recommended analysis (§4.2).</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 9.</b> Resolution of common benchmarks at 50% accuracy, one sample per problem (derived from \(\sqrt{p(1-p)/n}\)<a class="cite" href="#ref-17">17</a>, Eq. 2 and Eq. 3). Sizes: AIME 2024 and AMC 2023<a class="cite" href="#ref-5">5</a>; LiveMathBench and MATH-500<a class="cite" href="#ref-3">3</a>.</caption>
+  <thead><tr><th>Benchmark</th><th class="num">Problems</th><th class="num">One problem (points)</th><th class="num">Standard error (points)</th><th class="num">95% CI half-width (points)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">AIME 2024</td><td class="num">30</td><td class="num">3.33</td><td class="num">9.13</td><td class="num" data-worst>17.89</td></tr>
+    <tr><td class="row">AMC 2023</td><td class="num">40</td><td class="num">2.50</td><td class="num">7.91</td><td class="num">15.50</td></tr>
+    <tr><td class="row">LiveMathBench</td><td class="num">100</td><td class="num">1.00</td><td class="num">5.00</td><td class="num">9.80</td></tr>
+    <tr><td class="row">MATH-500</td><td class="num">500</td><td class="num">0.20</td><td class="num">2.24</td><td class="num" data-best>4.38</td></tr>
+  </tbody>
+</table>
+
+<h3 id="protocol-guess">8.3 Large-k pass@k counts lucky guesses</h3>
+<p>With answer-only checking, pass@k at large k also counts guesses. Under uniform guessing over \(N\) possible answers the chance of a hit within k samples is \(1-(1-1/N)^k\) (derived). Real guesses are not uniform, so Table 10 gives a scale, not a bound. Take <mark class="unverified" title="The MAA page returned HTTP 403 and a bot-challenge page; access was not worked around. Only a web-search summary of MAA and other pages gives integers 0 to 999, so no citable source was read">AIME answers to be integers from 0 to 999, so N = 1,000</mark>: a guesser alone would reach 64% at k = 1,024, which is why Yue et al. checked chains of thought by hand<a class="cite" href="#ref-1">1</a> (§2.2, §3.1). Binary grading making a best guess optimal over abstaining is the training-side version of the same incentive<a class="cite" href="#ref-18">18</a> (Module 24).</p>
+<table class="tbl tbl-compare">
+  <caption><b>Table 10.</b> Probability that uniform random guessing over \(N\) equally likely answers hits within k samples (derived from \(1-(1-1/N)^k\)).</caption>
+  <thead><tr><th class="num">Answer space N</th><th class="num">k = 8</th><th class="num">k = 64</th><th class="num">k = 256</th><th class="num">k = 1,024</th></tr></thead>
+  <tbody>
+    <tr><td class="num">4</td><td class="num">90.0%</td><td class="num">100.0%</td><td class="num">100.0%</td><td class="num">100.0%</td></tr>
+    <tr><td class="num">100</td><td class="num">7.7%</td><td class="num">47.4%</td><td class="num">92.4%</td><td class="num">100.0%</td></tr>
+    <tr><td class="num">1,000</td><td class="num">0.8%</td><td class="num">6.2%</td><td class="num">22.6%</td><td class="num">64.1%</td></tr>
+  </tbody>
+</table>
+
+<h3 id="protocol-cost">8.4 What large k costs</h3>
+<p>Large k is a serving workload. Yue et al. could not run pass@k on R1-Zero: their self-hosted copy delivered about 50 tokens per second at a 32k maximum length<a class="cite" href="#ref-1">1</a> (§4.6). AIME 2024 at n = 1,024 is 30,720 samples, at most 1.01 billion generated tokens at the 32,768-token cap, which is about 233 days at 50 tokens per second (derived upper bound; real lengths are shorter and a batched engine is far faster). Cost scales as problems times n times mean length, so a 1,024-sample partition of MATH-500 is 512,000 samples. Rollout-engine throughput (System Design Module 37) sets how far out the boundary can be measured.</p>
+
+<h3 id="protocol-checklist">8.5 The checklist, in the order of Figure 1</h3>
+<ol>
+  <li><strong>Same protocol.</strong> Score the base and the RL model with the same prompt, temperature, top-p, token cap and k, and also score the base under its own best prompt (Sections 5.5 and 6). Pin report versions: R1-Zero's AIME 2024 pass@1 is 71.0% in v1 and 77.9% in v2<a class="cite" href="#ref-6">6</a> (Module 10).</li>
+  <li><strong>Estimator and n.</strong> Use the unbiased pass@k estimator with \(n\ge k\), report n, and remember that at \(k=n\) the point is a single indicator per problem (Section 1.2).</li>
+  <li><strong>Noise.</strong> Report seeds, standard errors with the benchmark's size in view, and paired differences against the base (Section 8.2).</li>
+  <li><strong>Control rewards.</strong> Run a random-reward and a format-reward run through the same pipeline; their gain is the part of the claim that needs no verifier (Section 5; Olmo 3's negative control).</li>
+  <li><strong>Clean benchmark.</strong> Prefer post-cutoff or decontaminated sets, and run the partial-prompt completion probe on the base model (Section 6).</li>
+  <li><strong>Boundary.</strong> Compute pass@k out to \(k\) in the hundreds or more, partition problems into both, base-only, RL-only and neither, and spot-check chains of thought on the problems that decide the result (Sections 2.2 and 8.3). Track the partition across checkpoints, since expansion can be temporary<a class="cite" href="#ref-12">12</a>.</li>
+</ol>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The live question is whether RLVR creates solvable problems or raises the odds on problems the base could already solve. The sources split into three answers and a fourth position that questions what the benchmark gains measure.</p>
+<div class="positions">
+  <article class="position">
+    <h4>RLVR sharpens; the base model sets the boundary</h4>
+    <p class="who">Yue et al.<a class="cite" href="#ref-1">1</a>; DeepSeekMath<a class="cite" href="#ref-9">9</a>; Qwen3's Table 21<a class="cite" href="#ref-13">13</a>; the Invisible Leash study<a class="cite" href="#ref-12">12</a>; Hochlehnert et al.<a class="cite" href="#ref-5">5</a>; Karan and Du<a class="cite" href="#ref-14">14</a></p>
+    <p>pass@k at large k, per-problem solved sets and base-model perplexity of RL outputs all show the RL model solving a subset of what the base solves.</p>
+    <ul class="pros"><li>Replicated with different pipelines and metrics, including per-question tracking and a training-free sampler.</li><li>Operational: the claim is a measurement, not a story.</li></ul>
+    <ul class="cons"><li>Mostly short runs, strong math bases and answer-only checking.</li><li>Distilled starts and weak-base tasks show different behavior.</li></ul>
+  </article>
+  <article class="position">
+    <h4>RLVR can expand with long, diverse, KL-controlled training</h4>
+    <p class="who">ProRL<a class="cite" href="#ref-11">11</a>; Olmo 3's RL-Zero pass@32<a class="cite" href="#ref-4">4</a></p>
+    <p>Over 2,000 steps on 136K problems from five domains, gains were largest where the base started weak, and a held-out task the base could not solve at all was solved.</p>
+    <ul class="pros"><li>Sustained pass@k gains on code and logic tasks; a clean 7B base also improved at pass@32.</li><li>Names a concrete reason earlier studies may have stopped too early.</li></ul>
+    <ul class="cons"><li>Starts from a distilled 1.5B model, and its own math results diminish.</li><li>Not a matched comparison with Yue et al. (Table 4); Olmo 3's pass@32 is shown in a figure only.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Both, in two phases</h4>
+    <p class="who">Yao et al.<a class="cite" href="#ref-16">16</a></p>
+    <p>Probability mass first concentrates on explored high-reward routes (shrinkage), then, if training continues, flows to rare better ones (expansion).</p>
+    <ul class="pros"><li>Explains both camps and predicts when each appears.</li><li>The toy gives a duration scaling, about \(1/(\eta\,\Delta r\,\pi_{\min})\).</li></ul>
+    <ul class="cons"><li>In my derivation (Section 4.2) its exploration stage needs a reward gap between correct routes, which a binary verifier does not give.</li><li>Tested for about 42 steps; not tested at ProRL scale.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Most measured gains are prior amplification or contamination</h4>
+    <p class="who">Shao et al.<a class="cite" href="#ref-2">2</a>; Wu et al.<a class="cite" href="#ref-3">3</a>; Dr. GRPO<a class="cite" href="#ref-15">15</a>; Olmo 3<a class="cite" href="#ref-4">4</a></p>
+    <p>Random and incorrect rewards reproduce most of a Qwen2.5-Math gain; a partial-prompt probe shows MATH-500 is memorized; the template alone moves the baseline by tens of points.</p>
+    <ul class="pros"><li>Cheap controls any team can run, and they explain why Qwen results do not transfer.</li><li>Consistent with the post-cutoff AIME 2025 result.</li></ul>
+    <ul class="cons"><li>Ground truth still beats random by 7.7 to 23.8 points.</li><li>The two mechanisms (code behavior versus memory) are disputed, and this position says little about the boundary.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>For strong math bases, single-domain RLVR and runs of hundreds of steps, the sharpening evidence is the best supported, and the Qwen2.5-Math numbers should be treated as unconfirmed until a random-reward control and a second model family agree. The pass@1 gains are real; what they do not show is new problems solved. For weak starts, diverse tasks and long runs the expansion case is plausible but rests on one 1.5B distilled model, and the two-phase theory is an interpretation of it, not evidence. If your deployment is single-shot, sharpening is the goal; if it samples k times against a checker, evaluate pass@k at your k. What would settle it is an experiment I found in none of these sources: an open decontaminated base such as Olmo 3, one task mix and one evaluation protocol, RL from step 0 past 2,000 steps, per-problem partitions at 1,024 samples on a clean held-out set at every checkpoint, chain-of-thought validity checks and a random-reward control, repeated on a second family.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>This page is as of 2026-10-27, and several sources it depends on are revised preprints: the Invisible Leash study reached v5 on 14 October 2026 with its per-question support framework<a class="cite" href="#ref-12">12</a>, Spurious Rewards is at v2 of February 2026<a class="cite" href="#ref-2">2</a>, and Yue et al. is at v5<a class="cite" href="#ref-1">1</a>. Check versions before quoting a number. The released open base, data and logs of Olmo 3 make the matched ladder of Figure 1 runnable outside a frontier lab<a class="cite" href="#ref-4">4</a>.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Yue, Y., Chen, Z., Lu, R., Zhao, A., Wang, Z., Yue, Y., Song, S., Huang, G. <em>Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?</em> arXiv:2504.13837v5, 24 Nov 2025 (Tsinghua LeapLab, SJTU). <a href="https://arxiv.org/pdf/2504.13837v5">https://arxiv.org/pdf/2504.13837v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: pass@k protocol (§2.2, §3), Figures 2, 5, 7, 15, Tables 2-4, controlled run (§4.3-§4.5), CoT validity checks (§3.1), estimator settings (App. A.2), solvable-set partition (App. C.7).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Shao, R., Li, S. S., Xin, R., Geng, S., et al. <em>Spurious Rewards: Rethinking Training Signals in RLVR</em>. arXiv:2506.10947v2, 25 Feb 2026 (University of Washington, Allen Institute for AI, UC Berkeley). <a href="https://arxiv.org/pdf/2506.10947v2">https://arxiv.org/pdf/2506.10947v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: reward ladder (§2), Figure 1 and Table 6 data, clipping bias (§4, Eq. 2, App. B), code reasoning (§5, Tables 1-2), prompt sensitivity (Table 5, App. I), post-RL models (App. J), AIME results (App. D).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Wu, M., Zhang, Z., Dong, Q., Xi, Z., et al. <em>Reasoning or Memorization? Unreliable Results of Reinforcement Learning Due to Data Contamination</em>. arXiv:2507.10532v3, 17 Dec 2025 (Fudan University et al.). <a href="https://arxiv.org/abs/2507.10532">https://arxiv.org/abs/2507.10532</a>. Accessed 2026-10-27. <span class="ref-use">Used for: partial-prompt completion audit (Table 2), RandomCalculation experiments (§4.3), response similarity (Table 3), benchmark sizes.</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Team Olmo. <em>Olmo 3</em>. arXiv:2512.13961v2, 14 Apr 2026 (Allen Institute for AI). <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: RL-Zero motivation (§2.2), template finding and evaluation settings (§6.1), pass@32 result and random-reward negative control (§6.2, Figure 27).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Hochlehnert, A., Bhatnagar, H., Udandarao, V., Albanie, S., Prabhu, A., Bethge, M. <em>A Sober Look at Progress in Language Model Reasoning: Pitfalls and Paths to Reproducibility</em>. COLM 2025; arXiv:2504.07086v2, 6 Oct 2025. <a href="https://arxiv.org/abs/2504.07086">https://arxiv.org/abs/2504.07086</a>. Accessed 2026-10-27. <span class="ref-use">Used for: seed, temperature, top-p and hardware variance (§3, Figures 2, 4, 5, Takeaway 6), best practices (§4.1), RL replication results (§4.3), diversity collapse (§5.2), spurious prompt (§5.3), benchmark sizes.</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv:2501.12948v2 (4 Jan 2026; v1 22 Jan 2025 for the 71.0% figure). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: evaluation setup and pass@1 definition (Supplementary D.1), pass@1, cons@64 and pass@64 on AIME 2024 (Supplementary E.4), R1-Zero version numbers.</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Yu, Q., Zhang, Z., Zhu, R., Yuan, Y., et al. <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv:2503.14476v2, 20 May 2025 (ByteDance Seed, Tsinghua AIR). <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: avg@32, temperature 1.0 and top-p 0.7 (§4.1), 50 versus 47 AIME points, Clip-Higher epsilon values.</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Chen, M., Tworek, J., Jun, H., Yuan, Q., et al. <em>Evaluating Large Language Models Trained on Code</em>. arXiv:2107.03374, 2021 (OpenAI). <a href="https://arxiv.org/abs/2107.03374">https://arxiv.org/abs/2107.03374</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the unbiased pass@k estimator (Eq. 1), the numerically stable implementation (Figure 3), and the bias of the plug-in estimator (Appendix A, Figure 13).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R., et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv:2402.03300v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Maj@K versus Pass@K (§5.2.2, Figure 7) and the data-source caveat (§5.2.3).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Brown, B., Juravsky, J., Ehrlich, R., Clark, R., Le, Q. V., Ré, C., Mirhoseini, A. <em>Large Language Monkeys: Scaling Inference Compute with Repeated Sampling</em>. arXiv:2407.21787v3, 30 Dec 2024. <a href="https://arxiv.org/abs/2407.21787">https://arxiv.org/abs/2407.21787</a>. Accessed 2026-10-27. <span class="ref-use">Used for: coverage scaling with samples and the SWE-bench Lite figures (abstract).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Liu, M., Diao, S., Lu, X., Hu, J., Dong, X., Choi, Y., Kautz, J., Dong, Y. <em>ProRL: Prolonged Reinforcement Learning Expands Reasoning Boundaries in Large Language Models</em>. arXiv:2505.24864v1, 30 May 2025 (NVIDIA). <a href="https://arxiv.org/pdf/2505.24864v1">https://arxiv.org/pdf/2505.24864v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: claim and recipe (§1-§3), Tables 1-3, pass@k analysis (§4, Figures 3-5), Jensen bound on pass@k (§4.4), training and evaluation settings.</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Wu, F., Xuan, W., Xing, D., Lu, X., Liu, M., Dong, Y., Harchaoui, Z., Choi, Y. <em>The Invisible Leash? Why RLVR May or May Not Escape Its Origin</em>. arXiv:2507.14843v5, 14 Oct 2026. <a href="https://arxiv.org/abs/2507.14843">https://arxiv.org/abs/2507.14843</a>. Accessed 2026-10-27. <span class="ref-use">Used for: empirical support dynamics, shrinkage versus expansion findings (abstract, §1), temporary expansion at intermediate checkpoints, author list.</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Yang, A., Li, A., Yang, B., Zhang, B., et al. (Qwen Team). <em>Qwen3 Technical Report</em>. arXiv:2505.09388v1, 14 May 2025. <a href="https://arxiv.org/pdf/2505.09388v1">https://arxiv.org/pdf/2505.09388v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Table 21 and the RL versus on-policy distillation discussion (§4.7).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Karan, A., Du, Y. <em>Reasoning with Sampling: Your Base Model is Smarter Than You Think</em>. arXiv:2510.14901v1, 16 Oct 2025 (Harvard). <a href="https://arxiv.org/abs/2510.14901">https://arxiv.org/abs/2510.14901</a>. Accessed 2026-10-27. <span class="ref-use">Used for: training-free sharpened sampling result (abstract).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Liu, Z., Chen, C., Li, W., Qi, P., Pang, T., Du, C., Lee, W. S., Lin, M. <em>Understanding R1-Zero-Like Training: A Critical Perspective</em>. COLM 2025; arXiv:2503.20783v2, 6 Oct 2025. <a href="https://arxiv.org/pdf/2503.20783v2">https://arxiv.org/pdf/2503.20783v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Table 1 (prompt templates, Qwen2.5-Math), the no-reward-signal remark (§2.1), template destroying capability before RL (§3.3).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Yao, X., Yu, L., Hu, X., Teng, F., Cui, Q., Zhou, J., Liu, Y. <em>The Debate on RLVR Reasoning Capability Boundary: Shrinkage, Expansion, or Both? A Two-Stage Dynamic View</em>. arXiv:2510.04028v1, 5 Oct 2025 (Renmin University of China, Ant Group, Xiamen University). <a href="https://arxiv.org/abs/2510.04028">https://arxiv.org/abs/2510.04028</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Lemma 1, Theorem 1, Remark 3 (§3), toy example (§3.2), experiments (§4, Table 1, Figure 2), hyperparameters (App. C.2), footnote 3.</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Miller, E. <em>Adding Error Bars to Evals: A Statistical Approach to Language Model Evaluations</em>. arXiv:2411.00640v1, 1 Nov 2024 (Anthropic). <a href="https://arxiv.org/abs/2411.00640">https://arxiv.org/abs/2411.00640</a>. Accessed 2026-10-27. <span class="ref-use">Used for: standard error and confidence interval (Eq. 1-3), variance decomposition and resampling (§3.1), paired analysis (§4.2).</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Kalai, A. T., Nachum, O., Vempala, S. S., Zhang, E. <em>Why Language Models Hallucinate</em>. arXiv:2509.04664v1, 4 Sep 2025 (OpenAI, Georgia Tech). <a href="https://arxiv.org/pdf/2509.04664v1">https://arxiv.org/pdf/2509.04664v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the incentive under binary grading that makes a best guess optimal over abstaining (§4).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The RL Post-Training Loop as a Cost Model: Rollout, Reward, Update, and Where the GPU-Hours Go · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="One RL post-training iteration decomposed into rollout, scoring, advantage, update and weight sync, with the reported cost arithmetic of R1-Zero, Olmo 3, MiniMax-M1 and ScaleRL, and the memory each method keeps resident.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 1</p>
+  <h1>The RL Post-Training Loop as a Cost Model: Rollout, Reward, Update, and Where the GPU-Hours Go</h1>
+  <p class="lede">One RL iteration is a rollout, which is autoregressive decode of the kind you already serve, followed by an update of the kind pretraining does; which of the two dominates depends on response length, GPU split and engineering: generation dominates in Olmo 3's long-reasoning run and training in Tulu 3's 405B run. This module decomposes the loop, fixes the vocabulary every later module reuses (prompts per step, samples per prompt, minibatches per rollout), and works the published cost arithmetic of R1-Zero, Olmo 3, MiniMax-M1 and ScaleRL. Afterwards you can estimate from batch size, response length and engine throughput which phase bottlenecks a run and what it costs, and read any report's "steps" and "GPU-hours" critically.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>21</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">First module: no prerequisites</span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 350" role="img" aria-labelledby="f1t"><title id="f1t">One RL iteration as six phases, coloured by hardware shape, with reported phase durations drawn to scale</title>
+    <defs><marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="14" y="8" width="12" height="12" rx="2" class="d-block-accent"/><text x="32" y="19" class="d-text-light">inference-shaped (decode)</text>
+    <rect x="212" y="8" width="12" height="12" rx="2" class="d-block"/><text x="230" y="19" class="d-text-light">training-shaped (fwd + bwd)</text>
+    <rect x="430" y="8" width="12" height="12" rx="2" class="d-block-2"/><text x="448" y="19" class="d-text-light">forward pass or data movement</text>
+    <rect x="652" y="8" width="12" height="12" rx="2" class="d-block-muted"/><text x="670" y="19" class="d-text-light">light work</text>
+
+    <text x="70" y="52" text-anchor="middle" class="d-text-light">CPU, dataset</text>
+    <text x="202" y="52" text-anchor="middle" class="d-text-light">HBM-bound decode</text>
+    <text x="334" y="52" text-anchor="middle" class="d-text-light">verifier / RM</text>
+    <text x="466" y="52" text-anchor="middle" class="d-text-light">light arithmetic</text>
+    <text x="598" y="52" text-anchor="middle" class="d-text-light">compute-bound</text>
+    <text x="730" y="52" text-anchor="middle" class="d-text-light">network bytes</text>
+
+    <rect x="14" y="64" width="112" height="70" rx="8" class="d-block-muted"/>
+    <text x="70" y="93" text-anchor="middle" class="d-bold">1. Sample</text><text x="70" y="113" text-anchor="middle">P prompts</text>
+    <rect x="146" y="64" width="112" height="70" rx="8" class="d-block-accent"/>
+    <text x="202" y="93" text-anchor="middle" class="d-text-inv d-bold">2. Rollout</text><text x="202" y="113" text-anchor="middle" class="d-text-inv">G per prompt</text>
+    <rect x="278" y="64" width="112" height="70" rx="8" class="d-block-2"/>
+    <text x="334" y="93" text-anchor="middle" class="d-text-inv d-bold">3. Score</text><text x="334" y="113" text-anchor="middle" class="d-text-inv">reward signal</text>
+    <rect x="410" y="64" width="112" height="70" rx="8" class="d-block-muted"/>
+    <text x="466" y="93" text-anchor="middle" class="d-bold">4. Advantage</text><text x="466" y="113" text-anchor="middle">per sample</text>
+    <rect x="542" y="64" width="112" height="70" rx="8" class="d-block"/>
+    <text x="598" y="93" text-anchor="middle" class="d-text-inv d-bold">5. Update</text><text x="598" y="113" text-anchor="middle" class="d-text-inv">M minibatches</text>
+    <rect x="674" y="64" width="112" height="70" rx="8" class="d-block-2"/>
+    <text x="730" y="93" text-anchor="middle" class="d-text-inv d-bold">6. Weight sync</text><text x="730" y="113" text-anchor="middle" class="d-text-inv">trainer to engine</text>
+
+    <path d="M126,99 L144,99" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M258,99 L276,99" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M390,99 L408,99" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M522,99 L540,99" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M654,99 L672,99" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M730,136 L730,160 L202,160 L202,138" class="d-arrow-active" marker-end="url(#f1-arr)"/>
+    <text x="466" y="180" text-anchor="middle" class="d-text-light">the next rollout samples from the updated weights</text>
+
+    <rect x="14" y="194" width="772" height="146" rx="8" class="d-panel"/>
+    <text x="28" y="214" class="d-title">Reported phase durations, bars to scale (0.25 px per second)</text>
+    <text x="146" y="241" text-anchor="end">Olmo 3 generation</text><rect x="150" y="228" width="250" height="18" rx="3" class="d-block-accent"/><text x="408" y="241" class="d-mono">1,000 s</text>
+    <text x="146" y="263" text-anchor="end">Olmo 3 training</text><rect x="150" y="250" width="31.25" height="18" rx="3" class="d-block"/><text x="189" y="263" class="d-mono">125 s</text>
+    <text x="146" y="285" text-anchor="end">Tulu 3 inference</text><rect x="150" y="272" width="137.5" height="18" rx="3" class="d-block-accent"/><text x="295" y="285" class="d-mono">~550 s</text>
+    <text x="146" y="307" text-anchor="end">Tulu 3 training</text><rect x="150" y="294" width="375" height="18" rx="3" class="d-block"/><text x="533" y="307" class="d-mono">~1,500 s</text>
+    <text x="146" y="329" text-anchor="end">Tulu 3 weight sync</text><rect x="150" y="316" width="6.25" height="18" rx="2" class="d-block-2"/><text x="164" y="329" class="d-mono">~25 s</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The loop every later module modifies. Phase structure follows DeepSeek-R1's four-module RL framework (rollout, inference, rule-based reward, training)<a class="cite" href="#ref-1">1</a>. Lower panel: Olmo 3's footnote gives 1,000 s per batched generation and 125 s of training for "one of our main RL runs"<a class="cite" href="#ref-2">2</a>; Tulu 3's 405B RLVR run reports about 550 s inference, 25 s weight transfer and 1,500 s training per iteration<a class="cite" href="#ref-3">3</a>. The bottleneck is not the same phase in the two runs (Section 5).</figcaption>
+</figure>
+
+<h2 id="post-training-map">1. Where RL sits in post-training</h2>
+<p>Lambert's textbook splits modern post-training into three optimization methods: instruction or supervised fine-tuning (SFT), preference fine-tuning (RLHF and related methods), and reinforcement learning with verifiable rewards (RLVR)<a class="cite" href="#ref-4">4</a>. Real recipes interleave them over many rounds. Tulu 3, the fully open example, runs SFT on about 1M examples, then about 1M on-policy preference pairs, then RLVR on about 10K prompts<a class="cite" href="#ref-4">4</a>. DeepSeek-R1 first trains R1-Zero with RL directly on the base model; R1 itself adds a cold-start SFT stage, a large RL stage, rejection sampling into an SFT set of about 600k reasoning and 200k non-reasoning samples, and a second RL stage<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a>. The 2026 recipes add specialist training followed by multi-teacher on-policy distillation<a class="cite" href="#ref-4">4</a>; Modules 21 and 22 cover that. The data-flow and evaluation-gate plumbing around these stages is System Design Module 36, and rollout infrastructure and framework choice are Modules 37 and 38; this course does not repeat them.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 300" role="img" aria-labelledby="f2t"><title id="f2t">Post-training pipeline map: pretraining, SFT, preference tuning (RM plus PPO, or DPO), RLVR, distillation, with stages that sample from the current policy marked</title>
+    <defs><marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <rect x="10" y="94" width="118" height="70" rx="8" class="d-block-muted"/>
+    <text x="69" y="124" text-anchor="middle" class="d-bold">Pretraining</text><text x="69" y="144" text-anchor="middle">fixed corpus</text>
+    <rect x="150" y="94" width="118" height="70" rx="8" class="d-block-muted"/>
+    <text x="209" y="124" text-anchor="middle" class="d-bold">SFT</text><text x="209" y="144" text-anchor="middle">fixed demos</text>
+
+    <rect x="284" y="30" width="162" height="198" rx="10" class="d-outline d-dashed"/>
+    <text x="365" y="50" text-anchor="middle" class="d-title">Preference tuning</text>
+    <rect x="294" y="60" width="142" height="72" rx="8" class="d-block-accent"/>
+    <text x="365" y="90" text-anchor="middle" class="d-text-inv d-bold">RM + PPO</text><text x="365" y="110" text-anchor="middle" class="d-text-inv">4 models, sampling</text>
+    <rect x="294" y="146" width="142" height="72" rx="8" class="d-block-muted"/>
+    <text x="365" y="176" text-anchor="middle" class="d-bold">DPO</text><text x="365" y="196" text-anchor="middle">2 models, no sampling</text>
+
+    <rect x="462" y="94" width="150" height="70" rx="8" class="d-block-accent"/>
+    <text x="537" y="116" text-anchor="middle" class="d-text-inv d-bold">RLVR</text><text x="537" y="134" text-anchor="middle" class="d-text-inv">GRPO or PPO</text><text x="537" y="152" text-anchor="middle" class="d-text-inv">verifier reward</text>
+
+    <rect x="634" y="30" width="156" height="198" rx="10" class="d-outline d-dashed"/>
+    <text x="712" y="50" text-anchor="middle" class="d-title">Distillation</text>
+    <rect x="644" y="60" width="136" height="72" rx="8" class="d-block-muted"/>
+    <text x="712" y="90" text-anchor="middle" class="d-bold">Offline</text><text x="712" y="110" text-anchor="middle">SFT on teacher</text>
+    <rect x="644" y="146" width="136" height="72" rx="8" class="d-block-accent"/>
+    <text x="712" y="176" text-anchor="middle" class="d-text-inv d-bold">On-policy</text><text x="712" y="196" text-anchor="middle" class="d-text-inv">student samples</text>
+
+    <path d="M128,129 L148,129" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M268,129 L282,129" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M446,129 L460,129" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M612,129 L632,129" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+    <rect x="10" y="248" width="14" height="14" rx="2" class="d-block-accent"/><text x="32" y="260" class="d-text-light">samples from the current policy inside the training loop: needs a generation engine</text>
+    <rect x="10" y="272" width="14" height="14" rx="2" class="d-block-muted"/><text x="32" y="284" class="d-text-light">trains on fixed data: no rollout phase (preference pairs may be near-on-policy)</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> The common ordering. Orange stages need a rollout engine in the loop; grey stages do not. Stage structure from Lambert's canonical recipes (InstructGPT, Tulu 3, DeepSeek-R1, MOPD-style recipes)<a class="cite" href="#ref-4">4</a>; model counts are developed in Section 7 and Table 6. Recipes reorder and repeat stages: Llama 3 repeats preference tuning for six rounds<a class="cite" href="#ref-5">5</a>.</figcaption>
+</figure>
+
+<h3 id="post-training-map-onpolicy">1.1 Which stages sample from the current policy</h3>
+<p>The test that matters for cost is simple: does the data for this update come from the model being updated, at roughly its current weights? SFT does not; its demonstrations come from humans or from other models. Reward-model training does not; it fits fixed comparisons. DPO does not sample inside its loop either, although the preference pairs may be collected from the previous round's best model: Llama 3 trains DPO mainly on "the most recent batches of preference data collected using the best performing models from the previous alignment rounds", so that the data "conforms better to the distribution of the policy model that is being optimized in each round"<a class="cite" href="#ref-5">5</a>. PPO-style RLHF does sample: InstructGPT draws a prompt, generates a response from the current policy, and lets the reward model's score end the episode<a class="cite" href="#ref-6">6</a>. RLVR does the same with a verifier in place of the reward model<a class="cite" href="#ref-3">3</a>.</p>
+<p>Rejection sampling sits between the two: it samples from a checkpoint, keeps the high-reward outputs, then trains on them as ordinary SFT. R1's final-stage SFT data is of this kind, drawn from the stage-1 RL checkpoint with only correct reasoning samples kept<a class="cite" href="#ref-1">1</a>. A stage that samples from the current policy must keep a generation engine running inside the training loop, and that is the whole difference in cost profile. Lambert puts it directly: RL "requires a far larger infrastructure investment relative to instruction tuning or DPO-like algorithms", yet the author argues RL keeps winning anyway<a class="cite" href="#ref-4">4</a>.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 1.</b> Post-training stages by where their training data comes from and what is resident during the update. "Resident" counts models whose weights are in accelerator memory during that stage's update, before any rollout-engine copy (Section 7). Sources: InstructGPT<a class="cite" href="#ref-6">6</a>, Tulu 3<a class="cite" href="#ref-3">3</a>, Llama 3<a class="cite" href="#ref-5">5</a>, R1<a class="cite" href="#ref-1">1</a>, Lambert<a class="cite" href="#ref-4">4</a>.</caption>
+  <thead><tr><th>Stage</th><th>Training data comes from</th><th>Samples from current policy?</th><th>Models resident</th><th>Reported example</th></tr></thead>
+  <tbody>
+    <tr><td class="row">SFT</td><td>fixed demonstrations</td><td>no</td><td>1 (policy)</td><td>InstructGPT: about 13k prompts; Tulu 3: about 1M examples</td></tr>
+    <tr><td class="row">Reward-model training</td><td>fixed preference comparisons</td><td>no</td><td>1 (RM)</td><td>InstructGPT: 33k prompts, 6B RM</td></tr>
+    <tr><td class="row">DPO</td><td>fixed preference pairs, per round</td><td>no (data may be near-on-policy)</td><td>2 (policy, reference), or 1 with cached reference log-probs</td><td>Llama 3: six rounds; Tulu 3 caches reference log-probs</td></tr>
+    <tr><td class="row">PPO-RLHF</td><td>dataset prompts; responses from the policy; RM score</td><td data-worst>yes</td><td>4 (policy, reference, RM, value)</td><td>InstructGPT: 31k PPO prompts</td></tr>
+    <tr><td class="row">RLVR (PPO or GRPO)</td><td>dataset prompts; responses from the policy; verifier score</td><td data-worst>yes</td><td>3 for Tulu 3's PPO; fewer for critic-free GRPO</td><td>Tulu 3 PPO; R1-Zero GRPO</td></tr>
+    <tr><td class="row">Rejection sampling, then SFT</td><td>samples from an earlier checkpoint, filtered by reward</td><td>sampled once, then fixed</td><td>1 (policy)</td><td>R1: about 600k reasoning plus 200k non-reasoning samples</td></tr>
+    <tr><td class="row">Distillation</td><td>teacher outputs, or student samples scored by a teacher</td><td>offline: no; on-policy: yes</td><td>student, plus a teacher forward pass if on-policy</td><td>Modules 21 and 22</td></tr>
+  </tbody>
+</table>
+
+<h3 id="post-training-map-start">1.2 Where this course starts, and a correction to the lineage</h3>
+<p>You already know pretraining and SFT, so the course starts at the first stage that samples from its own policy. One correction to the request that shaped this track belongs here because it changes what you read next. DeepSeek-R1 trains with GRPO, introduced in DeepSeekMath (Shao et al., February 2024)<a class="cite" href="#ref-7">7</a><a class="cite" href="#ref-1">1</a>. TRPO (Schulman et al., 2015) is the ancestor of PPO, not of R1's algorithm directly<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-9">9</a>. Module 3 teaches TRPO to PPO and Module 9 teaches GRPO; Module 27 reads R1's pipeline stage by stage. Nor did R1 coin the term RLVR; Tulu 3 did, in November 2024<a class="cite" href="#ref-3">3</a>.</p>
+
+<h2 id="one-iteration">2. One iteration, phase by phase</h2>
+<p>An iteration of RL post-training is the loop in Figure 1. The notation follows PPO's Algorithm 1: sample data with the current policy, compute advantages, optimize a surrogate for several minibatches, then repeat with the new weights<a class="cite" href="#ref-9">9</a>. What changes for an LLM is the cost of each step, so each phase gets its resource profile here and its mathematics in later modules.</p>
+
+<h3 id="one-iteration-phases">2.1 The six phases</h3>
+<p><strong>Sample prompts.</strong> A batch of \(P\) prompts is drawn from the training set; R1-Zero uses 32 unique questions per step<a class="cite" href="#ref-1">1</a>. This is dataloader work and is never the bottleneck.</p>
+<p><strong>Rollout.</strong> The policy generates \(G\) completions per prompt, at temperature 1 in R1-Zero, Olmo 3 and Tulu 3<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a>. This phase runs on a serving engine. R1's framework dispatches prompts across vLLM workers holding the actor, uses expert parallelism across nodes for the MoE model with redundant copies of hot experts, and uses multi-token-prediction self-speculative decoding, which its authors say minimizes "the completion time for the longest samples"<a class="cite" href="#ref-1">1</a>. Olmo 3 runs one independent vLLM instance per actor, with a single GPU per actor for 7B and a node per actor for 32B<a class="cite" href="#ref-2">2</a>.</p>
+<p><strong>Score.</strong> Three kinds of scorer exist, with different hardware needs. A rule-based verifier (answer matcher, format checker, code executor) needs no model in GPU memory, but R1's authors note its "execution tends to be time-consuming" and schedule it asynchronously to overlap with rollout and inference<a class="cite" href="#ref-1">1</a>. A scalar reward model costs one forward pass per sample; R1's inference module loads the reward model and the reference and runs exactly that on the rollout samples<a class="cite" href="#ref-1">1</a>. A generative reward model costs another decode: DeepSeek-V3.2 scores general tasks with a generative reward model and a per-prompt rubric<a class="cite" href="#ref-10">10</a>. Module 16 covers judges.</p>
+<p><strong>Advantage.</strong> For GRPO the advantage is the reward minus the group mean, divided by the group standard deviation in the original formulation<a class="cite" href="#ref-1">1</a>; the arithmetic is negligible. For PPO it is GAE over a learned value model's predictions, which costs a value-model forward pass over every response token<a class="cite" href="#ref-7">7</a>. The phase is cheap in FLOPs; what differs between algorithms is what has to be resident for it (Section 7).</p>
+<p><strong>Update.</strong> Forward and backward passes over the sampled tokens, split into \(M\) minibatches. R1 sorts the global batch by length, distributes it across data-parallel ranks, then best-fit packs sequences into fixed-length chunks to minimize padding, and uses DualPipe pipeline parallelism<a class="cite" href="#ref-1">1</a>. This is pretraining-shaped work: large token batches, compute-bound.</p>
+<p><strong>Weight sync.</strong> The rollout engine needs the new weights before the next rollout. Tulu 3's 405B run broadcasts them over NCCL in about 25 seconds<a class="cite" href="#ref-3">3</a>. Kimi k1.5 reports under one minute to switch from training to inference and about ten seconds back in its colocated design<a class="cite" href="#ref-11">11</a>. The engineering of this step is covered in System Design Modules 37 and 38, and is not repeated here.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Resource profile of each phase. "Bound" is the writer's classification from the cited descriptions; the measured evidence is the utilization figure from Olmo 3's infrastructure benchmark (Table 23 there: MFU 1.01% and MBU 43.21% for the final configuration, measured on the inference side)<a class="cite" href="#ref-2">2</a>.</caption>
+  <thead><tr><th>Phase</th><th>Runs on</th><th>Bound</th><th>Scales with</th><th>Evidence</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Sample</td><td>CPU</td><td>none</td><td>\(P\)</td><td>R1 loads prompts and dispatches them to workers<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">Rollout</td><td>inference engine</td><td data-worst>HBM bandwidth, KV cache</td><td>\(P \cdot G \cdot \bar L\)</td><td>Olmo 3: MFU about 1%, MBU about 43%<a class="cite" href="#ref-2">2</a></td></tr>
+    <tr><td class="row">Score</td><td>CPU or sandbox; RM forward; judge decode</td><td>depends on scorer</td><td>\(P \cdot G\) samples</td><td>R1: rule-based reward overlapped asynchronously<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">Advantage</td><td>CPU or accelerator</td><td>negligible; value forward for PPO</td><td>\(P \cdot G \cdot \bar L\) for PPO only</td><td>GRPO group statistics<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">Update</td><td>training cluster</td><td data-best>compute</td><td>\(P \cdot G \cdot \bar L \cdot N_{\text{params}}\)</td><td>R1 length-sorted best-fit packing<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">Weight sync</td><td>network</td><td>bytes moved</td><td>\(N_{\text{params}}\)</td><td>Tulu 3 405B: about 25 s<a class="cite" href="#ref-3">3</a></td></tr>
+  </tbody>
+</table>
+
+<h3 id="one-iteration-placement">2.2 Placement: colocated, disaggregated, asynchronous</h3>
+<p>Because the rollout engine and the trainer want different memory layouts and different parallelism, how you place them decides how much hardware idles. Three arrangements appear in the reports.</p>
+<p><strong>Colocated.</strong> One pool of GPUs alternates between training and inference. Kimi k1.5 runs Megatron and vLLM in sidecar containers that share all GPUs: training finishes, Megatron offloads its memory, vLLM starts with dummy weights and receives the new ones, rolls out, is halted, and training resumes<a class="cite" href="#ref-11">11</a>. Hugging Face TRL's default <code>vllm_mode="colocate"</code> runs vLLM inside the trainer process, sharing GPU memory with the training model, and its docs warn of memory contention<a class="cite" href="#ref-12">12</a>. R1 offloads each module's models from VRAM to host memory or disk when the module finishes<a class="cite" href="#ref-1">1</a>.</p>
+<p><strong>Disaggregated, synchronous.</strong> Dedicated inference GPUs and training GPUs, one side waiting while the other works. Tulu 3's report states the cost plainly: synchronous training "means inference GPUs could be idling while the learner GPUs run, and vice versa"<a class="cite" href="#ref-3">3</a>.</p>
+<p><strong>Disaggregated, asynchronous.</strong> Generation overlaps training. Tulu 3 always trains on the second-latest inference batch<a class="cite" href="#ref-3">3</a>. Olmo 3 goes further with inflight updates: weights are updated without pausing the engine and without invalidating the KV cache, which the report credits with up to 4x throughput at the same resources<a class="cite" href="#ref-2">2</a>. ScaleRL's PipelineRL-\(k\) has trainers wait only if they get \(k\) steps ahead of the generators; \(k = 8\) was optimal in their ablation<a class="cite" href="#ref-13">13</a>. The price of overlap is staleness: samples come from weights older than the ones being updated, which is the subject of Modules 12, 14 and 18.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 346" role="img" aria-labelledby="f3t"><title id="f3t">Three placements of the same two phases over two iterations: colocated, disaggregated synchronous, disaggregated asynchronous</title>
+    <text x="14" y="18" class="d-text-light">time axis, 0.24 px per second; Olmo 3 durations: generation 1,000 s, training 125 s (footnote 41)</text>
+    <line x1="190" y1="30" x2="190" y2="264" class="d-grid"/><line x1="310" y1="30" x2="310" y2="264" class="d-grid"/><line x1="430" y1="30" x2="430" y2="264" class="d-grid"/><line x1="550" y1="30" x2="550" y2="264" class="d-grid"/><line x1="670" y1="30" x2="670" y2="264" class="d-grid"/>
+    <text x="190" y="42" text-anchor="middle" class="d-mono d-small">0 s</text><text x="310" y="42" text-anchor="middle" class="d-mono d-small">500</text><text x="430" y="42" text-anchor="middle" class="d-mono d-small">1,000</text><text x="550" y="42" text-anchor="middle" class="d-mono d-small">1,500</text><text x="670" y="42" text-anchor="middle" class="d-mono d-small">2,000</text>
+
+    <text x="14" y="62" class="d-bold">(a) Colocated: one GPU pool time-slices</text>
+    <text x="182" y="84" text-anchor="end">all GPUs</text>
+    <rect x="190" y="68" width="240" height="22" rx="3" class="d-block-accent"/><text x="310" y="84" text-anchor="middle" class="d-text-inv">rollout</text>
+    <rect x="430" y="68" width="14.4" height="22" class="d-block-2"/><rect x="444.4" y="68" width="30" height="22" class="d-block"/><rect x="474.4" y="68" width="2.4" height="22" class="d-block-2"/>
+    <rect x="476.8" y="68" width="240" height="22" rx="3" class="d-block-accent"/><text x="596.8" y="84" text-anchor="middle" class="d-text-inv">rollout</text>
+    <rect x="716.8" y="68" width="14.4" height="22" class="d-block-2"/><rect x="731.2" y="68" width="30" height="22" class="d-block"/>
+
+    <text x="14" y="118" class="d-bold">(b) Disaggregated, synchronous</text>
+    <text x="182" y="140" text-anchor="end">inference GPUs</text>
+    <rect x="190" y="124" width="240" height="22" rx="3" class="d-block-accent"/><text x="310" y="140" text-anchor="middle" class="d-text-inv">rollout</text>
+    <rect x="460" y="124" width="240" height="22" rx="3" class="d-block-accent"/><text x="580" y="140" text-anchor="middle" class="d-text-inv">rollout</text>
+    <text x="182" y="166" text-anchor="end">training GPUs</text>
+    <rect x="430" y="150" width="30" height="22" class="d-block"/><rect x="700" y="150" width="30" height="22" class="d-block"/>
+
+    <text x="14" y="202" class="d-bold">(c) Disaggregated, asynchronous (Olmo 3)</text>
+    <text x="182" y="224" text-anchor="end">inference GPUs</text>
+    <rect x="190" y="208" width="240" height="22" rx="3" class="d-block-accent"/><text x="310" y="224" text-anchor="middle" class="d-text-inv">rollout k</text>
+    <rect x="430" y="208" width="240" height="22" rx="3" class="d-block-accent"/><text x="550" y="224" text-anchor="middle" class="d-text-inv">rollout k+1</text>
+    <rect x="670" y="208" width="48" height="22" rx="3" class="d-block-accent"/>
+    <text x="182" y="250" text-anchor="end">training GPUs</text>
+    <rect x="430" y="234" width="30" height="22" class="d-block"/><rect x="670" y="234" width="30" height="22" class="d-block"/>
+    <text x="466" y="251" class="d-mono d-small">update k: 125 s</text>
+
+    <text x="14" y="288" class="d-text-light">(a) pays two switches per step: under 60 s to inference, about 10 s back (Kimi k1.5, slivers drawn to scale)</text>
+    <text x="14" y="308" class="d-text-light">(b) serialized step = 1,125 s: inference GPUs busy 88.9%, training GPUs 11.1% (derived)</text>
+    <text x="14" y="328" class="d-text-light">(c) generation never waits; training GPUs busy 125 of 1,000 s = 12.5% (derived); staleness is the price</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The same phase durations rearranged. Lane (c) is Olmo 3's regime: the footnote reports 1,000 s per batched generation and 125 s of training per step, with generation overlapped and "entirely" the bottleneck<a class="cite" href="#ref-2">2</a>. Lane (a) ignores the speed-up from giving rollout all GPUs and draws Kimi k1.5's reported switch times as slivers<a class="cite" href="#ref-11">11</a>. Lane (b) is the serialization of the same two durations and is derived, not measured.</figcaption>
+</figure>
+
+<h3 id="one-iteration-minibatches">2.3 Minibatches per rollout are a built-in off-policy lag</h3>
+<p>PPO's Algorithm 1 collects \(NT\) timesteps, then optimizes with \(K\) epochs of minibatches of size \(M \le NT\)<a class="cite" href="#ref-9">9</a>. In the MuJoCo setting of its Table 3 (horizon 2048, 10 epochs, minibatch 64), one iteration performs \(2048/64 \times 10 = 320\) minibatch updates, assuming a single actor (derived; the table does not list \(N\))<a class="cite" href="#ref-9">9</a>. LLM recipes reuse each rollout far less. InstructGPT splits each batch of 512 into 8 minibatches of 64 and trains a single inner epoch<a class="cite" href="#ref-6">6</a>. R1-Zero splits each rollout of 8,192 outputs into 16 minibatches, again one inner epoch<a class="cite" href="#ref-1">1</a>. DAPO samples 512 prompts times 16 responses and takes 16 gradient updates per rollout step<a class="cite" href="#ref-14">14</a>.</p>
+<p>The consequence is easy to miss. Only the first minibatch update of a rollout is exactly on-policy. The \(j\)-th minibatch sees samples generated by weights \(j-1\) optimizer steps old, so even with one epoch the importance ratio is not identically 1 for \(M-1\) of the \(M\) updates; on average the lag is \((M-1)/2\) steps, which is 7.5 for R1-Zero (derived). More minibatches per rollout amortize the expensive rollout over more updates, and make the data staler. ScaleRL names the same knob \(k = B/\hat B\), the number of gradient updates per generated batch, and contrasts PPO-off-policy-\(k\) with PipelineRL-\(k\)<a class="cite" href="#ref-13">13</a>. Modules 3 and 12 explain what the ratio and its clipping do with that lag.</p>
+
+<h2 id="run-size-vocabulary">3. The run-size vocabulary</h2>
+<p>Every later module uses the same six quantities, and every report defines them slightly differently. A <em>rollout</em> is one generation phase over \(P\) prompts with \(G\) samples each, giving \(B = P \cdot G\) completions and \(B\,\bar L\) generated tokens, where \(\bar L\) is the mean response length and \(L_{\max}\) the cap. The update then makes \(M\) optimizer steps per rollout (minibatches per rollout) for \(E\) inner epochs. A run is \(S\) optimizer steps long. TRL exposes the same knobs under other names: <code>num_generations</code> is \(G\) (default 8), <code>num_iterations</code> is \(E\) (default 1), <code>max_completion_length</code> is \(L_{\max}\) (default 512), and <code>steps_per_generation</code> or <code>generation_batch_size</code> sets how many training steps one generation feeds; by default "there is one generation batch processed per optimization step", that is \(M = 1\)<a class="cite" href="#ref-12">12</a>.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 3.</b> Run sizes as reported. "Completions" are samples per rollout, \(B = P \cdot G\). Dashes mean the cited section does not state the value. Entries marked † are derived by the writer from the cited figures; DeepSeekMath-RL's \(P = 16\) assumes its "training batch size" of 1,024 counts outputs, and R1-Zero's and DAPO's \(P\) is prompts per rollout (a step uses 32).</caption>
+  <thead><tr><th>Run</th><th class="num">Prompts \(P\)</th><th class="num">\(G\)</th><th class="num">Completions per rollout</th><th class="num">Minibatches \(M\)</th><th class="num">Max response (tokens)</th><th class="num">Steps reported</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td class="row">InstructGPT PPO, all sizes</td><td class="num">512</td><td class="num">1</td><td class="num">512</td><td class="num">8</td><td class="num">—</td><td class="num">500 rollouts, 4,000 minibatch steps†</td><td>App. C.4<a class="cite" href="#ref-6">6</a></td></tr>
+    <tr><td class="row">DeepSeekMath-RL 7B</td><td class="num">16†</td><td class="num">64</td><td class="num">1,024</td><td class="num">1</td><td class="num">1,024</td><td class="num">—</td><td>§4.2<a class="cite" href="#ref-7">7</a></td></tr>
+    <tr><td class="row">R1-Zero</td><td class="num">512†</td><td class="num">16</td><td class="num">8,192</td><td class="num">16</td><td class="num">32,768, then 65,536</td><td class="num">10,400 steps (1.6 epochs)</td><td>§2.1<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">DAPO, Qwen2.5-32B</td><td class="num">512</td><td class="num">16</td><td class="num">8,192†</td><td class="num">16</td><td class="num">20,480</td><td class="num">—</td><td>§4.1<a class="cite" href="#ref-14">14</a></td></tr>
+    <tr><td class="row">ScaleRL (8B, main setup)</td><td class="num">48 per update</td><td class="num">16</td><td class="num">768 per update</td><td class="num">async, max lag \(k=8\)</td><td class="num">14,336 (12k + 2k)</td><td class="num">about 1,000 steps per epoch</td><td>§2, App. A.3<a class="cite" href="#ref-13">13</a></td></tr>
+    <tr><td class="row">Olmo 3 Think 32B</td><td class="num">128</td><td class="num">8</td><td class="num">1,024†</td><td class="num">1</td><td class="num">32,768</td><td class="num">750 steps</td><td>Table 49<a class="cite" href="#ref-2">2</a></td></tr>
+    <tr><td class="row">Olmo 3 Think 7B</td><td class="num">64</td><td class="num">8</td><td class="num">512†</td><td class="num">1</td><td class="num">32,768</td><td class="num">1,400 steps</td><td>Table 49<a class="cite" href="#ref-2">2</a></td></tr>
+  </tbody>
+</table>
+
+<p>Three details of the table matter later. First, \(M\) ranges from 1 (Olmo 3, DeepSeekMath) to 16 (R1-Zero, DAPO), so the share of updates that are off-policy by construction differs by recipe. Second, \(G\) is 8 or 16 in every reasoning-RL row, versus 1 for InstructGPT's bandit setup; the group is what lets a critic-free method compute a baseline (Module 9). Third, ScaleRL found that for a fixed total batch, trading prompts for generations per prompt (8, 16, 24, 32) left the fitted scaling curves essentially unchanged<a class="cite" href="#ref-13">13</a>, so \(P\) and \(G\) are not independent budget knobs.</p>
+
+<h3 id="run-size-r1zero">3.1 R1-Zero worked through</h3>
+<p>R1-Zero's reported setup is enough to reconstruct its whole sampling budget<a class="cite" href="#ref-1">1</a>. Each step uses 32 unique questions with 16 samples each, a training batch of 512. A rollout generates 8,192 outputs, split at random into 16 minibatches and trained for one inner epoch. The run lasts 10,400 steps, or 1.6 epochs.</p>
+<details class="more"><summary>Derivation: what 10,400 steps means in rollouts and samples (derived)</summary>
+<p>Minibatches per rollout: \(8{,}192 / 512 = 16\). Rollouts: \(10{,}400 / 16 = 650\). Prompts per rollout: \(8{,}192 / 16 = 512\). Total completions: \(10{,}400 \times 512 = 5{,}324{,}800\), equivalently \(650 \times 8{,}192\). Prompt draws: \(10{,}400 \times 32 = 332{,}800\); if 1.6 epochs is exact this implies a pool of about \(332{,}800 / 1.6 = 208{,}000\) prompts, a number the report does not state in the passage cited. Compare Olmo 3 Think 32B: \(750 \times 1{,}024 = 768{,}000\) completions, about \(1/7\) of R1-Zero's sample count.</p>
+</details>
+<p>With the reported 198 hours<a class="cite" href="#ref-1">1</a>, the average optimizer step took \(198 \times 3{,}600 / 10{,}400 = 68.5\) s of wall-clock on 512 GPUs (derived), so one 8,192-output rollout plus its 16 updates averaged about \(16 \times 68.5 = 1{,}096\) s, or 18.3 minutes. That is an average over a run in which response length grew many-fold (Section 5.3), so early iterations were much faster and late ones slower.</p>
+
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Comparing "steps" across reports. R1's own figure caption defines a step as "a single policy update operation"<a class="cite" href="#ref-1">1</a>, so its 10,400 steps are 650 rollouts. DAPO uses both "rollout step" (512 prompts) and "gradient update steps" (16 per rollout) in one paper<a class="cite" href="#ref-14">14</a>. Olmo 3's 750 steps for 32B are one minibatch per rollout, each of 1,024 completions<a class="cite" href="#ref-2">2</a>. Before using a step count, convert it to completions and to generated tokens.</p></aside>
+
+<h2 id="gpu-hour-arithmetic">4. GPU-hour arithmetic</h2>
+<p>Five reports state what their RL phase cost, in four different units. The figures below are the reported ones; anything marked derived is the writer's arithmetic on them, shown so you can redo it.</p>
+
+<h3 id="gpu-hours-r1">4.1 DeepSeek-R1: Table 7 and one inconsistency</h3>
+<p>R1's supplementary Table 7 prices compute at $2 per H800 GPU-hour: R1-Zero 101K GPU-hours ($202K), SFT-data creation 5K ($10K), R1 41K ($82K), total 147K ($294K)<a class="cite" href="#ref-1">1</a>. The text gives the hardware: 64&times;8 H800 GPUs for about 198 hours for R1-Zero, and "about 4 days, or roughly 80 hours" for R1<a class="cite" href="#ref-1">1</a>. The first reconciles: \(512 \times 198 = 101{,}376\) GPU-hours, at \(\$2\) about \(\$202{,}752\). The second does not as written. Four days is 96 hours, which would be \(512 \times 96 = 49{,}152\) GPU-hours, while \(512 \times 80 = 40{,}960\) matches the table's 41K. Table 7 and "roughly 80 hours" agree with each other, so treat 80 hours as the figure of record and "4 days" as loose wording (derived). The table has no line for the A100 pilot experiments on a 30B model that the report mentions separately<a class="cite" href="#ref-1">1</a>. DeepSeek-V3's own cost table states that kind of exclusion explicitly: its figures cover only the official training run and exclude "prior research and ablation experiments"<a class="cite" href="#ref-15">15</a>.</p>
+
+<h3 id="gpu-hours-minimax">4.2 MiniMax-M1: a dollar figure with no stated rate</h3>
+<p>MiniMax reports that M1's full RL run completed in three weeks on 512 H800 GPUs at a rental cost of $534,700<a class="cite" href="#ref-16">16</a>. The passages I read do not state the hourly rate. Three weeks on 512 GPUs is \(512 \times 21 \times 24 = 258{,}048\) GPU-hours, which implies \(\$534{,}700 / 258{,}048 \approx \$2.07\) per GPU-hour (derived). At R1's \(\$2\) rate the same dollar figure is 267,350 GPU-hours, or 522 hours (21.8 days) on 512 GPUs, so the two descriptions agree to within a day. By this arithmetic M1's RL run used about 2.5 times the GPU-hours of R1-Zero (\(258{,}048 / 101{,}376 = 2.55\), derived).</p>
+
+<h3 id="gpu-hours-olmo">4.3 Olmo 3: wall-clock by design</h3>
+<p>Olmo 3 declines the single dollar figure. Its cost section notes that costs are "often reported as a single dollar figure", gives DeepSeek-V3's $5.576M as the example, and reports elapsed time instead: about 56 days on 1,024 H100 GPUs from start of training to evaluation of the 32B Think checkpoint, which at \(\$2\) per H100-hour would be $2.75M<a class="cite" href="#ref-2">2</a>. Pretraining took about 47 days of that. Post-training took about 9 days across SFT, DPO and RL, because "we run each stage multiple times, sweeping over learning rates and other hyperparameters"<a class="cite" href="#ref-2">2</a>. The final RL runs for the initial 32B Think spanned about 5 days with at least a day lost to instability, and the best run was later continued for another 21 days on 224 GPUs to produce Olmo 3.1 Think 32B<a class="cite" href="#ref-2">2</a>.</p>
+<p>Its Table 49 gives the RL allocation for 32B Think: 64 learner GPUs plus 160 actor GPUs, 224 in all<a class="cite" href="#ref-2">2</a>. From those two sources, and assuming all 224 GPUs were held for the whole period (derived):</p>
+<ul>
+<li>The initial 5-day run: \(224 \times 5 \times 24 = 26{,}880\) GPU-hours.</li>
+<li>The 21-day continuation: \(224 \times 21 \times 24 = 112{,}896\) GPU-hours, about \$226K at \$2 per hour.</li>
+<li>The whole project window: \(1{,}024 \times 56 \times 24 = 1{,}376{,}256\) GPU-hours, and \(1{,}376{,}256 \times \$2 = \$2{,}752{,}512\), which matches the reported $2.75M.</li>
+</ul>
+<p>The sweeps matter for reading anyone's RL figure. Olmo 3 says its recipe was developed on 7B or smaller and applied to 32B, and "The theory for post-training, particularly, RL, is less developed, so we have to run multiple experiments to identify the optimal hyperparameters for a given base model"<a class="cite" href="#ref-2">2</a>. ScaleRL makes the same point numerically: its whole study took more than 400,000 GPU-hours, its design-choice runs used 3.5K to 4K GPU-hours each, its leave-one-out ablations 16K each, and its largest single run 100K GPU-hours on an 8B dense model (the study ran on NVIDIA GB200 GPUs)<a class="cite" href="#ref-13">13</a>. A headline "RL run" figure is one run, not one recipe's development cost.</p>
+
+<h3 id="gpu-hours-share">4.4 RL as a share of pretraining</h3>
+<p>Three reported shares, from three eras. InstructGPT: the 175B PPO-ptx model took 60 petaflops/s-days, against 4.9 for the 175B SFT model and 3,640 for GPT-3<a class="cite" href="#ref-6">6</a>, so RLHF was \(60/3{,}640 = 1.65\%\) of pretraining compute (derived). R1-Zero: the ScaleRL authors write that R1-Zero "used 100,000 H800 GPU hours for RL training – 3.75% of its pre-training compute"<a class="cite" href="#ref-13">13</a>. The DeepSeek-V3 cost table lets you check that: pretraining was 2,664K H800 GPU-hours<a class="cite" href="#ref-15">15</a>, and \(100{,}000 / 2{,}664{,}000 = 3.75\%\); with R1's own 101,376 it is 3.81% (derived). The same table puts all of V3's post-training, SFT and RL, at 5K GPU-hours<a class="cite" href="#ref-15">15</a>, so R1-Zero's RL alone cost about 20 times V3's whole post-training budget (derived). DeepSeek-V3.2: the report says its RL protocol "allocates a post-training computational budget exceeding 10% of the pre-training cost"<a class="cite" href="#ref-10">10</a>. It gives no GPU-hours and does not say whether "pre-training cost" means V3's, V3.1-Terminus's or its own continued pre-training. If the denominator were V3's 2,664K GPU-hours, 10% would be 266,400 GPU-hours, about 2.6 times R1-Zero's RL (derived, and conditional on that reading).</p>
+<p>For Olmo 3 the shares depend on the denominator. Its main pretraining phase was about 9.5 days on 512 GPUs plus 35 days on 1,024 GPUs<a class="cite" href="#ref-2">2</a>, which is \(9.5 \times 512 \times 24 + 35 \times 1{,}024 \times 24 = 976{,}896\) GPU-hours (derived; excludes midtraining and context extension). Against it the 5-day run is 2.8% and the 21-day continuation 11.6%; against the full 1,376,256 GPU-hour project window they are 2.0% and 8.2%.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 508" role="img" aria-labelledby="f4t"><title id="f4t">Two bar panels: reported or derived RL GPU-hours per run, and RL compute as a percentage of pretraining compute, with comparability caveats</title>
+    <text x="14" y="22" class="d-title">A. RL GPU-hours per run (hardware differs per bar)</text>
+    <line x1="347.2" y1="36" x2="347.2" y2="236" class="d-grid"/><line x1="469.4" y1="36" x2="469.4" y2="236" class="d-grid"/><line x1="591.7" y1="36" x2="591.7" y2="236" class="d-grid"/><line x1="713.9" y1="36" x2="713.9" y2="236" class="d-grid"/>
+    <line x1="225" y1="36" x2="225" y2="236" class="d-axis"/><line x1="225" y1="236" x2="775" y2="236" class="d-axis"/>
+    <text x="215" y="63" text-anchor="end">Olmo 3 Think 32B, 5 d (H100)</text><rect x="225" y="50" width="32.9" height="18" class="d-fill-amber"/><text x="265" y="63" class="d-mono d-small">26,880</text>
+    <text x="215" y="87" text-anchor="end">DeepSeek-R1 (H800)</text><rect x="225" y="74" width="50.1" height="18" class="d-fill-blue"/><text x="283" y="87" class="d-mono d-small">41K</text>
+    <text x="215" y="111" text-anchor="end">ScaleRL 8B largest run (GB200)</text><rect x="225" y="98" width="122.2" height="18" class="d-fill-blue"/><text x="355" y="111" class="d-mono d-small">100,000</text>
+    <text x="215" y="135" text-anchor="end">R1-Zero (H800)</text><rect x="225" y="122" width="123.9" height="18" class="d-fill-blue"/><text x="357" y="135" class="d-mono d-small">101K</text>
+    <text x="215" y="159" text-anchor="end">Olmo 3.1 continuation (H100)</text><rect x="225" y="146" width="138" height="18" class="d-fill-amber"/><text x="371" y="159" class="d-mono d-small">112,896</text>
+    <text x="215" y="183" text-anchor="end">MiniMax-M1 (H800)</text><rect x="225" y="170" width="315.4" height="18" class="d-fill-amber"/><text x="548" y="183" class="d-mono d-small">258,048</text>
+    <text x="215" y="207" text-anchor="end">ScaleRL whole study (GB200)</text><rect x="225" y="194" width="488.9" height="18" class="d-fill-blue"/><text x="706" y="207" text-anchor="end" class="d-text-inv d-mono d-small">more than 400,000</text>
+    <text x="225" y="252" text-anchor="middle" class="d-mono d-small">0</text><text x="347.2" y="252" text-anchor="middle" class="d-mono d-small">100K</text><text x="469.4" y="252" text-anchor="middle" class="d-mono d-small">200K</text><text x="591.7" y="252" text-anchor="middle" class="d-mono d-small">300K</text><text x="713.9" y="252" text-anchor="middle" class="d-mono d-small">400K GPU-hours</text>
+
+    <text x="14" y="288" class="d-title">B. RL compute as % of pretraining compute (denominators differ)</text>
+    <line x1="225" y1="302" x2="225" y2="436" class="d-axis"/><line x1="225" y1="436" x2="775" y2="436" class="d-axis"/>
+    <line x1="408.3" y1="302" x2="408.3" y2="436" class="d-grid"/><line x1="591.7" y1="302" x2="591.7" y2="436" class="d-grid"/><line x1="775" y1="302" x2="775" y2="436" class="d-grid"/>
+    <text x="215" y="325" text-anchor="end">InstructGPT 175B PPO-ptx</text><rect x="225" y="312" width="60.5" height="18" class="d-fill-amber"/><text x="293" y="325" class="d-mono d-small">1.65%</text>
+    <text x="215" y="349" text-anchor="end">Olmo 3 Think 32B, 5 d</text><rect x="225" y="336" width="100.8" height="18" class="d-fill-amber"/><text x="333" y="349" class="d-mono d-small">2.75%</text>
+    <text x="215" y="373" text-anchor="end">R1-Zero vs V3 pretraining</text><rect x="225" y="360" width="137.5" height="18" class="d-fill-blue"/><text x="370" y="373" class="d-mono d-small">3.75%</text>
+    <text x="215" y="397" text-anchor="end">DeepSeek-V3.2 (reported)</text><rect x="225" y="384" width="366.7" height="18" class="d-fill-blue"/><path d="M591.7,393 L640,393" class="d-arrow-active" marker-end="url(#f4-arr)"/><text x="648" y="397" class="d-mono d-small">more than 10%</text>
+    <text x="215" y="421" text-anchor="end">Olmo 3.1 continuation, 21 d</text><rect x="225" y="408" width="425.5" height="18" class="d-fill-amber"/><text x="658" y="421" class="d-mono d-small">11.6%</text>
+    <text x="225" y="452" text-anchor="middle" class="d-mono d-small">0</text><text x="408.3" y="452" text-anchor="middle" class="d-mono d-small">5%</text><text x="591.7" y="452" text-anchor="middle" class="d-mono d-small">10%</text><text x="775" y="452" text-anchor="middle" class="d-mono d-small">15%</text>
+    <defs><marker id="f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker></defs>
+    <rect x="14" y="468" width="12" height="12" class="d-fill-blue"/><text x="32" y="479" class="d-text-light d-small">as reported</text>
+    <rect x="112" y="468" width="12" height="12" class="d-fill-amber"/><text x="130" y="479" class="d-text-light d-small">derived by the writer from reported figures</text>
+    <text x="14" y="498" class="d-text-light d-small">Caveat: bars mix hardware generations, unit definitions and denominators (Table 4). Do not rank runs by bar length.</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> Reported and derived RL cost. Panel A: R1 and R1-Zero from Table 7 (41K and 101K GPU-hours)<a class="cite" href="#ref-1">1</a>; ScaleRL's 100,000 GPU-hour run and more than 400,000 GPU-hour study<a class="cite" href="#ref-13">13</a>; MiniMax-M1 from 512 GPUs for three weeks<a class="cite" href="#ref-16">16</a>; the two Olmo 3 bars from 224 GPUs times the reported durations<a class="cite" href="#ref-2">2</a>. Panel B: InstructGPT's 60 versus 3,640 petaflops/s-days<a class="cite" href="#ref-6">6</a>; R1-Zero's 3.75% as stated by ScaleRL<a class="cite" href="#ref-13">13</a> and reproduced from V3's 2,664K GPU-hours<a class="cite" href="#ref-15">15</a>; Olmo 3 against its 976,896 GPU-hour main pretraining phase (derived), for both the 5-day run and the 21-day continuation<a class="cite" href="#ref-2">2</a>; V3.2's reported budget above 10% of pre-training cost, with no denominator<a class="cite" href="#ref-10">10</a>.</figcaption>
+</figure>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 4.</b> How each report counts compute, and what a reader cannot recover from it. Sources as cited in each row.</caption>
+  <thead><tr><th>Report</th><th>Unit</th><th>Hardware</th><th>Covers</th><th>Leaves out or leaves ambiguous</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DeepSeek-R1, Table 7<a class="cite" href="#ref-1">1</a></td><td>GPU-hours; USD at $2/h</td><td>H800</td><td>R1-Zero (198 h), SFT-data creation, R1 (about 80 h)</td><td>A100 pilots on a 30B model; "4 days" in the text versus 80 h in the table</td></tr>
+    <tr><td class="row">DeepSeek-V3, Table 1<a class="cite" href="#ref-15">15</a></td><td>GPU-hours; USD at $2/h</td><td>H800</td><td>pre-training, context extension, post-training</td><td>prior research and ablations (stated)</td></tr>
+    <tr><td class="row">MiniMax-M1<a class="cite" href="#ref-16">16</a></td><td>USD rental; wall-clock</td><td>H800</td><td>one full RL run, three weeks on 512 GPUs</td><td>hourly rate not stated in the passages read</td></tr>
+    <tr><td class="row">ScaleRL<a class="cite" href="#ref-13">13</a></td><td>GPU-hours</td><td>GB200</td><td>whole study; single runs of 3.5K to 100K</td><td>not convertible to H800 or H100 hours without a factor the paper does not give</td></tr>
+    <tr><td class="row">Olmo 3<a class="cite" href="#ref-2">2</a></td><td>wall-clock days by GPU count</td><td>H100</td><td>5-day initial RL run; 21-day continuation; project total priced at $2/h</td><td>reports wall-clock because it is "more representative" than a single dollar figure; sweeps and lost days are inside the elapsed time</td></tr>
+    <tr><td class="row">DeepSeek-V3.2<a class="cite" href="#ref-10">10</a></td><td>percent of "pre-training cost"</td><td>not stated</td><td>RL budget</td><td>denominator undefined; no GPU-hours</td></tr>
+    <tr><td class="row">InstructGPT<a class="cite" href="#ref-6">6</a></td><td>petaflops/s-days</td><td>not stated in the passage cited</td><td>175B SFT (4.9) and PPO-ptx (60)</td><td>FLOP-days are not GPU-hours; efficiency is hidden</td></tr>
+  </tbody>
+</table>
+
+<aside class="callout callout-warning"><span class="callout-title">Caveat</span><p>Nothing in Figure 4 is comparable across bars without conversions the reports do not supply: a GB200 GPU-hour is not an H800 GPU-hour, a petaflops/s-day is not a GPU-hour, and a percentage is only as good as its denominator. ScaleRL's curves are comparable with each other because every run used the same hardware and step definitions<a class="cite" href="#ref-13">13</a>. R1-Zero's roughly 100K GPU-hours, Olmo 3.1's roughly 140K and M1's roughly 258K sit within a factor of three of one another, which is about as much as these figures can support.</p></aside>
+
+<h2 id="wall-clock">5. Where the wall-clock goes</h2>
+<p>The previous section counted GPU-hours; this one asks what the GPUs were doing. The answer differs sharply between the two runs that report a per-phase breakdown, and the difference is the useful lesson.</p>
+
+<h3 id="wall-clock-olmo">5.1 Olmo 3: generation is the bottleneck</h3>
+<p>Olmo 3's RL rollouts are capped at 32K tokens and average more than 10K for the reasoner models; "Inference dominated our computational costs", with 8 H100 nodes for training and 20 for inference on the 32B run<a class="cite" href="#ref-2">2</a>. The report says the learner "spends 75% of the time waiting for data", so GPU utilization for inference is "approximately 5x" that for training, and 14x on the 7B run, which used 7 inference nodes against 2 learner nodes<a class="cite" href="#ref-2">2</a>. It adds that the learner uses "the minimal possible sharding configuration to fit the learner in memory" and does not optimize for speed, unlike supervised training<a class="cite" href="#ref-2">2</a>. That sentence matters for cost modelling: the learner's GPU count is set by memory, not by throughput, so its utilization is whatever remains.</p>
+<p>Footnote 41 gives the step-level numbers. For one main run, "each training step averaged 1000 seconds, of which 125 seconds was spent running training", each batched generation took 1,000 seconds, generation and training overlap, and generation would need to be faster by more than 8x before training became the bottleneck<a class="cite" href="#ref-2">2</a>. The 8x is \(1{,}000/125\) (derived check). Three caveats apply, and a careful reader should notice them.</p>
+<ul>
+<li>125 s of training in a 1,000 s step means the learner was busy 12.5% of the time, so idle 87.5%, not the 75% in the main text. The footnote says only "one of our main RL runs".</li>
+<li>For the 7B figure, 7 inference nodes against 2 learner nodes at 25% learner utilization gives \(7/(2 \times 0.25) = 14\), matching the report. For 32B, 20 inference nodes against 8 learner nodes at 25% gives \(20/(8 \times 0.25) = 10\), not 5 (derived). The report does not give its accounting.</li>
+<li>The footnote does not say which model size the 1,000 s refers to, so the ledger below applies it to both Table 49 configurations<a class="cite" href="#ref-2">2</a>.</li>
+</ul>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 292" role="img" aria-labelledby="f5t"><title id="f5t">Allocated GPU-seconds per step split into inference busy, training busy, weight sync and idle, for two Olmo 3 configurations and Tulu 3 405B</title>
+    <text x="14" y="20" class="d-title">Allocated GPU-seconds per step, by what the GPUs were doing (derived)</text>
+    <text x="132" y="62" text-anchor="end" class="d-bold">Olmo 3 32B config</text><text x="132" y="78" text-anchor="end" class="d-mono d-small">224 GPUs, 1,000 s</text>
+    <rect x="140" y="44" width="457" height="34" class="d-block-accent"/><rect x="597" y="44" width="23" height="34" class="d-block"/><rect x="620" y="44" width="160" height="34" class="d-block-muted"/>
+    <text x="368" y="66" text-anchor="middle" class="d-text-inv d-bold">inference busy 71.4%</text><text x="700" y="66" text-anchor="middle">learner idle 25.0%</text>
+    <text x="140" y="96" class="d-text-light d-small">training busy 3.6% (8,000 of 224,000 GPU-s)</text>
+
+    <text x="132" y="134" text-anchor="end" class="d-bold">Olmo 3 7B config</text><text x="132" y="150" text-anchor="end" class="d-mono d-small">72 GPUs, 1,000 s</text>
+    <rect x="140" y="116" width="498" height="34" class="d-block-accent"/><rect x="638" y="116" width="18" height="34" class="d-block"/><rect x="656" y="116" width="124" height="34" class="d-block-muted"/>
+    <text x="389" y="138" text-anchor="middle" class="d-text-inv d-bold">inference busy 77.8%</text><text x="718" y="138" text-anchor="middle">idle 19.4%</text>
+    <text x="140" y="168" class="d-text-light d-small">training busy 2.8% (2,000 of 72,000 GPU-s)</text>
+
+    <text x="132" y="206" text-anchor="end" class="d-bold">Tulu 3 405B</text><text x="132" y="222" text-anchor="end" class="d-mono d-small">256 GPUs, 1,525 s</text>
+    <rect x="140" y="188" width="14.7" height="34" class="d-block-accent"/><rect x="154.7" y="188" width="590" height="34" class="d-block"/><rect x="744.7" y="188" width="9.6" height="34" class="d-block-2"/><rect x="754.3" y="188" width="25.7" height="34" class="d-block-muted"/>
+    <text x="450" y="210" text-anchor="middle" class="d-text-inv d-bold">training busy 92.2%</text>
+    <text x="140" y="240" class="d-text-light d-small">inference busy 2.3% (left sliver) · weight sync 1.5% · inference idle 4.0%</text>
+
+    <rect x="14" y="258" width="12" height="12" class="d-block-accent"/><text x="32" y="269" class="d-text-light d-small">inference GPUs busy</text>
+    <rect x="170" y="258" width="12" height="12" class="d-block"/><text x="188" y="269" class="d-text-light d-small">training GPUs busy</text>
+    <rect x="322" y="258" width="12" height="12" class="d-block-2"/><text x="340" y="269" class="d-text-light d-small">weight sync</text>
+    <rect x="438" y="258" width="12" height="12" class="d-block-muted"/><text x="456" y="269" class="d-text-light d-small">idle</text>
+    <text x="14" y="287" class="d-text-light d-small">Olmo rows: footnote 41's 1,000 s and 125 s applied to each Table 49 configuration. Tulu row: inference overlaps training.</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Where one step's allocated GPU-seconds go. Olmo 3: 160 actor plus 64 learner GPUs (32B) and 56 plus 16 (7B Think), 1,000 s per step with 125 s of training<a class="cite" href="#ref-2">2</a>. Tulu 3 405B: 16 inference GPUs and 240 training GPUs, about 550 s inference, 25 s weight transfer and 1,500 s training; the step is taken as 1,525 s with inference overlapped<a class="cite" href="#ref-3">3</a>. Percentages are derived: Olmo 32B is 160,000 / 8,000 / 56,000 of 224,000 GPU-s; Tulu is 8,800 / 360,000 / 6,000 / 15,600 of 390,400.</figcaption>
+</figure>
+
+<h3 id="wall-clock-tulu">5.2 Tulu 3 405B: the bottleneck moves to the learner</h3>
+<p>Tulu 3's 405B RLVR run is the opposite regime. Inference used vLLM with 16-way tensor parallelism, and the remaining 240 of the 256 GPUs trained. Per iteration, inference took about 550 s, weight transfer about 25 s, and training about 1,500 s<a class="cite" href="#ref-3">3</a>. Responses were capped at 1,024 tokens and the effective batch was 1,856<a class="cite" href="#ref-3">3</a>. Training is about 72% of the 2,075 s sum, and with inference overlapped the 16 inference GPUs idle for about 975 s per step (derived). Figure 5 shows 92% of allocated GPU-seconds spent training.</p>
+<p>Two different things changed relative to Olmo 3, and they are easy to conflate. Responses are at least 14 times shorter (a 1,024-token cap against Olmo 3's 14,628-token mean), so rollouts are cheap. And the learner is a 405B policy with a reference model on 240 GPUs. A generous bound shows how slow that learner was. Even if all 1,856 sequences hit the 3,072-token cap (2,048 prompt plus 1,024 response), training the policy at \(6N\) FLOPs per token<a class="cite" href="#ref-17">17</a> and running a \(2N\) reference pass is \(8 \times 405 \times 10^9 \times 1{,}856 \times 3{,}072 \approx 1.8 \times 10^{19}\) FLOPs. Against \(240 \times 989\) TFLOPS \(\times 1{,}500\) s \(= 3.6 \times 10^{20}\) FLOPs of peak (989 TFLOPS is half of NVIDIA's with-sparsity figure of 1,979 TFLOPS for an H100 SXM<a class="cite" href="#ref-18">18</a>), that is at most about 5% utilization (derived; assumes "effective batch size" counts sequences and ignores the 8B value model)<a class="cite" href="#ref-3">3</a>. The report does not say why; it does say it hit NCCL timeouts and synchronization issues and trained only 75 steps because of infrastructure scaling difficulty<a class="cite" href="#ref-3">3</a>. So "which phase dominates" is a property of response length, GPU split and how well each side is engineered, not a law of RL.</p>
+
+<h3 id="wall-clock-per-token">5.3 A per-token cost model</h3>
+<p>Every sampled token is processed twice: once on the engine at decode time and once on the learner at update time. For a dense model with \(N\) non-embedding parameters, a forward pass costs about \(2N\) FLOPs per token and forward plus backward about \(6N\)<a class="cite" href="#ref-17">17</a>. With \(F\) the peak FLOP/s of a GPU and \(u\) its model-FLOPs utilization, the GPU-seconds per token are</p>
+$$ c_{\text{dec}} = \frac{2N}{F\,u_{\text{dec}}}, \qquad c_{\text{train}} = \frac{6N}{F\,u_{\text{train}}}, \qquad \frac{c_{\text{dec}}}{c_{\text{train}}} = \frac{u_{\text{train}}}{3\,u_{\text{dec}}}. $$
+<p>Decode runs at very low utilization because each step reads all the weights and the KV cache to emit one token per sequence. Olmo 3's infrastructure benchmark measures MFU 1.01% and MBU 43.21% on the inference side for its final configuration<a class="cite" href="#ref-2">2</a>. That is the bandwidth-bound signature you know from serving; the RL-specific point is that this regime sets the bill. Training utilization is not reported directly, but the footnote's 125 s lets you back it out.</p>
+<details class="more"><summary>Derivation: the 125 s training segment as a 6ND estimate (derived, 32B configuration assumed)</summary>
+<p>Tokens per step: \(128 \times 8 = 1{,}024\) completions at the 14,628-token mean, \(1{,}024 \times 14{,}628 = 1.498 \times 10^{7}\) (prompt tokens ignored). Training FLOPs: \(6 \times 32 \times 10^{9} \times 1.498 \times 10^{7} = 2.88 \times 10^{18}\). Peak of 64 learner H100s at 989 TFLOPS dense: \(64 \times 989 \times 10^{12} = 6.33 \times 10^{16}\) FLOP/s<a class="cite" href="#ref-18">18</a>. Time at full utilization: \(2.88 \times 10^{18} / 6.33 \times 10^{16} = 45.4\) s. A 125 s step therefore corresponds to \(u_{\text{train}} = 45.4/125 = 36\%\). With the 10K-token lower bound on the mean (\(1.02 \times 10^{7}\) tokens) it is 25%. Both are ordinary large-scale training utilizations. If the footnote's run was the 7B configuration (16 learner GPUs, 512 completions) the same arithmetic gives about 16%, so this is a consistency check on the order of magnitude, not a measurement.</p>
+</details>
+<p>Taking \(u_{\text{train}} \approx 0.25\) to \(0.36\) and \(u_{\text{dec}} = 0.0101\), decode costs \(0.25/(3 \times 0.0101) = 8.3\) to \(11.9\) times the GPU-seconds of training for the same tokens (derived). The ledger in Figure 5 shows 160,000 inference GPU-seconds against 8,000 of training busy time for the 32B configuration, a factor of 20, which is the same order. Two consequences follow, both specific to this long-response regime.</p>
+<ul>
+<li><strong>Extra models barely move the FLOP bill, but they move the learner's size.</strong> A policy-sized critic adds another \(6N\) per token on the training side, which with these utilizations is about 7% of total GPU-seconds per token (derived: \(16.7\) units on top of \(215\)). The cost shows up elsewhere, as more resident parameters per learner GPU (Section 7), and in Olmo's setup the learner is already sized by memory with most of its GPU-seconds idle.</li>
+<li><strong>A rule of thumb from two runs.</strong> R1-Zero's 101,376 GPU-hours over \(5{,}324{,}800\) completions of <mark class="unverified" title="Read by eye from DeepSeek-R1 Fig. 1b: average length per response rises from roughly 1K to roughly 14K tokens over 10,400 steps; the report gives no table of mean lengths">about 6,000 tokens on average</mark> is about 3.2 GPU-hours per million sampled tokens, all-in (derived). Olmo 3's 32B configuration, \(224 \times 1{,}000 / 3{,}600 = 62.2\) GPU-hours for \(1.498 \times 10^{7}\) tokens, is about 4.2 (derived). Different models, hardware and accounting, but both land at 3 to 4 GPU-hours per million sampled tokens, which is a usable first estimate for a long-chain-of-thought run.</li>
+</ul>
+
+<div class="calc">
+  <p class="calc-title">One RL step: generation time against training time (first-order model)</p>
+  <div class="calc-row"><label for="c1-P">Prompts per step \(P\)</label><input type="range" id="c1-P" name="P" min="16" max="512" step="16" value="128" data-format="int"></div>
+  <div class="calc-row"><label for="c1-G">Samples per prompt \(G\)</label><input type="range" id="c1-G" name="G" min="1" max="32" step="1" value="8" data-format="int"></div>
+  <div class="calc-row"><label for="c1-L">Mean response length \(\bar L\)</label><input type="range" id="c1-L" name="L" min="1000" max="32000" step="100" value="14600" data-format="int" data-unit="tokens"></div>
+  <div class="calc-row"><label for="c1-Lm">Max response length \(L_{\max}\)</label><input type="range" id="c1-Lm" name="Lmax" min="4096" max="65536" step="1024" value="32768" data-format="int" data-unit="tokens"></div>
+  <div class="calc-row"><label for="c1-N">Parameters \(N\) (billions)</label><input type="range" id="c1-N" name="Np" min="1" max="405" step="1" value="32" data-format="int"></div>
+  <div class="calc-row"><label for="c1-Ng">Inference GPUs</label><input type="range" id="c1-Ng" name="Ng" min="8" max="512" step="8" value="160" data-format="int"></div>
+  <div class="calc-row"><label for="c1-r">Effective decode tokens/s per inference GPU</label><input type="range" id="c1-r" name="r" min="20" max="800" step="2" value="94" data-format="int"></div>
+  <div class="calc-row"><label for="c1-Nt">Training GPUs</label><input type="range" id="c1-Nt" name="Nt" min="8" max="256" step="8" value="64" data-format="int"></div>
+  <div class="calc-row"><label for="c1-u">Training MFU</label><input type="range" id="c1-u" name="u" min="5" max="60" step="1" value="36" data-unit="%"></div>
+  <div class="calc-out">
+    <div>Sampled tokens per step<output data-expr="P * G * L" data-format="si"></output></div>
+    <div>Generation time, continuous batching<output data-expr="P * G * L / (Ng * r)" data-format="int" data-unit="s"></output></div>
+    <div>Training time<output data-expr="6 * Np * 1e9 * P * G * L / (Nt * 989e12 * u / 100)" data-format="int" data-unit="s"></output></div>
+    <div>Generation time over training time<output data-expr="(P * G * L / (Ng * r)) / (6 * Np * 1e9 * P * G * L / (Nt * 989e12 * u / 100))" data-format="fixed:1" data-unit="x"></output></div>
+    <div>Step time, overlapped<output data-expr="max(P * G * L / (Ng * r), 6 * Np * 1e9 * P * G * L / (Nt * 989e12 * u / 100))" data-format="int" data-unit="s"></output></div>
+    <div>Learner busy fraction, overlapped<output data-expr="(6 * Np * 1e9 * P * G * L / (Nt * 989e12 * u / 100)) / max(P * G * L / (Ng * r), 6 * Np * 1e9 * P * G * L / (Nt * 989e12 * u / 100))" data-format="pct"></output></div>
+    <div>GPU-hours per step, overlapped<output data-expr="(Ng + Nt) * max(P * G * L / (Ng * r), 6 * Np * 1e9 * P * G * L / (Nt * 989e12 * u / 100)) / 3600" data-format="fixed:1"></output></div>
+    <div>GPU-hours per million sampled tokens<output data-expr="(Ng + Nt) * max(P * G * L / (Ng * r), 6 * Np * 1e9 * P * G * L / (Nt * 989e12 * u / 100)) / 3600 / (P * G * L / 1e6)" data-format="fixed:1"></output></div>
+    <div>Generation time under static batching<output data-expr="P * G * L / (Ng * r) * Lmax / L" data-format="int" data-unit="s"></output></div>
+  </div>
+  <p class="calc-note">Model: \(T_{\text{gen}} = PG\bar L/(N_g r)\), \(T_{\text{train}} = 6N\,PG\bar L/(N_t F u)\) with \(F = 989\) TFLOPS dense H100 BF16<a class="cite" href="#ref-18">18</a> and \(6N\) FLOPs per trained token<a class="cite" href="#ref-17">17</a>. The defaults are Olmo 3 32B Think's Table 49 batch (128 prompts, 8 samples, 160 actor plus 64 learner GPUs) and its 14,628-token mean<a class="cite" href="#ref-2">2</a>; \(r = 94\) and \(u = 36\%\) are back-solved from footnote 41's 1,000 s and 125 s, so they are effective figures that include tail idling, not engine peaks. Static batching multiplies generation time by \(L_{\max}/\bar L\), the idealized memory-bound case of Section 6. Prompt tokens, the reference pass, weight sync and scoring are ignored.</p>
+</div>
+<p>Play with it and one property is visible at once: the ratio of generation to training time does not depend on \(P\), \(G\) or \(\bar L\). Both phases scale linearly with sampled tokens, so the ratio is set by the GPU split, \(N\), \(r\) and \(u\). Length enters through \(r\): decode throughput per GPU falls as contexts grow because each token reads more KV bytes. That is the writer's reasoning, and no reported curve of \(r\) against length was found, which is why the calculator takes \(r\) as an input rather than modelling it.</p>
+
+<h2 id="long-tails">6. Long tails and batching waste</h2>
+<p>RL response lengths are long-tailed against a hard cap. Olmo 3's reasoner runs have a 32K cap, a mean generation length of 14,628 tokens, and some sequences that reach the cap<a class="cite" href="#ref-2">2</a>. Under static batching, the batch of prompts is split over the actors, each actor generates its whole share, returns the responses, and only then receives new work; when a sequence finishes, its slot stays empty until the longest one in the batch is done<a class="cite" href="#ref-2">2</a>. The report gives the waste as the maximum length minus the mean, over the maximum:</p>
+$$ \text{waste} = \frac{L_{\max} - \bar L}{L_{\max}} = \frac{32{,}000 - 14{,}628}{32{,}000} = 54.3\% $$
+<p>which matches its statement that "up to 54% of our compute would have been wasted with static batching"<a class="cite" href="#ref-2">2</a>. Figure 6 draws the difference. With the cap at 32,768 the figure is 55.4% (derived); the report does not say which it used. "Up to" is honest: the formula is exact only if every batch contains a sequence that reaches the cap. Slot-time waste translates to wall-clock waste to the extent that decode is memory-bound, where a step with few live sequences costs nearly as much as a full one because the weight reads dominate; that is the writer's reasoning, and Table 2's MBU figure describes that regime.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 396" role="img" aria-labelledby="f6t"><title id="f6t">Gantt chart of eight decode slots under static batching, where finished slots idle, and under continuous batching, where they backfill</title>
+    <text x="14" y="20" class="d-title">A. Static batching: finished slots wait for the longest sequence</text>
+    <text x="122" y="41" text-anchor="end" class="d-mono d-small">slot 1</text>
+    <rect x="130" y="30" width="72" height="14" class="d-block-accent"/>
+    <rect x="202" y="30" width="408" height="14" class="d-block-muted"/>
+    <text x="122" y="59" text-anchor="end" class="d-mono d-small">slot 2</text>
+    <rect x="130" y="48" width="120" height="14" class="d-block-accent"/>
+    <rect x="250" y="48" width="360" height="14" class="d-block-muted"/>
+    <text x="122" y="77" text-anchor="end" class="d-mono d-small">slot 3</text>
+    <rect x="130" y="66" width="144" height="14" class="d-block-accent"/>
+    <rect x="274" y="66" width="336" height="14" class="d-block-muted"/>
+    <text x="122" y="95" text-anchor="end" class="d-mono d-small">slot 4</text>
+    <rect x="130" y="84" width="168" height="14" class="d-block-accent"/>
+    <rect x="298" y="84" width="312" height="14" class="d-block-muted"/>
+    <text x="122" y="113" text-anchor="end" class="d-mono d-small">slot 5</text>
+    <rect x="130" y="102" width="216" height="14" class="d-block-accent"/>
+    <rect x="346" y="102" width="264" height="14" class="d-block-muted"/>
+    <text x="122" y="131" text-anchor="end" class="d-mono d-small">slot 6</text>
+    <rect x="130" y="120" width="264" height="14" class="d-block-accent"/>
+    <rect x="394" y="120" width="216" height="14" class="d-block-muted"/>
+    <text x="122" y="149" text-anchor="end" class="d-mono d-small">slot 7</text>
+    <rect x="130" y="138" width="297.6" height="14" class="d-block-accent"/>
+    <rect x="427.6" y="138" width="182.4" height="14" class="d-block-muted"/>
+    <text x="122" y="167" text-anchor="end" class="d-mono d-small">slot 8</text>
+    <rect x="130" y="156" width="480" height="14" class="d-block-accent"/>
+    <text x="622" y="62" class="d-bold">busy 46%, idle 54%</text>
+    <text x="622" y="82" class="d-text-light">(max - mean) / max</text>
+    <text x="622" y="102" class="d-mono d-small">(32,000 - 14,628) / 32,000</text>
+    <text x="622" y="120" class="d-mono d-small">= 54.3%</text>
+    <text x="14" y="200" class="d-title">B. Continuous batching: a finished slot is refilled at once</text>
+    <text x="122" y="221" text-anchor="end" class="d-mono d-small">slot 1</text>
+    <rect x="130" y="210" width="70.5" height="14" class="d-block-accent"/>
+    <rect x="202" y="210" width="118.5" height="14" class="d-fill-amber"/>
+    <rect x="322" y="210" width="142.5" height="14" class="d-block-accent"/>
+    <rect x="466" y="210" width="142.5" height="14" class="d-fill-amber"/>
+    <text x="122" y="239" text-anchor="end" class="d-mono d-small">slot 2</text>
+    <rect x="130" y="228" width="118.5" height="14" class="d-block-accent"/>
+    <rect x="250" y="228" width="166.5" height="14" class="d-fill-amber"/>
+    <rect x="418" y="228" width="190.5" height="14" class="d-block-accent"/>
+    <text x="122" y="257" text-anchor="end" class="d-mono d-small">slot 3</text>
+    <rect x="130" y="246" width="142.5" height="14" class="d-block-accent"/>
+    <rect x="274" y="246" width="334.5" height="14" class="d-fill-amber"/>
+    <text x="122" y="275" text-anchor="end" class="d-mono d-small">slot 4</text>
+    <rect x="130" y="264" width="166.5" height="14" class="d-block-accent"/>
+    <rect x="298" y="264" width="310.5" height="14" class="d-fill-amber"/>
+    <text x="122" y="293" text-anchor="end" class="d-mono d-small">slot 5</text>
+    <rect x="130" y="282" width="214.5" height="14" class="d-block-accent"/>
+    <rect x="346" y="282" width="262.5" height="14" class="d-fill-amber"/>
+    <text x="122" y="311" text-anchor="end" class="d-mono d-small">slot 6</text>
+    <rect x="130" y="300" width="262.5" height="14" class="d-block-accent"/>
+    <rect x="394" y="300" width="214.5" height="14" class="d-fill-amber"/>
+    <text x="122" y="329" text-anchor="end" class="d-mono d-small">slot 7</text>
+    <rect x="130" y="318" width="296.1" height="14" class="d-block-accent"/>
+    <rect x="427.6" y="318" width="180.9" height="14" class="d-fill-amber"/>
+    <text x="122" y="347" text-anchor="end" class="d-mono d-small">slot 8</text>
+    <rect x="130" y="336" width="478.5" height="14" class="d-block-accent"/>
+    <text x="622" y="262" class="d-bold">no idle slots</text>
+    <text x="622" y="282" class="d-text-light">same slots, same horizon</text>
+    <text x="622" y="302" class="d-text-light">more sequences finished</text>
+    <line x1="610" y1="26" x2="610" y2="360" class="d-line d-stroke-red d-dashed" style="stroke-width:1.5"/>
+    <line x1="130" y1="360" x2="610" y2="360" class="d-axis"/>
+    <text x="130" y="376" text-anchor="middle" class="d-mono d-small">0</text><text x="370" y="376" text-anchor="middle" class="d-mono d-small">L_max / 2</text><text x="610" y="376" text-anchor="middle" class="d-mono d-small">L_max</text>
+    <text x="370" y="392" text-anchor="middle" class="d-text-light d-small">decode steps (time); lengths illustrative, mean/max = 0.46</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Eight decode slots over one batch horizon. Panel A: each slot idles after its sequence ends, so busy time is the mean length over the longest. Panel B: finished slots backfill, so the same slots complete more sequences. Sequence lengths are illustrative, chosen so mean over maximum is 0.46, about the ratio of Olmo 3's 14,628-token mean to its 32K cap<a class="cite" href="#ref-2">2</a>; they are not measured data.</figcaption>
+</figure>
+
+<h3 id="long-tails-fixes">6.1 What each fix bought</h3>
+<p>Olmo 3 benchmarked its infrastructure changes one at a time, for two hours on two 8-GPU A100 nodes, one for training and one for inference, and reports MFU and MBU on the inference side<a class="cite" href="#ref-2">2</a>.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> Effect of Olmo 3's RL infrastructure changes, cumulative from the OLMo 2 baseline (Table 23 of the report: 2-hour benchmark, one A100 node for training and one for inference; MFU and MBU computed on the inference side)<a class="cite" href="#ref-2">2</a>. The speed-up column is derived.</caption>
+  <thead><tr><th>Configuration</th><th class="num">Total tokens (Mtok)</th><th class="num">Tokens/s</th><th class="num">vs OLMo 2 (derived)</th><th class="num">MFU (%)</th><th class="num">MBU (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">OLMo 2 infrastructure</td><td class="num">6.34</td><td class="num">881</td><td class="num">1.00x</td><td class="num">0.30</td><td class="num">12.90</td></tr>
+    <tr><td class="row">+ continuous batching</td><td class="num">7.02</td><td class="num">975</td><td class="num">1.11x</td><td class="num">0.33</td><td class="num">14.29</td></tr>
+    <tr><td class="row">+ better threading</td><td class="num">9.77</td><td class="num">1,358</td><td class="num">1.54x</td><td class="num">0.46</td><td class="num">19.89</td></tr>
+    <tr><td class="row">+ inflight updates (Olmo 3)</td><td class="num" data-best>21.23</td><td class="num" data-best>2,949</td><td class="num" data-best>3.35x</td><td class="num" data-best>1.01</td><td class="num" data-best>43.21</td></tr>
+  </tbody>
+</table>
+
+<p>Continuous batching alone bought 11%, because the CPU side became the limit: the report says its first continuous-batching implementation "was slower than static batching before adding a prefetch thread to our actors that constantly refilled the inference queue"<a class="cite" href="#ref-2">2</a>. Threading added 39% and inflight updates 117% on top (\(2{,}949/1{,}358 = 2.17\), derived). Inflight updates replace the usual synchronization, in which every actor finishes its ongoing generations, dumps the KV cache and updates its weights, with an immediate weight update that keeps generating and keeps the KV cache<a class="cite" href="#ref-2">2</a>. The report's end-to-end claims are "two times faster training on half as many GPUs", the 7B Think run dropping from about 15 days to about 6, and one epoch moving from 14 days on 9 nodes to 7 days on 5 nodes, which is \(126\) node-days against \(35\) (3.6 times fewer, derived)<a class="cite" href="#ref-2">2</a>.</p>
+<p>The price is algorithmic. After an inflight update, a long sequence is partly generated under older weights, with a KV cache computed by the old policy. ScaleRL's PipelineRL states this directly: generators continue "with the updated weights but a stale KV cache from the old policy"<a class="cite" href="#ref-13">13</a>. What that does to the importance ratio is the subject of Modules 12 and 14; the staleness taxonomy is System Design Module 37.</p>
+
+<h3 id="long-tails-algorithmic">6.2 Attacking the tail from the algorithm side</h3>
+<p>Three more levers appear in the reports, and none comes with a speed-up figure in the passages read. Kimi k1.5's partial rollouts set a fixed output-token budget per iteration; a trajectory that exceeds it is saved to a replay buffer and continued in the next iteration, so "no single lengthy trajectory monopolizes the system's resources", and only the current iteration's segment needs on-policy computation<a class="cite" href="#ref-11">11</a>. Modules 18 and 28 treat this properly. R1 uses multi-token-prediction self-speculative decoding to cut "the completion time for the longest samples"<a class="cite" href="#ref-1">1</a>. And truncation is a cost lever with a stability edge: ScaleRL's baseline destabilized beyond about 3,500 GPU-hours because overlong generations exceeded 10% of all generations, which shrinks the effective batch, and its recipe adds interruption-based length control<a class="cite" href="#ref-13">13</a>.</p>
+
+<h2 id="models-in-memory">7. Models held in memory per method</h2>
+<p>Time is half the cost model; memory is the other half, because in Olmo 3 the learner's GPU count is set by what must fit, and because the methods differ in how many models they keep resident by a factor of more than two.</p>
+
+<h3 id="models-in-memory-count">7.1 What each method keeps</h3>
+<p>R1's appendix draws the comparison as a figure with trained and frozen models marked. PPO has four: policy and value model trained, reference and reward model frozen. GRPO has three: policy trained, reference and reward model frozen, with the value model replaced by a group computation<a class="cite" href="#ref-1">1</a>. DeepSeekMath's motivation is memory and a modelling difficulty: the PPO value function "is typically another model of comparable size as the policy model", and because the reward arrives at the last token a per-token value is hard to train<a class="cite" href="#ref-7">7</a>.</p>
+<p>The "comparable size" is a design choice, not a requirement. InstructGPT used a 6B reward model and a 6B value function, the latter initialized from the former, with policies of 1.3B, 6B and 175B<a class="cite" href="#ref-6">6</a>; in the 175B run the critic is 3.4% of the policy (derived). Tulu 3's 405B RLVR run used an 8B value model<a class="cite" href="#ref-3">3</a>. When the reward is a verifier, the reward model disappears: Tulu 3 states "In RLVR, we have 3 models: the policy model, the reference policy model, and the value model", of which the policy and value are trained and the reference only does inference<a class="cite" href="#ref-3">3</a>.</p>
+<p>GRPO's reference is optional. TRL's default KL coefficient is 0.0, and the docs state that at 0.0 "the reference model is not loaded, reducing memory usage and improving training speed"<a class="cite" href="#ref-12">12</a>. R1-Zero used 0.001 and DeepSeekMath 0.04, so those runs held a reference<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-7">7</a>. DPO keeps the policy and, nominally, a reference, but never samples. Tulu 3 removes the resident reference by precomputing and caching its log-probabilities, and runs chosen and rejected sequences in separate forward passes to save activation memory<a class="cite" href="#ref-3">3</a>.</p>
+
+<h3 id="models-in-memory-arithmetic">7.2 The memory arithmetic</h3>
+<p>For mixed-precision Adam, a trained model with \(\Psi\) parameters holds 2\(\Psi\) bytes of half-precision weights, 2\(\Psi\) of gradients and 12\(\Psi\) of fp32 optimizer state (master weights, momentum, variance), 16\(\Psi\) in total<a class="cite" href="#ref-19">19</a>. A frozen model holds weights only, 2\(\Psi\) in bf16. Treating every model as policy-sized, the resident model state per method is below. It excludes activations, which at 32K-token sequences are large, and the rollout engine's own copy of the policy weights (another 2\(\Psi\), plus its KV cache, in every online row).</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 6.</b> Resident model state per method, all models policy-sized unless noted, weights and optimizer state only, 1 GB = 10<sup>9</sup> bytes. Bytes per parameter from the 2+2+12 accounting of ZeRO<a class="cite" href="#ref-19">19</a>. Every memory value is derived by the writer; the model sets are from R1's Figure 3<a class="cite" href="#ref-1">1</a>, Tulu 3<a class="cite" href="#ref-3">3</a>, TRL<a class="cite" href="#ref-12">12</a> and InstructGPT<a class="cite" href="#ref-6">6</a>.</caption>
+  <thead><tr><th>Method</th><th>Trained (16 B/param)</th><th>Frozen (2 B/param)</th><th>Samples?</th><th class="num">State, \(\Psi\) units</th><th class="num">7B (GB)</th><th class="num">70B (GB)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">PPO-RLHF</td><td>policy, value</td><td>reference, reward model</td><td>yes</td><td class="num">36</td><td class="num" data-worst>252</td><td class="num" data-worst>2,520</td></tr>
+    <tr><td class="row">PPO-RLVR (Tulu 3)</td><td>policy, value</td><td>reference</td><td>yes</td><td class="num">34</td><td class="num">238</td><td class="num">2,380</td></tr>
+    <tr><td class="row">GRPO, RM and KL</td><td>policy</td><td>reference, reward model</td><td>yes</td><td class="num">20</td><td class="num">140</td><td class="num">1,400</td></tr>
+    <tr><td class="row">GRPO, verifier, KL 0 (TRL default)</td><td>policy</td><td>none</td><td>yes</td><td class="num">16</td><td class="num" data-best>112</td><td class="num" data-best>1,120</td></tr>
+    <tr><td class="row">DPO, reference resident</td><td>policy</td><td>reference</td><td>no</td><td class="num">18</td><td class="num">126</td><td class="num">1,260</td></tr>
+    <tr><td class="row">DPO, cached reference log-probs (Tulu 3)</td><td>policy</td><td>none</td><td>no</td><td class="num">16</td><td class="num" data-best>112</td><td class="num" data-best>1,120</td></tr>
+    <tr><td class="row">InstructGPT 175B with 6B RM and 6B value</td><td>175B policy, 6B value</td><td>175B reference, 6B RM</td><td>yes</td><td class="num">n/a</td><td class="num">n/a</td><td class="num">3,258 GB at 175B (6,300 GB if the RM and value were 175B)</td></tr>
+  </tbody>
+</table>
+
+<p>Worked check for the first row at 70B: \(16\Psi + 16\Psi + 2\Psi + 2\Psi = 36\Psi = 36 \times 70 = 2{,}520\) GB. On 80 GB H100s<a class="cite" href="#ref-18">18</a> that is 31.5, so at least 32 GPUs for model state alone; GRPO with a verifier and no KL is \(1{,}120/80 = 14\). For the InstructGPT row: \(16 \times 175 + 16 \times 6 + 2 \times 175 + 2 \times 6 = 3{,}258\) GB, against \(36 \times 175 = 6{,}300\) GB if the critic and reward model were policy-sized, a factor of 1.9 (derived).</p>
+<p>Resident is not peak. R1's framework offloads each module's models from VRAM to host memory or disk when the module finishes<a class="cite" href="#ref-1">1</a>, and Kimi k1.5 offloads Megatron's GPU memory before vLLM starts<a class="cite" href="#ref-11">11</a>. Frozen models are the cheapest to time-multiplex. The states also understate the learner: Olmo 3's 32B learner holds about \(16 \times 32 = 512\) GB of states (derived), under 7 H100s' worth of HBM, yet uses 64 learner GPUs; the report calls its sharding "minimal" for fitting the learner and suspects it is suboptimal<a class="cite" href="#ref-2">2</a>. At long sequence lengths, activations and layout, not weights, decide the learner's size.</p>
+
+<h3 id="models-in-memory-compute">7.3 Compute per sampled token, and what the methods cost in practice</h3>
+<p>Counting FLOPs per sampled token with equal-sized models and the \(2N\) and \(6N\) rules of Section 5.3: PPO-RLHF is \(2\) (decode) \(+\ 6\) (policy) \(+\ 6\) (value) \(+\ 2\) (reference) \(+\ 2\) (reward model) \(= 18N\); GRPO with a reward model and KL is \(12N\); GRPO with a verifier and no KL is \(8N\) (derived). The ratio of 2.25 between the extremes understates the wall-clock gap, since in Olmo's regime decode's low utilization dominates the time and the extra models mostly cost resident memory.</p>
+<p>DPO has no decode phase at all, which is where it saves most. Tulu 3 measured both in a controlled, untuned setup: PPO reached comparable but slightly lower average scores, at about 28 hours on two nodes against about 4 hours on one for DPO<a class="cite" href="#ref-3">3</a>. That is 7 times the wall-clock and 14 times the node-hours (\(56\) against \(4\), derived). Llama 3's team reports the same direction at scale: DPO "required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval"<a class="cite" href="#ref-5">5</a>. These are cost measurements of one stage, not a verdict on methods; the quality side is in Modules 7 and 33.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The cost model sharpens two disagreements that the reports leave open. The first is whether online RL repays its extra cost for preference tuning, where a cheaper offline method exists. The second is how large a share of the total compute budget RL should be, which the reports answer with figures that look conflicting (3.75% for R1-Zero, more than 10% for DeepSeek-V3.2) until their denominators are examined. The first question is decided on quality in Modules 7 and 33; only its cost side is weighed here.</p>
+<div class="positions">
+  <article class="position">
+    <h4>A. Offline preference optimization is enough; online RL does not repay its cost</h4>
+    <p class="who">Llama 3 team<a class="cite" href="#ref-5">5</a>; Tulu 3 team<a class="cite" href="#ref-3">3</a></p>
+    <p>Llama 3 chose simple post-training (SFT, rejection sampling, DPO) over RL algorithms that "tend to be less stable and harder to scale", tried PPO, and found DPO "required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval"<a class="cite" href="#ref-5">5</a>. Tulu 3 measured PPO at comparable but slightly lower scores for about 28 hours on two nodes against about 4 hours on one for DPO, and kept DPO for preference iteration and PPO for RLVR<a class="cite" href="#ref-3">3</a>.</p>
+    <ul class="pros"><li>7 times the wall-clock and 14 times the node-hours in Tulu 3's measurement (derived); no rollout engine, no weight sync, no staleness.</li><li>Preference data can be refreshed each round from the latest model, as Llama 3 does over six rounds, which recovers much of the on-policy benefit.</li></ul>
+    <ul class="cons"><li>Tulu 3's comparison was in a "Non-Tuned Setup", and its authors say more compute or tuning could plausibly raise PPO's score<a class="cite" href="#ref-3">3</a>.</li><li>Neither report shows an offline method matching RL where the reward is a verifier; Tulu 3 used PPO there.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B. Tuned online RL beats DPO, so the cost is worth paying</h4>
+    <p class="who">Xu et al.<a class="cite" href="#ref-20">20</a>; Ivison et al.<a class="cite" href="#ref-21">21</a>; Lambert<a class="cite" href="#ref-4">4</a></p>
+    <p>Xu et al. report that PPO "is able to surpass other alignment methods in all cases" tested, including code competitions<a class="cite" href="#ref-20">20</a>. Ivison et al. find PPO ahead of DPO by up to 2.5% in math and 1.2% in general domains, while ranking the factors as preference data quality first, then algorithm, then reward model, then extra prompts<a class="cite" href="#ref-21">21</a>. Lambert argues that RL-based methods "continue to win out" despite needing "a far larger infrastructure investment", and that RL can be surgical: Tulu 3's math-only RL kept general capability<a class="cite" href="#ref-4">4</a>.</p>
+    <ul class="pros"><li>Measured gains in controlled comparisons; and reasoning models come from either a large RL run or distillation from one<a class="cite" href="#ref-4">4</a>.</li><li>RL's effect stays confined to the prompt distribution, so a narrow RL stage does not squash other skills<a class="cite" href="#ref-4">4</a>.</li></ul>
+    <ul class="cons"><li>The Ivison margins (up to 2.5 and 1.2 points) are small next to the data-quality effect they rank higher.</li><li>"Tuned" carries the cost: PPO needs hyperparameter search that DPO largely avoids (Table 6 and Section 7.3 give the resource side).</li></ul>
+  </article>
+  <article class="position">
+    <h4>C. RL is a modest slice of the budget; cost is not the constraint</h4>
+    <p class="who">InstructGPT authors<a class="cite" href="#ref-6">6</a>; R1-Zero's share as computed by the ScaleRL authors<a class="cite" href="#ref-13">13</a></p>
+    <p>InstructGPT's lesson 1 is that "the cost of increasing model alignment is modest relative to pretraining": 60 against 3,640 petaflops/s-days, 1.65% (derived)<a class="cite" href="#ref-6">6</a>. R1-Zero's RL is 3.75% of its pretraining compute by the ScaleRL authors' figure, which reproduces from V3's table<a class="cite" href="#ref-13">13</a><a class="cite" href="#ref-15">15</a>.</p>
+    <ul class="pros"><li>The figures are small and, in two cases, checkable from primary tables.</li><li>Olmo 3's 5-day 32B run is about 2.75% of its main pretraining GPU-hours (derived)<a class="cite" href="#ref-2">2</a>.</li></ul>
+    <ul class="cons"><li>They count one final run; Olmo 3 states that RL needed many experiments<a class="cite" href="#ref-2">2</a>, and ScaleRL's study was over 400,000 GPU-hours<a class="cite" href="#ref-13">13</a>.</li><li>The share has been rising since 2022, so a 2022 figure is not a forecast.</li></ul>
+  </article>
+  <article class="position">
+    <h4>D. RL is becoming a first-class budget line and will keep growing</h4>
+    <p class="who">DeepSeek-V3.2 authors<a class="cite" href="#ref-10">10</a>; ScaleRL authors<a class="cite" href="#ref-13">13</a>; Olmo 3 team<a class="cite" href="#ref-2">2</a></p>
+    <p>V3.2 states an RL budget exceeding 10% of pre-training cost, observes "consistent performance improvements correlating with extended RL training budget", and hypothesizes that more budget would help further<a class="cite" href="#ref-10">10</a>. ScaleRL fits sigmoidal compute curves and notes, citing others, that RL compute grew by more than 10 times from o1 to o3 (a secondary claim here)<a class="cite" href="#ref-13">13</a>. Olmo 3 continued its best RL run for 21 more days after release<a class="cite" href="#ref-2">2</a>.</p>
+    <ul class="pros"><li>Reported gains keep following compute in three separate reports.</li><li>ScaleRL's extrapolations from 50K GPU-hours held at 100K on an 8B model<a class="cite" href="#ref-13">13</a>.</li></ul>
+    <ul class="cons"><li>V3.2 gives no denominator, so ">10%" cannot be converted to GPU-hours.</li><li>R1's own distillation experiment found that RL on Qwen2.5-32B for over 10K steps only matched QwQ-32B-Preview while distilling R1 did significantly better<a class="cite" href="#ref-1">1</a>, so for small models compute spent on RL is not obviously the best use.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>A and B answer a question about preference tuning and get compatible answers: online RL buys at most a few points in the comparisons that favor it (Ivison: up to 2.5 and 1.2), and cost 7 to 14 times as much in the one measurement that reports cost (Tulu 3, where it did not win). DPO is the sensible default when preference data is good and no verifier exists, and PPO or GRPO earn their cost where the reward is verifiable. That is my reading, and the evidence is thin: one untuned PPO baseline and one team's statement about Llama 3. A matched-compute comparison on identical data, with GPU-hours defined, would settle it. C and D are not in conflict. They are 1.65% (2022), 3.75% (2025) and more than 10% (late 2025) on three different denominators, a rising trend rather than a dispute; the one claim that needs the denominator to be stated is V3.2's. For planning, budget by sampled tokens, about 3 to 4 GPU-hours per million in the two long-response runs worked above (derived), not by step count, which Section 3 showed is not comparable across reports.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>The cost structure this module describes is a snapshot of rollout-heavy, verifier-reward RL as of late 2026. Two shifts are visible. Lambert's textbook records that multi-teacher on-policy distillation (MOPD) became a popular final stage in 2026 recipes, with Nemotron 3 Ultra at more than ten experts, Kimi K3 at nine and DeepSeek V4 at more than ten, while labs "are far from unanimous in its usage"<a class="cite" href="#ref-4">4</a>; a final stage that distills several specialist teachers into one student (Modules 21, 22 and 30). And reporting is moving toward phase times, as Olmo 3's wall-clock accounting and Tulu 3's per-phase seconds show, which would make the ledgers in Figure 5 measurable instead of derived. Treat the "more than 10%" and "3.75%" figures as dated: they are likely to move within a year.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>DeepSeek-AI (Guo, D., Yang, D., Zhang, H., et al.). <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv:2501.12948v2 (4 Jan 2026; expanded version of Nature 645, 633-638, 2025). <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Fig. 1 caption and §2.1 (10,400 steps, 32 questions x 16 outputs, 8,192-output rollouts in 16 minibatches, one inner epoch); Supp. A.3 and Figure 3 (PPO and GRPO model sets); Supp. B.1 (RL framework modules); Supp. B.3.3 (SFT data sizes); Supp. B.4.4 and Table 7 (GPU-hours); Supp. F.1 (distillation versus RL).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Team Olmo (Ettinger, A., Bertsch, A., et al.). <em>Olmo 3</em>. Allen Institute for AI, arXiv:2512.13961v2 (14 Apr 2026). <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §2.4 (wall-clock and cost), §4.4.3 (OlmoRL infrastructure, footnotes 40, 41 and 43), Table 23 (infrastructure ablation), Table 49 (RL hyperparameters and GPU allocation).</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S., et al. <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv:2411.15124v5 (14 Apr 2025; v1 22 Nov 2024). <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §5.4.1 (PPO versus DPO cost), §5.4.2 (cached DPO log-probs), §6.3 (RLVR infrastructure, three models), §8.1 (405B phase times), Table 35 (405B hyperparameters), RLVR coinage.</span></li>
+  <li id="ref-4"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv:2504.12501v12 (11 Sep 2026); Manning print edition 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §1 (p. 7, three optimization methods), §3.1.6 (RL's advantages and cost), §3.2.1 to §3.2.4 (canonical recipes, MOPD expert counts), pp. 27 to 31.</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Grattafiori, A., Dubey, A., Jauhri, A., et al. (Llama Team, AI  Meta). <em>The Llama 3 Herd of Models</em>. arXiv:2407.21783v3 (23 Nov 2024). <a href="https://arxiv.org/pdf/2407.21783v3">https://arxiv.org/pdf/2407.21783v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §1 (design stance), §4.1.4 (DPO versus PPO compute, on-policy preference data), §4.1.6 (six rounds).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Ouyang, L., Wu, J., Jiang, X., Almeida, D., et al. <em>Training language models to follow instructions with human feedback</em>. NeurIPS 2022; arXiv:2203.02155v1. <a href="https://arxiv.org/pdf/2203.02155v1">https://arxiv.org/pdf/2203.02155v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §3.2 (dataset sizes), §3.5 (RL as a bandit environment), Appendix C.4 (batch 512, minibatch 64, 256k episodes, 6B RM and value function), §6 lesson 1 (4.9 and 60 versus 3,640 petaflops/s-days).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R., et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv:2402.03300v3 (27 Apr 2024). <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: GRPO's origin (Feb 2024), §4.1.1 (value-model cost and last-token reward), §4.2 (64 outputs, batch 1,024, KL 0.04, single update per exploration stage).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Schulman, J., Levine, S., Moritz, P., Jordan, M. I., Abbeel, P. <em>Trust Region Policy Optimization</em>. ICML 2015; arXiv:1502.05477v5. <a href="https://arxiv.org/pdf/1502.05477v5">https://arxiv.org/pdf/1502.05477v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the TRPO-to-PPO lineage pointer in Section 1.2 (treated in Module 3).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Schulman, J., Wolski, F., Dhariwal, P., Radford, A., Klimov, O. <em>Proximal Policy Optimization Algorithms</em>. arXiv:1707.06347v2 (28 Aug 2017). <a href="https://arxiv.org/pdf/1707.06347v2">https://arxiv.org/pdf/1707.06347v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §5 Algorithm 1 (N actors, T timesteps, K epochs, minibatch M), Appendix A Table 3 (MuJoCo hyperparameters), TRPO relationship (§1).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>DeepSeek-AI (Liu, A., Mei, A., Lin, B., et al.). <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv:2512.02556v1 (2 Dec 2025). <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §1 and §4 (RL budget above 10% of pre-training cost), §3 (generative reward model with per-prompt rubrics), §2.1.1 (continued pre-training from V3.1-Terminus).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Kimi Team (Du, A., Gao, B., Xing, B., et al.). <em>Kimi k1.5: Scaling Reinforcement Learning with LLMs</em>. arXiv:2501.12599v4 (3 Jun 2025). <a href="https://arxiv.org/pdf/2501.12599v4">https://arxiv.org/pdf/2501.12599v4</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §2.6.2 (partial rollouts), §2.6.3 (hybrid colocated deployment, under one minute to inference and about ten seconds back).</span></li>
+  <li id="ref-12"><span class="ref-type">official</span>Hugging Face TRL maintainers. <em>TRL documentation: GRPO Trainer</em>. docs/trl/main (unversioned snapshot). <a href="https://huggingface.co/docs/trl/main/en/grpo_trainer">https://huggingface.co/docs/trl/main/en/grpo_trainer</a>. Accessed 2026-10-27. <span class="ref-use">Used for: GRPOConfig parameters num_generations, generation_batch_size, steps_per_generation, num_iterations, max_completion_length, beta (reference not loaded at 0.0), vllm_mode colocate and server.</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Khatri, D., Madaan, L., Tiwari, R., Bansal, R., et al. <em>The Art of Scaling Reinforcement Learning Compute for LLMs</em>. arXiv:2510.13786v1 (15 Oct 2025). <a href="https://arxiv.org/pdf/2510.13786v1">https://arxiv.org/pdf/2510.13786v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §1 (R1-Zero 3.75% of pre-training compute; o1 to o3 growth as cited), §2 and App. A.3 (batch 768, 80 GB200 GPUs, 64 generators and 16 trainers, GPU-hour budgets), §3.1 and App. A.11 (PPO-off-policy-k, PipelineRL-k), App. A.6 (truncation instability).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Yu, Q., Zhang, Z., Zhu, R., Yuan, Y., et al. <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>. arXiv:2503.14476v2 (20 May 2025). <a href="https://arxiv.org/pdf/2503.14476v2">https://arxiv.org/pdf/2503.14476v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: §4.1 (prompt batch 512, 16 responses, minibatch 512 giving 16 gradient updates per rollout step, maximum 20,480 tokens).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3 Technical Report</em>. arXiv:2412.19437v2 (18 Feb 2025). <a href="https://arxiv.org/abs/2412.19437">https://arxiv.org/abs/2412.19437</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Table 1 (2,664K pre-training, 119K context extension, 5K post-training H800 GPU-hours at $2 per hour) and the exclusion of prior research and ablation costs (§1). Added beyond the source map.</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>MiniMax (Chen, A., Li, A., et al.). <em>MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention</em>. arXiv:2506.13585v1 (16 Jun 2025). <a href="https://arxiv.org/pdf/2506.13585v1">https://arxiv.org/pdf/2506.13585v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: abstract and §3 (full RL run on 512 H800 GPUs in three weeks, rental cost $534,700).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., et al. <em>Scaling Laws for Neural Language Models</em>. arXiv:2001.08361v1 (23 Jan 2020). <a href="https://arxiv.org/abs/2001.08361">https://arxiv.org/abs/2001.08361</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §2.1 (non-embedding compute of about 6N FLOPs per training token, forward plus backward). Added beyond the source map.</span></li>
+  <li id="ref-18"><span class="ref-type">official</span>NVIDIA. <em>NVIDIA H100 Tensor Core GPU</em> (product page, specifications table). <a href="https://www.nvidia.com/en-us/data-center/h100/">https://www.nvidia.com/en-us/data-center/h100/</a>. Accessed 2026-10-27. <span class="ref-use">Used for: H100 SXM BF16 Tensor Core 1,979 TFLOPS with sparsity (dense taken as half, 989 TFLOPS, derived), 80 GB memory. Added beyond the source map.</span></li>
+  <li id="ref-19"><span class="ref-type">paper</span>Rajbhandari, S., Rasley, J., Ruwase, O., He, Y. <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>. SC 2020; arXiv:1910.02054v3 (13 May 2020). <a href="https://arxiv.org/abs/1910.02054">https://arxiv.org/abs/1910.02054</a>. Accessed 2026-10-27. <span class="ref-use">Used for: §3.1 (mixed-precision Adam memory, 2 + 2 + K with K = 12, 16 bytes per parameter). Added beyond the source map.</span></li>
+  <li id="ref-20"><span class="ref-type">paper</span>Xu, S., Fu, W., Gao, J., Ye, W., et al. <em>Is DPO Superior to PPO for LLM Alignment? A Comprehensive Study</em>. ICML 2024; arXiv:2404.10719v3 (10 Oct 2024). <a href="https://arxiv.org/abs/2404.10719">https://arxiv.org/abs/2404.10719</a>. Accessed 2026-10-26. <span class="ref-use">Used for: abstract (PPO surpasses other alignment methods in all cases tested, including code competitions).</span></li>
+  <li id="ref-21"><span class="ref-type">paper</span>Ivison, H., Wang, Y., Liu, J., Wu, Z., et al. <em>Unpacking DPO and PPO: Disentangling Best Practices for Learning from Preference Feedback</em>. NeurIPS 2024; arXiv:2406.09279v2 (7 Oct 2024). <a href="https://arxiv.org/abs/2406.09279">https://arxiv.org/abs/2406.09279</a>. Accessed 2026-10-26. <span class="ref-use">Used for: abstract (PPO ahead of DPO by up to 2.5% in math and 1.2% in general domains; data quality, algorithm, reward model, extra prompts ranking).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

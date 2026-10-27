@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Direct Alignment: Deriving DPO, the Implicit Reward, Its Failure Modes, and the KTO, Length-Normalized and NLL-Regularized Variants · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Derives DPO from the KL-regularized objective, reads its gradient and implicit reward, catalogues its failure modes (null directions, likelihood displacement, length drift, over-optimization), compares the IPO, SimPO, ORPO, KTO, length-normalized and NLL-regularized variants, and sets the evidence on whether DPO is enough.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 7</p>
+  <h1>Direct Alignment: Deriving DPO, the Implicit Reward, Its Failure Modes, and the KTO, Length-Normalized and NLL-Regularized Variants</h1>
+  <p class="lede">Direct Preference Optimization replaces the reward model and the PPO loop with one classification loss over preference pairs. This module derives that loss from the KL-regularized objective of Module 6, reads its gradient and its implicit reward, and catalogues what goes wrong in practice (unconstrained probability mass, falling chosen likelihood, length drift, over-optimization) together with the fixes Llama 3, Tulu 3 and Olmo 3 shipped. Afterwards you can derive and implement DPO, pick among its variants, and say precisely which evidence supports and which contradicts "DPO is enough".</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>18</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisites: <b>Modules 4, 6</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 350" role="img" aria-labelledby="f1t"><title id="f1t">Two pipelines from preference pairs to a policy: RLHF with PPO needs a reward model, online rollouts and a value model; DPO needs only log-probabilities of the stored responses under the policy and a frozen reference</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <text x="15" y="26" class="d-title">RLHF with PPO: reward model, online rollouts, critic</text>
+    <rect x="15" y="40" width="105" height="64" rx="8" class="d-block"/>
+    <text x="67" y="68" text-anchor="middle" class="d-text-inv d-bold">preference</text>
+    <text x="67" y="87" text-anchor="middle" class="d-text-inv d-bold">pairs</text>
+    <path d="M120,72 L150,72" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="150" y="40" width="120" height="64" rx="8" class="d-block-accent"/>
+    <text x="210" y="68" text-anchor="middle" class="d-text-inv d-bold">reward model</text>
+    <text x="210" y="87" text-anchor="middle" class="d-text-inv d-small">trained, Module 4</text>
+    <path d="M270,72 L300,72" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="300" y="40" width="120" height="64" rx="8" class="d-block-accent"/>
+    <text x="360" y="68" text-anchor="middle" class="d-text-inv d-bold">rollouts</text>
+    <text x="360" y="87" text-anchor="middle" class="d-text-inv d-small">sample from π_θ</text>
+    <path d="M420,72 L450,72" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="450" y="40" width="120" height="64" rx="8" class="d-block-accent"/>
+    <text x="510" y="68" text-anchor="middle" class="d-text-inv d-bold">value model</text>
+    <text x="510" y="87" text-anchor="middle" class="d-text-inv d-small">GAE, KL reward</text>
+    <path d="M570,72 L600,72" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="600" y="40" width="185" height="64" rx="8" class="d-block"/>
+    <text x="692" y="68" text-anchor="middle" class="d-text-inv d-bold">PPO update</text>
+    <text x="692" y="87" text-anchor="middle" class="d-text-inv d-small">clipped surrogate, Module 3</text>
+
+    <text x="15" y="168" class="d-title">DPO: stored pairs, policy and frozen reference, one loss</text>
+    <rect x="15" y="182" width="105" height="64" rx="8" class="d-block"/>
+    <text x="67" y="210" text-anchor="middle" class="d-text-inv d-bold">preference</text>
+    <text x="67" y="229" text-anchor="middle" class="d-text-inv d-bold">pairs</text>
+    <path d="M120,214 L150,214" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="150" y="182" width="270" height="64" rx="8" class="d-block-2"/>
+    <text x="285" y="210" text-anchor="middle" class="d-text-inv d-bold">log π_θ and log π_ref</text>
+    <text x="285" y="229" text-anchor="middle" class="d-text-inv d-small">of y_w and y_l (reference can be cached)</text>
+    <path d="M420,214 L450,214" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="450" y="182" width="120" height="64" rx="8" class="d-block"/>
+    <text x="510" y="210" text-anchor="middle" class="d-text-inv d-bold">−log σ(β Δ)</text>
+    <text x="510" y="229" text-anchor="middle" class="d-text-inv d-small">Eq. 7</text>
+    <path d="M570,214 L600,214" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="600" y="182" width="185" height="64" rx="8" class="d-block"/>
+    <text x="692" y="210" text-anchor="middle" class="d-text-inv d-bold">gradient step</text>
+    <text x="692" y="229" text-anchor="middle" class="d-text-inv d-small">supervised-style training</text>
+
+    <rect x="15" y="272" width="770" height="62" rx="8" class="d-panel"/>
+    <rect x="30" y="287" width="14" height="14" rx="3" class="d-block-accent"/>
+    <text x="52" y="299" class="d-small">deleted by DPO: an explicit reward model, sampling from the policy during training, a value model</text>
+    <rect x="30" y="311" width="14" height="14" rx="3" class="d-block-2"/>
+    <text x="52" y="323" class="d-small">kept: preference pairs, a reference policy, and β, which carries the KL strength</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The RLHF pipeline of Modules 4 and 5 (top) against DPO (bottom). The three orange boxes are what DPO removes. The pairs, the reference policy and β remain; the reference log-probabilities can be precomputed once. Sources: DPO Figure 1 and §3-§4<a class="cite" href="#ref-1">1</a>; reference-log-prob caching, Tulu 3 §5.4.2<a class="cite" href="#ref-2">2</a>.</figcaption>
+</figure>
+
+<h2 id="what-dpo-removes">1. What DPO removes from the RLHF pipeline</h2>
+
+<h3 id="what-dpo-removes-stages">1.1 Three stages become one loss</h3>
+<p>The classical recipe you met in Modules 4 and 5 has three stages: supervised fine-tuning to get \(\pi_{\mathrm{SFT}}\), a reward model fit to preference pairs with a Bradley-Terry loss, and an RL stage that maximizes the learned reward minus a KL penalty to the SFT model<a class="cite" href="#ref-1">1</a> (§3). DPO keeps the first stage and the pairs, and replaces the other two with one loss computed on stored responses. The abstract states the consequence directly: no sampling from the language model during fine-tuning and no significant hyperparameter tuning<a class="cite" href="#ref-1">1</a>.</p>
+<p>The cost difference is measured. In Tulu 3's controlled comparison PPO took about 28 hours on two nodes and DPO about 4 hours on one, with roughly equal average scores<a class="cite" href="#ref-2">2</a> (§5.4.1); Module 5 §9.1 converts this to 14 times the node-hours. Tulu 3's production DPO runs took 10 hours on 8 H100 GPUs (8B) and 19 hours on 64 H100 GPUs (70B)<a class="cite" href="#ref-2">2</a>, which is 80 and 1,216 H100-hours (derived).</p>
+<p>What remains is a training loop of supervised-learning shape: per pair, the policy runs forward and backward on two sequences and the frozen reference runs forward on the same two. Tulu 3 takes the reference out of GPU memory by precomputing its log-probabilities once over the dataset, and runs chosen and rejected sequences in separate forward passes instead of one concatenated batch; the two changes gave near-identical training losses and lower peak memory<a class="cite" href="#ref-2">2</a> (§5.4.2, Figure 17). Lambert reports that caching alone cuts peak memory by 50%<a class="cite" href="#ref-3">3</a> (§8.3). The reference costs one extra forward pass over the dataset, not a standing second copy of the weights.</p>
+
+<h3 id="what-dpo-removes-kept">1.2 What the loss still needs, and what it never sees</h3>
+<p>Three things survive from the RLHF recipe. The pairs \((x, y_w, y_l)\) are still required, and they should come from or near the reference policy: the paper sets \(\pi_{\mathrm{ref}}=\pi_{\mathrm{SFT}}\) when the pairs were sampled from the SFT model, and otherwise fits \(\pi_{\mathrm{ref}}\) by maximum likelihood on the chosen responses to reduce the distribution shift<a class="cite" href="#ref-1">1</a> (§4). The reference policy is still the anchor of the KL term. And \(\beta\) is still the price of moving away from it (Module 6, Section 4.1); in DPO it is the scale inside the sigmoid, not a penalty added to a reward.</p>
+<p>What DPO never sees is any response the policy generates itself during training. Every probability the loss touches belongs to a response that was written down before training began. Sections 4 and 6 show that this one fact explains most of the method's failure modes and most of the evidence for online RL.</p>
+<aside class="callout callout-insight"><span class="callout-title">Key insight</span><p>DPO optimizes the same KL-regularized objective as RLHF, but only through the log-ratios of the responses in the dataset. Probability mass on any other response is constrained by normalization and by smoothness of the network, not by the loss. That is both why it is cheap and why it fails in the ways Section 4 lists.</p></aside>
+
+<h2 id="derivation">2. Deriving the loss</h2>
+
+<h3 id="derivation-chain">2.1 Five equations, in order</h3>
+<p>The derivation is a change of variables from rewards to policies. Start from the objective of Module 6, \(\max_\pi \mathbb E_{y\sim\pi}[r(x,y)]-\beta\,\mathrm{KL}(\pi\|\pi_{\mathrm{ref}})\) (Eq. 3 in the paper)<a class="cite" href="#ref-1">1</a>. Its maximizer, derived in Module 6 Section 1.2 and in Appendix A.1 of the paper, is \(\pi_r(y|x)=\pi_{\mathrm{ref}}(y|x)\,e^{r(x,y)/\beta}/Z(x)\) (Eq. 4), with \(Z(x)=\sum_y\pi_{\mathrm{ref}}(y|x)e^{r(x,y)/\beta}\). Taking logarithms and solving for the reward gives Eq. 5:</p>
+$$ r(x,y)=\beta\log\frac{\pi_r(y|x)}{\pi_{\mathrm{ref}}(y|x)}+\beta\log Z(x). $$
+<p>Eq. 5 is useless for a reward model by itself, because \(Z(x)\) sums over every possible response. The step that makes it usable is that Bradley-Terry depends only on the difference of two rewards for the same prompt (Module 4, Section 2.3). Substituting Eq. 5 into \(p^*(y_1\succ y_2|x)=\sigma(r^*(x,y_1)-r^*(x,y_2))\), the two \(\beta\log Z(x)\) terms are identical and cancel (Eq. 6; Appendix A.2)<a class="cite" href="#ref-1">1</a>. What is left is a preference probability written entirely in policies. Maximum likelihood over a parametrized policy \(\pi_\theta\) in place of the unknown optimal one gives Eq. 7, the DPO loss:</p>
+$$ \mathcal L_{\mathrm{DPO}}(\pi_\theta;\pi_{\mathrm{ref}})=-\mathbb E_{(x,y_w,y_l)\sim\mathcal D}\Big[\log\sigma\Big(\beta\log\tfrac{\pi_\theta(y_w|x)}{\pi_{\mathrm{ref}}(y_w|x)}-\beta\log\tfrac{\pi_\theta(y_l|x)}{\pi_{\mathrm{ref}}(y_l|x)}\Big)\Big]. $$
+
+<div class="stepper">
+  <figure class="fig fig-plain">
+    <svg viewBox="0 0 800 330" role="img" aria-label="Derivation chain from the KL-regularized objective to the DPO loss in five steps">
+      <defs>
+        <marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      </defs>
+      <g data-step="1">
+        <text x="15" y="34" class="d-mono d-text-light">Eq. 3</text>
+        <rect x="75" y="8" width="710" height="52" rx="8" class="d-surface"/>
+        <text x="90" y="30" class="d-mono">max_π  E[ r(x,y) ]  −  β · KL( π(·|x) ‖ π_ref(·|x) )</text>
+        <text x="90" y="49" class="d-small d-text-light">the RLHF objective for a reward r (Module 6, Section 1)</text>
+      </g>
+      <g data-step="2">
+        <path d="M430,60 L430,72" class="d-arrow" marker-end="url(#f2-arr)"/>
+        <text x="15" y="106" class="d-mono d-text-light">Eq. 4</text>
+        <rect x="75" y="72" width="710" height="52" rx="8" class="d-surface"/>
+        <text x="90" y="94" class="d-mono">π_r(y|x) = π_ref(y|x) · exp( r(x,y)/β ) / Z(x)</text>
+        <text x="90" y="113" class="d-small d-text-light">closed-form optimum; Z(x) = Σ_y π_ref · exp(r/β) depends on the prompt only</text>
+      </g>
+      <g data-step="3">
+        <path d="M430,124 L430,136" class="d-arrow" marker-end="url(#f2-arr)"/>
+        <text x="15" y="170" class="d-mono d-text-light">Eq. 5</text>
+        <rect x="75" y="136" width="710" height="52" rx="8" class="d-surface"/>
+        <text x="90" y="158" class="d-mono">r(x,y) = β · log[ π_r(y|x) / π_ref(y|x) ]  +  β · log Z(x)</text>
+        <text x="90" y="177" class="d-small d-text-light">invert: the reward is a log-ratio plus a term that depends on x alone</text>
+      </g>
+      <g data-step="4">
+        <path d="M430,188 L430,200" class="d-arrow" marker-end="url(#f2-arr)"/>
+        <text x="15" y="234" class="d-mono d-text-light">Eq. 6</text>
+        <rect x="75" y="200" width="710" height="52" rx="8" class="d-hl"/>
+        <text x="90" y="222" class="d-mono">p*(y1 ≻ y2) = σ( β log π*(y1)/π_ref(y1)  −  β log π*(y2)/π_ref(y2) )</text>
+        <text x="90" y="241" class="d-small">Bradley-Terry subtracts two rewards at the same x, so β · log Z(x) cancels</text>
+      </g>
+      <g data-step="5">
+        <path d="M430,252 L430,264 " class="d-arrow-active" marker-end="url(#f2-arr)"/>
+        <text x="15" y="298" class="d-mono d-text-light">Eq. 7</text>
+        <rect x="75" y="264" width="710" height="52" rx="8" class="d-block"/>
+        <text x="90" y="286" class="d-mono d-text-inv">L_DPO = −E log σ( β log π_θ(y_w)/π_ref(y_w)  −  β log π_θ(y_l)/π_ref(y_l) )</text>
+        <text x="90" y="305" class="d-small d-text-inv">maximum likelihood over the policy replaces fitting a separate reward model</text>
+      </g>
+    </svg>
+  </figure>
+  <ol class="steps">
+    <li><b>Objective.</b> The KL-regularized reward maximization every RLHF recipe uses, for any reward function.</li>
+    <li><b>Optimum.</b> The maximizer is the reference policy exponentially tilted by the reward.</li>
+    <li><b>Invert.</b> Solve the tilt for the reward: a scaled log-ratio plus a prompt-only normalizer.</li>
+    <li><b>Cancel.</b> Substituted into Bradley-Terry, the normalizer drops out because both responses share the prompt.</li>
+    <li><b>Fit.</b> Maximize the likelihood of the observed preferences over the policy itself.</li>
+  </ol>
+</div>
+<p class="small muted"><b>Figure 2.</b> The derivation chain, one equation per step. The numbering is the paper's<a class="cite" href="#ref-1">1</a> (§4, Appendix A.1-A.2).</p>
+
+<h3 id="derivation-cancel">2.2 Why cancelling \(Z\) loses nothing</h3>
+<p>Two reward functions that differ by \(f(x)\) are equivalent: they induce the same Bradley-Terry preference distribution (Lemma 1) and the same optimal policy (Lemma 2). Theorem 1 then states that every equivalence class contains exactly one reward of the form \(\beta\log\frac{\pi(y|x)}{\pi_{\mathrm{ref}}(y|x)}\), namely the one whose normalizer satisfies \(\sum_y\pi_{\mathrm{ref}}(y|x)e^{r(x,y)/\beta}=1\)<a class="cite" href="#ref-1">1</a> (§5.1, Appendix A.5-A.6). The reparameterization therefore does not restrict which preference distributions can be represented. It selects one representative per class, and because \(\pi_\theta\) is a normalized distribution, the constraint that picks the representative holds automatically.</p>
+<p>The guarantee has conditions: a Bradley-Terry data-generating process, a reference policy with \(\pi_{\mathrm{ref}}(y|x)&gt;0\) everywhere, and a policy class rich enough to hit the optimum<a class="cite" href="#ref-1">1</a> (§5.1, Theorem 1); the paper states consistency only "under suitable assumption of the preference data distribution"<a class="cite" href="#ref-1">1</a> (§4). A finite offline dataset covers a vanishing fraction of the response space, which is where Section 4 begins.</p>
+
+<h3 id="derivation-implicit-reward">2.3 The implicit reward is a sum of token log-ratios</h3>
+<p>The paper's title claim is that the language model is secretly a reward model: \(\hat r_\theta(x,y)=\beta\log\frac{\pi_\theta(y|x)}{\pi_{\mathrm{ref}}(y|x)}\)<a class="cite" href="#ref-1">1</a>. By the chain rule this is \(\beta\sum_t\log\frac{\pi_\theta(y_t|x,y_{&lt;t})}{\pi_{\mathrm{ref}}(y_t|x,y_{&lt;t})}\) (derived), a sum over tokens of the same log-ratio that is the k1 sample of \(\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})\) in Module 6, here evaluated on a stored response rather than a sampled one. Lambert stresses the reading: DPO is, at its core, learning a reward model, and the policy is how that reward is parametrized<a class="cite" href="#ref-3">3</a> (§8.1.1). The reference implementation returns these detached implicit rewards for logging<a class="cite" href="#ref-1">1</a> (Appendix B), and the fraction of pairs with \(\hat r_w>\hat r_l\) is the usual "reward accuracy" curve.</p>
+
+<h3 id="derivation-gradient">2.4 The gradient: a per-pair weight on a contrast</h3>
+<p>Differentiating Eq. 7 (Appendix A.4)<a class="cite" href="#ref-1">1</a> gives</p>
+$$ \nabla_\theta\mathcal L_{\mathrm{DPO}}=-\beta\,\mathbb E\Big[\underbrace{\sigma\big(\hat r_\theta(x,y_l)-\hat r_\theta(x,y_w)\big)}_{\text{larger when the implicit ordering is wrong}}\big(\nabla_\theta\log\pi_\theta(y_w|x)-\nabla_\theta\log\pi_\theta(y_l|x)\big)\Big]. $$
+<p>The structure is the one Module 4 derived for the Bradley-Terry reward-model gradient, with \(\nabla\hat r_\theta=\beta\nabla\log\pi_\theta\) in place of \(\nabla r_\theta\). Each pair raises the likelihood of \(y_w\) and lowers that of \(y_l\), scaled by \(\beta\) and by a weight in \((0,1)\) that is 0.5 at a tie. The paper reports that the weight matters: an unweighted likelihood-up, likelihood-down baseline produced meaningless text on summarization<a class="cite" href="#ref-1">1</a> (Appendix C.3). With \(\Delta=\log\frac{\pi_\theta(y_w)}{\pi_{\mathrm{ref}}(y_w)}-\log\frac{\pi_\theta(y_l)}{\pi_{\mathrm{ref}}(y_l)}\) in nats, the weight is \(\sigma(-\beta\Delta)\), and \(\beta\) sets how many nats of log-ratio gap a pair can absorb before it stops teaching.</p>
+<p><b>Worked pair (derived).</b> Take \(\beta=0.1\), a chosen response whose log-ratio is \(+2.0\) nats and a rejected one at \(-3.0\) nats. Then \(\Delta=5.0\), the margin inside the sigmoid is \(\beta\Delta=0.5\), the loss is \(-\log\sigma(0.5)=0.474\), and the weight is \(\sigma(-0.5)=0.378\). The step on \(\nabla\log\pi_\theta(y_w)\) is \(\beta\cdot0.378=0.0378\) times the learning rate. The weight falls to 0.1 when \(\beta\Delta=\ln 9=2.197\), i.e. at \(\Delta=22.0\) nats for \(\beta=0.1\) and \(\Delta=0.44\) nats for \(\beta=5\).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 340" role="img" aria-labelledby="f3t"><title id="f3t">DPO per-pair gradient weight sigma(-beta times Delta) against the log-ratio difference Delta in nats for beta 0.1, 0.5 and 5</title>
+    <defs><marker id="f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker></defs>
+    <line x1="70" y1="290.0" x2="770" y2="290.0" class="d-grid"/>
+    <text x="62" y="294.0" text-anchor="end" class="d-mono d-small">0</text>
+    <line x1="70" y1="225.0" x2="770" y2="225.0" class="d-grid"/>
+    <text x="62" y="229.0" text-anchor="end" class="d-mono d-small">0.25</text>
+    <line x1="70" y1="160.0" x2="770" y2="160.0" class="d-grid"/>
+    <text x="62" y="164.0" text-anchor="end" class="d-mono d-small">0.5</text>
+    <line x1="70" y1="95.0" x2="770" y2="95.0" class="d-grid"/>
+    <text x="62" y="99.0" text-anchor="end" class="d-mono d-small">0.75</text>
+    <line x1="70" y1="30.0" x2="770" y2="30.0" class="d-grid"/>
+    <text x="62" y="34.0" text-anchor="end" class="d-mono d-small">1</text>
+    <line x1="140.0" y1="30" x2="140.0" y2="290" class="d-grid"/>
+    <text x="140.0" y="307" text-anchor="middle" class="d-mono d-small">-20</text>
+    <line x1="280.0" y1="30" x2="280.0" y2="290" class="d-grid"/>
+    <text x="280.0" y="307" text-anchor="middle" class="d-mono d-small">-10</text>
+    <line x1="420.0" y1="30" x2="420.0" y2="290" class="d-grid"/>
+    <text x="420.0" y="307" text-anchor="middle" class="d-mono d-small">0</text>
+    <line x1="560.0" y1="30" x2="560.0" y2="290" class="d-grid"/>
+    <text x="560.0" y="307" text-anchor="middle" class="d-mono d-small">10</text>
+    <line x1="700.0" y1="30" x2="700.0" y2="290" class="d-grid"/>
+    <text x="700.0" y="307" text-anchor="middle" class="d-mono d-small">20</text>
+    <line x1="70" y1="290" x2="770" y2="290" class="d-axis"/>
+    <line x1="70" y1="30" x2="70" y2="290" class="d-axis"/>
+    <text x="420.0" y="328" text-anchor="middle" class="d-small d-text-light">Δ = chosen log-ratio − rejected log-ratio (nats)</text>
+    <text x="14" y="160.0" text-anchor="middle" transform="rotate(-90 14 160.0)" class="d-small d-text-light">gradient weight σ(−βΔ)</text>
+    <polyline points="70.0,49.7 77.0,50.7 84.0,51.6 91.0,52.6 98.0,53.7 105.0,54.8 112.0,55.9 119.0,57.1 126.0,58.4 133.0,59.7 140.0,61.0 147.0,62.4 154.0,63.8 161.0,65.3 168.0,66.9 175.0,68.5 182.0,70.2 189.0,71.9 196.0,73.7 203.0,75.5 210.0,77.4 217.0,79.4 224.0,81.4 231.0,83.5 238.0,85.7 245.0,87.9 252.0,90.2 259.0,92.5 266.0,94.9 273.0,97.4 280.0,99.9 287.0,102.5 294.0,105.2 301.0,107.9 308.0,110.6 315.0,113.4 322.0,116.3 329.0,119.2 336.0,122.1 343.0,125.1 350.0,128.2 357.0,131.2 364.0,134.3 371.0,137.5 378.0,140.6 385.0,143.8 392.0,147.0 392.7,147.4 393.4,147.7 394.1,148.0 394.8,148.3 395.5,148.7 396.2,149.0 396.9,149.3 397.6,149.6 398.3,149.9 399.0,150.3 399.0,150.3 399.7,150.6 400.4,150.9 401.1,151.2 401.8,151.6 402.5,151.9 403.2,152.2 403.9,152.5 404.6,152.9 405.3,153.2 406.0,153.5 406.0,153.5 406.7,153.8 407.4,154.2 408.1,154.5 408.8,154.8 409.5,155.1 410.2,155.5 410.9,155.8 411.6,156.1 412.3,156.4 413.0,156.8 413.0,156.8 413.7,157.1 414.4,157.4 415.1,157.7 415.8,158.1 416.5,158.4 417.2,158.7 417.9,159.0 418.6,159.4 419.3,159.7 420.0,160.0 420.0,160.0 420.7,160.3 421.4,160.6 422.1,161.0 422.8,161.3 423.5,161.6 424.2,161.9 424.9,162.3 425.6,162.6 426.3,162.9 427.0,163.2 427.0,163.2 427.7,163.6 428.4,163.9 429.1,164.2 429.8,164.5 430.5,164.9 431.2,165.2 431.9,165.5 432.6,165.8 433.3,166.2 434.0,166.5 434.0,166.5 434.7,166.8 435.4,167.1 436.1,167.5 436.8,167.8 437.5,168.1 438.2,168.4 438.9,168.8 439.6,169.1 440.3,169.4 441.0,169.7 441.0,169.7 441.7,170.1 442.4,170.4 443.1,170.7 443.8,171.0 444.5,171.3 445.2,171.7 445.9,172.0 446.6,172.3 447.3,172.6 448.0,173.0 448.0,173.0 455.0,176.2 462.0,179.4 469.0,182.5 476.0,185.7 483.0,188.8 490.0,191.8 497.0,194.9 504.0,197.9 511.0,200.8 518.0,203.7 525.0,206.6 532.0,209.4 539.0,212.1 546.0,214.8 553.0,217.5 560.0,220.1 567.0,222.6 574.0,225.1 581.0,227.5 588.0,229.8 595.0,232.1 602.0,234.3 609.0,236.5 616.0,238.6 623.0,240.6 630.0,242.6 637.0,244.5 644.0,246.3 651.0,248.1 658.0,249.8 665.0,251.5 672.0,253.1 679.0,254.7 686.0,256.2 693.0,257.6 700.0,259.0 707.0,260.3 714.0,261.6 721.0,262.9 728.0,264.1 735.0,265.2 742.0,266.3 749.0,267.4 756.0,268.4 763.0,269.3 770.0,270.3" class="d-line d-stroke-blue"/>
+    <polyline points="70.0,30.0 77.0,30.0 84.0,30.0 91.0,30.0 98.0,30.0 105.0,30.0 112.0,30.0 119.0,30.0 126.0,30.0 133.0,30.0 140.0,30.0 147.0,30.0 154.0,30.0 161.0,30.0 168.0,30.0 175.0,30.0 182.0,30.1 189.0,30.1 196.0,30.1 203.0,30.1 210.0,30.1 217.0,30.2 224.0,30.2 231.0,30.3 238.0,30.4 245.0,30.5 252.0,30.6 259.0,30.8 266.0,31.1 273.0,31.4 280.0,31.7 287.0,32.2 294.0,32.9 301.0,33.7 308.0,34.7 315.0,36.0 322.0,37.6 329.0,39.7 336.0,42.3 343.0,45.6 350.0,49.7 357.0,54.8 364.0,61.0 371.0,68.5 378.0,77.4 385.0,87.9 392.0,99.9 392.7,101.2 393.4,102.5 394.1,103.8 394.8,105.2 395.5,106.5 396.2,107.9 396.9,109.2 397.6,110.6 398.3,112.0 399.0,113.4 399.0,113.4 399.7,114.8 400.4,116.3 401.1,117.7 401.8,119.2 402.5,120.6 403.2,122.1 403.9,123.6 404.6,125.1 405.3,126.6 406.0,128.2 406.0,128.2 406.7,129.7 407.4,131.2 408.1,132.8 408.8,134.3 409.5,135.9 410.2,137.5 410.9,139.1 411.6,140.6 412.3,142.2 413.0,143.8 413.0,143.8 413.7,145.4 414.4,147.0 415.1,148.7 415.8,150.3 416.5,151.9 417.2,153.5 417.9,155.1 418.6,156.8 419.3,158.4 420.0,160.0 420.0,160.0 420.7,161.6 421.4,163.2 422.1,164.9 422.8,166.5 423.5,168.1 424.2,169.7 424.9,171.3 425.6,173.0 426.3,174.6 427.0,176.2 427.0,176.2 427.7,177.8 428.4,179.4 429.1,180.9 429.8,182.5 430.5,184.1 431.2,185.7 431.9,187.2 432.6,188.8 433.3,190.3 434.0,191.8 434.0,191.8 434.7,193.4 435.4,194.9 436.1,196.4 436.8,197.9 437.5,199.4 438.2,200.8 438.9,202.3 439.6,203.7 440.3,205.2 441.0,206.6 441.0,206.6 441.7,208.0 442.4,209.4 443.1,210.8 443.8,212.1 444.5,213.5 445.2,214.8 445.9,216.2 446.6,217.5 447.3,218.8 448.0,220.1 448.0,220.1 455.0,232.1 462.0,242.6 469.0,251.5 476.0,259.0 483.0,265.2 490.0,270.3 497.0,274.4 504.0,277.7 511.0,280.3 518.0,282.4 525.0,284.0 532.0,285.3 539.0,286.3 546.0,287.1 553.0,287.8 560.0,288.3 567.0,288.6 574.0,288.9 581.0,289.2 588.0,289.4 595.0,289.5 602.0,289.6 609.0,289.7 616.0,289.8 623.0,289.8 630.0,289.9 637.0,289.9 644.0,289.9 651.0,289.9 658.0,289.9 665.0,290.0 672.0,290.0 679.0,290.0 686.0,290.0 693.0,290.0 700.0,290.0 707.0,290.0 714.0,290.0 721.0,290.0 728.0,290.0 735.0,290.0 742.0,290.0 749.0,290.0 756.0,290.0 763.0,290.0 770.0,290.0" class="d-line d-stroke-cyan"/>
+    <polyline points="70.0,30.0 77.0,30.0 84.0,30.0 91.0,30.0 98.0,30.0 105.0,30.0 112.0,30.0 119.0,30.0 126.0,30.0 133.0,30.0 140.0,30.0 147.0,30.0 154.0,30.0 161.0,30.0 168.0,30.0 175.0,30.0 182.0,30.0 189.0,30.0 196.0,30.0 203.0,30.0 210.0,30.0 217.0,30.0 224.0,30.0 231.0,30.0 238.0,30.0 245.0,30.0 252.0,30.0 259.0,30.0 266.0,30.0 273.0,30.0 280.0,30.0 287.0,30.0 294.0,30.0 301.0,30.0 308.0,30.0 315.0,30.0 322.0,30.0 329.0,30.0 336.0,30.0 343.0,30.0 350.0,30.0 357.0,30.0 364.0,30.0 371.0,30.0 378.0,30.0 385.0,30.0 392.0,30.0 392.7,30.0 393.4,30.0 394.1,30.0 394.8,30.0 395.5,30.0 396.2,30.1 396.9,30.1 397.6,30.1 398.3,30.1 399.0,30.1 399.0,30.1 399.7,30.2 400.4,30.2 401.1,30.3 401.8,30.4 402.5,30.5 403.2,30.6 403.9,30.8 404.6,31.1 405.3,31.4 406.0,31.7 406.0,31.7 406.7,32.2 407.4,32.9 408.1,33.7 408.8,34.7 409.5,36.0 410.2,37.6 410.9,39.7 411.6,42.3 412.3,45.6 413.0,49.7 413.0,49.7 413.7,54.8 414.4,61.0 415.1,68.5 415.8,77.4 416.5,87.9 417.2,99.9 417.9,113.4 418.6,128.2 419.3,143.8 420.0,160.0 420.0,160.0 420.7,176.2 421.4,191.8 422.1,206.6 422.8,220.1 423.5,232.1 424.2,242.6 424.9,251.5 425.6,259.0 426.3,265.2 427.0,270.3 427.0,270.3 427.7,274.4 428.4,277.7 429.1,280.3 429.8,282.4 430.5,284.0 431.2,285.3 431.9,286.3 432.6,287.1 433.3,287.8 434.0,288.3 434.0,288.3 434.7,288.6 435.4,288.9 436.1,289.2 436.8,289.4 437.5,289.5 438.2,289.6 438.9,289.7 439.6,289.8 440.3,289.8 441.0,289.9 441.0,289.9 441.7,289.9 442.4,289.9 443.1,289.9 443.8,289.9 444.5,290.0 445.2,290.0 445.9,290.0 446.6,290.0 447.3,290.0 448.0,290.0 448.0,290.0 455.0,290.0 462.0,290.0 469.0,290.0 476.0,290.0 483.0,290.0 490.0,290.0 497.0,290.0 504.0,290.0 511.0,290.0 518.0,290.0 525.0,290.0 532.0,290.0 539.0,290.0 546.0,290.0 553.0,290.0 560.0,290.0 567.0,290.0 574.0,290.0 581.0,290.0 588.0,290.0 595.0,290.0 602.0,290.0 609.0,290.0 616.0,290.0 623.0,290.0 630.0,290.0 637.0,290.0 644.0,290.0 651.0,290.0 658.0,290.0 665.0,290.0 672.0,290.0 679.0,290.0 686.0,290.0 693.0,290.0 700.0,290.0 707.0,290.0 714.0,290.0 721.0,290.0 728.0,290.0 735.0,290.0 742.0,290.0 749.0,290.0 756.0,290.0 763.0,290.0 770.0,290.0" class="d-line d-stroke-orange"/>
+    <circle cx="727.6" cy="264.0" r="5" class="d-fill-blue"/>
+    <circle cx="426.2" cy="264.0" r="5" class="d-fill-orange"/>
+    <circle cx="490.0" cy="191.8" r="5" class="d-fill-amber"/>
+    <rect x="470" y="36" width="300" height="136" rx="6" class="d-label-bg"/>
+    <line x1="482" y1="56" x2="510" y2="56" class="d-line d-stroke-blue"/>
+    <text x="520" y="60" class="d-small">β = 0.1</text>
+    <line x1="482" y1="77" x2="510" y2="77" class="d-line d-stroke-cyan"/>
+    <text x="520" y="81" class="d-small">β = 0.5</text>
+    <line x1="482" y1="98" x2="510" y2="98" class="d-line d-stroke-orange"/>
+    <text x="520" y="102" class="d-small">β = 5</text>
+    <circle cx="496" cy="119" r="5" class="d-fill-blue"/>
+    <text x="520" y="123" class="d-small">β=0.1 reaches weight 0.1 at Δ = 22.0</text>
+    <circle cx="496" cy="140" r="5" class="d-fill-orange"/>
+    <text x="520" y="144" class="d-small">β=5 reaches weight 0.1 at Δ = 0.44</text>
+    <circle cx="496" cy="161" r="5" class="d-fill-amber"/>
+    <text x="520" y="165" class="d-small">worked pair: Δ = 5.0, weight 0.378</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> The per-pair weight \(\sigma(-\beta\Delta)\) on the DPO gradient against \(\Delta\), the chosen-minus-rejected change in log-ratio, in nats (derived from the gradient in Appendix A.4<a class="cite" href="#ref-1">1</a>). At \(\beta=0.1\) a pair keeps teaching until the gap reaches tens of nats; at \(\beta=5\) it saturates within a fraction of a nat. Length normalization (Section 3.2) moves a recipe along this axis.</figcaption>
+</figure>
+
+<h3 id="derivation-code">2.5 The loss as code</h3>
+<p>The implementation is short enough that the code is the clearest statement of what is computed. This version follows the paper's Appendix B<a class="cite" href="#ref-1">1</a>, with a token mask (Section 4.4) and the optional NLL term of Section 4.2 added, and with the reference log-probabilities passed in as cached values.</p>
+<pre class="code" data-lang="python" data-title="dpo_loss.py"><code>import torch
+import torch.nn.functional as F
+
+def seq_logp(logits, labels, mask):
+    # logits (B,T,V); labels, mask (B,T). mask is 1 on response tokens that count in the loss
+    lp = torch.log_softmax(logits.float(), dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    return (lp * mask).sum(-1)                      # log pi(y|x), summed over tokens
+
+def dpo_loss(pi_w, pi_l, ref_w, ref_l, beta=0.1, n_w=None, alpha=0.0):
+    # pi_*: (B,) policy sequence log-probs; ref_*: (B,) cached reference log-probs
+    delta = (pi_w - ref_w) - (pi_l - ref_l)         # log-ratio difference, nats
+    loss = -F.logsigmoid(beta * delta)              # Eq. 7; gradient weight is sigmoid(-beta * delta)
+    if alpha &gt; 0:                                   # NLL on the chosen sequence (Section 4.2)
+        loss = loss + alpha * (-pi_w / n_w)         # n_w = number of unmasked chosen tokens
+    r_w = (beta * (pi_w - ref_w)).detach()          # implicit rewards, for logging
+    r_l = (beta * (pi_l - ref_l)).detach()
+    return loss.mean(), r_w, r_l</code></pre>
+<p>Two details are easy to get wrong. The log-probabilities are sums over response tokens, not means, unless you are deliberately running the length-normalized variant (Section 3.2). And the reference pass must use the same tokenization, template and mask as the policy pass, or every \(\Delta\) shifts by a constant the loss will then try to undo.</p>
+
+<h2 id="settings">3. What you set: β, learning rate, the reference model and the data</h2>
+
+<h3 id="settings-table">3.1 Reported settings span two orders of magnitude in learning rate</h3>
+<p>The original paper's defaults are \(\beta=0.1\), batch size 64, RMSprop and a learning rate of \(10^{-6}\) with a 150-step linear warmup, with \(\beta=0.5\) for TL;DR summarization<a class="cite" href="#ref-1">1</a> (Appendix B). Lambert notes that the method only worked for the community after it found the right data and "surprisingly low learning rates"<a class="cite" href="#ref-3">3</a> (§8). Table 1 collects what the primary reports used since. Two patterns: the learning rate falls by more than two orders of magnitude from Llama 3 to Olmo 3 Think, and \(\beta\) jumps from 0.1 to 5 exactly when the loss changes from summed to length-normalized log-ratios (Section 3.2).</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 1.</b> Reported DPO settings, by recipe. "Sum" is the original loss on summed token log-ratios; "norm" divides each log-ratio by its response length. "n/s" means not stated in the cited section. Sources in the first column.</caption>
+  <thead><tr><th>Recipe</th><th>Loss form</th><th class="num">β</th><th class="num">Learning rate</th><th class="num">Batch</th><th>Other settings</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DPO paper, models ≤ 6B<a class="cite" href="#ref-1">1</a> (App. B)</td><td>sum</td><td class="num">0.1 (TL;DR 0.5)</td><td class="num">1e-6, RMSprop</td><td class="num">64</td><td>150-step warmup</td></tr>
+    <tr><td class="row">Llama 3, up to 405B<a class="cite" href="#ref-4">4</a> (§4.1.4)</td><td>sum + NLL</td><td class="num">0.1</td><td class="num">1e-5</td><td class="num">n/s</td><td>NLL coefficient 0.2 on chosen; formatting tokens masked; six rounds</td></tr>
+    <tr><td class="row">Tulu 3 8B<a class="cite" href="#ref-2">2</a> (Table 20)</td><td>norm</td><td class="num">5</td><td class="num">5e-7</td><td class="num">128</td><td>1 epoch, warmup ratio 0.1, max length 2,048</td></tr>
+    <tr><td class="row">Tulu 3 70B<a class="cite" href="#ref-2">2</a> (Table 20)</td><td>norm</td><td class="num">5</td><td class="num">2e-7</td><td class="num">128</td><td>as 8B; 19 h on 64 H100</td></tr>
+    <tr><td class="row">Olmo 3 Think 7B<a class="cite" href="#ref-5">5</a> (Table 48)</td><td>norm</td><td class="num">5</td><td class="num">8e-8</td><td class="num">128</td><td>150K pairs, 1 epoch, max length 16K, 32 GPUs</td></tr>
+    <tr><td class="row">Olmo 3 Think 32B<a class="cite" href="#ref-5">5</a> (Table 48)</td><td>norm</td><td class="num">5</td><td class="num">7e-8</td><td class="num">128</td><td>200K pairs, 1 epoch, max length 8K, 64-128 GPUs</td></tr>
+    <tr><td class="row">Olmo 3 Instruct 7B<a class="cite" href="#ref-5">5</a> (Table 48)</td><td>norm</td><td class="num">5</td><td class="num">1e-6</td><td class="num">128</td><td>260K pairs, 1 epoch, max length 16K, 16 GPUs</td></tr>
+    <tr><td class="row">Iterative RPO (GSM8K)<a class="cite" href="#ref-6">6</a> (§2, §3.1)</td><td>sum + NLL</td><td class="num">0.1</td><td class="num">7e-7, AdamW</td><td class="num">16</td><td>NLL coefficient 1; about 55-60k pairs per iteration; four iterations</td></tr>
+  </tbody>
+</table>
+
+<h3 id="settings-beta">3.2 What β means once log-ratios are divided by length</h3>
+<p>The length-normalized loss (Tulu 3 Eq. 6<a class="cite" href="#ref-2">2</a>; the Olmo 3 appendix writes the same form<a class="cite" href="#ref-5">5</a>, A.6.2) replaces each log-ratio by its per-token mean:</p>
+$$ \mathcal L_{\mathrm{DPO\text{-}norm}}=-\mathbb E\Big[\log\sigma\Big(\tfrac{\beta}{|y_w|}\log\tfrac{\pi_\theta(y_w|x)}{\pi_{\mathrm{ref}}(y_w|x)}-\tfrac{\beta}{|y_l|}\log\tfrac{\pi_\theta(y_l|x)}{\pi_{\mathrm{ref}}(y_l|x)}\Big)\Big]. $$
+<p>Two consequences follow (derived). First, \(\beta\) is only comparable across loss forms at a given length: \(\beta_{\mathrm{norm}}\) acts like a summed-form \(\beta_{\mathrm{sum}}=\beta_{\mathrm{norm}}/L\), so \(\beta_{\mathrm{norm}}=5\) equals the paper's 0.1 at \(L=50\) tokens. As an illustration only, Llama 3's preference data average 284.0 response tokens<a class="cite" href="#ref-4">4</a> (Table 6), which puts \(\beta_{\mathrm{norm}}=5\) at \(5/284=0.018\) on the summed scale; a pair then saturates (weight 0.1) at a mean per-token gap of \(\ln 9/5=0.44\) nats, about 125 nats of summed gap, against 22 nats at \(\beta_{\mathrm{sum}}=0.1\). Second, the per-token gradient on each response is \(\beta/|y|\) times the pair weight, so a rejected response twice as long as the chosen one is pushed down half as hard per token; in the summed form every token gets \(\beta\) times the weight regardless of length, and longer responses absorb more total gradient. Tulu 3 states the intent as mitigating the length bias common in human and model preferences<a class="cite" href="#ref-2">2</a> (§5.1).</p>
+
+<h3 id="settings-reference">3.3 The reference model and the SFT stage</h3>
+<p>DPO keeps the reference fixed at the SFT checkpoint, which makes it the anchor of the implicit KL (Module 6, Section 4.2 lists the alternatives). The evidence that this stage matters comes from the KTO paper: SFT "is always needed for best results with DPO", and DPO run without SFT on a base model rambles and hallucinates whole conversations, while KTO at 13B and 30B does not need SFT<a class="cite" href="#ref-7">7</a> (§1, §4.3, Figure 4). When training is iterated, the reference moves: Iterative RPO uses the previous iteration's model \(M_t\) as the reference for iteration \(t+1\)<a class="cite" href="#ref-6">6</a> (§2), and Xu et al.'s DPO-Iter sets the reference to the latest DPO model each round<a class="cite" href="#ref-8">8</a> (§4.3). With a cached reference pass (Section 1.1) that costs one forward pass over the new data per round.</p>
+
+<h3 id="settings-data">3.4 Pair construction: strength filters and synthetic judges</h3>
+<p>Llama 3's annotators rate preference strength on four levels (significantly better, better, slightly better, marginally better). For both reward modeling and DPO the team trains on pairs labeled significantly better or better and discards pairs with similar responses; reward modeling uses all preference data available, while DPO uses only the most recent batches<a class="cite" href="#ref-4">4</a> (§4.2.1). Tulu 3 builds 354,192 preference instances with an UltraFeedback-style pipeline: four responses per prompt from a pool of 22 models plus on-policy samples from the Tulu SFT model, rated 1 to 5 by GPT-4o-2024-08-06 on helpfulness, instruction following, truthfulness and honesty, then binarized<a class="cite" href="#ref-2">2</a> (§1, §5.2.1, Figure 7). Ivison et al. rank the factors: preference data quality gave the largest improvements, then the learning algorithm, then a better reward model, then extra unlabeled prompts<a class="cite" href="#ref-9">9</a> (abstract). Section 4 turns to what the loss itself does not control.</p>
+
+<h2 id="failure-modes">4. Failure modes, in the order they bite</h2>
+<p>The failures below share one cause: the loss sees only differences of log-ratios on stored responses, so anything it cannot see is left to the network's inductive bias. They are listed roughly by how early a practitioner meets them.</p>
+
+<h3 id="failure-null-space">4.1 The loss is flat along directions it cannot see</h3>
+<p>For one prompt with stored responses \(y_1\succ y_2\) and \(\pi_{\mathrm{ref}}(y_1)=\pi_{\mathrm{ref}}(y_2)\), Eq. 7 reduces to \(\log\big(1+(\pi(y_2)/\pi(y_1))^{\beta}\big)\) (derived): any change that keeps the ratio fixed leaves the loss untouched, whatever it does to every other response. Rafailov et al. give the general form. Written as logistic regression on vectors \(q_i=\mathbb 1_{(x,y_w)}-\mathbb 1_{(x,y_l)}\) over the prompt-response space, the data matrix has one row per pair and one column per possible (prompt, response), so its null space is enormous, and infinitely many minimizers put weight on responses absent from the data (Proposition 1, adapted from Hejna et al.)<a class="cite" href="#ref-10">10</a> (§4). Their minimal example, two conflicting pairs \(y_1\succ y_2\) and \(y_2\succ y_1\) plus an unseen \(y_3\), is minimized by both \((0.5,0.5,0)\) and \((0,0,1)\). Xu et al. give a one-pair version with \(\pi_{\mathrm{ref}}=(0.5,0.5,0)\), where \(\pi_{\mathrm{DPO}}=(0.1,0.0,0.9)\) attains the minimum but a PPO policy cannot leave the reference's support<a class="cite" href="#ref-8">8</a> (Table 1, §4.1).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 290" role="img" aria-labelledby="f4t"><title id="f4t">Three-response example: two policies with the same probability ratio between the chosen and rejected responses have identical DPO loss, but one places 0.901 on a response that appears in no pair</title>
+    <line x1="70" y1="250.0" x2="560" y2="250.0" class="d-grid"/>
+    <text x="62" y="254.0" text-anchor="end" class="d-mono d-small">0</text>
+    <line x1="70" y1="197.5" x2="560" y2="197.5" class="d-grid"/>
+    <text x="62" y="201.5" text-anchor="end" class="d-mono d-small">0.25</text>
+    <line x1="70" y1="145.0" x2="560" y2="145.0" class="d-grid"/>
+    <text x="62" y="149.0" text-anchor="end" class="d-mono d-small">0.5</text>
+    <line x1="70" y1="92.5" x2="560" y2="92.5" class="d-grid"/>
+    <text x="62" y="96.5" text-anchor="end" class="d-mono d-small">0.75</text>
+    <line x1="70" y1="40.0" x2="560" y2="40.0" class="d-grid"/>
+    <text x="62" y="44.0" text-anchor="end" class="d-mono d-small">1</text>
+    <line x1="70" y1="250" x2="560" y2="250" class="d-axis"/>
+    <text x="14" y="145.0" text-anchor="middle" transform="rotate(-90 14 145.0)" class="d-small d-text-light">probability</text>
+    <rect x="81" y="155.5" width="42" height="94.5" class="d-block-muted"/>
+    <text x="102" y="150.5" text-anchor="middle" class="d-mono d-small">0.45</text>
+    <rect x="129" y="61.0" width="42" height="189.0" class="d-fill-blue"/>
+    <text x="150" y="56.0" text-anchor="middle" class="d-mono d-small">0.9</text>
+    <rect x="177" y="231.1" width="42" height="18.9" class="d-fill-orange"/>
+    <text x="198" y="226.1" text-anchor="middle" class="d-mono d-small">0.09</text>
+    <text x="150" y="270" text-anchor="middle" class="d-small">y1 (chosen)</text>
+    <rect x="246" y="155.5" width="42" height="94.5" class="d-block-muted"/>
+    <text x="267" y="150.5" text-anchor="middle" class="d-mono d-small">0.45</text>
+    <rect x="294" y="231.1" width="42" height="18.9" class="d-fill-blue"/>
+    <text x="315" y="226.1" text-anchor="middle" class="d-mono d-small">0.09</text>
+    <rect x="342" y="248.1" width="42" height="1.9" class="d-fill-orange"/>
+    <text x="363" y="243.1" text-anchor="middle" class="d-mono d-small">0.009</text>
+    <text x="315" y="270" text-anchor="middle" class="d-small">y2 (rejected)</text>
+    <rect x="411" y="229.0" width="42" height="21.0" class="d-block-muted"/>
+    <text x="432" y="224.0" text-anchor="middle" class="d-mono d-small">0.1</text>
+    <rect x="459" y="247.9" width="42" height="2.1" class="d-fill-blue"/>
+    <text x="480" y="242.9" text-anchor="middle" class="d-mono d-small">0.01</text>
+    <rect x="507" y="60.8" width="42" height="189.2" class="d-fill-orange"/>
+    <text x="528" y="55.8" text-anchor="middle" class="d-mono d-small">0.901</text>
+    <text x="480" y="270" text-anchor="middle" class="d-small">y3 (not in data)</text>
+    <rect x="585" y="40" width="205" height="210" rx="8" class="d-panel"/>
+    <rect x="598" y="52" width="14" height="14" rx="3" class="d-block-muted"/>
+    <text x="620" y="64" class="d-small">π_ref</text>
+    <rect x="598" y="74" width="14" height="14" rx="3" class="d-fill-blue"/>
+    <text x="620" y="86" class="d-small">P1: KL 0.456 nats</text>
+    <rect x="598" y="96" width="14" height="14" rx="3" class="d-fill-orange"/>
+    <text x="620" y="108" class="d-small">P2: KL 1.801 nats</text>
+    <text x="598" y="140" class="d-small">π(y1)/π(y2) = 10 for P1 and P2</text>
+    <text x="598" y="160" class="d-small d-bold">DPO loss, β = 0.1: 0.5846</text>
+    <text x="598" y="180" class="d-small d-bold">DPO loss, β = 1: 0.0953</text>
+    <text x="598" y="200" class="d-small d-bold">identical for both policies</text>
+    <text x="598" y="220" class="d-small">P2 puts 0.901 on y3, a</text>
+    <text x="598" y="240" class="d-small">response no pair contains</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> A three-response example (constructed and computed here). The reference is (0.45, 0.45, 0.10) and the only pair is \(y_1\succ y_2\). P1 and P2 both have \(\pi(y_1)/\pi(y_2)=10\), so \(\mathcal L=\log(1+10^{-\beta})\) is identical for them (0.5846 at \(\beta=0.1\)); their KL to the reference differs by a factor of 3.9. Nothing in Eq. 7 prefers P1. The mechanism is the one in the null-space argument of Rafailov et al.<a class="cite" href="#ref-10">10</a> and the counterexample of Xu et al.<a class="cite" href="#ref-8">8</a>.</figcaption>
+</figure>
+
+<p>RLHF does not have this hole because its KL term is evaluated on responses sampled from the policy, so mass that moves to \(y_3\) is charged for; PPO can also use prompt-only data, and the KL regularizes those samples<a class="cite" href="#ref-8">8</a> (§4.1). What keeps the drift small in practice is a small learning rate, a preference set covering diverse domains, and the robustness of large models to new data, as SimPO's authors argue for a method with no reference at all<a class="cite" href="#ref-11">11</a> (§2.3). Where those fail, mass leaks: in Rafailov et al.'s tree-structured toy MDP with one pair, DPO, IPO and SLiC all put substantial mass on out-of-distribution trajectories while in-distribution probability falls<a class="cite" href="#ref-10">10</a> (§4, Figure 7).</p>
+<aside class="callout callout-critical"><span class="callout-title">Common error</span><p>Selecting checkpoints by training loss or implicit-reward accuracy. Rafailov et al. find that for DPO and SLiC, within one model size, neither the implicit-reward accuracy nor the loss shows a discernible relationship with downstream win rate<a class="cite" href="#ref-10">10</a> (§3.4, Figure 4). Evaluate generations.</p></aside>
+
+<h3 id="failure-displacement">4.2 Likelihood displacement: the chosen response gets less likely</h3>
+<p>The most-cited symptom is that \(\log\pi_\theta(y_w|x)\) decreases during DPO training while the margin grows. Pal et al. prove that the DPO loss can reduce the preferred response's likelihood as long as the preferred-to-dispreferred ratio increases, and show it empirically, especially when completions differ in few tokens<a class="cite" href="#ref-12">12</a> (abstract, §3): a shared prefix contributes nothing to \(\nabla\log\pi(y_w)-\nabla\log\pi(y_l)\), the differing token is pushed up, and the tokens after it can be pushed down (Figure 1). Tajwar et al. see the chosen response's induced reward fall as prompts grow relative to model capacity: Pythia-1.4B on AlpacaFarm lowers both responses, while Mistral-7B on UltraFeedback raises the chosen one, which they attribute to more distinct pairs<a class="cite" href="#ref-13">13</a> (§5.2.2, Figures 16-17). Razin et al. name it likelihood displacement, tie it to preferences with similar hidden embeddings (a centered hidden embedding similarity, CHES, score), and show it can be harmful: mass moves to responses with a different meaning, and refusal training lowered Llama-3-8B-Instruct's refusal rate from 74.4% to 33.4%<a class="cite" href="#ref-14">14</a> (abstract).</p>
+<p>Figure 5 reproduces the mechanism in a model small enough to inspect. Three responses have feature vectors \(\phi_w=(1,0)\), \(\phi_l=(0.8,0.3)\), \(\phi_o=(0.4,-1)\) and logits \(z_y=\theta\cdot\phi_y\), starting from \(\theta=0\) (uniform). The DPO gradient moves \(\theta\) along \(\phi_w-\phi_l\), which raises the logit of the "other" response \(o\) faster than that of \(y_w\), so \(o\) absorbs mass even though the margin grows.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 320" role="img" aria-labelledby="f5t"><title id="f5t">Toy log-linear model: under DPO alone the chosen log-probability falls from -1.10 to -4.00 while the margin grows to 2.87; adding a 0.1 NLL term on the chosen response keeps it rising to -0.25</title>
+    <line x1="70" y1="44.7" x2="770" y2="44.7" class="d-grid"/>
+    <text x="62" y="48.7" text-anchor="end" class="d-mono d-small">0</text>
+    <line x1="70" y1="103.4" x2="770" y2="103.4" class="d-grid"/>
+    <text x="62" y="107.4" text-anchor="end" class="d-mono d-small">-2</text>
+    <line x1="70" y1="162.2" x2="770" y2="162.2" class="d-grid"/>
+    <text x="62" y="166.2" text-anchor="end" class="d-mono d-small">-4</text>
+    <line x1="70" y1="220.9" x2="770" y2="220.9" class="d-grid"/>
+    <text x="62" y="224.9" text-anchor="end" class="d-mono d-small">-6</text>
+    <text x="70.0" y="282" text-anchor="middle" class="d-mono d-small">0</text>
+    <text x="303.3" y="282" text-anchor="middle" class="d-mono d-small">100</text>
+    <text x="536.7" y="282" text-anchor="middle" class="d-mono d-small">200</text>
+    <text x="770.0" y="282" text-anchor="middle" class="d-mono d-small">300</text>
+    <line x1="70" y1="265" x2="770" y2="265" class="d-axis"/>
+    <line x1="70" y1="30" x2="70" y2="265" class="d-axis"/>
+    <text x="420.0" y="301" text-anchor="middle" class="d-small d-text-light">gradient step</text>
+    <text x="14" y="147.5" text-anchor="middle" transform="rotate(-90 14 147.5)" class="d-small d-text-light">log probability (nats)</text>
+    <line x1="70" y1="77.0" x2="770" y2="77.0" class="d-axis d-dashed"/>
+    <polyline points="70.0,77.0 81.7,77.9 93.3,79.4 105.0,81.3 116.7,83.5 128.3,85.8 140.0,88.3 151.7,90.8 163.3,93.3 175.0,95.7 186.7,98.2 198.3,100.6 210.0,102.9 221.7,105.1 233.3,107.3 245.0,109.4 256.7,111.5 268.3,113.4 280.0,115.3 291.7,117.2 303.3,119.0 315.0,120.7 326.7,122.4 338.3,124.0 350.0,125.5 361.7,127.1 373.3,128.5 385.0,130.0 396.7,131.4 408.3,132.7 420.0,134.0 431.7,135.3 443.3,136.5 455.0,137.8 466.7,138.9 478.3,140.1 490.0,141.2 501.7,142.3 513.3,143.4 525.0,144.4 536.7,145.5 548.3,146.5 560.0,147.4 571.7,148.4 583.3,149.3 595.0,150.3 606.7,151.2 618.3,152.0 630.0,152.9 641.7,153.7 653.3,154.6 665.0,155.4 676.7,156.2 688.3,157.0 700.0,157.8 711.7,158.5 723.3,159.3 735.0,160.0 746.7,160.7 758.3,161.4 770.0,162.1" class="d-line d-stroke-blue"/>
+    <polyline points="70.0,77.0 81.7,82.5 93.3,88.3 105.0,94.1 116.7,99.9 128.3,105.6 140.0,111.2 151.7,116.6 163.3,121.8 175.0,126.9 186.7,131.7 198.3,136.4 210.0,140.8 221.7,145.1 233.3,149.2 245.0,153.1 256.7,156.8 268.3,160.5 280.0,163.9 291.7,167.3 303.3,170.5 315.0,173.6 326.7,176.6 338.3,179.5 350.0,182.3 361.7,185.0 373.3,187.7 385.0,190.2 396.7,192.7 408.3,195.1 420.0,197.4 431.7,199.6 443.3,201.8 455.0,204.0 466.7,206.0 478.3,208.1 490.0,210.0 501.7,212.0 513.3,213.9 525.0,215.7 536.7,217.5 548.3,219.2 560.0,220.9 571.7,222.6 583.3,224.3 595.0,225.9 606.7,227.4 618.3,229.0 630.0,230.5 641.7,232.0 653.3,233.4 665.0,234.8 676.7,236.2 688.3,237.6 700.0,238.9 711.7,240.3 723.3,241.6 735.0,242.8 746.7,244.1 758.3,245.3 770.0,246.5" class="d-line d-stroke-blue d-dashed"/>
+    <polyline points="70.0,77.0 81.7,76.7 93.3,76.6 105.0,76.4 116.7,76.1 128.3,75.8 140.0,75.3 151.7,74.7 163.3,74.0 175.0,73.3 186.7,72.5 198.3,71.7 210.0,70.9 221.7,70.0 233.3,69.2 245.0,68.4 256.7,67.6 268.3,66.8 280.0,66.0 291.7,65.3 303.3,64.6 315.0,63.9 326.7,63.3 338.3,62.7 350.0,62.1 361.7,61.5 373.3,61.0 385.0,60.5 396.7,60.0 408.3,59.5 420.0,59.1 431.7,58.6 443.3,58.2 455.0,57.8 466.7,57.5 478.3,57.1 490.0,56.8 501.7,56.5 513.3,56.2 525.0,55.9 536.7,55.6 548.3,55.3 560.0,55.1 571.7,54.8 583.3,54.6 595.0,54.4 606.7,54.2 618.3,54.0 630.0,53.8 641.7,53.6 653.3,53.4 665.0,53.2 676.7,53.0 688.3,52.9 700.0,52.7 711.7,52.6 723.3,52.4 735.0,52.3 746.7,52.1 758.3,52.0 770.0,51.9" class="d-line d-stroke-orange"/>
+    <polyline points="70.0,77.0 81.7,81.2 93.3,85.1 105.0,88.5 116.7,91.6 128.3,94.2 140.0,96.5 151.7,98.5 163.3,100.2 175.0,101.7 186.7,103.0 198.3,104.2 210.0,105.2 221.7,106.1 233.3,106.9 245.0,107.6 256.7,108.3 268.3,109.0 280.0,109.6 291.7,110.2 303.3,110.7 315.0,111.3 326.7,111.8 338.3,112.3 350.0,112.8 361.7,113.3 373.3,113.8 385.0,114.3 396.7,114.8 408.3,115.2 420.0,115.7 431.7,116.2 443.3,116.7 455.0,117.1 466.7,117.6 478.3,118.0 490.0,118.5 501.7,119.0 513.3,119.4 525.0,119.9 536.7,120.3 548.3,120.7 560.0,121.2 571.7,121.6 583.3,122.0 595.0,122.5 606.7,122.9 618.3,123.3 630.0,123.7 641.7,124.2 653.3,124.6 665.0,125.0 676.7,125.4 688.3,125.8 700.0,126.2 711.7,126.6 723.3,127.0 735.0,127.3 746.7,127.7 758.3,128.1 770.0,128.5" class="d-line d-stroke-orange d-dashed"/>
+    <text x="766.0" y="43.9" text-anchor="end" class="d-mono d-small">chosen -0.25</text>
+    <text x="766.0" y="120.5" text-anchor="end" class="d-mono d-small">rejected -2.85</text>
+    <text x="766.0" y="154.1" text-anchor="end" class="d-mono d-small">chosen -4.00</text>
+    <text x="766.0" y="262.5" text-anchor="end" class="d-mono d-small">rejected -6.87</text>
+    <rect x="88" y="204" width="320" height="58" rx="6" class="d-label-bg"/>
+    <line x1="100" y1="217" x2="126" y2="217" class="d-line d-stroke-blue"/>
+    <text x="134" y="221" class="d-small">chosen, DPO</text>
+    <line x1="100" y1="234" x2="126" y2="234" class="d-line d-stroke-blue d-dashed"/>
+    <text x="134" y="238" class="d-small">rejected, DPO</text>
+    <line x1="258" y1="217" x2="284" y2="217" class="d-line d-stroke-orange"/>
+    <text x="292" y="221" class="d-small">chosen, DPO + NLL</text>
+    <line x1="258" y1="234" x2="284" y2="234" class="d-line d-stroke-orange d-dashed"/>
+    <text x="292" y="238" class="d-small">rejected, DPO + NLL</text>
+    <line x1="100" y1="251" x2="126" y2="251" class="d-axis d-dashed"/>
+    <text x="134" y="255" class="d-small">reference, ln(1/3) = −1.099</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> Likelihood displacement in a constructed two-parameter model (computed here; \(\beta=1\), learning rate 0.5, 300 steps). Without the NLL term the chosen log-probability falls from −1.10 to −4.00 while the margin \(\beta\Delta\) rises to 2.87 and 98.1% of the mass moves to the response in neither slot. With a 0.1-weighted NLL term it rises to −0.25, the margin reaches 2.61 and the other response holds 16.0%. The toy illustrates the mechanism of Pal et al.<a class="cite" href="#ref-12">12</a> and Razin et al.<a class="cite" href="#ref-14">14</a>; it measures no LLM.</figcaption>
+</figure>
+
+<p>Three fixes have shipped. <b>An NLL term on the chosen sequence.</b> Llama 3 adds one with coefficient 0.2; the report says the term "helps further stabilize DPO training by maintaining desired formatting for generation and preventing the decrease of log probability of chosen responses"<a class="cite" href="#ref-4">4</a> (§4.1.4). Pang et al. use coefficient 1 with the term normalized by response length, and measure its value on GSM8K from Llama-2-70B-Chat: DPO on the iteration-1 pairs reaches 61.8%, DPO plus NLL after one iteration reaches 73.1% (Table 1), and the chosen log-probability falls under plain DPO but rises with the NLL term (Figure 3)<a class="cite" href="#ref-6">6</a> (§3.1). Their Figure 2 also shows why SFT on the chosen responses alone is not a substitute: it raises the rejected responses' probability along with the chosen ones. <b>A hinge on the chosen log-ratio.</b> DPO-Positive adds \(-\lambda\max\!\big(0,\log\frac{\pi_{\mathrm{ref}}(y_w)}{\pi_\theta(y_w)}\big)\) inside the sigmoid, which is zero until the chosen likelihood drops below the reference; the paper uses \(\beta=0.3,\ \lambda=50\)<a class="cite" href="#ref-12">12</a> (§4, §5). <b>Data filtering.</b> Razin et al. drop the pairs with the highest CHES scores and report that this mitigated the unalignment in their experiments<a class="cite" href="#ref-14">14</a> (abstract).</p>
+<p>Whether the falling likelihood is a defect at all is disputed. If \(\pi_{\mathrm{ref}}\) was fit by SFT on the chosen responses, the expected implicit reward of the chosen response is approximately \(-\mathrm{KL}(\pi_{\mathrm{ref}}\|\pi_\theta)\), which is non-positive by construction, and Rafailov et al. find win rate rising while it falls, until the over-optimization hump of Section 4.6<a class="cite" href="#ref-10">10</a> (§3.5, Eq. 7, Figure 5). The disagreement section returns to this.</p>
+
+<h3 id="failure-length">4.3 Length and verbosity</h3>
+<p>The DPO paper's own judge shows the hazard: with the simple prompt GPT-4 preferred longer, more repetitive summaries than humans did, so the headline numbers use a prompt that also asks for concision<a class="cite" href="#ref-1">1</a> (§6.4). Rafailov et al. relay that DPO-trained models grow longer during training without a matching rise in ground-truth win rate<a class="cite" href="#ref-10">10</a> (§2, §3.3, citing Park et al.), and the KTO authors see response length climb sharply when DPO is run without SFT<a class="cite" href="#ref-7">7</a> (Figure 4). SimPO adds a diagnosis: the DPO reward and the likelihood that decoding uses can disagree. On UltraFeedback training pairs with \(\hat r_w&gt;\hat r_l\), about half have a lower average log-likelihood for the chosen response, and the Spearman correlation between average log-likelihood and length is 0.82 for SimPO without length normalization, 0.59 for DPO and 0.34 for SimPO<a class="cite" href="#ref-11">11</a> (§2.2, §4.4, Table 6). Applied to DPO itself, length normalization raised AlpacaEval 2 length-controlled win rate from 15.1% to 21.0% on Mistral-Base, where the data have strong length bias, and lowered it from 26.8% to 21.7% on Mistral-Instruct, where winners and losers have similar lengths<a class="cite" href="#ref-11">11</a> (Appendix I, Table 15).</p>
+
+<h3 id="failure-format-tokens">4.4 Formatting tokens and tail repetition</h3>
+<p>Llama 3 masks header and termination tokens out of the DPO loss for both chosen and rejected responses, because letting them contribute produced tail repetition and abruptly generated termination tokens<a class="cite" href="#ref-4">4</a> (§4.1.4). The team's hypothesis is that common tokens in both responses give a conflicting objective, since the model must raise and lower their likelihood at once. The gradient makes this concrete (derived): a token with the same prefix in both responses cancels exactly in \(\nabla\log\pi(y_w)-\nabla\log\pi(y_l)\), but an end-of-turn token follows two different prefixes, so it is pushed up in \(y_w\) and down in \(y_l\) with nothing to cancel it. Masking the formatting tokens, as in the <code>mask</code> argument of Section 2.5, removes that term.</p>
+
+<h3 id="failure-deterministic">4.5 Deterministic preferences and the case for IPO</h3>
+<p>Azar et al. show that when a pair is always ordered the same way, Bradley-Terry requires the reward gap to diverge and the optimal policy gives the loser zero probability for any \(\beta\); with finite data an empirical preference of 1 can arise even when the true one is 0.8. RLHF is protected in practice because its reward model is under-fit, which regularizes the policy; DPO skips the reward model and loses that protection<a class="cite" href="#ref-15">15</a> (§4.2). IPO regresses the gap instead of maximizing a likelihood:</p>
+$$ \mathcal L_{\mathrm{IPO}}=\mathbb E\Big[\Big(\log\tfrac{\pi_\theta(y_w)\,\pi_{\mathrm{ref}}(y_l)}{\pi_\theta(y_l)\,\pi_{\mathrm{ref}}(y_w)}-\tfrac{1}{2\tau}\Big)^{2}\Big], $$
+<p>pulling the log-ratio gap to a finite target \(1/(2\tau)\) (Eq. 17)<a class="cite" href="#ref-15">15</a>; with \(\tau=0.1\) the target is 5 nats. The support is tabular, small bandit examples with two or three actions, not language models<a class="cite" href="#ref-15">15</a> (§5.3-§5.4). At LLM scale the evidence is mixed: Rafailov et al. find IPO less prone to over-optimization, with the 6.9B model showing little or none<a class="cite" href="#ref-10">10</a> (§3.1), while in SimPO's tuned comparison IPO trails DPO's AlpacaEval 2 length-controlled win rate in all four settings (11.8% against 15.1% on Mistral-Base)<a class="cite" href="#ref-11">11</a> (Table 4). Lambert lists conservative DPO (a label-noise assumption) with IPO as overfitting remedies<a class="cite" href="#ref-3">3</a> (§8.2).</p>
+
+<h3 id="failure-overopt">4.6 Over-optimization and a narrow stable region</h3>
+<p>DPO has its own version of reward over-optimization (Module 6, Section 5). Rafailov et al. trained Pythia 1B, 2.8B and 6.9B on Reddit TL;DR with DPO, IPO and SLiC at seven values of \(\beta\), scoring by GPT-4 win rate against the dataset summary. Every objective shows a hump: win rate rises and then falls as the KL budget grows, and the Gao et al. functional form \(R(d)=d(\alpha-\beta_{\mathrm{fit}}\log d)\) in \(d=\sqrt{\mathrm{KL}}\) fits the points<a class="cite" href="#ref-10">10</a> (§3.1-§3.2, Figure 1). The 1B model over-optimizes almost at once, and in the intra-epoch curves the best result arrives within the first 25% of an epoch for most settings, after which win rate declines while KL keeps rising (Figure 2).</p>
+<p>Tulu 3's hyperparameter table is the practitioner's view of the same hump. Figure 6 plots every row: one algorithm, length-normalized DPO, spans 46.8 to 57.3 across six settings, 10.5 points, and only two settings (56.1 and 57.3) beat the SFT checkpoint's 55.7. Moving from three epochs to one at \(\beta=5\) was worth 3.9 points (53.4 to 57.3)<a class="cite" href="#ref-2">2</a> (§5.4.1, Table 18).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 380" role="img" aria-labelledby="f6t"><title id="f6t">Tulu 3 hyperparameter and algorithm search on an early SFT checkpoint with UltraFeedback: average score for SimPO, DPO, PPO and length-normalized DPO settings, against the SFT base of 55.7</title>
+    <line x1="290.0" y1="30" x2="290.0" y2="328" class="d-grid"/>
+    <text x="290.0" y="344" text-anchor="middle" class="d-mono d-small">44</text>
+    <line x1="357.1" y1="30" x2="357.1" y2="328" class="d-grid"/>
+    <text x="357.1" y="344" text-anchor="middle" class="d-mono d-small">46</text>
+    <line x1="424.3" y1="30" x2="424.3" y2="328" class="d-grid"/>
+    <text x="424.3" y="344" text-anchor="middle" class="d-mono d-small">48</text>
+    <line x1="491.4" y1="30" x2="491.4" y2="328" class="d-grid"/>
+    <text x="491.4" y="344" text-anchor="middle" class="d-mono d-small">50</text>
+    <line x1="558.6" y1="30" x2="558.6" y2="328" class="d-grid"/>
+    <text x="558.6" y="344" text-anchor="middle" class="d-mono d-small">52</text>
+    <line x1="625.7" y1="30" x2="625.7" y2="328" class="d-grid"/>
+    <text x="625.7" y="344" text-anchor="middle" class="d-mono d-small">54</text>
+    <line x1="692.9" y1="30" x2="692.9" y2="328" class="d-grid"/>
+    <text x="692.9" y="344" text-anchor="middle" class="d-mono d-small">56</text>
+    <line x1="760.0" y1="30" x2="760.0" y2="328" class="d-grid"/>
+    <text x="760.0" y="344" text-anchor="middle" class="d-mono d-small">58</text>
+    <line x1="682.8" y1="30" x2="682.8" y2="328" class="d-axis d-dashed"/>
+    <text x="686.8" y="26" class="d-small d-text-light">SFT base 55.7</text>
+    <text x="280" y="56.0" text-anchor="end" class="d-small">SFT base</text>
+    <line x1="290.0" y1="52.0" x2="682.8" y2="52.0" class="d-axis"/>
+    <circle cx="682.8" cy="52.0" r="6" class="d-fill-amber"/>
+    <text x="693.8" y="56.0" class="d-mono d-small">55.7</text>
+    <text x="280" y="80.0" text-anchor="end" class="d-small">SimPO β=2, γ/β=0.5, 1 epoch</text>
+    <line x1="290.0" y1="76.0" x2="551.9" y2="76.0" class="d-axis"/>
+    <circle cx="551.9" cy="76.0" r="6" class="d-fill-cyan"/>
+    <text x="562.9" y="80.0" class="d-mono d-small">51.8</text>
+    <text x="280" y="104.0" text-anchor="end" class="d-small">SimPO β=10, γ/β=0.3, 1 epoch</text>
+    <line x1="290.0" y1="100.0" x2="588.8" y2="100.0" class="d-axis"/>
+    <circle cx="588.8" cy="100.0" r="6" class="d-fill-cyan"/>
+    <text x="599.8" y="104.0" class="d-mono d-small">52.9</text>
+    <text x="280" y="128.0" text-anchor="end" class="d-small">DPO β=0.1, 3 epochs</text>
+    <line x1="290.0" y1="124.0" x2="666.0" y2="124.0" class="d-axis"/>
+    <circle cx="666.0" cy="124.0" r="6" class="d-fill-blue"/>
+    <text x="677.0" y="128.0" class="d-mono d-small">55.2</text>
+    <text x="280" y="152.0" text-anchor="end" class="d-small">PPO β=0.0325, 1 epoch</text>
+    <line x1="290.0" y1="148.0" x2="642.5" y2="148.0" class="d-axis"/>
+    <circle cx="642.5" cy="148.0" r="6" class="d-fill-green"/>
+    <text x="653.5" y="152.0" class="d-mono d-small">54.5</text>
+    <text x="280" y="176.0" text-anchor="end" class="d-small">PPO β=0.05, 1 epoch</text>
+    <line x1="290.0" y1="172.0" x2="676.1" y2="172.0" class="d-axis"/>
+    <circle cx="676.1" cy="172.0" r="6" class="d-fill-green"/>
+    <text x="687.1" y="176.0" class="d-mono d-small">55.5</text>
+    <text x="280" y="200.0" text-anchor="end" class="d-small">DPO-norm β=5, lr 1e-7, 3 epochs</text>
+    <line x1="290.0" y1="196.0" x2="696.2" y2="196.0" class="d-axis"/>
+    <circle cx="696.2" cy="196.0" r="6" class="d-fill-orange"/>
+    <text x="707.2" y="200.0" class="d-mono d-small">56.1</text>
+    <text x="280" y="224.0" text-anchor="end" class="d-small">DPO-norm β=10, 3 epochs</text>
+    <line x1="290.0" y1="220.0" x2="666.0" y2="220.0" class="d-axis"/>
+    <circle cx="666.0" cy="220.0" r="6" class="d-fill-orange"/>
+    <text x="677.0" y="224.0" class="d-mono d-small">55.2</text>
+    <text x="280" y="248.0" text-anchor="end" class="d-small">DPO-norm β=15, 3 epochs</text>
+    <line x1="290.0" y1="244.0" x2="682.8" y2="244.0" class="d-axis"/>
+    <circle cx="682.8" cy="244.0" r="6" class="d-fill-orange"/>
+    <text x="693.8" y="248.0" class="d-mono d-small">55.7</text>
+    <text x="280" y="272.0" text-anchor="end" class="d-small">DPO-norm β=2, 3 epochs</text>
+    <line x1="290.0" y1="268.0" x2="384.0" y2="268.0" class="d-axis"/>
+    <circle cx="384.0" cy="268.0" r="6" class="d-fill-orange"/>
+    <text x="395.0" y="272.0" class="d-mono d-small">46.8</text>
+    <text x="280" y="296.0" text-anchor="end" class="d-small">DPO-norm β=5, 3 epochs</text>
+    <line x1="290.0" y1="292.0" x2="605.6" y2="292.0" class="d-axis"/>
+    <circle cx="605.6" cy="292.0" r="6" class="d-fill-orange"/>
+    <text x="616.6" y="296.0" class="d-mono d-small">53.4</text>
+    <text x="280" y="320.0" text-anchor="end" class="d-small">DPO-norm β=5, 1 epoch</text>
+    <line x1="290.0" y1="316.0" x2="736.5" y2="316.0" class="d-axis"/>
+    <circle cx="736.5" cy="316.0" r="6" class="d-fill-orange"/>
+    <text x="747.5" y="320.0" class="d-mono d-small">57.3</text>
+    <text x="525.0" y="364" text-anchor="middle" class="d-small d-text-light">Tulu 3 average score (axis starts at 44)</text>
+  </svg>
+  <figcaption><b>Figure 6.</b> Average score for each configuration in Tulu 3's preference-tuning search (UltraFeedback, early SFT checkpoint; Table 18<a class="cite" href="#ref-2">2</a>). The dashed line is the SFT base, 55.7. Length-normalized DPO (orange) ranges from 46.8 to 57.3 depending on \(\beta\) and epochs. DPO, SimPO and length-normalized DPO rows differ also in learning rate and batch size, as listed in the source table.</figcaption>
+</figure>
+
+<h2 id="variants">5. Variants: what each one changes</h2>
+
+<h3 id="variants-table">5.1 One table, with the same benchmark where it exists</h3>
+<p>Most variants change one of four things: the form of the loss on the log-ratio gap, whether a reference model is needed, how length enters, or what the data must look like. Table 2 lines them up. The two numeric columns come from the one paper that tuned DPO, IPO, KTO, ORPO and SimPO on the same data and judge (SimPO's Table 4). They are chat-benchmark numbers (AlpacaEval 2, length-controlled win rate) and say nothing about reasoning or safety.</p>
+
+<table class="tbl tbl-compare tbl-dense">
+  <caption><b>Table 2.</b> DPO and its variants. LC = AlpacaEval 2 length-controlled win rate (%) from the SimPO paper's tuned comparison, Mistral-7B-Base and Llama-3-8B-Base after UltraChat SFT and UltraFeedback preference tuning<a class="cite" href="#ref-11">11</a> (Table 4, Table 15). "n/r" = not reported there. Loss definitions: DPO<a class="cite" href="#ref-1">1</a>, IPO<a class="cite" href="#ref-15">15</a>, ORPO<a class="cite" href="#ref-16">16</a>, KTO<a class="cite" href="#ref-7">7</a>, DPOP<a class="cite" href="#ref-12">12</a>, NLL term<a class="cite" href="#ref-6">6</a>.</caption>
+  <thead><tr><th>Method</th><th>What changes</th><th>Data</th><th>Reference</th><th>Length</th><th class="num">LC Mistral</th><th class="num">LC Llama-3</th></tr></thead>
+  <tbody>
+    <tr><td class="row">SFT start</td><td>none</td><td>demonstrations</td><td>n/a</td><td>n/a</td><td class="num">8.4</td><td class="num">6.2</td></tr>
+    <tr><td class="row">DPO</td><td>logistic loss on summed log-ratio gap</td><td>pairs</td><td>yes (cacheable)</td><td>none; sums grow with length</td><td class="num">15.1</td><td class="num">18.2</td></tr>
+    <tr><td class="row">DPO, length-normalized</td><td>divide each log-ratio by \(|y|\)</td><td>pairs</td><td>yes</td><td>per-token mean</td><td class="num">21.0</td><td class="num">n/r</td></tr>
+    <tr><td class="row">R-DPO</td><td>adds a length term \(\alpha(|y_w|-|y_l|)\) to the margin</td><td>pairs</td><td>yes</td><td>explicit penalty</td><td class="num">17.4</td><td class="num">17.6</td></tr>
+    <tr><td class="row">DPO + NLL</td><td>adds \(\alpha\cdot\mathrm{NLL}(y_w)\)</td><td>pairs</td><td>yes</td><td>none</td><td class="num">n/r</td><td class="num">n/r</td></tr>
+    <tr><td class="row">DPOP</td><td>penalizes chosen log-ratio below 0 (\(\lambda=50\))</td><td>pairs</td><td>yes</td><td>none</td><td class="num">n/r</td><td class="num">n/r</td></tr>
+    <tr><td class="row">IPO</td><td>squared loss to gap \(1/(2\tau)\)</td><td>pairs</td><td>yes</td><td>none</td><td class="num">11.8</td><td class="num">14.4</td></tr>
+    <tr><td class="row">KTO</td><td>sigmoid utility of the reward against a KL reference point</td><td>binary labels</td><td>yes</td><td>none</td><td class="num">13.1</td><td class="num">14.2</td></tr>
+    <tr><td class="row">ORPO</td><td>SFT loss + log-odds-ratio term on per-token mean probabilities</td><td>pairs</td><td>no</td><td>per-token mean</td><td class="num">14.7</td><td class="num">12.2</td></tr>
+    <tr><td class="row">SimPO</td><td>mean log-prob as reward, margin \(\gamma\)</td><td>pairs</td><td>no</td><td>per-token mean</td><td class="num" data-best>21.5</td><td class="num" data-best>22.0</td></tr>
+  </tbody>
+</table>
+
+<p>The loss changes that act on the gradient weight (IPO, DPOP, the NLL term) target the failure modes of Section 4 and are mostly evaluated on those, not on chat win rates; the changes that act on the reward definition (length normalization, SimPO's reference-free reward, ORPO) are the ones that move AlpacaEval 2; and KTO changes the data contract.</p>
+
+<h3 id="variants-kto">5.2 KTO: learning from a binary signal</h3>
+<p>KTO starts from a different question: does the feedback have to be a pair? Ethayarajh et al. recast alignment losses as human-aware losses (HALOs), prove that DPO and PPO-Clip belong to the family, and derive a member from the Kahneman-Tversky value function<a class="cite" href="#ref-7">7</a> (§3, Theorem 3.5, §4.1). With \(r_\theta=\log\frac{\pi_\theta(y|x)}{\pi_{\mathrm{ref}}(y|x)}\) and a reference point \(z_0=\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})\), the loss is \(\mathbb E[\lambda_y-v(x,y)]\) with</p>
+$$ v(x,y)=\begin{cases}\lambda_D\,\sigma\big(\beta(r_\theta-z_0)\big)&y\text{ desirable}\\ \lambda_U\,\sigma\big(\beta(z_0-r_\theta)\big)&y\text{ undesirable.}\end{cases} $$
+<p>Every example is a single (prompt, response, label) triple, so n preference pairs become 2n examples, and a 1:10 imbalance of desirable to undesirable examples is handled by setting \(\lambda_D n_D/\lambda_U n_U\in[1,3/2]\). Because sampling from \(\pi_\theta\) is slow, \(z_0\) is estimated from mismatched (prompt, response) pairs within a microbatch of at least two, clamped at zero, with no gradient through it<a class="cite" href="#ref-7">7</a> (§4.1-§4.2). The recommended start is \(\beta=0.1\), batch size 8 to 128 and a learning rate of \(5\times10^{-6}\) with AdamW, 2 to 10 times DPO's, because the reference-adjusted reward is smaller<a class="cite" href="#ref-7">7</a> (§4.2).</p>
+<p>The reported results are strong on the authors' benchmarks: SFT+KTO matches SFT+DPO from 1B to 30B on GPT-4-judged win rate, matches DPO with up to 90% fewer desirable examples, and on Zephyr-β-SFT with UltraFeedback raises GSM8K from 40.0 to 53.5 and BBH from 44.1 to 52.6 over DPO (Table 2)<a class="cite" href="#ref-7">7</a> (§4.3). The authors' explanations: an example's gradient vanishes as its implied reward goes to either extreme (Proposition 4.1), so mislabeled and intransitive feedback is effectively ignored, and under contradictory preferences DPO can favor the minority answer when the reference is unaligned (Theorem 4.3). With low-noise, transitive preferences they expect DPO to do better, since KTO risks underfitting<a class="cite" href="#ref-7">7</a> (§4.4-§4.5). The v5 revision of 8 September 2026 changed proofs and wording, not the empirical results<a class="cite" href="#ref-7">7</a> (Acknowledgements).</p>
+
+<h3 id="variants-evidence">5.3 Reference-free variants, and what independent comparisons found</h3>
+<p>SimPO defines the reward as the length-normalized average log-probability, \(r(x,y)=\frac{\beta}{|y|}\log\pi_\theta(y|x)\), and trains \(-\log\sigma(r_w-r_l-\gamma)\) with a target margin \(\gamma\) and no reference model<a class="cite" href="#ref-11">11</a> (§2.2-§2.3, Eq. 6), with tuned \(\beta\in\{2,2.5\}\) and \(\gamma\) between 0.3 and 1.6 (Table 8). It reports gains over DPO of up to 6.4 points on AlpacaEval 2 and 7.5 on Arena-Hard, notes that a higher learning rate lifted chat scores at the cost of forgetting on GSM8K and MMLU, and shows every baseline other than R-DPO trailing DPO's length-controlled win rate in all four settings (abstract, Table 4, Appendix J). ORPO folds SFT and an odds-ratio term into one reference-free stage, \(\mathcal L=\mathcal L_{\mathrm{SFT}}+\lambda\,\mathcal L_{\mathrm{OR}}\) with \(\mathcal L_{\mathrm{OR}}=-\log\sigma\big(\log\frac{\mathrm{odds}_\theta(y_w)}{\mathrm{odds}_\theta(y_l)}\big)\)<a class="cite" href="#ref-16">16</a> (§4.1-§4.2), and reports 11.33% and 12.20% on AlpacaEval 2.0 for two Mistral-7B models after one epoch on UltraFeedback (§5-§6.1).</p>
+<p>Independent runs are less generous. Tulu 3 tried SimPO at two settings and got 51.8 and 52.9 against an SFT base of 55.7, and found that only length-normalized DPO beat the base overall<a class="cite" href="#ref-2">2</a> (§5.4.1, Table 18). The KTO paper's own comparison puts ORPO (\(\lambda=0.1\)) below the SFT starting point on GSM8K, 36.5 against 39.0<a class="cite" href="#ref-7">7</a> (Table 2). Lambert's reading is that the algorithm is a second-order choice: "the choice of algorithm is far less important than the initial model and the data used"<a class="cite" href="#ref-3">3</a> (§8.2). What survives these sources: start with DPO; use the length-normalized form when chosen responses are systematically longer; add the NLL term when chosen likelihood falls or the task is reasoning-like; reach for KTO when labels are binary; treat SimPO and ORPO as methods that need their own hyperparameter search, not drop-in upgrades.</p>
+
+<h2 id="on-policy-data">6. Offline versus on-policy preference data</h2>
+
+<h3 id="on-policy-mismatch">6.1 When the data stop describing the policy</h3>
+<p>DPO's pairs are written before training starts, by the SFT model or a pool of other models; as the policy moves, they describe a distribution it no longer samples from. Xu et al. isolate the effect on SafeRLHF with Llama-2-7B trained on Alpaca: DPO lifts the safe-response rate from 41.6% to only 55.4% where PPO reaches 99.5%; SFT on the safe responses first, so the reference sits closer to the data, lifts DPO to 71.8%; and regenerating responses, labeling them with a learned reward model, and repeating with the latest DPO model as reference ("DPO-Iter") reaches 86.7% after one round and 99.9% after three<a class="cite" href="#ref-8">8</a> (§4.3, Table 2). Table 3 gives all rows, including the cost: DPO-Iter's helpfulness change stays near −3 while PPO's is +1.69.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 3.</b> Xu et al.'s SafeRLHF experiment, Llama-2-7B trained on Alpaca then aligned. Helpfulness and harmfulness are reward-model score changes (higher helpfulness is better, lower harmfulness is better); "+" rows are labeled as in the source<a class="cite" href="#ref-8">8</a> (Table 2).</caption>
+  <thead><tr><th>Setting</th><th class="num">Δ helpfulness</th><th class="num">Δ harmfulness</th><th class="num">Safe rate (%)</th></tr></thead>
+  <tbody>
+    <tr><td class="row">SFT (Alpaca)</td><td class="num">−2.62</td><td class="num">1.50</td><td class="num">41.6</td></tr>
+    <tr><td class="row">PPO</td><td class="num">1.69</td><td class="num" data-best>−12.08</td><td class="num">99.5</td></tr>
+    <tr><td class="row">DPO</td><td class="num" data-worst>−4.19</td><td class="num">−0.97</td><td class="num">55.4</td></tr>
+    <tr><td class="row">DPO, + SFT (Safe) as reference</td><td class="num">−1.62</td><td class="num">−3.50</td><td class="num">71.8</td></tr>
+    <tr><td class="row">DPO, + filter dual-unsafe pairs</td><td class="num" data-best>2.46</td><td class="num">−4.88</td><td class="num">80.8</td></tr>
+    <tr><td class="row">DPO, + filter dual-safe pairs</td><td class="num">−2.86</td><td class="num">−6.82</td><td class="num">95.8</td></tr>
+    <tr><td class="row">DPO-Iter, round 1</td><td class="num">−3.22</td><td class="num">−5.23</td><td class="num">86.7</td></tr>
+    <tr><td class="row">DPO-Iter, round 2</td><td class="num">−3.27</td><td class="num">−8.83</td><td class="num">99.7</td></tr>
+    <tr><td class="row">DPO-Iter, round 3</td><td class="num">−3.26</td><td class="num">−10.21</td><td class="num" data-best>99.9</td></tr>
+    <tr><td class="row">DPO-Iter, round 4</td><td class="num">−2.96</td><td class="num">−11.07</td><td class="num" data-best>99.9</td></tr>
+  </tbody>
+</table>
+
+<p>Two further studies agree. Tajwar et al. find across bandit, synthetic and full-scale problems that on-policy sampling and a negative gradient (pushing probability down on bad responses, as DPO's contrastive term does) each beat offline maximum likelihood and are complementary; on-policy DPO and IPO converge faster and to better solutions than offline DPO and on-policy RL in their synthetic length tasks, though they stop short of saying on-policy DPO always beats PPO<a class="cite" href="#ref-13">13</a> (abstract, §5.1-§5.3). The benefit concentrates where the reward peak lies in a low-probability region of the reference; where it lies in a high-probability region, offline supervised methods can suffice. Tang et al. measure at equal KL budget in a Gao-style gold-reward setup (Module 6) and find online algorithms a Pareto improvement over offline ones, with the gap surviving contrastive and non-contrastive losses and not closed by scaling the policy; offline policies were better pairwise classifiers but worse generators, and the one working fix was generating the data close to the starting policy<a class="cite" href="#ref-17">17</a> (abstract, §1, §6).</p>
+
+<h3 id="on-policy-llama3">6.2 Llama 3: iterate, and use only the newest batches</h3>
+<p>Llama 3 is the large-scale answer. Each of six rounds collects fresh preference annotations by sampling two responses from two different models, with the best models of the previous round doing the sampling; reward-model training uses all preference data collected so far, while DPO uses only the newest batches. The report's reasoning: "As a result, our training data conforms better to the distribution of the policy model that is being optimized in each round"<a class="cite" href="#ref-4">4</a> (§4.1.4, §4.1.6, §4.2.1). Models are also averaged within each stage (§4.1.5). The team also tried PPO and found that DPO "required less compute for large-scale models and performed better, especially on instruction following benchmarks like IFEval"<a class="cite" href="#ref-4">4</a> (§4.1.4). The report gives no PPO numbers.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 350" role="img" aria-labelledby="f7t"><title id="f7t">Offline DPO on a fixed dataset against Llama 3's six-round loop in which each round's preference data are sampled from the best models of the previous round</title>
+    <defs>
+      <marker id="f7-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+      <marker id="f7-arra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker-active"/></marker>
+    </defs>
+    <text x="15" y="24" class="d-title">Offline DPO: one fixed dataset</text>
+    <rect x="15" y="38" width="200" height="62" rx="8" class="d-block-muted"/>
+    <text x="115" y="64" text-anchor="middle" class="d-bold">pairs from π_SFT</text>
+    <text x="115" y="84" text-anchor="middle" class="d-small">or a pool of other models</text>
+    <path d="M215,69 L255,69" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <rect x="255" y="38" width="170" height="62" rx="8" class="d-block"/>
+    <text x="340" y="64" text-anchor="middle" class="d-text-inv d-bold">DPO, 1-3 epochs</text>
+    <text x="340" y="84" text-anchor="middle" class="d-text-inv d-small">reference = π_SFT</text>
+    <path d="M425,69 L465,69" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <rect x="465" y="38" width="120" height="62" rx="8" class="d-block-2"/>
+    <text x="525" y="74" text-anchor="middle" class="d-text-inv d-bold">policy</text>
+    <text x="605" y="62" class="d-small d-text-light">the policy never writes</text>
+    <text x="605" y="80" class="d-small d-text-light">its own training data</text>
+    <line x1="15" y1="128" x2="785" y2="128" class="d-grid"/>
+    <text x="15" y="156" class="d-title">Llama 3: six rounds, each sampled from the latest models</text>
+    <rect x="15" y="172" width="150" height="64" rx="8" class="d-block"/>
+    <text x="90.0" y="199" text-anchor="middle" class="d-text-inv d-bold">sample two responses</text>
+    <text x="90.0" y="219" text-anchor="middle" class="d-text-inv d-small">from two different models</text>
+    <path d="M165,204 L180,204" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <rect x="180" y="172" width="150" height="64" rx="8" class="d-block"/>
+    <text x="255.0" y="199" text-anchor="middle" class="d-text-inv d-bold">annotators rate</text>
+    <text x="255.0" y="219" text-anchor="middle" class="d-text-inv d-small">strength, then edit</text>
+    <path d="M330,204 L345,204" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <rect x="345" y="172" width="165" height="64" rx="8" class="d-block"/>
+    <text x="427.5" y="199" text-anchor="middle" class="d-text-inv d-bold">keep significantly</text>
+    <text x="427.5" y="219" text-anchor="middle" class="d-text-inv d-small">better and better pairs</text>
+    <path d="M510,204 L525,204" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <rect x="525" y="172" width="150" height="64" rx="8" class="d-block-accent"/>
+    <text x="600.0" y="199" text-anchor="middle" class="d-text-inv d-bold">SFT, then DPO on</text>
+    <text x="600.0" y="219" text-anchor="middle" class="d-text-inv d-small">the newest batches</text>
+    <path d="M675,204 L690,204" class="d-arrow" marker-end="url(#f7-arr)"/>
+    <rect x="690" y="172" width="95" height="64" rx="8" class="d-block"/>
+    <text x="737.5" y="199" text-anchor="middle" class="d-text-inv d-bold">average</text>
+    <text x="737.5" y="219" text-anchor="middle" class="d-text-inv d-small">models</text>
+    <path d="M737.5,236 L737.5,276 L90.0,276 L90.0,238" class="d-arrow-active" marker-end="url(#f7-arra)"/>
+    <text x="410" y="268" text-anchor="middle" class="d-small">round k+1 samples from the best round-k models: ×6</text>
+    <rect x="15" y="296" width="770" height="44" rx="8" class="d-panel"/>
+    <text x="30" y="316" class="d-small">Reward-model training uses all preference data collected so far; DPO uses only the newest batches.</text>
+    <text x="30" y="333" class="d-small">PPO was tried and dropped: DPO needed less compute at scale and did better on IFEval.</text>
+  </svg>
+  <figcaption><b>Figure 7.</b> Offline DPO (top) and the iterated loop Llama 3 describes (bottom). The loop is not online RL: each round's data are collected in a batch and used for many steps; what changes is that the sampling policy tracks the training policy at the granularity of a round. Sources: Llama 3 §4.1.4, §4.1.6, §4.2.1<a class="cite" href="#ref-4">4</a>.</figcaption>
+</figure>
+
+<h3 id="on-policy-delta">6.3 The contrast matters more than either response</h3>
+<p>On-policy pairs are one theory of what makes DPO data work. Olmo 3 and SmolLM3 support another, delta learning: the quality of a pair depends mainly on the gap between chosen and rejected, not on either response alone. Both took chosen responses from Qwen3-32B and rejected ones from Qwen3-0.6B, developed concurrently and independently<a class="cite" href="#ref-3">3</a> (§8.4). Olmo 3 shows why the framing is useful. Continued SFT of a development 7B SFT checkpoint on the Qwen3-32B chosen responses lowered the 10-benchmark average from 70.3 to 64.5; DPO preferring those same responses over Qwen3-0.6B's raised it to 72.9, 8.4 points above SFT on the same chosen data (derived)<a class="cite" href="#ref-5">5</a> (§4.5, Table 21). The authors conjecture that the 32B responses are weaker than what the model has already seen, so imitation no longer helps while the contrast still does. A single 7B run then found DPO a better start for RLVR than SFT alone: 74.1 for SFT+DPO+RLVR against 71.9 for SFT+RLVR (Table 22)<a class="cite" href="#ref-5">5</a> (§4.5).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 290" role="img" aria-labelledby="f8t"><title id="f8t">Olmo 3 delta learning: average benchmark score of the chosen and rejected generators, the 7B SFT checkpoint, continued SFT on the chosen responses, and DPO with chosen over rejected</title>
+    <line x1="280.0" y1="18" x2="280.0" y2="244" class="d-grid"/>
+    <text x="280.0" y="260" text-anchor="middle" class="d-mono d-small">0</text>
+    <line x1="376.0" y1="18" x2="376.0" y2="244" class="d-grid"/>
+    <text x="376.0" y="260" text-anchor="middle" class="d-mono d-small">20</text>
+    <line x1="472.0" y1="18" x2="472.0" y2="244" class="d-grid"/>
+    <text x="472.0" y="260" text-anchor="middle" class="d-mono d-small">40</text>
+    <line x1="568.0" y1="18" x2="568.0" y2="244" class="d-grid"/>
+    <text x="568.0" y="260" text-anchor="middle" class="d-mono d-small">60</text>
+    <line x1="664.0" y1="18" x2="664.0" y2="244" class="d-grid"/>
+    <text x="664.0" y="260" text-anchor="middle" class="d-mono d-small">80</text>
+    <line x1="760.0" y1="18" x2="760.0" y2="244" class="d-grid"/>
+    <text x="760.0" y="260" text-anchor="middle" class="d-mono d-small">100</text>
+    <line x1="280" y1="18" x2="280" y2="244" class="d-axis"/>
+    <text x="270" y="47.0" text-anchor="end" class="d-small">Qwen3 32B (chosen)</text>
+    <rect x="280" y="30.0" width="399.4" height="26" rx="3" class="d-block-muted"/>
+    <text x="687.4" y="48.0" class="d-mono d-small">83.2</text>
+    <text x="270" y="91.0" text-anchor="end" class="d-small">Qwen3 0.6B (rejected)</text>
+    <rect x="280" y="74.0" width="168.5" height="26" rx="3" class="d-block-muted"/>
+    <text x="456.5" y="92.0" class="d-mono d-small">35.1</text>
+    <text x="270" y="135.0" text-anchor="end" class="d-small">Dev. 7B SFT checkpoint</text>
+    <rect x="280" y="118.0" width="337.4" height="26" rx="3" class="d-fill-blue"/>
+    <text x="625.4" y="136.0" class="d-mono d-small">70.3</text>
+    <text x="270" y="179.0" text-anchor="end" class="d-small">continued SFT on the chosen</text>
+    <rect x="280" y="162.0" width="309.6" height="26" rx="3" class="d-fill-red"/>
+    <text x="597.6" y="180.0" class="d-mono d-small">64.5</text>
+    <text x="270" y="223.0" text-anchor="end" class="d-small">DPO: 32B chosen over 0.6B rejected</text>
+    <rect x="280" y="206.0" width="349.9" height="26" rx="3" class="d-fill-orange"/>
+    <text x="637.9" y="224.0" class="d-mono d-small">72.9</text>
+    <text x="520.0" y="280" text-anchor="middle" class="d-small d-text-light">average over 10 reasoning, knowledge and instruction benchmarks (0-100)</text>
+  </svg>
+  <figcaption><b>Figure 8.</b> Olmo 3 development 7B SFT checkpoint, average over ten benchmarks (MMLU, BBH, GPQA, Zebra, AGI, AIME 2025, AIME 2024, CHE, LCB, IFEval, with the source's column names). Imitating the Qwen3-32B responses hurts the 70.3 checkpoint; preferring them over Qwen3-0.6B's helps. Data: Table 21<a class="cite" href="#ref-5">5</a>. Module 31 treats the full Olmo 3 recipe.</figcaption>
+</figure>
+
+<p>The same logic, with a verifier choosing the pairs, is Iterative Reasoning Preference Optimization: sample 30 chain-of-thought solutions per problem, form ten winner-loser pairs per problem with correct answers as winners and incorrect ones as losers, train DPO plus NLL, and repeat from the new model. On GSM8K from Llama-2-70B-Chat the four iterations score 73.1%, 78.0%, 81.1% and 81.6%, against 55.6% zero-shot and 63.5% for SFT on gold solutions; the per-iteration gains of 17.5, 4.9, 3.1 and 0.5 points show saturation on a fixed prompt set<a class="cite" href="#ref-6">6</a> (§3.1, Table 1). This is offline-in-rounds learning from a binary outcome signal. Modules 9 and 10 treat the online version, in which the policy is updated on every batch of its own samples.</p>
+
+<h2 id="unified-view">7. DeepSeekMath's view: one gradient, different data and coefficients</h2>
+<p>DeepSeekMath writes SFT, rejection-sampling fine-tuning (RFT), DPO, PPO and GRPO as one gradient, \(\nabla_\theta\mathcal J_{\mathcal A}=\mathbb E_{(q,o)\sim\mathcal D}\big[\tfrac1{|o|}\sum_t GC_{\mathcal A}(q,o,t,\pi_{rf})\,\nabla_\theta\log\pi_\theta(o_t|q,o_{&lt;t})\big]\), and says the methods differ in three things: the data source \(\mathcal D\), the reward function \(\pi_{rf}\), and the algorithm that turns reward into the gradient coefficient \(GC\)<a class="cite" href="#ref-18">18</a> (§5.2.1, Eq. 5). Table 4 reproduces their summary for the rows relevant here. DPO's coefficient is the pair weight of Section 2.4, \(\sigma(\hat r_l-\hat r_w)\) (their Eq. 14), and their Eq. 12 writes the DPO objective with \(1/|o|\) averaging of the log-ratios, i.e. in the length-normalized form of Section 3.2.</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> Data source, reward and gradient coefficient for the methods of this module and its neighbours, from DeepSeekMath's Table 10<a class="cite" href="#ref-18">18</a>. \(P_{sft}\) is the SFT question distribution; \(\pi_{sft}\) the SFT model; \(\pi_\theta\) the policy being trained.</caption>
+  <thead><tr><th>Method</th><th>Data source</th><th>Reward</th><th>Gradient coefficient</th><th>Data</th><th>Sign</th></tr></thead>
+  <tbody>
+    <tr><td class="row">SFT</td><td>\(q,o\sim P_{sft}\)</td><td>none (human selection)</td><td>1</td><td>offline</td><td>positive</td></tr>
+    <tr><td class="row">RFT</td><td>\(q\sim P_{sft},\ o\sim\pi_{sft}\)</td><td>rule</td><td>\(\mathbb 1[\text{correct}]\)</td><td>offline</td><td>positive</td></tr>
+    <tr><td class="row">DPO</td><td>\(q\sim P_{sft},\ o^+,o^-\sim\pi_{sft}\)</td><td>preference (rule in math)</td><td>\(\sigma(\hat r_l-\hat r_w)\), Eq. 14</td><td>offline</td><td>signed pair</td></tr>
+    <tr><td class="row">Online RFT</td><td>\(q\sim P_{sft},\ o\sim\pi_\theta\)</td><td>rule</td><td>\(\mathbb 1[\text{correct}]\)</td><td>online</td><td>positive</td></tr>
+    <tr><td class="row">PPO</td><td>\(q\sim P_{sft},\ o\sim\pi_\theta\)</td><td>reward model</td><td>advantage, Eq. 18</td><td>online</td><td>signed</td></tr>
+    <tr><td class="row">GRPO</td><td>\(q\sim P_{sft},\ \{o_i\}\sim\pi_\theta\)</td><td>reward model</td><td>group-relative advantage, Eq. 21</td><td>online</td><td>signed</td></tr>
+  </tbody>
+</table>
+
+<p>The last two columns are added here, and they organize Section 6: the two ingredients Tajwar et al. found complementary, on-policy sampling and a negative gradient, are the two axes. RFT is offline and non-negative, Online RFT online and non-negative, DPO offline and signed, PPO and GRPO online and signed. DeepSeekMath's measurements fall on the same axes: Online RFT matches RFT early, when "the actor and the SFT model exhibit close resemblance", and pulls ahead as the policy's samples diverge; GRPO beats Online RFT because its coefficient penalizes incorrect answers while Online RFT "does not penalize incorrect responses"<a class="cite" href="#ref-18">18</a> (§5.2.1, Figure 5, DeepSeekMath-Instruct 1.3B). "Online DPO", which samples pairs from the current policy and labels them, fills the remaining cell, online and signed with a pairwise coefficient<a class="cite" href="#ref-3">3</a> (§8.2). GRPO itself is Module 9.</p>
+
+<h2 id="evidence">8. The evidence ledger: what supports "DPO is enough"</h2>
+<p>Module 5 Section 9.2 (Table 6) lists the head-to-head PPO and DPO-family studies one row each. Table 5 is organized by claim, so that the evidence on both sides can be read together. Cost has the least dissent: 28 hours against 4 hours in Tulu 3's controlled setup is 7 times (derived), or 14 times in node-hours<a class="cite" href="#ref-2">2</a> (§5.4.1), and Llama 3 reports less compute for DPO at its scale<a class="cite" href="#ref-4">4</a> (§4.1.4).</p>
+
+<table class="tbl tbl-compare">
+  <caption><b>Table 5.</b> Claims about DPO against the evidence for and against them. Numbers are as reported; setups differ, so compare within a row only.</caption>
+  <thead><tr><th>Claim</th><th>Evidence for</th><th>Evidence against or limiting</th></tr></thead>
+  <tbody>
+    <tr><td class="row">DPO matches or beats PPO-RLHF on preference tuning</td><td>TL;DR with GPT-J: DPO about 61% win rate at temperature 0.0 against PPO's 57% at its best temperature; human raters preferred DPO samples 58% of the time<a class="cite" href="#ref-1">1</a> (§6.2). Llama 3 found DPO better on IFEval<a class="cite" href="#ref-4">4</a>. Tulu 3: PPO reached a comparable but slightly lower average in an untuned setup<a class="cite" href="#ref-2">2</a> (§5.4.1).</td><td>Xu et al.: PPO ahead on every testbed, from dialogue to code<a class="cite" href="#ref-8">8</a>. Ivison et al.: PPO ahead by up to 2.5% on math and 1.2% in general domains<a class="cite" href="#ref-9">9</a>. The paper's own authors note that β was not meaningfully tuned and models were ≤ 6B<a class="cite" href="#ref-1">1</a> (§6.2, §7).</td></tr>
+    <tr><td class="row">DPO generalizes out of distribution as well as PPO</td><td>Summarization policies moved to CNN/DailyMail: GPT-4 win rate against ground truth 0.36 (DPO) against 0.26 (PPO) at temperature 0, and 0.31 against 0.23 at 0.25<a class="cite" href="#ref-1">1</a> (§6.3, Table 1).</td><td>Distribution shift between reference and pairs is DPO's weak point: 55.4% against PPO's 99.5% safe rate until the mismatch is repaired<a class="cite" href="#ref-8">8</a> (Table 2); online algorithms are a Pareto improvement at equal KL<a class="cite" href="#ref-17">17</a>.</td></tr>
+    <tr><td class="row">DPO suffices for tasks with verifiable outcomes</td><td>DPO plus NLL on verifier-labeled pairs lifts GSM8K from 55.6% to 81.6% over four iterations<a class="cite" href="#ref-6">6</a> (Table 1). Olmo 3 reports DPO before RLVR as a better start than SFT alone<a class="cite" href="#ref-5">5</a> (Table 22).</td><td>CodeContests test 10@1k with CodeLlama-34B: SFT 15.2%, DPO 0.0%, DPO-Iter 3.2%, PPO with test-case rewards 22.4%<a class="cite" href="#ref-8">8</a> (Table 8). Tulu 3 kept DPO for preference iteration and used PPO for RLVR<a class="cite" href="#ref-2">2</a> (§5.4.1). Iterative RPO's gains shrink to 0.5 points by round four<a class="cite" href="#ref-6">6</a>.</td></tr>
+    <tr><td class="row">Online or on-policy data are necessary</td><td>Tajwar et al., Tang et al. and Xu et al. (Section 6.1); DPO-Iter closes most of the safety gap in Table 3.</td><td>Delta learning gains came from fixed pairs generated by other models<a class="cite" href="#ref-5">5</a>; Llama 3's rounds are batch-collected, not online<a class="cite" href="#ref-4">4</a>. Tajwar et al. say offline supervised methods can suffice when the reward peak lies in a high-probability region of the reference<a class="cite" href="#ref-13">13</a>.</td></tr>
+    <tr><td class="row">A better variant loss improves results</td><td>SimPO: up to +6.4 AlpacaEval 2 and +7.5 Arena-Hard over DPO<a class="cite" href="#ref-11">11</a>. KTO: +13.5 GSM8K over DPO on Zephyr-β-SFT<a class="cite" href="#ref-7">7</a>.</td><td>Tulu 3: only length-normalized DPO beat the base<a class="cite" href="#ref-2">2</a>. In SimPO's own table most variants trail DPO. Data quality ranks above the algorithm<a class="cite" href="#ref-9">9</a>.</td></tr>
+  </tbody>
+</table>
+
+<p>The ledger has a shape. DPO's advantages are cost and simplicity, and they are real. The evidence against it is concentrated in two regimes: when the reference and the pairs are mismatched, and when the objective is a hard verifiable outcome. In the regime where most DPO is actually used, chat-style preference tuning from a strong SFT checkpoint with well-built pairs, the differences between DPO and tuned PPO are a few points, and Ivison et al. rank them below the effect of the preference data<a class="cite" href="#ref-9">9</a>.</p>
+
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>The primary disagreement is whether offline DPO is enough or online RL is needed for preference tuning. Three more sit under it: whether the loss or the data is the lever, whether a falling chosen likelihood is a defect, and whether the variants beat DPO at all (Section 5.3). The studies below use different stacks, which is part of the problem.</p>
+<div class="positions">
+  <article class="position">
+    <h4>DPO-family methods are the right default</h4>
+    <p class="who">Llama 3 team, Tulu 3 authors, Lambert's practical advice<a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-2">2</a><a class="cite" href="#ref-3">3</a></p>
+    <p>Llama 3 chose a simple post-training loop over RL algorithms that "tend to be less stable and harder to scale", tried PPO, and kept DPO for compute and IFEval reasons<a class="cite" href="#ref-4">4</a> (§1, §4.1.4). Tulu 3 measured PPO at about 7 times the wall-clock for a comparable average and spent the savings on data iteration<a class="cite" href="#ref-2">2</a> (§5.4.1). Lambert advises starting with direct alignment on synthetic preferences<a class="cite" href="#ref-3">3</a> (§8.4).</p>
+    <ul class="pros"><li>Seven times cheaper in wall-clock in the one controlled measurement; stable at 405B.</li><li>Fast data iteration, with cacheable reference log-probs.</li></ul>
+    <ul class="cons"><li>Llama 3 publishes no PPO numbers and Tulu 3's PPO was untuned, so neither shows a ceiling.</li><li>Both recipes carry patches (NLL term, token masking, length normalization, one epoch), so "simple" describes the loss, not the recipe.</li></ul>
+  </article>
+  <article class="position">
+    <h4>Online RL wins, and the gap is structural</h4>
+    <p class="who">Xu et al., Tang et al., Tajwar et al.; Lambert's book<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-17">17</a><a class="cite" href="#ref-13">13</a><a class="cite" href="#ref-3">3</a></p>
+    <p>The loss is flat off the data's support (Section 4.1), the pairs go stale as the policy moves (Section 6.1), and hard verifiable tasks expose both: DPO scored 0.0% on CodeContests where PPO scored 22.4%<a class="cite" href="#ref-8">8</a> (Table 8). Tang et al. find a Pareto gap at equal KL that scaling the policy does not close<a class="cite" href="#ref-17">17</a>. Lambert writes that "despite the simplicity of alternatives, RL-based methods continue to win out"<a class="cite" href="#ref-3">3</a> (§3.1.6).</p>
+    <ul class="pros"><li>Theory (a proper-subset result in Xu et al.) and experiments agree across three groups.</li><li>Fits why Tulu 3 and Olmo 3 end their pipelines with RLVR.</li></ul>
+    <ul class="cons"><li>The strongest numbers pair a heavily tuned PPO with a DPO lacking an NLL term, length control or iteration.</li><li>Tang et al. use a gold-reward synthetic setup; no source here has a matched comparison at 70B and up on human preferences.</li></ul>
+  </article>
+  <article class="position">
+    <h4>The loss is second-order; the pairs are the lever</h4>
+    <p class="who">Ivison et al., Olmo 3 authors, Lambert<a class="cite" href="#ref-9">9</a><a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-3">3</a></p>
+    <p>Ivison et al. find preference data quality gives the largest gains, ahead of the algorithm, the reward model and extra prompts<a class="cite" href="#ref-9">9</a>. Olmo 3 turns a response set that hurts under SFT into a gain under DPO by choosing the rejected side<a class="cite" href="#ref-5">5</a> (Table 21). Lambert writes that the algorithm matters far less than the initial model and the data<a class="cite" href="#ref-3">3</a> (§8.2).</p>
+    <ul class="pros"><li>Consistent across independent groups and the variant comparisons of Section 5.3.</li><li>Actionable: build pairs with a large capability delta or from on-policy samples.</li></ul>
+    <ul class="cons"><li>"Good data" has two competing definitions, on-policy (Tulu 3) and large delta (Olmo 3, SmolLM3), which Lambert presents as separate theories<a class="cite" href="#ref-3">3</a> (§8.4).</li><li>No study here varies data and algorithm jointly at scale.</li></ul>
+  </article>
+  <article class="position">
+    <h4>A falling chosen likelihood is a bug to patch, or it is expected</h4>
+    <p class="who">Pal et al., Razin et al., Pang et al., Llama 3 against Rafailov et al.<a class="cite" href="#ref-12">12</a><a class="cite" href="#ref-14">14</a><a class="cite" href="#ref-6">6</a><a class="cite" href="#ref-10">10</a></p>
+    <p>The first group patches it (NLL term, DPOP, CHES filtering) and shows harm: a refusal rate falling from 74.4% to 33.4%<a class="cite" href="#ref-14">14</a>, GSM8K at 61.8% without the NLL term against 73.1% with it<a class="cite" href="#ref-6">6</a>. Rafailov et al. argue that after SFT on the chosen responses a negative implied reward is the expected sign, and that win rate rises while it falls, until the over-optimization hump<a class="cite" href="#ref-10">10</a> (§3.5).</p>
+    <ul class="pros"><li>The patch is cheap, and Llama 3 and Pang et al. report it helps.</li><li>The skeptical view fits the DPO objectives of Tulu 3 and Olmo 3, which carry no NLL term in the cited sections.</li></ul>
+    <ul class="cons"><li>The harm is shown for near-duplicate pairs (Pal et al.) and refusal data (Razin et al.).</li><li>Rafailov et al. measured TL;DR summarization at 1B to 6.9B; the NLL gains are on a reasoning task.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>Both camps are right inside their regimes. For chat, instruction-following and safety tuning from a strong SFT start with well-built pairs, a patched DPO is the efficient default: length normalization when chosen responses run long, token masking, one epoch, early stopping judged on generations, and an NLL term when the chosen log-ratio falls and the task is reasoning-like. The measured gap to tuned PPO there is a few points and ranks below the effect of the data<a class="cite" href="#ref-9">9</a>. Online or verifier-driven RL wins where the target is a hard verifiable outcome, where reference and pairs cannot be kept matched by iteration, or where the goal is to move beyond the support of the data. Chosen-likelihood decline is a monitor, not a verdict: log it, and patch when downstream behavior degrades in the way Razin et al. describe. What would settle the primary question is a matched-compute, matched-data comparison with both sides tuned, at 70B or larger, scored on held-out human preferences and on verifiable tasks, reporting KL and the chosen-likelihood trace. No source here contains one. Module 33 turns this into a decision procedure.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>DPO's role has moved from "the alignment method" to one stage in a longer pipeline. Olmo 3 runs SFT, then length-normalized DPO on delta-learning pairs, then RLVR, and reports DPO as the better start for RL<a class="cite" href="#ref-5">5</a> (§4.5). Lambert expects that as reasoning models are trained mainly with RL, investment will return to RL for preference tuning, widening the margin over direct alignment<a class="cite" href="#ref-3">3</a> (§8.5). Whether a DPO stage expands what the model can solve, as Olmo 3 claims from improved pass@k on AIME<a class="cite" href="#ref-5">5</a> (§4.5, Figure 20), or only sharpens it, is the question of Module 20. The critic-free online methods of Modules 9 to 12 occupy the cell Section 7 left open: online data with a signed coefficient and no value model. The evidence here is dated: the controlled comparisons are from 2023 to 2024, the production reports from 2024 to 2025, and the KTO paper was revised as late as September 2026, so treat any single number as a snapshot of one stack.</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Rafailov, R., Sharma, A., Mitchell, E., Ermon, S., Manning, C. D., Finn, C. <em>Direct Preference Optimization: Your Language Model is Secretly a Reward Model</em>. NeurIPS 2023; arXiv v3, 29 Jul 2024. <a href="https://arxiv.org/pdf/2305.18290v3">https://arxiv.org/pdf/2305.18290v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Eqs. 3-7 and the derivations in Appendix A.1-A.6; Lemmas 1-2 and Theorem 1 (§5.1); gradient (Appendix A.4); defaults and the PyTorch loss (Appendix B); TL;DR 61% against 57% and the human study (§6.2, §6.4); CNN/DailyMail transfer (Table 1); the unlikelihood baseline (Appendix C.3).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S., et al. <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv v5, 14 Apr 2025 (v1 22 Nov 2024). <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Length-normalized DPO (Eq. 6); the algorithm and hyperparameter search (§5.4.1, Table 18); final settings (Table 20); PPO about 28 h on two nodes against DPO about 4 h on one; reference log-prob caching and separate forward passes (§5.4.2, Figure 17); the 354,192-instance preference pipeline (§1, §5.2.1).</span></li>
+  <li id="ref-3"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback</em> (RLHF Book). arXiv v12, 11 Sep 2026; web edition built 14 Oct 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Chapter 8: the implicit-reward reading (§8.1.1), variants and preference displacement (§8.2), reference caching (§8.3), delta learning and synthetic preferences (§8.4), DAAs against RL (§8.5); the RL stance in §3.1.6.</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Grattafiori, A., Dubey, A., Jauhri, A., et al. (Llama Team, AI @ Meta). <em>The Llama 3 Herd of Models</em>. arXiv v3, 23 Nov 2024 (v1 31 Jul 2024). <a href="https://arxiv.org/pdf/2407.21783v3">https://arxiv.org/pdf/2407.21783v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Design stance (§1); DPO settings, token masking, NLL coefficient 0.2 and the PPO comparison (§4.1.4); six rounds (§4.1.6); preference-data strength levels and filtering (§4.2.1); response-length statistics (Table 6).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Olmo Team (Ettinger, A., Bertsch, A., et al.). <em>Olmo 3</em>. arXiv v2, 14 Apr 2026 (v1 15 Dec 2025). <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Delta learning and the Dolci Think DPO data (§4.3, §4.5); Tables 21 and 22; length-normalized DPO loss and hyperparameters (Appendix A.6.2, Table 48).</span></li>
+  <li id="ref-6"><span class="ref-type">paper</span>Pang, R. Y., Yuan, W., Cho, K., He, H., Sukhbaatar, S., Weston, J. <em>Iterative Reasoning Preference Optimization</em>. arXiv v3, 26 Jun 2024. <a href="https://arxiv.org/abs/2404.19733">https://arxiv.org/abs/2404.19733</a>. Accessed 2026-10-27. <span class="ref-use">Used for: The DPO plus NLL loss and iteration scheme (§2); hyperparameters and GSM8K results (§3.1, Table 1, Figures 2-3).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Ethayarajh, K., Xu, W., Muennighoff, N., Jurafsky, D., Kiela, D. <em>KTO: Model Alignment as Prospect Theoretic Optimization</em>. ICML 2024; arXiv v5, 8 Sep 2026. <a href="https://arxiv.org/abs/2402.01306">https://arxiv.org/abs/2402.01306</a>. Accessed 2026-10-27. <span class="ref-use">Used for: HALO definition and Theorem 3.5 (§3); the KTO loss and KL estimate (§4.1); hyperparameters (§4.2); results, Table 2 and Figure 4 (§4.3); Proposition 4.1, Theorem 4.3 and the DPO-or-KTO guidance (§4.4-§4.5). Full text read; the source map had the abstract only.</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Xu, S., Fu, W., Gao, J., Ye, W., et al. <em>Is DPO Superior to PPO for LLM Alignment? A Comprehensive Study</em>. ICML 2024; arXiv v3, 10 Oct 2024. <a href="https://arxiv.org/abs/2404.10719">https://arxiv.org/abs/2404.10719</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Three-action counterexample and the proper-subset theorem (Table 1, §4.1); SafeRLHF distribution-shift and DPO-Iter results (Table 2, §4.3); APPS and CodeContests results (Tables 7-8).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>Ivison, H., Wang, Y., Liu, J., Wu, Z., et al. <em>Unpacking DPO and PPO: Disentangling Best Practices for Learning from Preference Feedback</em>. NeurIPS 2024; arXiv v2, 7 Oct 2024. <a href="https://arxiv.org/abs/2406.09279">https://arxiv.org/abs/2406.09279</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Ranking of factors (data, algorithm, reward model, prompts) and the PPO margins of 2.5% (math) and 1.2% (general), from the abstract.</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Rafailov, R., Chittepu, Y., Park, R., Sikchi, H., Hejna, J., Knox, W. B., Finn, C., Niekum, S. <em>Scaling Laws for Reward Model Overoptimization in Direct Alignment Algorithms</em>. NeurIPS 2024; arXiv v2, 5 Nov 2024. <a href="https://arxiv.org/abs/2406.02900">https://arxiv.org/abs/2406.02900</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Hump-shaped over-optimization in DPO, IPO and SLiC (§3.1-§3.2, Figures 1-2); implicit-reward accuracy against win rate (§3.4); decreasing-likelihood argument (§3.5); null-space argument, Proposition 1 and Figure 7 (§4).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Meng, Y., Xia, M., Chen, D. <em>SimPO: Simple Preference Optimization with a Reference-Free Reward</em>. NeurIPS 2024; arXiv v3, 1 Nov 2024. <a href="https://arxiv.org/abs/2405.14734">https://arxiv.org/abs/2405.14734</a>. Accessed 2026-10-27. <span class="ref-use">Used for: The reward and objective (§2.2-§2.3, Eq. 6); Table 4 (tuned baselines); Table 6 and Figure 4 (length and likelihood mismatch); Appendices B, I (Table 15, DPO with length normalization) and J.</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Pal, A., Karkhanis, D., Dooley, S., Roberts, M., Naidu, S., White, C. <em>Smaug: Fixing Failure Modes of Preference Optimisation with DPO-Positive</em>. arXiv v2, 3 Jul 2024. <a href="https://arxiv.org/abs/2402.13228">https://arxiv.org/abs/2402.13228</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Preferred-likelihood reduction result and the token-level account (§3, Figure 1); the DPOP loss (Eq. 3) and settings beta 0.3, lambda 50 (§4-§5).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Tajwar, F., Singh, A., Sharma, A., Rafailov, R., Schneider, J., Xie, T., Ermon, S., Finn, C., Kumar, A. <em>Preference Fine-Tuning of LLMs Should Leverage Suboptimal, On-Policy Data</em>. arXiv v3, 2 Jun 2024. <a href="https://arxiv.org/abs/2404.14367">https://arxiv.org/abs/2404.14367</a>. Accessed 2026-10-27. <span class="ref-use">Used for: On-policy sampling and negative-gradient takeaways (§5.1-§5.3); induced-reward behavior under DPO (Figures 16-17).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Razin, N., Malladi, S., Bhaskar, A., Chen, D., Arora, S., Hanin, B. <em>Unintentional Unalignment: Likelihood Displacement in Direct Preference Optimization</em>. ICLR 2025; arXiv v4, 27 Apr 2025. <a href="https://arxiv.org/abs/2410.08847">https://arxiv.org/abs/2410.08847</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Definition of likelihood displacement, the CHES score, the refusal-rate drop from 74.4% to 33.4% and the filtering result (abstract).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Azar, M. G., Rowland, M., Piot, B., Guo, D., Calandriello, D., Valko, M., Munos, R. <em>A General Theoretical Paradigm to Understand Learning from Human Preferences</em>. arXiv v2, 22 Nov 2023. <a href="https://arxiv.org/abs/2310.12036">https://arxiv.org/abs/2310.12036</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Overfitting under deterministic preferences (§4.2); the IPO loss (Eq. 17); bandit experiments (§5.3-§5.4).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Hong, J., Lee, N., Thorne, J. <em>ORPO: Monolithic Preference Optimization without Reference Model</em>. arXiv v2, 14 Mar 2024. <a href="https://arxiv.org/abs/2403.07691">https://arxiv.org/abs/2403.07691</a>. Accessed 2026-10-27. <span class="ref-use">Used for: The odds-ratio objective and per-token mean probability (§4.1-§4.2); Mistral-ORPO AlpacaEval 2.0 results.</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Tang, Y., Guo, D., Zheng, Z., Calandriello, D., et al. <em>Understanding the performance gap between online and offline alignment algorithms</em>. arXiv v1, 14 May 2024. <a href="https://arxiv.org/abs/2405.08448">https://arxiv.org/abs/2405.08448</a>. Accessed 2026-10-27. <span class="ref-use">Used for: Online against offline at equal KL budget; hypotheses on coverage, data quality, classification, loss form and scale (abstract, §1, §3, §5, §6).</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R., et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Unified gradient form and Table 10 (§5.2.1, Eq. 5); the DPO objective and coefficient (Appendix A.1.4, Eqs. 12-14); Online RFT against RFT and GRPO (Figure 5).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>

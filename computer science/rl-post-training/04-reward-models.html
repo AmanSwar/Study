@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en" class="study-standalone">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reward Models from Preferences · Reinforcement Learning for LLM Post-Training</title>
+<meta name="description" content="Derives the Bradley-Terry reward-model loss and its gradient from the primary sources, bounds what labeler agreement allows any reward model to reach, covers architecture, scale and training recipes, and compares outcome and process supervision with the evidence and the reasons R1 dropped learned reward models for reasoning RL.">
+<link rel="stylesheet" href="../../website/public/study/study.css">
+<script defer src="../../website/public/study/study.js"></script>
+</head>
+<body>
+<div class="study-shell">
+<main class="study">
+
+<header class="study-header">
+  <p class="kicker">Reinforcement Learning for LLM Post-Training · Module 4</p>
+  <h1>Reward Models from Preferences: the Bradley-Terry Loss, Architecture and Scale, and Outcome versus Process Supervision</h1>
+  <p class="lede">A reward model is a language model with a scalar head, trained so that the difference of its scores on two completions is the log-odds that a human prefers the first. This module derives that loss and its gradient from the primary sources, bounds what labeler agreement lets any reward model reach, and covers how the model is built, scaled and trained. It then sets outcome against process supervision with the measured evidence, so you can write the loss, say which questions a scalar score cannot answer, and explain why 2026 recipes keep learned reward models for some jobs and drop them for others.</p>
+  <div class="meta">
+    <span class="chip chip-blue">Course</span>
+    <span class="chip"><b>45 min</b> read</span>
+    <span class="chip"><b>23</b> sources</span>
+    <span class="chip chip-amber">As of 2026-10-27</span>
+    <span class="chip">Prerequisite: <b>Module 2</b></span>
+  </div>
+</header>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 392" role="img" aria-labelledby="f1t"><title id="f1t">Computation graph of Bradley-Terry reward-model training: prompt plus chosen and prompt plus rejected pass through one shared backbone and scalar head, the two scores are subtracted, and the loss is minus log sigmoid of the difference</title>
+    <defs>
+      <marker id="f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <rect x="122" y="52" width="400" height="266" rx="12" class="d-outline d-dashed"/>
+    <text x="132" y="70" class="d-small d-text-light">same weights θ in both lanes</text>
+
+    <rect x="8" y="95" width="104" height="60" rx="8" class="d-fill-green-soft d-stroke-green"/>
+    <text x="60" y="122" text-anchor="middle" class="d-small">prompt + chosen</text>
+    <text x="60" y="140" text-anchor="middle" class="d-mono d-small">x ⊕ y_w</text>
+    <path d="M112,125 L130,125" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="130" y="95" width="124" height="60" rx="8" class="d-block"/>
+    <text x="192" y="130" text-anchor="middle" class="d-text-inv d-bold">LM backbone</text>
+    <path d="M254,125 L272,125" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="272" y="100" width="70" height="50" rx="8" class="d-block-2"/>
+    <text x="307" y="130" text-anchor="middle" class="d-text-inv d-small">h at EOS</text>
+    <path d="M342,125 L360,125" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="360" y="100" width="76" height="50" rx="8" class="d-block-accent"/>
+    <text x="398" y="122" text-anchor="middle" class="d-text-inv d-small">linear</text>
+    <text x="398" y="138" text-anchor="middle" class="d-text-inv d-small">head</text>
+    <path d="M436,125 L454,125" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="454" y="100" width="56" height="50" rx="25" class="d-surface"/>
+    <text x="482" y="130" text-anchor="middle" class="d-mono">r_w</text>
+
+    <rect x="8" y="225" width="104" height="60" rx="8" class="d-fill-red-soft d-stroke-red"/>
+    <text x="60" y="252" text-anchor="middle" class="d-small">prompt + rejected</text>
+    <text x="60" y="270" text-anchor="middle" class="d-mono d-small">x ⊕ y_l</text>
+    <path d="M112,255 L130,255" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="130" y="225" width="124" height="60" rx="8" class="d-block"/>
+    <text x="192" y="260" text-anchor="middle" class="d-text-inv d-bold">LM backbone</text>
+    <path d="M254,255 L272,255" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="272" y="230" width="70" height="50" rx="8" class="d-block-2"/>
+    <text x="307" y="260" text-anchor="middle" class="d-text-inv d-small">h at EOS</text>
+    <path d="M342,255 L360,255" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="360" y="230" width="76" height="50" rx="8" class="d-block-accent"/>
+    <text x="398" y="252" text-anchor="middle" class="d-text-inv d-small">linear</text>
+    <text x="398" y="268" text-anchor="middle" class="d-text-inv d-small">head</text>
+    <path d="M436,255 L454,255" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="454" y="230" width="56" height="50" rx="25" class="d-surface"/>
+    <text x="482" y="260" text-anchor="middle" class="d-mono">r_l</text>
+
+    <text x="322" y="182" text-anchor="middle" class="d-small d-fill-orange">∂L/∂r_w = −σ(−Δ)</text>
+    <text x="322" y="204" text-anchor="middle" class="d-small d-fill-orange">∂L/∂r_l = +σ(−Δ)</text>
+    <text x="322" y="226" text-anchor="middle" class="d-small d-text-light">equal and opposite</text>
+
+    <path d="M510,125 L588,125 L588,155" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <path d="M510,255 L588,255 L588,225" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="546" y="155" width="84" height="70" rx="8" class="d-hl"/>
+    <text x="588" y="183" text-anchor="middle" class="d-bold">Δ =</text>
+    <text x="588" y="203" text-anchor="middle" class="d-mono d-small">r_w − r_l</text>
+    <path d="M630,190 L648,190" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="648" y="160" width="56" height="60" rx="8" class="d-block-muted"/>
+    <text x="676" y="195" text-anchor="middle" class="d-text-inv d-bold">σ(Δ)</text>
+    <path d="M704,190 L722,190" class="d-arrow" marker-end="url(#f1-arr)"/>
+    <rect x="722" y="160" width="70" height="60" rx="8" class="d-block"/>
+    <text x="757" y="186" text-anchor="middle" class="d-text-inv d-small">−log</text>
+    <text x="757" y="204" text-anchor="middle" class="d-text-inv d-small">loss L</text>
+    <text x="676" y="242" text-anchor="middle" class="d-small d-text-light">P(y_w ≻ y_l)</text>
+
+    <text x="400" y="346" text-anchor="middle" class="d-small d-text-light">Prompt tokens are context; only the last position feeds the head. Adding any constant to both scores leaves L unchanged.</text>
+    <text x="400" y="368" text-anchor="middle" class="d-small d-text-light">The orange head is the only new parameter block; everything else is initialized from an SFT or pretrained LM.</text>
+  </svg>
+  <figcaption><b>Figure 1.</b> The whole reward-model training step. Two lanes run the same network on prompt-plus-chosen and prompt-plus-rejected, the scalar head reads the final-position state, and only the score difference enters the loss<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-2">2</a>. The gradient labels are derived in section 2.2.</figcaption>
+</figure>
+
+<h2 id="preference-data">1. Preference data: what the model is fit to</h2>
+<p>A reward model is trained on comparisons, not on absolute scores. Christiano et al. set the template for deep RL: show a human two trajectory segments, record which one they prefer, and treat "equally good" as a uniform label and "cannot compare" as a dropped example<a class="cite" href="#ref-3">3</a> (§2.2.2). Stiennon et al. carried the same format to language, collecting 64,832 summary comparisons on TL;DR and noting that they chose comparisons over Likert scores<a class="cite" href="#ref-4">4</a> (§1, §3.3, footnote 6). </p>
+
+<h3 id="preference-data-pairs">1.1 Pairs, rankings and strength labels</h3>
+<p>The atomic record is a prompt \(x\), a preferred completion \(y_w\) and a rejected completion \(y_l\)<a class="cite" href="#ref-2">2</a> (§3). How the pairs are produced differs by lab:</p>
+<ul>
+<li><strong>Rankings expanded to pairs (InstructGPT).</strong> Labelers rank \(K\) between 4 and 9 responses per prompt, which yields \(\binom{K}{2}\) comparisons per prompt. Ties were dropped, and the RM training set held 33,207 prompts<a class="cite" href="#ref-1">1</a> (§3.5, Appendix C.2, Table 9).</li>
+<li><strong>Two responses plus a strength label (Llama 3).</strong> Annotators compare two responses sampled from two different models and mark the preference as significantly better, better, slightly better or marginally better. For some prompts they also edit the chosen response, which creates a ranking edited &gt; chosen &gt; rejected. Both reward modeling and DPO train only on pairs labeled significantly better or better and discard pairs with similar responses<a class="cite" href="#ref-5">5</a> (§4.2.1).</li>
+<li><strong>Ratings turned into pairs.</strong> With 1-5 ratings per completion, a common construction pairs the highest-rated completion with a random lower-rated one, the way UltraFeedback-style datasets are built<a class="cite" href="#ref-6">6</a> (§11.2.2).</li>
+</ul>
+<p>The chosen response is better relative to the alternatives shown, not globally correct: both responses in a pair can be wrong, and the model still learns from a well-labeled ordering<a class="cite" href="#ref-6">6</a> (§11.2).</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f2t"><title id="f2t">A ranking of K=5 completions is scored by K forward passes and expanded into ten pair terms of a loss</title>
+    <defs>
+      <marker id="f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-marker"/></marker>
+    </defs>
+    <text x="110" y="40" text-anchor="middle" class="d-small d-text-light">labeler ranking</text>
+    <text x="245" y="40" text-anchor="middle" class="d-small d-text-light">scores</text>
+    <text x="440" y="34" text-anchor="middle" class="d-small d-text-light">pair terms, row i beats column j</text>
+
+    <rect x="20" y="60" width="180" height="32" rx="6" class="d-block"/><text x="110" y="81" text-anchor="middle" class="d-text-inv d-small">completion 1 (best)</text>
+    <rect x="20" y="100" width="180" height="32" rx="6" class="d-block"/><text x="110" y="121" text-anchor="middle" class="d-text-inv d-small">completion 2</text>
+    <rect x="20" y="140" width="180" height="32" rx="6" class="d-block"/><text x="110" y="161" text-anchor="middle" class="d-text-inv d-small">completion 3</text>
+    <rect x="20" y="180" width="180" height="32" rx="6" class="d-block"/><text x="110" y="201" text-anchor="middle" class="d-text-inv d-small">completion 4</text>
+    <rect x="20" y="220" width="180" height="32" rx="6" class="d-block"/><text x="110" y="241" text-anchor="middle" class="d-text-inv d-small">completion 5 (worst)</text>
+
+    <rect x="222" y="60" width="46" height="32" rx="16" class="d-surface"/><text x="245" y="81" text-anchor="middle" class="d-mono d-small">r_1</text>
+    <rect x="222" y="100" width="46" height="32" rx="16" class="d-surface"/><text x="245" y="121" text-anchor="middle" class="d-mono d-small">r_2</text>
+    <rect x="222" y="140" width="46" height="32" rx="16" class="d-surface"/><text x="245" y="161" text-anchor="middle" class="d-mono d-small">r_3</text>
+    <rect x="222" y="180" width="46" height="32" rx="16" class="d-surface"/><text x="245" y="201" text-anchor="middle" class="d-mono d-small">r_4</text>
+    <rect x="222" y="220" width="46" height="32" rx="16" class="d-surface"/><text x="245" y="241" text-anchor="middle" class="d-mono d-small">r_5</text>
+    <path d="M200,76 L222,76" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M200,116 L222,116" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M200,156 L222,156" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M200,196 L222,196" class="d-arrow" marker-end="url(#f2-arr)"/>
+    <path d="M200,236 L222,236" class="d-arrow" marker-end="url(#f2-arr)"/>
+
+    <rect x="340" y="60" width="40" height="40" class="d-block-muted"/><rect x="380" y="60" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/><rect x="420" y="60" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/><rect x="460" y="60" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/><rect x="500" y="60" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="340" y="100" width="40" height="40" class="d-outline d-dim"/><rect x="380" y="100" width="40" height="40" class="d-block-muted"/><rect x="420" y="100" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/><rect x="460" y="100" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/><rect x="500" y="100" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="340" y="140" width="40" height="40" class="d-outline d-dim"/><rect x="380" y="140" width="40" height="40" class="d-outline d-dim"/><rect x="420" y="140" width="40" height="40" class="d-block-muted"/><rect x="460" y="140" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/><rect x="500" y="140" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="340" y="180" width="40" height="40" class="d-outline d-dim"/><rect x="380" y="180" width="40" height="40" class="d-outline d-dim"/><rect x="420" y="180" width="40" height="40" class="d-outline d-dim"/><rect x="460" y="180" width="40" height="40" class="d-block-muted"/><rect x="500" y="180" width="40" height="40" class="d-fill-blue-soft d-stroke-blue"/>
+    <rect x="340" y="220" width="40" height="40" class="d-outline d-dim"/><rect x="380" y="220" width="40" height="40" class="d-outline d-dim"/><rect x="420" y="220" width="40" height="40" class="d-outline d-dim"/><rect x="460" y="220" width="40" height="40" class="d-outline d-dim"/><rect x="500" y="220" width="40" height="40" class="d-block-muted"/>
+    <text x="400" y="85" text-anchor="middle" class="d-mono d-small">1≻2</text><text x="440" y="85" text-anchor="middle" class="d-mono d-small">1≻3</text><text x="480" y="85" text-anchor="middle" class="d-mono d-small">1≻4</text><text x="520" y="85" text-anchor="middle" class="d-mono d-small">1≻5</text>
+    <text x="440" y="125" text-anchor="middle" class="d-mono d-small">2≻3</text><text x="480" y="125" text-anchor="middle" class="d-mono d-small">2≻4</text><text x="520" y="125" text-anchor="middle" class="d-mono d-small">2≻5</text>
+    <text x="480" y="165" text-anchor="middle" class="d-mono d-small">3≻4</text><text x="520" y="165" text-anchor="middle" class="d-mono d-small">3≻5</text>
+    <text x="520" y="205" text-anchor="middle" class="d-mono d-small">4≻5</text>
+    <path d="M268,76 L340,76" class="d-arrow d-dashed" marker-end="url(#f2-arr)"/>
+
+    <text x="440" y="284" text-anchor="middle" class="d-small">10 terms = C(5,2), from 5 scored sequences</text>
+    <text x="440" y="304" text-anchor="middle" class="d-mono d-small">L = −(1/10) Σ log σ(r_i − r_j)</text>
+
+    <rect x="580" y="60" width="200" height="192" rx="10" class="d-panel"/>
+    <text x="680" y="84" text-anchor="middle" class="d-bold">scored sequences</text>
+    <text x="596" y="108" class="d-mono d-small">K   shared   per-pair   pairs</text>
+    <text x="596" y="130" class="d-mono d-small">4      4        12       6</text>
+    <text x="596" y="150" class="d-mono d-small">5      5        20      10</text>
+    <text x="596" y="170" class="d-mono d-small">6      6        30      15</text>
+    <text x="596" y="190" class="d-mono d-small">9      9        72      36</text>
+    <text x="680" y="222" text-anchor="middle" class="d-small d-text-light">ratio = K − 1</text>
+    <text x="680" y="240" text-anchor="middle" class="d-small d-text-light">64 prompts × 36 = 2,304</text>
+  </svg>
+  <figcaption><b>Figure 2.</b> InstructGPT trains on all \(\binom{K}{2}\) comparisons of one prompt as a single batch element, so a ranking of \(K\) completions costs \(K\) scored sequences rather than \(K(K-1)\) if each pair were two separate rows<a class="cite" href="#ref-1">1</a> (§3.5). The "per-pair" column and the ratio \(K-1\) are derived from that rule; the 2,304-comparison batch ceiling (64 prompts, \(K=9\)) is stated in Appendix C.2.</figcaption>
+</figure>
+
+<p>InstructGPT's batching rule is a systems decision with an algorithmic reason. Comparisons from one labeling task are strongly correlated, and shuffling all pairs into one dataset made the RM overfit within a single pass. Training on all \(\binom{K}{2}\) comparisons of a prompt as one batch element fixed the overfitting and needed one forward pass per completion rather than \(\binom{K}{2}\) passes<a class="cite" href="#ref-1">1</a> (§3.5), the factor \(K-1\) in Figure 2. Llama 3 concatenates the prompt with two or three shuffled responses into one row, which its ablations showed improved training efficiency without losing accuracy<a class="cite" href="#ref-5">5</a> (§4.1.2).</p>
+<p>Each lane is a prefill-shaped computation: one forward pass over prompt plus response, no sampling (Module 1 prices that pass inside the RL loop). The prompt is still re-encoded in every completion's row unless the implementation shares the prefix, an optimization the sources do not describe.</p>
+<h3 id="preference-data-noise-ceiling">1.2 Labeler agreement is the ceiling on pair accuracy</h3>
+<p>Human labels on language comparisons are noisy, and the noise level is measured. InstructGPT reports that training labelers agree with each other 72.6 ± 1.5% of the time and held-out labelers 77.3 ± 1.3%, against 73 ± 4% researcher-researcher agreement in the earlier summarization work<a class="cite" href="#ref-1">1</a> (§3.4). Stiennon et al. give the same picture with more structure: labelers agree with each other 72% of the time on the training corpus, researcher-researcher agreement runs from about 65% on the hardest comparisons (two high-temperature samples from one RL policy) to about 80% on the easiest and about 95% when the researchers discussed the pair, and taking the modal label of three labelers lifts agreement with researchers from 72% to 77%<a class="cite" href="#ref-4">4</a> (Appendix C.2). The RewardBench authors summarize older validation sets such as Anthropic HH and TL;DR as having accuracy ceilings between 60 and 70% because of inter-annotator disagreement<a class="cite" href="#ref-7">7</a> (§1).</p>
+<p>Reward-model accuracies sit inside that band. InstructGPT's 6B RMs, cross-validated across five labeler groups, reached 72.4 ± 0.4% on preferences of labelers in their training groups and 69.6 ± 0.9% on a held-out group<a class="cite" href="#ref-1">1</a> (§4.1). Stiennon's 6.7B RM agreed with labelers 66.5% of the time on out-of-distribution CNN/DM summaries against an inter-labeler agreement of 66.9%<a class="cite" href="#ref-4">4</a> (§4.3). A reward model that matches inter-labeler agreement predicts a human's choice about as well as one more labeler would.</p>
+
+<h4 id="preference-data-strength">Accuracy tracks preference strength</h4>
+<p>The ceiling is not uniform across pairs. Llama 2 splits its test pairs by the annotators' four-level strength label and reports accuracy per bucket<a class="cite" href="#ref-8">8</a> (Table 8):</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 330" role="img" aria-labelledby="f3t"><title id="f3t">Llama 2 reward-model accuracy by annotator preference strength, falling toward 50 percent as pairs become similar</title>
+    <text x="90" y="30" class="d-small d-text-light">pair accuracy (%), bars start at 50 = chance</text>
+    <line x1="100" y1="270" x2="760" y2="270" class="d-axis"/>
+    <line x1="100" y1="50" x2="100" y2="270" class="d-axis"/>
+    <line x1="100" y1="226" x2="760" y2="226" class="d-grid"/><line x1="100" y1="182" x2="760" y2="182" class="d-grid"/><line x1="100" y1="138" x2="760" y2="138" class="d-grid"/><line x1="100" y1="94" x2="760" y2="94" class="d-grid"/><line x1="100" y1="50" x2="760" y2="50" class="d-grid"/>
+    <text x="92" y="274" text-anchor="end" class="d-small d-text-light">50</text><text x="92" y="230" text-anchor="end" class="d-small d-text-light">60</text><text x="92" y="186" text-anchor="end" class="d-small d-text-light">70</text><text x="92" y="142" text-anchor="end" class="d-small d-text-light">80</text><text x="92" y="98" text-anchor="end" class="d-small d-text-light">90</text><text x="92" y="54" text-anchor="end" class="d-small d-text-light">100</text>
+
+    <rect x="120" y="134.9" width="50" height="135.1" class="d-fill-blue"/><text x="145" y="129.9" text-anchor="middle" class="d-mono d-small">80.7</text>
+    <rect x="180" y="75.1" width="50" height="194.9" class="d-fill-orange"/><text x="205" y="70.1" text-anchor="middle" class="d-mono d-small">94.3</text>
+    <rect x="280" y="193" width="50" height="77" class="d-fill-blue"/><text x="305" y="188" text-anchor="middle" class="d-mono d-small">67.5</text>
+    <rect x="340" y="154.3" width="50" height="115.7" class="d-fill-orange"/><text x="365" y="149.3" text-anchor="middle" class="d-mono d-small">76.3</text>
+    <rect x="440" y="222" width="50" height="48" class="d-fill-blue"/><text x="465" y="217" text-anchor="middle" class="d-mono d-small">60.9</text>
+    <rect x="500" y="200.9" width="50" height="69.1" class="d-fill-orange"/><text x="525" y="195.9" text-anchor="middle" class="d-mono d-small">65.7</text>
+    <rect x="600" y="249.3" width="50" height="20.7" class="d-fill-blue"/><text x="625" y="244.3" text-anchor="middle" class="d-mono d-small">54.7</text>
+    <rect x="660" y="246.7" width="50" height="23.3" class="d-fill-orange"/><text x="685" y="241.7" text-anchor="middle" class="d-mono d-small">55.3</text>
+
+    <text x="180" y="292" text-anchor="middle" class="d-small">significantly better</text>
+    <text x="340" y="292" text-anchor="middle" class="d-small">better</text>
+    <text x="500" y="292" text-anchor="middle" class="d-small">slightly better</text>
+    <text x="660" y="292" text-anchor="middle" class="d-small">negligibly better</text>
+    <text x="430" y="316" text-anchor="middle" class="d-small d-text-light">annotator preference label (strength increases to the left)</text>
+
+    <rect x="420" y="6" width="340" height="40" rx="6" class="d-label-bg"/>
+    <rect x="432" y="14" width="22" height="10" class="d-fill-blue"/><text x="462" y="23" class="d-small">Helpfulness RM on Meta Helpful test</text>
+    <rect x="432" y="30" width="22" height="10" class="d-fill-orange"/><text x="462" y="39" class="d-small">Safety RM on Meta Safety test</text>
+  </svg>
+  <figcaption><b>Figure 3.</b> Accuracy of each Llama 2 reward model on its matched test set, by annotator preference label (the last bucket is "negligibly better / unsure"). Data: Llama 2 Table 8<a class="cite" href="#ref-8">8</a>. Both reward models fall toward chance as pairs become similar; Llama 3 keeps only the top two strength levels for training<a class="cite" href="#ref-5">5</a>, though its report gives no reason.</figcaption>
+</figure>
+
+<p>The authors read this as expected: modeling preferences between two similar responses is hard because of annotator subjectivity, and the annotation agreement rate is also higher on distinct responses<a class="cite" href="#ref-8">8</a> (§3.2.2). Two consequences follow. A single headline accuracy hides a mixture of nearly deterministic pairs and near-coin-flips. And the pairs where the RM is most reliable are the separable ones, which fits Llama 3's decision to discard similar pairs<a class="cite" href="#ref-5">5</a> (§4.2.1); the report states the filter but not its rationale.</p>
+
+<h4 id="preference-data-bounds">A bound on what any RM can score (derived)</h4>
+<p>Agreement between labelers pins the achievable accuracy between two numbers. Suppose each pair has a latent probability \(q\in[\tfrac12,1]\) that a labeler picks its majority side, and labelers are exchangeable and independent given the pair. Two labelers agree with probability \(a=\mathbb{E}[q^2+(1-q)^2]\). An oracle that knows \(q\) and always predicts the majority side scores \(\mathbb{E}[q]\) against a single labeler's label. Then</p>
+$$ a \;\le\; \mathbb{E}[q] \;\le\; \frac{1+\sqrt{2a-1}}{2}. $$
+<details class="more"><summary>Why the two inequalities hold</summary>
+<p>Lower bound: \(q-\big(q^2+(1-q)^2\big)=(2q-1)(1-q)\ge 0\) for \(q\in[\tfrac12,1]\), so the oracle is at least as accurate as a second labeler pointwise. Upper bound: \(a=1-2\mathbb{E}[q]+2\mathbb{E}[q^2]\ge 1-2\mathbb{E}[q]+2\mathbb{E}[q]^2\) by Jensen's inequality; the right side increases in \(\mathbb{E}[q]\) on \([\tfrac12,1]\), and solving \(2m^2-2m+1-a=0\) for \(m\) gives the stated root. Equality in the upper bound holds when every pair has the same \(q\); equality in the lower bound holds when \(q\in\{\tfrac12,1\}\) (pairs are either coin flips or certain).</p>
+</details>
+<p>For InstructGPT's training labelers, \(a=0.726\) gives a ceiling between 72.6% and 83.6%; for held-out labelers, \(a=0.773\) gives 77.3% to 86.9% (derived from the agreement rates above<a class="cite" href="#ref-1">1</a>). Stiennon's three-label vote is a consistency check on where in that interval real data sits. With \(a=0.72\), the homogeneous case predicts that the modal label of three labelers agrees with another rater 78.2% of the time, and the coin-flip-or-certain case predicts 72%. The measured value, agreement with researchers, is 77%<a class="cite" href="#ref-4">4</a>, near the homogeneous end, which suggests that on that corpus most pairs are moderately noisy rather than a mixture of certain and hopeless ones. The check is approximate because it treats researchers and labelers as exchangeable.</p>
+
+<div class="calc">
+  <p class="calc-title">Accuracy ceiling from labeler agreement</p>
+  <div class="calc-row"><label for="c1a">Agreement between two labelers</label><input type="range" id="c1a" name="a" min="0.55" max="0.95" step="0.005" value="0.726" data-format="pct"></div>
+  <div class="calc-out">
+    <div>Oracle accuracy, at least<output data-expr="a" data-format="pct"></output></div>
+    <div>Oracle accuracy, at most<output data-expr="(1 + sqrt(2 * a - 1)) / 2" data-format="pct"></output></div>
+  </div>
+  <p class="calc-note">Formula: \( a \le \mathbb{E}[q] \le \tfrac{1}{2}\big(1+\sqrt{2a-1}\big) \). Derived above; assumes exchangeable, conditionally independent labelers. Set 72.6% for InstructGPT's training labelers<a class="cite" href="#ref-1">1</a>, 77.3% for its held-out labelers, 66.9% for Stiennon's CNN/DM inter-labeler figure<a class="cite" href="#ref-4">4</a>.</p>
+</div>
+
+<p>Christiano et al. build a noise floor into the model itself: they assume a 10% chance that the human answers uniformly at random, because "human raters have a constant probability of making an error, which doesn't decay to 0" as the reward difference grows<a class="cite" href="#ref-3">3</a> (§2.2.3). Under that assumption no predictor can agree with the human more than \(0.9+0.1\times0.5=95\%\) of the time (derived). Plain Bradley-Terry as used for language-model RMs has no such floor; section 2.2 derives what label noise does to the optimal score gap.</p>
+
+<h3 id="preference-data-sources">1.3 Who produces the labels in 2026</h3>
+<p>Two facts shape current practice. First, on-policy matters: preference data collected on the current model family transfers better to RLHF than datasets pooled from unrelated models, and as of 2026 no open model ships with fully open human preference data and its collection methods; the largest recent releases are NVIDIA's HelpSteer line<a class="cite" href="#ref-6">6</a> (§11.2). Second, AI labelers fill the gap. DeepSeek-R1's helpfulness RM was trained on 66,000 pairs that DeepSeek-V3 labeled: each pair judged four times with randomized order, averaged, and kept only if the score difference exceeded 1, with chosen and rejected responses length-matched across the dataset<a class="cite" href="#ref-9">9</a> (§3.1). Module 8 covers AI feedback; the point here is that the Bradley-Terry loss does not care who produced \((y_w,y_l)\).</p>
+<h2 id="bradley-terry">2. The Bradley-Terry model, its loss and its gradient</h2>
+
+<h3 id="bradley-terry-model">2.1 From pairwise choice to a logistic loss</h3>
+<p>Every reward model in this module descends from one assumption, quoted here from the sources that introduced it to language. DPO states it as the standard preference model of RLHF:</p>
+<blockquote>"The BT model stipulates that the human preference distribution \(p^*\) can be written as" \( p^*(y_1\succ y_2\mid x)=\dfrac{\exp(r^*(x,y_1))}{\exp(r^*(x,y_1))+\exp(r^*(x,y_2))} \). "Framing the problem as a binary classification we have the negative log-likelihood loss" \( \mathcal{L}_R(r_\phi,\mathcal{D})=-\mathbb{E}_{(x,y_w,y_l)\sim\mathcal{D}}\big[\log\sigma\big(r_\phi(x,y_w)-r_\phi(x,y_l)\big)\big] \)<a class="cite" href="#ref-2">2</a> (§3, Eq. 1-2).</blockquote>
+<p>InstructGPT, following Stiennon et al., writes the same loss with the K-way batching of section 1.1 and states what the scalar means:</p>
+<blockquote>"They use a cross-entropy loss, with the comparisons as labels—the difference in rewards represents the log odds that one response will be preferred to the other by a human labeler." The loss is \( \mathrm{loss}(\theta)=-\tfrac{1}{\binom{K}{2}}\,\mathbb{E}_{(x,y_w,y_l)\sim D}\big[\log\sigma\big(r_\theta(x,y_w)-r_\theta(x,y_l)\big)\big] \)<a class="cite" href="#ref-1">1</a> (§3.5, Eq. 1).</blockquote>
+<p>The model itself is older. Bradley and Terry (1952) gave each item a latent strength; Christiano et al. identify the reward-difference form with the Elo rating system, where the gap in rating points estimates the probability that one player beats the other<a class="cite" href="#ref-3">3</a> (§2.2.3). Lambert's derivation makes the reparameterization explicit: with strengths \(p_i=e^{r_i}\) the choice probability becomes \(P(i>j)=e^{r_i}/(e^{r_i}+e^{r_j})=\sigma(r_i-r_j)\), and "adding the same constant \(c\) to every \(r_k\) leaves \(P(i>j)\) unchanged"<a class="cite" href="#ref-6">6</a> (§5.1, Eq. 12-13). The loss is the negative log-likelihood of the observed choices, i.e. logistic regression on the score difference. The softplus form \(\log(1+e^{r_l-r_w})\) used in some codebases is the same function<a class="cite" href="#ref-6">6</a> (Eq. 17-18).</p>
+
+<h3 id="bradley-terry-gradient">2.2 The gradient, derived</h3>
+<p>Write \(\Delta=r_\theta(x,y_w)-r_\theta(x,y_l)\) and \(\mathcal{L}(\Delta)=-\log\sigma(\Delta)=\log(1+e^{-\Delta})\). Using \(\sigma'(\Delta)=\sigma(\Delta)\sigma(-\Delta)\),</p>
+$$ \frac{d\mathcal{L}}{d\Delta}=-\frac{\sigma'(\Delta)}{\sigma(\Delta)}=-\sigma(-\Delta)=-\big(1-\sigma(\Delta)\big),\qquad \nabla_\theta\mathcal{L}=-\sigma(-\Delta)\,\big(\nabla_\theta r_\theta(x,y_w)-\nabla_\theta r_\theta(x,y_l)\big). $$
+<p>Three properties matter for practice. First, the per-pair weight \(\sigma(-\Delta)\) lies in \((0,1)\): it is 0.5 at a tie, approaches 1 when the model orders the pair wrongly, and approaches 0 when it orders it correctly with a wide margin (Table 1). This is the same weight DPO's gradient carries, with the implicit reward in place of \(r_\theta\): "higher weight when reward estimate is wrong"<a class="cite" href="#ref-2">2</a> (§4). Second, the gradient is bounded, so one mislabeled pair can push with weight at most 1 however confident the model is; the loss grows only linearly, \(\mathcal{L}\approx-\Delta\) for \(\Delta\ll0\). Third, the two scores receive equal and opposite signals, \(\partial\mathcal{L}/\partial r_w=-\sigma(-\Delta)\) and \(\partial\mathcal{L}/\partial r_l=+\sigma(-\Delta)\), which is what Figure 1 labels.</p>
+
+<table class="tbl">
+  <caption><b>Table 1.</b> Bradley-Terry loss and gradient weight at selected margins \(\Delta=r_w-r_l\). Derived from \(\mathcal{L}=\log(1+e^{-\Delta})\) and weight \(\sigma(-\Delta)\); values rounded to four decimals.</caption>
+  <thead><tr><th class="num">Margin Δ</th><th class="num">P(y_w ≻ y_l)</th><th class="num">Loss</th><th class="num">Gradient weight σ(−Δ)</th><th>Reading</th></tr></thead>
+  <tbody>
+    <tr><td class="num">−4</td><td class="num">0.0180</td><td class="num">4.0181</td><td class="num">0.9820</td><td>confidently wrong; weight saturates at 1</td></tr>
+    <tr><td class="num">−2</td><td class="num">0.1192</td><td class="num">2.1269</td><td class="num">0.8808</td><td>wrong</td></tr>
+    <tr><td class="num">−1</td><td class="num">0.2689</td><td class="num">1.3133</td><td class="num">0.7311</td><td>wrong</td></tr>
+    <tr><td class="num">0</td><td class="num">0.5000</td><td class="num">0.6931</td><td class="num">0.5000</td><td>tie; loss is ln 2</td></tr>
+    <tr><td class="num">1</td><td class="num">0.7311</td><td class="num">0.3133</td><td class="num">0.2689</td><td>right</td></tr>
+    <tr><td class="num">2</td><td class="num">0.8808</td><td class="num">0.1269</td><td class="num">0.1192</td><td>right</td></tr>
+    <tr><td class="num">4</td><td class="num">0.9820</td><td class="num">0.0181</td><td class="num">0.0180</td><td>learned; pair contributes under 2% of maximum weight</td></tr>
+  </tbody>
+</table>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 360" role="img" aria-labelledby="f4t"><title id="f4t">Bradley-Terry loss and gradient weight as functions of the reward margin, with the gradient weight falling to zero for large positive margins and saturating at one for large negative margins</title>
+    <rect x="80" y="50" width="320" height="250" class="d-fill-red-soft"/>
+    <rect x="560" y="50" width="160" height="250" class="d-fill-green-soft"/>
+    <line x1="80" y1="300" x2="720" y2="300" class="d-axis"/>
+    <line x1="80" y1="50" x2="80" y2="300" class="d-axis"/>
+    <line x1="720" y1="50" x2="720" y2="300" class="d-axis"/>
+    <line x1="80" y1="216.7" x2="720" y2="216.7" class="d-grid"/><line x1="80" y1="133.3" x2="720" y2="133.3" class="d-grid"/><line x1="80" y1="50" x2="720" y2="50" class="d-grid"/>
+    <line x1="400" y1="50" x2="400" y2="300" class="d-grid d-dashed"/>
+    <polyline points="80.0,49.9 106.7,70.7 133.3,91.4 160.0,112.0 186.7,132.6 213.3,152.9 240.0,173.0 266.7,192.5 293.3,211.4 320.0,229.1 346.7,245.3 373.3,259.4 400.0,271.1 426.7,280.2 453.3,286.9 480.0,291.6 506.7,294.7 533.3,296.7 560.0,298.0 586.7,298.8 613.3,299.2 640.0,299.5 666.7,299.7 693.3,299.8 720.0,299.9" class="d-line d-stroke-blue" style="stroke-width:2.5"/>
+    <polyline points="80.0,50.6 106.7,51.0 133.3,51.7 160.0,52.7 186.7,54.5 213.3,57.3 240.0,61.9 266.7,69.0 293.3,79.8 320.0,95.6 346.7,117.2 373.3,144.4 400.0,175.0 426.7,205.6 453.3,232.8 480.0,254.4 506.7,270.2 533.3,281.0 560.0,288.1 586.7,292.7 613.3,295.5 640.0,297.3 666.7,298.3 693.3,299.0 720.0,299.4" class="d-line d-stroke-orange" style="stroke-width:2.5"/>
+    <circle cx="400" cy="271.1" r="5" class="d-fill-blue"/><text x="412" y="266" class="d-mono d-small">ln 2 = 0.693</text>
+    <circle cx="400" cy="175" r="5" class="d-fill-orange"/><text x="412" y="170" class="d-mono d-small">0.5</text>
+
+    <text x="80" y="318" text-anchor="middle" class="d-small d-text-light">−6</text><text x="186.7" y="318" text-anchor="middle" class="d-small d-text-light">−4</text><text x="293.3" y="318" text-anchor="middle" class="d-small d-text-light">−2</text><text x="400" y="318" text-anchor="middle" class="d-small d-text-light">0</text><text x="506.7" y="318" text-anchor="middle" class="d-small d-text-light">2</text><text x="613.3" y="318" text-anchor="middle" class="d-small d-text-light">4</text><text x="720" y="318" text-anchor="middle" class="d-small d-text-light">6</text>
+    <text x="72" y="304" text-anchor="end" class="d-small d-text-light">0</text><text x="72" y="221" text-anchor="end" class="d-small d-text-light">2</text><text x="72" y="138" text-anchor="end" class="d-small d-text-light">4</text><text x="72" y="54" text-anchor="end" class="d-small d-text-light">6</text>
+    <text x="728" y="304" class="d-small d-text-light">0</text><text x="728" y="179" class="d-small d-text-light">0.5</text><text x="728" y="54" class="d-small d-text-light">1</text>
+    <text x="80" y="30" class="d-small d-text-light">loss (left axis)</text>
+    <text x="720" y="30" text-anchor="end" class="d-small d-text-light">weight (right axis)</text>
+    <text x="400" y="344" text-anchor="middle" class="d-small d-text-light">margin Δ = r_w − r_l</text>
+    <text x="240" y="288" text-anchor="middle" class="d-small">model orders pair wrong</text>
+    <text x="640" y="200" text-anchor="middle" class="d-small">weight under 0.05</text>
+    <text x="640" y="216" text-anchor="middle" class="d-small">for Δ above 3</text>
+
+    <rect x="424" y="58" width="190" height="48" rx="6" class="d-label-bg"/>
+    <line x1="432" y1="75" x2="456" y2="75" class="d-line d-stroke-blue" style="stroke-width:2.5"/><text x="464" y="79" class="d-small">loss −log σ(Δ)</text>
+    <line x1="432" y1="93" x2="456" y2="93" class="d-line d-stroke-orange" style="stroke-width:2.5"/><text x="464" y="97" class="d-small">weight σ(−Δ)</text>
+  </svg>
+  <figcaption><b>Figure 4.</b> The Bradley-Terry loss and per-pair gradient weight against the reward margin, plotted from the closed forms in section 2.2 (derived; Table 1 lists exact values). The loss is linear on the left, so a wrongly ordered pair is penalized without bound but its gradient weight stops at 1; on the right both go to zero, so pairs that are already ordered with margin above 3 stop teaching.</figcaption>
+</figure>
+
+<div class="calc">
+  <p class="calc-title">One pair under Bradley-Terry</p>
+  <div class="calc-row"><label for="c2d">Margin Δ = r_w − r_l</label><input type="range" id="c2d" name="d" min="-8" max="8" step="0.1" value="0" data-format="fixed:1"></div>
+  <div class="calc-out">
+    <div>Model's P(y_w ≻ y_l)<output data-expr="1 / (1 + exp(-d))" data-format="pct"></output></div>
+    <div>Loss −log σ(Δ)<output data-expr="log(1 + exp(-d))" data-format="fixed:4"></output></div>
+    <div>Gradient weight σ(−Δ)<output data-expr="1 / (1 + exp(d))" data-format="fixed:4"></output></div>
+  </div>
+  <p class="calc-note">Formulas from section 2.2. The loss gradient is \( -\sigma(-\Delta)\,(\nabla r_w - \nabla r_l) \), so descent raises \( r_w \) and lowers \( r_l \) with equal force.</p>
+</div>
+
+<h4 id="bradley-terry-calibration">What the optimum looks like under label noise (derived)</h4>
+<p>Suppose a pair's label says \(y_w\) with probability \(p\). The expected loss \(-p\log\sigma(\Delta)-(1-p)\log\sigma(-\Delta)\) has zero gradient exactly where \(\sigma(\Delta)=p\), so the optimal margin is the log-odds \(\Delta^*=\ln\frac{p}{1-p}\). Take the two ends of the interval derived in section 1.2 for InstructGPT's training labelers<a class="cite" href="#ref-1">1</a>: \(p=0.726\) gives \(\Delta^*=0.97\) and \(p=0.836\) gives \(\Delta^*=1.63\). A well-fit reward model on this kind of data therefore produces score gaps of order one nat, not tens. Margins far above that on training pairs are memorization: each pair carries a single label, nothing in the data opposes pushing its gap beyond \(\Delta^*\), and every extra pass lets the network do so. This is a reading of the loss, not a claim from the sources, but it is consistent with what they report: InstructGPT's RM "quickly overfit" on multiple epochs with deteriorating validation loss, and it trained for one<a class="cite" href="#ref-1">1</a> (Appendix C.2).</p>
+
+<h3 id="bradley-terry-invariance">2.3 Shift invariance, and what it forces you to do</h3>
+<p>The loss depends only on \(r_w-r_l\), so \(\mathcal{L}(r_w+c,\,r_l+c)=\mathcal{L}(r_w,r_l)\). Because comparisons are always within one prompt, the invariance is per prompt: DPO's Lemma 1 states that two reward functions with \(r'(x,y)=r(x,y)+f(x)\) induce the same Bradley-Terry and Plackett-Luce preference distribution<a class="cite" href="#ref-2">2</a> (§5.1, Appendix A.5). Two practical consequences.</p>
+<ul>
+<li><strong>The reward's level is not trained.</strong> The head's bias receives gradient \(\partial\mathcal{L}/\partial r_w+\partial\mathcal{L}/\partial r_l=0\), so absolute scores are an accident of initialization. Pipelines that describe the step normalize after training: InstructGPT adds a bias so the labeler demonstrations score a mean of 0 before RL<a class="cite" href="#ref-1">1</a> (§3.5); Stiennon et al. normalize so the reference summaries average 0<a class="cite" href="#ref-4">4</a> (§3.4); Gao et al. recenter every RM so the initial policy averages 0 and scale the gold RM to unit variance<a class="cite" href="#ref-10">10</a> (§2.2); DPO describes the same practice as normalizing so \(\mathbb{E}[r_\phi(x,y)]=0\)<a class="cite" href="#ref-2">2</a> (§3).</li>
+<li><strong>Drift has to be controlled by something other than the loss.</strong> Llama 3's vision reward model adds "a weighted regularization term on the square of the reward logits averaged over the batch, which prevents the reward scores from drifting"<a class="cite" href="#ref-5">5</a> (§7.5.4). Llama 2 saw a related effect from its margin loss, which pushed scores into a binary split; its authors flag reward calibration as future work because PPO can be sensitive to changes in the reward distribution<a class="cite" href="#ref-8">8</a> (Appendix A.3.3).</li>
+</ul>
+<p>The within-prompt invariance is also why group-relative RL fits RM scores naturally: DeepSeekMath observes that the group-relative advantage "aligns well with the comparative nature of rewards models, as reward models are typically trained on datasets of comparisons between outputs on the same question"<a class="cite" href="#ref-11">11</a> (§4.1.1). A per-group baseline removes exactly the \(f(x)\) the RM never constrained (the writer's reading; Module 9 develops the estimator).</p>
+
+<h3 id="bradley-terry-limits">2.4 What a scalar Bradley-Terry score cannot represent</h3>
+<ul>
+<li><strong>Cross-prompt comparison.</strong> Section 2.3 means \(r(x_1,y_1)>r(x_2,y_2)\) carries no information unless the RM was separately calibrated; only within-prompt gaps are identified.</li>
+<li><strong>Intransitive or incomparable preferences.</strong> A scalar score induces a total order on the completions of a prompt. Lambert lists the assumptions that fail in practice: measured preferences may not be transitive or comparable, and the number and presentation of options changes the answer<a class="cite" href="#ref-6">6</a> (§10). Aggregating annotators with different tastes into one score is the usual source of such cycles (the writer's reading); the model fits the aggregate and cannot express the disagreement.</li>
+<li><strong>Ties and uncertainty.</strong> InstructGPT dropped ties<a class="cite" href="#ref-1">1</a> (Appendix C.2) and Christiano et al. map "equally good" to a uniform label<a class="cite" href="#ref-3">3</a>; neither leaves the trained model with an uncertainty estimate on its output.</li>
+<li><strong>Length and style preferences it was not asked about.</strong> Stiennon's 6.7B RM preferred improving edits that make a summary shorter only 62.6% of the time, against 76.4% for humans, so it is biased toward longer summaries<a class="cite" href="#ref-4">4</a> (§4.3). R1's pipeline length-matches chosen and rejected responses in its RM data for this reason<a class="cite" href="#ref-9">9</a> (§3.1).</li>
+<li><strong>Anything off the training distribution.</strong> The RM is fit to samples from the SFT policy or a close relative. DPO's description of why the RL objective carries a KL term is that it "prevents the model from deviating too far from the distribution on which the reward model is accurate"<a class="cite" href="#ref-2">2</a> (§3). Module 6 quantifies what happens when it is not enough.</li>
+</ul>
+
+<h3 id="bradley-terry-variants">2.5 Variants of the pairwise loss</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 2.</b> Reward-model losses reported in the sources. \(r_c, r_r\) are chosen and rejected scores, \(m\) a margin from the annotators' strength label.</caption>
+  <thead><tr><th>Loss</th><th>Form</th><th>Needs</th><th>Reported use and effect</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Pairwise BT</td><td>\(-\log\sigma(r_c-r_r)\)</td><td>(chosen, rejected) pairs</td><td>InstructGPT, Stiennon, Llama 2, Llama 3, Tulu 3<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a><a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-5">5</a><a class="cite" href="#ref-12">12</a></td></tr>
+    <tr><td class="row">K-way batched BT</td><td>\(-\binom{K}{2}^{-1}\sum\log\sigma(r_i-r_j)\), one batch element per prompt</td><td>rankings of 4 to 9</td><td>InstructGPT; avoids overfitting from correlated pairs<a class="cite" href="#ref-1">1</a></td></tr>
+    <tr><td class="row">Margin BT</td><td>\(-\log\sigma(r_c-r_r-m)\)</td><td>graded strength labels</td><td>Llama 2: margins {1, 2/3, 1/3, 0} (small) or {3, 2, 1, 0} (large); Meta Helpful accuracy 62.5% without margin, 63.0% small, 62.9% large<a class="cite" href="#ref-8">8</a> (Tables 27-28). Llama 3 removed it after "diminishing improvements after data scaling"<a class="cite" href="#ref-5">5</a></td></tr>
+    <tr><td class="row">Plackett-Luce</td><td>\(\prod_k \dfrac{e^{r_{\tau(k)}}}{\sum_{j\ge k}e^{r_{\tau(j)}}}\), equals BT at \(K=2\)</td><td>full rankings</td><td>Used in early Starling models<a class="cite" href="#ref-6">6</a> (§5.5.3); DPO derives its objective for it as well<a class="cite" href="#ref-2">2</a> (Appendix A.3)</td></tr>
+    <tr><td class="row">Point-wise label</td><td>binary cross-entropy on a single response</td><td>safe/unsafe tags</td><td>R1's safety RM: 106,000 prompts, trained point-wise, unlike its pairwise helpfulness RM<a class="cite" href="#ref-9">9</a> (§3.1)</td></tr>
+  </tbody>
+</table>
+<p>The margin result is worth reading carefully. A 0.4 to 0.5 point average gain from encoding annotator strength is small, it is largest on the most separable bucket ("significantly better" moved from 79.1% to 80.4% and 80.7%), and the Llama 3 team dropped the margin once data volume grew<a class="cite" href="#ref-8">8</a><a class="cite" href="#ref-5">5</a>. The plain pairwise logistic loss stays the default, in the writer's reading because no variant has beaten it by enough to justify the change; Lambert writes that the modifications "have not solidified into a single best practice"<a class="cite" href="#ref-6">6</a> (§5.5).</p>
+<h2 id="architecture-scale-training">3. Architecture, scale and training recipes</h2>
+
+<h3 id="architecture-head">3.1 A language model with a scalar head</h3>
+<p>The reports that describe the architecture build the reward model the same way: take a decoder-only LM, remove the next-token output layer, and put a one-output projection on the hidden state of the last position. InstructGPT states it for both reward models and value functions: "the unembedding layer of the original model is replaced with a projection layer to output a scalar value"<a class="cite" href="#ref-1">1</a> (Appendix C). Stiennon et al. add "a randomly initialized linear head"<a class="cite" href="#ref-4">4</a> (§3.4); Llama 2 replaces the classification head for next-token prediction with a regression head and initializes from the chat checkpoint on the argument that "the reward model 'knows' what the chat model knows", which avoids an information mismatch that could favor hallucinations<a class="cite" href="#ref-8">8</a> (§3.2.2). Tulu 3 reads the logit at the end-of-sequence token and initializes the head with weights drawn from \(\mathcal{N}(0,1/\sqrt{d_{\text{model}}+1})\)<a class="cite" href="#ref-12">12</a> (§5.4.1). Lambert's reference implementation takes the last non-padding token's hidden state through a linear layer<a class="cite" href="#ref-6">6</a> (§5.1.1-5.1.2).</p>
+<p>Reading at the last position is forced by the causal mask: only the final token has attended to the whole prompt and response, so it is the one state that summarizes both. It also means a truncated response, which has no EOS, is scored from a state the RM never saw during training (Module 2 returns to this for the RL reward). Initialization matters less than the head design suggests. InstructGPT started its RM from a 6B GPT-3 fine-tuned on public NLP datasets "mostly for historical reasons" and found similar results starting from GPT-3 or the SFT model<a class="cite" href="#ref-1">1</a> (Appendix C.2).</p>
+<pre class="code" data-lang="python" data-title="reward_model.py"><code>import torch, torch.nn as nn, torch.nn.functional as F
+
+class RewardModel(nn.Module):
+    def __init__(self, backbone, d_model):
+        super().__init__()
+        self.backbone = backbone               # decoder-only LM without its unembedding
+        self.head = nn.Linear(d_model, 1)      # the only new parameters
+
+    def forward(self, input_ids, attention_mask):   # right-padded batch: prompt + response
+        h = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        last = attention_mask.sum(dim=1) - 1        # index of the final real token (EOS)
+        h_last = h[torch.arange(h.size(0)), last]
+        return self.head(h_last).squeeze(-1)        # one scalar per sequence
+
+def pair_loss(model, chosen, rejected):             # each is a dict(input_ids, attention_mask)
+    r_w, r_l = model(**chosen), model(**rejected)
+    return -F.logsigmoid(r_w - r_l).mean()         # section 2.2, batch-averaged</code></pre>
+<p class="small muted">The pattern follows Lambert's reference code<a class="cite" href="#ref-6">6</a> (§5.1.2), rewritten for right-padded batches. The code is the mechanism: the whole model is one head plus a two-line loss, and everything else in a production RM pipeline is data loading and distributed training.</p>
+
+<h3 id="architecture-recipes">3.2 Training recipes as reported</h3>
+<table class="tbl tbl-dense">
+  <caption><b>Table 3.</b> Reward-model setups in six reports. "Not stated" means the section read does not give the value. Training is one epoch wherever stated.</caption>
+  <thead><tr><th>Report</th><th>RM size and init</th><th>Preference data</th><th>Epochs, LR, batch</th><th>Reported accuracy</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Stiennon 2020<a class="cite" href="#ref-4">4</a></td><td>160M to 13B ablated; supervised baseline plus random linear head; RM, policy and value same size</td><td>64,832 TL;DR comparisons released; 8k to 64k used in the size study</td><td>1 epoch; 5e-6 (6.7B), 1.5e-5 (1.3B); 64 (Appendix B.1)</td><td>6.7B RM 66.5% on CNN/DM vs 66.9% inter-labeler</td><td>PPO reward; value initialized from RM</td></tr>
+    <tr><td class="row">InstructGPT 2022<a class="cite" href="#ref-1">1</a></td><td>6B only; GPT-3 6B fine-tuned on public NLP sets</td><td>33,207 training prompts, K = 4 to 9, ties dropped</td><td>1 epoch; 9e-6, cosine to 10%; 64 prompts, up to 2,304 comparisons</td><td>72.4 ± 0.4% (train groups); 69.6 ± 0.9% (held-out group)</td><td>PPO reward; value initialized from RM</td></tr>
+    <tr><td class="row">Llama 2 2023<a class="cite" href="#ref-8">8</a></td><td>7B, 13B, 70B; from chat checkpoint; separate helpfulness and safety RMs</td><td>2,919,326 comparisons, 1,418,091 of them Meta-collected</td><td>1 epoch; 5e-6 (70B), 1e-5 (others); 512 pairs (1,024 rows)</td><td>Helpfulness RM 63.2% (Meta Helpful); Safety RM 64.5% (Meta Safety)</td><td>PPO reward and rejection sampling</td></tr>
+    <tr><td class="row">Llama 3 2024<a class="cite" href="#ref-5">5</a></td><td>pre-trained checkpoint; size not stated</td><td>all preference data after dropping similar pairs; 2 to 3 ranked responses per row</td><td>not stated; margin term removed</td><td>not stated</td><td>rejection sampling (10 to 30 samples per prompt), quality scoring; not in the DPO loss</td></tr>
+    <tr><td class="row">DeepSeek-R1 helpful RM<a class="cite" href="#ref-9">9</a></td><td>R1 architecture plus a reward head</td><td>66,000 pairs labeled by DeepSeek-V3</td><td>1 epoch; 6e-6; 256; 8,192 tokens max</td><td>not stated</td><td>stage-2 RL reward, final 400 of 1,700 steps</td></tr>
+    <tr><td class="row">Tulu 3 2024<a class="cite" href="#ref-12">12</a></td><td>from Tulu 3 SFT; scalar head at EOS</td><td>the Tulu 3 8B preference mix (same data as the best DPO run)</td><td>1 epoch; 3e-6, linear decay; 256; 2,048 tokens max</td><td>not tuned or reported</td><td>PPO-vs-DPO comparison; value-function init for RLVR</td></tr>
+  </tbody>
+</table>
+<p>Two patterns stand out. Every setup that states an epoch count uses one: InstructGPT found multiple epochs "quickly overfit the model to the training data with obvious deterioration in the validation loss"<a class="cite" href="#ref-1">1</a> (Appendix C.2), Llama 2 reports the same<a class="cite" href="#ref-8">8</a> (§3.2.2), and Lambert gives one epoch as the common practice<a class="cite" href="#ref-6">6</a> (§5.1.2). And reward-model training is cheap next to the RL in the same pipeline. Tulu 3's final 8B reward model took 9 hours on 8 H100 GPUs, while the final 8B RL run took 65 hours on 8 GPUs<a class="cite" href="#ref-12">12</a> (§6.3), which is 72 against 520 GPU-hours, a factor of 7.2 (derived).</p>
+
+<h3 id="architecture-scale">3.3 Scale: what limits the size of a reward model</h3>
+<p>InstructGPT used one 6B reward model for policies of 1.3B, 6B and 175B parameters. The stated reasons were stability and cost: larger 175B RMs "had the potential to achieve lower validation loss, but (1) their training was more unstable which made them less suitable for use as initializations for the PPO value functions, and (2) using a 175B RM and value function greatly increase the compute requirements of PPO", while 6B RMs "were stable across a wide range of learning rates, and led to equally strong PPO models"<a class="cite" href="#ref-1">1</a> (Appendix C.2). That is a systems argument: because the value function is initialized from the RM, a 175B RM would mean a 175B value function training alongside the policy (Module 5 counts the four models).</p>
+<p>Within the sizes that are practical, accuracy keeps improving. Stiennon et al. trained seven RMs from 160M to 13B parameters on 8k to 64k comparisons and found that doubling the training data adds about 1.1% to validation accuracy while doubling the model size adds about 1.8%<a class="cite" href="#ref-4">4</a> (§4.3, Figure 6). Llama 2 reports that RM accuracy rose with both more weekly data batches and model size from 7B to 70B, and had not plateaued at 1.4M Meta comparisons<a class="cite" href="#ref-8">8</a> (§3.2.2, Figure 6). Gao et al.'s synthetic study, which used 3M to 3B parameter proxy RMs against a 6B gold RM, adds the small-data end: below roughly 2,000 comparisons every RM stays close to chance loss, larger RMs do not reach the threshold sooner, and four epochs on the same data give no gain while one epoch on four times the data helps substantially<a class="cite" href="#ref-10">10</a> (§3.3). How these RM properties set the over-optimization curve is Module 6's subject.</p>
+<p>Llama 2 also shows a limit that scale does not remove: helpfulness and safety trade off, so the authors trained two RMs rather than one. Each wins on its own test set (Helpfulness RM 63.2% vs Safety RM 56.2% on Meta Helpful; the reverse on Meta Safety, 62.8% vs 64.5%), which they tentatively attribute ("potentially due to") to the tension between the objectives confusing a single model<a class="cite" href="#ref-8">8</a> (§3.2.2, Tables 7-8).</p>
+
+<h3 id="architecture-proxy">3.4 Pair accuracy as a proxy for the policy you get</h3>
+<p>The accepted justification for evaluating an RM on held-out pairs is Llama 2's: RM accuracy is "one of the most important proxies for the final performance", and because the ranking task has no ambiguity, an RM improvement should translate into a model improvement everything else equal<a class="cite" href="#ref-8">8</a> (§3.2.2). InstructGPT used the RM score itself to choose SFT checkpoints, finding it "more predictive of human preference results compared to validation loss"<a class="cite" href="#ref-1">1</a> (Appendix C.1). The evidence on how far that proxy extends is mixed:</p>
+<ul>
+<li>Frick et al. build Preference Proxy Evaluations by correlating offline RM metrics with the post-RLHF human preference ranking of nine models. Pair accuracy on a large human preference set is the best single predictor, and the full set of PPE evaluations reaches a 77% Pearson correlation with downstream performance<a class="cite" href="#ref-13">13</a> (§7, §9). Their downstream training used DPO, not PPO, and they note the result may not transfer to online RL<a class="cite" href="#ref-13">13</a> (§8.2). They also report that for top models the correlation between RewardBench scores and downstream RLHF performance has turned negative<a class="cite" href="#ref-13">13</a> (§2).</li>
+<li>Tulu 3's authors write that "strong RM performance on RM-specific benchmarks does not necessarily translate to better downstream performance for PPO"<a class="cite" href="#ref-12">12</a> (§5.4.1), and for that reason trained their RM once without tuning.</li>
+<li>Gao et al. show the other direction: a proxy RM can keep rising while the gold score falls. That is Module 6.</li>
+</ul>
+<p>Pair accuracy is the best offline proxy available but an imperfect one, and it cannot see what optimization pressure will exploit. DPO drops the separate model: its loss is the Bradley-Terry loss with the reward defined as \(\beta\log\pi_\theta/\pi_{\text{ref}}\), so "your language model is secretly a reward model"<a class="cite" href="#ref-2">2</a> (§4-5). Module 7 derives it; for this module the relevant fact is that every property in section 2 (shift invariance, bounded gradient weight, noise floor) carries over to the implicit reward.</p>
+<h2 id="outcome-vs-process">4. Outcome and process supervision</h2>
+<p>A preference RM scores a whole response. For reasoning tasks there are two other ways to turn a solution into a learned score, and the choice between them is the most contested design decision in reward modeling. Outcome supervision labels a solution by its final answer. Process supervision labels each reasoning step. Lightman et al. ran the large-scale comparison on MATH<a class="cite" href="#ref-14">14</a>, following Uesato et al., who made the first comprehensive comparison of the two on grade-school math<a class="cite" href="#ref-15">15</a>.</p>
+
+<h3 id="outcome-vs-process-taxonomy">4.1 Four learned scorers and what each predicts</h3>
+<table class="tbl tbl-compare">
+  <caption><b>Table 4.</b> Reward-model types after Lambert's comparison table<a class="cite" href="#ref-6">6</a> (§5.4), with Lightman et al.'s details for ORM and PRM<a class="cite" href="#ref-14">14</a> (§2.5-2.6, Appendix E-F).</caption>
+  <thead><tr><th>Type</th><th>Predicts</th><th>Label per training example</th><th>Loss</th><th>Used at inference as</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Preference RM</td><td>sequence-level quality \(r_\theta(x,y)\)</td><td>a pair ordered on one prompt</td><td>\(-\log\sigma(r_c-r_r)\)</td><td>one scalar from the EOS state: rerank, or RL reward</td></tr>
+    <tr><td class="row">Outcome RM (ORM)</td><td>probability the answer ends correct, at every token</td><td>one correct/incorrect label per sample, from a verifier or dataset, copied to every completion token</td><td>per-token binary cross-entropy; no pairs needed</td><td>score of the final token<a class="cite" href="#ref-14">14</a>, or mean, min or product over tokens</td></tr>
+    <tr><td class="row">Process RM (PRM)</td><td>correctness of each step given the prefix</td><td>a label per step: positive, neutral or negative; supervised only up to the first error<a class="cite" href="#ref-14">14</a></td><td>per-step cross-entropy on a label token after each step</td><td>product (or minimum) of step probabilities; prune branches in search</td></tr>
+    <tr><td class="row">Value function</td><td>expected remaining return from the current prefix</td><td>return from the policy's own rollouts, recomputed as the policy changes</td><td>regression to the return at each token</td><td>baseline for advantages; not a reward</td></tr>
+  </tbody>
+</table>
+<p>Lambert's formal versions are the per-token loss \(L_{\text{token}}=-\mathbb{E}\big[\tfrac1T\sum_t r\log p_\theta(s_t)+(1-r)\log(1-p_\theta(s_t))\big]\) for the ORM, with the sequence outcome label \(r\in\{0,1\}\) applied at every completion token and prompt tokens masked, and a per-step cross-entropy over the \(K\) annotated steps for the PRM<a class="cite" href="#ref-6">6</a> (§5.2-5.3, Eq. 19-21). Three boundaries in the table are blurred in the literature and worth fixing:</p>
+<ul>
+<li><strong>ORM versus value function.</strong> Both put a scalar head on every token. With discount \(\gamma=1\) and a terminal correctness reward, the value of a prefix is the probability the completion ends correct, which is what the ORM predicts. They differ in where targets come from: an ORM trains offline on fixed verifier labels, a value function trains on-policy returns that move with the policy<a class="cite" href="#ref-6">6</a> (§5.4). Module 2 covers the value-function side.</li>
+<li><strong>"ORM" is used loosely.</strong> Lightman et al. introduce ORMs and PRMs through Uesato et al.'s outcome/process distinction<a class="cite" href="#ref-14">14</a> (§1), and Cobbe et al.'s GSM8K verifiers, which were also trained jointly with the language-modeling loss, are the template they follow; some papers use the name for any verifier trained to predict correctness<a class="cite" href="#ref-6">6</a> (§5.2).</li>
+<li><strong>A BT model on correct-versus-incorrect pairs is still a BT model.</strong> If the chosen response is a correct solution and the rejected one an incorrect solution to the same problem, the training uses the contrastive sequence-level loss and falls in the first row of Table 4<a class="cite" href="#ref-6">6</a> (§5.4).</li>
+</ul>
+
+<h3 id="outcome-vs-process-example">4.2 Scoring one solution both ways</h3>
+<p>The difference shows on solutions that reach the right answer for the wrong reason. Lightman et al. note that outcome labels come from final-answer checking, which is "not perfectly reliable": a solution that reaches the correct answer with incorrect reasoning is misgraded as positive<a class="cite" href="#ref-14">14</a> (§2.5). Figure 5 shows the mechanism on a constructed example.</p>
+
+<figure class="fig">
+  <svg viewBox="0 0 800 440" role="img" aria-labelledby="f5t"><title id="f5t">Two four-step solutions to one problem scored by an outcome reward model at the final token and a process reward model at each step; the right-answer solution with a flawed step gets a high outcome score and a low process score</title>
+    <text x="400" y="22" text-anchor="middle" class="d-small">problem: how many positive integers n satisfy 3n − 7 &lt; 20?  (answer 8)</text>
+    <rect x="10" y="36" width="385" height="396" rx="10" class="d-panel"/>
+    <text x="202" y="60" text-anchor="middle" class="d-bold">A: wrong answer</text>
+    <text x="213" y="86" text-anchor="middle" class="d-small d-text-light">label</text>
+    <text x="285" y="86" text-anchor="middle" class="d-small d-text-light">PRM p(step ok)</text>
+    <rect x="18" y="96" width="170" height="44" rx="6" class="d-surface"/>
+    <text x="103" y="123" text-anchor="middle" class="d-mono d-small">3n &lt; 27</text>
+    <rect x="196" y="104" width="34" height="28" rx="6" class="d-fill-green-soft d-stroke-green"/>
+    <text x="213" y="123" text-anchor="middle" class="d-bold">✓</text>
+    <rect x="240" y="111" width="90" height="14" class="d-outline"/>
+    <rect x="240" y="111" width="88.2" height="14" class="d-fill-blue"/>
+    <text x="338" y="123" class="d-mono d-small">0.98</text>
+    <rect x="18" y="154" width="170" height="44" rx="6" class="d-surface"/>
+    <text x="103" y="181" text-anchor="middle" class="d-mono d-small">n &lt; 9</text>
+    <rect x="196" y="162" width="34" height="28" rx="6" class="d-fill-green-soft d-stroke-green"/>
+    <text x="213" y="181" text-anchor="middle" class="d-bold">✓</text>
+    <rect x="240" y="169" width="90" height="14" class="d-outline"/>
+    <rect x="240" y="169" width="86.4" height="14" class="d-fill-blue"/>
+    <text x="338" y="181" class="d-mono d-small">0.96</text>
+    <rect x="18" y="212" width="170" height="44" rx="6" class="d-surface"/>
+    <text x="103" y="239" text-anchor="middle" class="d-mono d-small">n = 1, …, 9</text>
+    <rect x="196" y="220" width="34" height="28" rx="6" class="d-fill-red-soft d-stroke-red"/>
+    <text x="213" y="239" text-anchor="middle" class="d-bold">✗</text>
+    <rect x="240" y="227" width="90" height="14" class="d-outline"/>
+    <rect x="240" y="227" width="16.2" height="14" class="d-fill-blue"/>
+    <text x="338" y="239" class="d-mono d-small">0.18</text>
+    <rect x="18" y="270" width="170" height="44" rx="6" class="d-surface"/>
+    <text x="103" y="297" text-anchor="middle" class="d-mono d-small">answer: 9</text>
+    <rect x="196" y="278" width="34" height="28" rx="6" class="d-outline d-dashed"/>
+    <text x="213" y="297" text-anchor="middle" class="d-bold">–</text>
+    <rect x="240" y="285" width="90" height="14" class="d-outline"/>
+    <rect x="240" y="285" width="9.9" height="14" class="d-fill-blue"/>
+    <text x="338" y="297" class="d-mono d-small">0.11</text>
+    <text x="18" y="353" class="d-small">ORM score, final token</text>
+    <rect x="240" y="340" width="90" height="14" class="d-outline"/>
+    <rect x="240" y="340" width="6.3" height="14" class="d-fill-orange"/>
+    <text x="338" y="352" class="d-mono d-small">0.07</text>
+    <text x="18" y="385" class="d-small">PRM score, product of steps</text>
+    <rect x="240" y="372" width="90" height="14" class="d-outline"/>
+    <rect x="240" y="372" width="1.7" height="14" class="d-fill-blue"/>
+    <text x="338" y="384" class="d-mono d-small">0.019</text>
+    <text x="202" y="418" text-anchor="middle" class="d-small d-text-light">step 4 unlabeled: supervision stops at first error</text>
+    <rect x="405" y="36" width="385" height="396" rx="10" class="d-panel"/>
+    <text x="597" y="60" text-anchor="middle" class="d-bold">B: right answer, flawed step</text>
+    <text x="608" y="86" text-anchor="middle" class="d-small d-text-light">label</text>
+    <text x="680" y="86" text-anchor="middle" class="d-small d-text-light">PRM p(step ok)</text>
+    <rect x="413" y="96" width="170" height="44" rx="6" class="d-surface"/>
+    <text x="498" y="123" text-anchor="middle" class="d-mono d-small">3n &lt; 27</text>
+    <rect x="591" y="104" width="34" height="28" rx="6" class="d-fill-green-soft d-stroke-green"/>
+    <text x="608" y="123" text-anchor="middle" class="d-bold">✓</text>
+    <rect x="635" y="111" width="90" height="14" class="d-outline"/>
+    <rect x="635" y="111" width="88.2" height="14" class="d-fill-blue"/>
+    <text x="733" y="123" class="d-mono d-small">0.98</text>
+    <rect x="413" y="154" width="170" height="44" rx="6" class="d-surface"/>
+    <text x="498" y="181" text-anchor="middle" class="d-mono d-small">n &lt; 9</text>
+    <rect x="591" y="162" width="34" height="28" rx="6" class="d-fill-green-soft d-stroke-green"/>
+    <text x="608" y="181" text-anchor="middle" class="d-bold">✓</text>
+    <rect x="635" y="169" width="90" height="14" class="d-outline"/>
+    <rect x="635" y="169" width="86.4" height="14" class="d-fill-blue"/>
+    <text x="733" y="181" class="d-mono d-small">0.96</text>
+    <rect x="413" y="212" width="170" height="44" rx="6" class="d-surface"/>
+    <text x="498" y="239" text-anchor="middle" class="d-mono d-small">n = 0, …, 7</text>
+    <rect x="591" y="220" width="34" height="28" rx="6" class="d-fill-red-soft d-stroke-red"/>
+    <text x="608" y="239" text-anchor="middle" class="d-bold">✗</text>
+    <rect x="635" y="227" width="90" height="14" class="d-outline"/>
+    <rect x="635" y="227" width="19.8" height="14" class="d-fill-blue"/>
+    <text x="733" y="239" class="d-mono d-small">0.22</text>
+    <rect x="413" y="270" width="170" height="44" rx="6" class="d-surface"/>
+    <text x="498" y="297" text-anchor="middle" class="d-mono d-small">answer: 8</text>
+    <rect x="591" y="278" width="34" height="28" rx="6" class="d-outline d-dashed"/>
+    <text x="608" y="297" text-anchor="middle" class="d-bold">–</text>
+    <rect x="635" y="285" width="90" height="14" class="d-outline"/>
+    <rect x="635" y="285" width="36.0" height="14" class="d-fill-blue"/>
+    <text x="733" y="297" class="d-mono d-small">0.40</text>
+    <text x="413" y="353" class="d-small">ORM score, final token</text>
+    <rect x="635" y="340" width="90" height="14" class="d-outline"/>
+    <rect x="635" y="340" width="79.2" height="14" class="d-fill-orange"/>
+    <text x="733" y="352" class="d-mono d-small">0.88</text>
+    <text x="413" y="385" class="d-small">PRM score, product of steps</text>
+    <rect x="635" y="372" width="90" height="14" class="d-outline"/>
+    <rect x="635" y="372" width="7.5" height="14" class="d-fill-blue"/>
+    <text x="733" y="384" class="d-mono d-small">0.083</text>
+    <text x="597" y="418" text-anchor="middle" class="d-small d-text-light">step 4 unlabeled: supervision stops at first error</text>
+  </svg>
+  <figcaption><b>Figure 5.</b> One problem, two solutions, scored by an ORM (one number at the final token) and a PRM (a probability per step, combined by product). Solution B reaches the right answer from a wrong set at step 3; the ORM cannot see the flaw, the PRM can. Structure follows Lightman et al.: PRM score is the product of step probabilities, and labels stop at the first incorrect step<a class="cite" href="#ref-14">14</a> (§2.5-2.6). All probabilities are illustrative values chosen to show the mechanism, not outputs of a trained model; for scale, four steps at 0.95 each would score 0.95<sup>4</sup> = 0.81 (derived).</figcaption>
+</figure>
+<h3 id="outcome-vs-process-evidence">4.3 What the measurements show</h3>
+<table class="tbl tbl-dense">
+  <caption><b>Table 5.</b> Controlled or semi-controlled comparisons of outcome and process supervision. Metrics differ by row; read within a row, not down a column.</caption>
+  <thead><tr><th>Study and setting</th><th>Outcome supervision</th><th>Process supervision</th><th>What it measures</th></tr></thead>
+  <tbody>
+    <tr><td class="row">Uesato et al. 2022, GSM8K<a class="cite" href="#ref-15">15</a></td><td>final-answer error 23.5% without an RM, 16.6% with an RM; best trace error 12.4% when RL targets final-answer correctness</td><td>final-answer error 22.3% without an RM, 14.8% with an RM; trace error 3.8% for the best process-based method</td><td>error rates of the trained generator, using human trace annotation (§1). RL against a learned RM that emulates process feedback reached 5.5% trace error</td></tr>
+    <tr><td class="row">Lightman et al. 2023, MATH, GPT-4 base<a class="cite" href="#ref-14">14</a></td><td>ORM best-of-1,860: 72.4%; majority vote 69.6%. Out-of-distribution STEM set (234 problems in Table 1; the text says 224; best-of-100): 63.8% (majority 61.3%)</td><td>PRM best-of-1,860: 78.2%. STEM set: 72.9%. Active learning: about 2.6× more data-efficient</td><td>reranking quality of a fixed generator; no RL (§2.1, §3, §5, Table 1)</td></tr>
+    <tr><td class="row">Math-Shepherd, Mistral-7B<a class="cite" href="#ref-16">16</a></td><td>PPO against an ORM: GSM8K 81.8%, MATH 31.3% (base 77.9%, 28.6%)</td><td>step-by-step PPO against an automatically labeled PRM: 84.1%, 33.0%</td><td>greedy-decoding accuracy after RL (Table 2)</td></tr>
+    <tr><td class="row">DeepSeekMath-Instruct 1.3B<a class="cite" href="#ref-11">11</a></td><td>GRPO with outcome supervision</td><td>GRPO with process supervision "shows superior performance"</td><td>benchmark accuracy over RL steps, GSM8K and MATH (§5.2.1, Figure 5); no numbers in text</td></tr>
+  </tbody>
+</table>
+<p>Four readings keep the table honest.</p>
+<ul>
+<li><strong>The largest margin comes from selection, not training.</strong> Lightman et al. "do not attempt to improve the generator with reinforcement learning" and score RMs by best-of-N search<a class="cite" href="#ref-14">14</a> (§2.1). The 78.2% against 72.4% says a PRM ranks candidates better than an ORM; it does not say that rewarding with a PRM yields a better policy.</li>
+<li><strong>The Uesato-Lightman conflict is a data-scale effect.</strong> Uesato et al. found similar final-answer error for both kinds of supervision<a class="cite" href="#ref-15">15</a>. Lightman et al. argue that a little process supervision and a lot of outcome supervision perform alike, and that process supervision pulls ahead when scaled, even judged on outcomes alone<a class="cite" href="#ref-14">14</a> (§7.1). Math-Shepherd's authors add that the PRM advantage is larger on MATH than on GSM8K, whose problems need fewer steps<a class="cite" href="#ref-16">16</a> (§4.1).</li>
+<li><strong>The clearest win is on the reasoning trace, not the answer.</strong> In Uesato et al., every RL run that targeted final-answer correctness left high trace error: 12.4% at best, against 3.8% for the best process-based method, and 5.5% for RL against a learned RM. Even ORMs agreed more with process labels than with their own outcome labels, a result the authors flag as possibly dataset-specific<a class="cite" href="#ref-15">15</a> (§1).</li>
+<li><strong>Lightman's outcome baseline is confounded.</strong> Final-answer labels give false positives on right-answer-wrong-reasoning solutions. When the large PRM supplied outcome-style labels instead, the outcome-trained RM improved noticeably, which the authors consider the more representative baseline where false positives are rarer. Process supervision still beat both at every data scale in that small-scale study<a class="cite" href="#ref-14">14</a> (§4.1).</li>
+</ul>
+
+<h4 id="outcome-vs-process-scoring">Combining step probabilities into one score (derived)</h4>
+<p>A PRM outputs one probability per step; ranking whole solutions needs a reduction. Lightman et al. tried product and minimum, with neutral steps read as positive or negative. The four settings gave 78.2%, 77.6%, 77.4% and 77.8% best-of-1,860, "minor" differences, and they chose the product with neutral as positive<a class="cite" href="#ref-14">14</a> (Appendix F.2, Table 4). The product carries a length bias, which they note: if each step is correct with probability \(q\), a solution of \(n\) steps scores \(q^n\). At \(q=0.97\) that is 0.737 for ten steps and 0.544 for twenty, while the minimum stays at 0.97. For a reward in RL the same bias would favor shorter solutions regardless of correctness unless it were normalized, one reason a PRM's output is not used as a drop-in reward (the writer's reading).</p>
+
+<h3 id="outcome-vs-process-labels">4.4 Where process labels come from, and how good they are</h3>
+<p>Human step labels are the expensive part. Lightman et al. collected 1,085,590 step-level labels over 101,599 solutions and kept about 800,000 over 75,000 solutions (12,000 problems) as PRM800K. Labelers had to agree with gold labels at least 75% of the time on 30 screening questions<a class="cite" href="#ref-14">14</a> (§2.4, Appendix B). They chose which solutions to label by active learning: show "convincing wrong-answer" solutions, meaning ones the current best PRM scores highly although the final answer is wrong, because each of those is known to contain a step the PRM misjudges. The resulting data is skewed by design: 14.2% of the labeled solutions end correct, against 85.1% in the smaller first collection phase<a class="cite" href="#ref-14">14</a> (Appendix B, Table 3).</p>
+<p>The labels are noisier than the headline suggests. DeepSeekMath's authors write that even PRM800K, "carefully annotated by well-trained annotators", contains approximately 20% incorrect annotations, citing a GitHub issue thread for the figure rather than a measurement<a class="cite" href="#ref-11">11</a> (§5.2.3, footnote 7); treat that number as a secondhand report.</p>
+<p>Math-Shepherd removes the humans. For a prefix ending in step \(s_i\), a "completer" model samples \(N\) continuations to a final answer, and the step label is either the hard estimate \(y^{\text{HE}}_{s_i}=1\) if any completion reaches the correct answer \(a^*\), or the soft estimate \(y^{\text{SE}}_{s_i}=\tfrac1N\sum_{j=1}^N\mathbb{1}[a_j=a^*]\)<a class="cite" href="#ref-16">16</a> (§3.3, Eq. 3-4). The soft label is a Monte Carlo estimate of the probability that the completer finishes correctly from that prefix. In Module 2's terms it is the value of the prefix under the completer policy with a binary terminal reward and \(\gamma=1\): an automatic PRM is a value function trained offline on a fixed policy's rollouts (the writer's observation, resting on the definitions in sections 3.3 of that paper and 4.1 here). A hand check of 160 GSM8K steps found the hard estimate 86% accurate at \(N=4\) with a LLaMA2-70B completer, falling for larger \(N\) because of false positives; verifier quality was about the same with either estimate<a class="cite" href="#ref-16">16</a> (§5.2). On MATH the automatic data beat the human-annotated PRM800K for open-source generators, which the authors attribute to a distribution gap (PRM800K steps were labeled on GPT-4 samples) and to four times as much data<a class="cite" href="#ref-16">16</a> (§5.1).</p>
+<p>That last point is the structural weakness of every learned PRM: its labels describe the policy that produced the labeled samples. After RL changes the policy, the labels are stale. Math-Shepherd saw this directly. On MATH500, reranking the PPO-trained model with the original reward models (ORM 41.3%, Math-Shepherd 41.1%) fell below plain self-consistency (42.3%), though on GSM8K the reward models still edged ahead. The authors' explanation is that "the initial reward model is not sufficient to supervise the more powerful model after PPO"<a class="cite" href="#ref-16">16</a> (§4.1, Table 3).</p>
+
+<h3 id="outcome-vs-process-rl-scale">4.5 Why PRMs did not survive RL at scale</h3>
+<p>DeepSeek-R1 records its attempt in the "unsuccessful attempts" supplement. It calls PRM "a reasonable method to guide the model toward better approaches" and then lists three limitations: "it is challenging to explicitly define a fine-grain step in general reasoning"; determining whether an intermediate step is correct is hard, because automated annotation "may not yield satisfactory results" and manual annotation does not scale; and "once a model-based PRM is introduced, it inevitably leads to reward hacking", with retraining adding cost and complexity. The conclusion is carefully scoped: a PRM "demonstrates a good ability to rerank the top-N responses generated by the model or assist in guided search," but its advantages are "limited compared to the additional computational overhead it introduces during the large-scale reinforcement learning process in our experiments"<a class="cite" href="#ref-9">9</a> (Supplement G.2; §4.2 in arXiv v1). The main text applies the decision to all neural reward models for reasoning, outcome or process<a class="cite" href="#ref-9">9</a> (§2.2). Kimi k1.5 states the same design stance in its abstract: no Monte Carlo tree search, value functions or process reward models<a class="cite" href="#ref-17">17</a>.</p>
+<p>The three objections map onto the mechanics above. Step granularity is the label problem of section 4.4. Step correctness is the cost and noise problem. Reward hacking is the staleness problem: a model-based PRM is a frozen approximation of "correct" fit on yesterday's policy, and RL pressure finds its gaps (Module 6 shows the shape of that curve; Module 19 covers practice). The cost objection is separate: R1's own pipeline trains a helpfulness RM and a safety RM for non-reasoning data, so the objection is to using reward models in reasoning RL, not to training them<a class="cite" href="#ref-9">9</a> (§3.1).</p>
+<p>What did survive is the off-loop use. Llama 3 trains "outcome and stepwise reward models" to filter SFT data in which intermediate reasoning steps were wrong, and for harder prompts it runs Monte Carlo tree search with learned step-wise reward models to generate valid reasoning traces<a class="cite" href="#ref-5">5</a> (§4.3.3). The reward is not in an RL loop that can exploit it; it removes bad samples from a fixed training set. Finer credit assignment inside RL without a learned PRM comes back by other routes, such as grouping trajectories that share intermediate states, which Module 18 treats.</p>
+<h2 id="where-learned-rms-live">5. Where learned reward models live in current recipes</h2>
+<p>Read across the reports, a learned scalar reward model has held five distinct jobs: the RL reward, the initialization of the value function, a selector in rejection sampling or best-of-N, a filter or scorer for training data, and a proxy metric for choosing checkpoints. Table 6 lists what each report documents; one model's pipeline often spans several families.</p>
+<table class="tbl tbl-dense">
+  <caption><b>Table 6.</b> Role of a learned reward model by recipe family, with the report that documents it. "Judge" means a prompted or trained generative model that outputs a score or verdict, covered in Module 16.</caption>
+  <thead><tr><th>Family</th><th>Report</th><th>What replaces or uses the RM</th></tr></thead>
+  <tbody>
+    <tr><td class="row" rowspan="3">PPO-RLHF</td><td>InstructGPT, Stiennon<a class="cite" href="#ref-1">1</a><a class="cite" href="#ref-4">4</a></td><td>RM score ends a bandit episode and is the RL reward; value function initialized from the RM; RM score also selects SFT checkpoints</td></tr>
+    <tr><td>Llama 2<a class="cite" href="#ref-8">8</a></td><td>Two RMs (helpfulness, safety) feed PPO and rejection-sampling fine-tuning</td></tr>
+    <tr><td>Tulu 3 preference study<a class="cite" href="#ref-12">12</a></td><td>RM trained once for a PPO-versus-DPO comparison: PPO was comparable but cost about 28 hours on two nodes against about 4 hours on one node for DPO, so DPO was kept for preference tuning</td></tr>
+    <tr><td class="row" rowspan="3">DPO pipelines</td><td>Llama 3<a class="cite" href="#ref-5">5</a></td><td>RM on the pre-trained checkpoint serves rejection sampling (10 to 30 samples per prompt, best by RM), quality scoring (top RM quartile counts as high quality) and, with step-wise RMs, filtering of reasoning traces; DPO consumes preference pairs directly</td></tr>
+    <tr><td>Olmo 3 Think DPO<a class="cite" href="#ref-18">18</a></td><td>No RM: pairs contrast a Qwen3 32B Thinking response with a Qwen3 0.6B Thinking response ("delta learning"), plus pairs from a delta-aware LLM-judge pipeline</td></tr>
+    <tr><td>DeepSeek-R1 SFT data<a class="cite" href="#ref-9">9</a></td><td>Reasoning data filtered by rule-based correctness, some judged by a generative reward model via DeepSeek-V3</td></tr>
+    <tr><td class="row" rowspan="3">RLVR and reasoning RL</td><td>DeepSeek-R1-Zero and stage 1<a class="cite" href="#ref-9">9</a></td><td>Rule-based accuracy and format rewards only; "we abstain from applying neural reward models" to reasoning</td></tr>
+    <tr><td>DeepSeek-R1 stage 2<a class="cite" href="#ref-9">9</a></td><td>Helpfulness and safety RMs enter only for the final 400 of 1,700 steps, because more steps with the model-based preference reward "may lead to reward hacking" (Figure 6 of the report: reward up while CodeForces performance falls)</td></tr>
+    <tr><td>Tulu 3 RLVR<a class="cite" href="#ref-12">12</a></td><td>Verifier reward; the RM only initializes the value function (best GSM8K and average scores), and adding RM scores on top of verifiable rewards "seems to introduce more noise"</td></tr>
+    <tr><td class="row" rowspan="5">2026 general-RL recipes</td><td>Qwen3<a class="cite" href="#ref-19">19</a></td><td>Three reward types over more than 20 tasks: rule-based; model-based with a reference answer (Qwen2.5-72B-Instruct as judge); model-based without one (a reward model trained on human preference data, producing a scalar)</td></tr>
+    <tr><td>GLM-5<a class="cite" href="#ref-20">20</a></td><td>Hybrid system of rule-based rewards, outcome reward models and generative reward models, each covering the others' weakness</td></tr>
+    <tr><td>DeepSeek-V3.2<a class="cite" href="#ref-21">21</a></td><td>Rule-based outcome reward for reasoning and agent tasks; a generative reward model with per-prompt rubrics for general tasks</td></tr>
+    <tr><td>DeepSeek-V4<a class="cite" href="#ref-22">22</a></td><td>"We dispense with these conventional scalar-based reward models"; a generative reward model is trained jointly with the actor, which doubles as the judge</td></tr>
+    <tr><td>Kimi K3, Olmo 3<a class="cite" href="#ref-23">23</a><a class="cite" href="#ref-18">18</a></td><td>K3: an agentic generative reward model that must read the output, write a rubric, score each candidate and record a scorepad. Olmo 3: verifiers plus an LM judge (Qwen3 32B) for chat; no learned scalar RM is described</td></tr>
+  </tbody>
+</table>
+<p>Four things follow. First, the pairwise-trained scalar RM is absent from the verifiable-reward stages (R1-Zero, Tulu 3 RLVR) and documented as a reward only in preference-centred or general-purpose stages. Second, its most durable jobs are those where no policy optimizes directly against its output: selection, filtering, and value-function initialization (Tulu 3's value initialized from a general RM beat the alternative). Third, where reports keep a learned reward inside RL they bound its exposure: R1 confines it to 400 steps, Tulu 3 drops it when a verifier exists, and GLM-5 pairs outcome reward models with generative ones because outcome RMs give "low-variance signals and high training efficiency, but are more susceptible to reward hacking" while generative RMs "are more robust to such exploitation, but tend to exhibit higher variance"<a class="cite" href="#ref-20">20</a> (§3.4). Fourth, the replacement for non-verifiable tasks is a judge that reasons before scoring, not a smaller or better scalar head, which is Module 16's subject.</p>
+<aside class="callout callout-tip"><span class="callout-title">In practice</span><p>If you need a reward for RL and a verifier exists, the reports above use the verifier. If you need to rank or filter samples at scale, a Bradley-Terry RM is still the cheap tool: one prefill-shaped forward pass per sample, with a stable, bounded training loss. If you need a value-function initialization for PPO, an RM trained on your preference mix is the documented choice<a class="cite" href="#ref-12">12</a> (§6.2.1). Choose the checkpoint by held-out pair accuracy with the caveats in section 3.4, and plan on re-collecting preferences on the current policy's samples rather than reusing a pooled dataset<a class="cite" href="#ref-6">6</a> (§11.2).</p></aside>
+<section class="disagree">
+<h2 id="where-experts-disagree">Where experts disagree</h2>
+<p>Two questions are open. The first is whether supervising reasoning steps is worth its cost, now that outcome-only RL with rule-based rewards has produced frontier reasoning models. The second is what should fill the learned-reward slot for tasks without a verifier: a scalar Bradley-Terry model, or a generative judge. The positions below are what the reports state; where no report ran the comparison, the card says so.</p>
+<div class="positions">
+  <article class="position">
+    <h4>A. Process supervision gives better reward models, and it should be used</h4>
+    <p class="who">Lightman et al.<a class="cite" href="#ref-14">14</a>; Shao et al. (DeepSeekMath)<a class="cite" href="#ref-11">11</a>; Wang et al. (Math-Shepherd)<a class="cite" href="#ref-16">16</a></p>
+    <p>Step labels localize errors, which makes credit assignment easier; Lightman et al. also argue process supervision is easier to interpret and incurs a "negative alignment tax" on MATH (§6.2). DeepSeekMath's GRPO with process supervision beat the outcome version, and Math-Shepherd's step-by-step PPO beat ORM-PPO.</p>
+    <ul class="pros"><li>PRM 78.2% against ORM 72.4% and majority vote 69.6% at best-of-1,860; the gap widens with N<a class="cite" href="#ref-14">14</a>.</li><li>Catches right-answer-wrong-reasoning solutions that outcome labels credit<a class="cite" href="#ref-14">14</a><a class="cite" href="#ref-15">15</a>.</li><li>Automatic step labels (Math-Shepherd) remove the human cost and, for open-source generators, beat PRM800K<a class="cite" href="#ref-16">16</a>.</li></ul>
+    <ul class="cons"><li>The strongest numbers are reranking, not RL, on math, with a GPT-4 base<a class="cite" href="#ref-14">14</a>.</li><li>Label noise: about 20% of PRM800K labels reported wrong, secondhand<a class="cite" href="#ref-11">11</a>; automatic labels are 86% accurate in a 160-step check<a class="cite" href="#ref-16">16</a>.</li><li>Labels describe the labeled policy and go stale after RL<a class="cite" href="#ref-16">16</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>B. Do not use learned reward models for reasoning RL; use rules</h4>
+    <p class="who">DeepSeek-R1<a class="cite" href="#ref-9">9</a>; Kimi k1.5<a class="cite" href="#ref-17">17</a>; Tulu 3's RLVR ablation<a class="cite" href="#ref-12">12</a></p>
+    <p>R1 abstains from neural reward models, outcome or process, for reasoning because they are susceptible to hacking at scale and need retraining; accuracy and format rewards were enough to take R1-Zero's AIME 2024 pass@1 from 15.6% to 77.9% in the expanded version<a class="cite" href="#ref-9">9</a> (§2.3). Tulu 3 found that layering RM scores on verifiable rewards added noise<a class="cite" href="#ref-12">12</a>.</p>
+    <ul class="pros"><li>Precise reward with no second model to train, serve or refresh.</li><li>Removes the hacking surface that R1 observed with its helpfulness RM (reward rising while CodeForces performance fell)<a class="cite" href="#ref-9">9</a>.</li></ul>
+    <ul class="cons"><li>Works only where a reliable verifier exists; R1 itself says that for complex tasks that "cannot be effectively evaluated by a reliable reward model", scaling pure RL "remains an open challenge"<a class="cite" href="#ref-9">9</a> (Supplement G.1).</li><li>The PRM verdict is scoped to "our experiments", and the report shows no controlled run of RL with a PRM against RL without one.</li></ul>
+  </article>
+  <article class="position">
+    <h4>C. Keep process reward models, but outside the RL loop</h4>
+    <p class="who">Llama 3<a class="cite" href="#ref-5">5</a>; R1's own concession<a class="cite" href="#ref-9">9</a>; Lightman et al.'s best-of-N framing<a class="cite" href="#ref-14">14</a></p>
+    <p>Use outcome and step-wise RMs to filter SFT data, run tree search with step-wise RMs on hard prompts, and rerank at inference. R1 agrees that PRMs "rerank the top-N responses" and "assist in guided search" well; its objection is to their cost inside large-scale RL.</p>
+    <ul class="pros"><li>No policy optimizes against the RM, so there is no exploitation pressure.</li><li>Uses the selection gains that are actually measured.</li></ul>
+    <ul class="cons"><li>Does not improve the on-policy training signal.</li><li>The Llama 3 passage read gives no measurement of the filter's effect on the final model<a class="cite" href="#ref-5">5</a>.</li></ul>
+  </article>
+  <article class="position">
+    <h4>D. Replace scalar reward models with generative judges</h4>
+    <p class="who">DeepSeek-V4<a class="cite" href="#ref-22">22</a>; Kimi K3<a class="cite" href="#ref-23">23</a>; DeepSeek-V3.2<a class="cite" href="#ref-21">21</a>. Retaining trained scalar or outcome RMs: Qwen3<a class="cite" href="#ref-19">19</a>, GLM-5<a class="cite" href="#ref-20">20</a>; Lambert's benchmark observation<a class="cite" href="#ref-6">6</a></p>
+    <p>V4 drops scalar RMs for a rubric-guided generative reward model trained jointly with the actor. Lambert notes that on RM evaluations generative models "tend to be behind existing reward models"<a class="cite" href="#ref-6">6</a> (§5.6), and Qwen3 and GLM-5 still train preference or outcome reward models alongside rule-based and judge rewards.</p>
+    <ul class="pros"><li>GLM-5 describes generative RMs as more robust to exploitation<a class="cite" href="#ref-20">20</a>.</li><li>V4 reports "highly robust scoring" from only a minimal set of diverse human annotations, by fusing reasoning into evaluation<a class="cite" href="#ref-22">22</a>.</li></ul>
+    <ul class="cons"><li>Higher variance than outcome RMs<a class="cite" href="#ref-20">20</a>; each judgment costs a decode, not a prefill (Module 1).</li><li>None of the passages read compares a judge and a scalar RM at equal data and scale.</li></ul>
+  </article>
+</div>
+<div class="verdict"><span class="verdict-title">Assessment</span><p>A and B measure different things and can both be true. A is a statement about verification quality: given a fixed generator, a PRM selects better solutions than an ORM, and the measured advantage grows with the number of candidates. B is a statement about training stability: inside a long RL run, a frozen learned scorer fit on earlier samples is the weakest component, and R1 reports it being exploited. Math-Shepherd's post-PPO staleness result and R1's hacking curve look like the same phenomenon at two scales (the writer's reading). The unmeasured quantity is what a continually refreshed PRM, retrained on on-policy samples as DeepSeekMath's iterative GRPO does for its reward model<a class="cite" href="#ref-11">11</a> (§4.1.4), would add over a rule-based outcome reward at 30B+ parameters and thousands of steps, scored on pass@k and on reasoning-trace error. No source runs that experiment. Until one does, the defensible rule is: where a reliable verifier exists, use it as the RL reward (B) and keep PRMs for filtering, reranking and search (C); where none exists, steps are rarely definable (R1's first objection), and the live choice is between a scalar RM and a judge (D).</p><p>On D, the evidence is thin on both sides. The reports that drop scalar RMs for judges (V4, K3) publish no controlled comparison against a scalar RM, and Lambert's RM-benchmark gap measures pair accuracy, which section 3.4 showed predicts downstream policy quality imperfectly. A judge-versus-scalar comparison at matched data, with downstream human preference as the endpoint (the design of Preference Proxy Evaluations<a class="cite" href="#ref-13">13</a>), would settle it; none of the reports supplies one.</p></div>
+</section>
+
+<h2 id="what-is-changing">What is changing</h2>
+<p>Three movements are visible as of October 2026. The scalar head is being absorbed into the policy: DeepSeek-V4 trains the actor as its own judge, and DPO showed earlier that the policy itself defines a Bradley-Terry reward<a class="cite" href="#ref-22">22</a><a class="cite" href="#ref-2">2</a>. Reward-model evaluation is moving from raw pair accuracy toward benchmarks validated against post-RLHF outcomes, with the caution that the one downstream validation among the sources used DPO rather than online RL<a class="cite" href="#ref-13">13</a>. And process-level credit is leaving the learned-PRM form: automatic step labels such as Math-Shepherd's are Monte Carlo value estimates (section 4.4), and the process-level credit in later recipes comes from group-structured or critic-style estimators rather than a separately trained PRM (Modules 9 and 18). Lambert's book still describes reward modeling as a "relatively under-explored area" whose modifications "have not solidified into a single best practice"<a class="cite" href="#ref-6">6</a> (§5.5).</p>
+
+<section id="references">
+<h2 id="references-heading">References</h2>
+<ol class="refs">
+  <li id="ref-1"><span class="ref-type">paper</span>Ouyang, L., Wu, J., Jiang, X., Almeida, D. et al. <em>Training language models to follow instructions with human feedback</em>. NeurIPS 2022; arXiv v1, 4 Mar 2022. <a href="https://arxiv.org/pdf/2203.02155v1">https://arxiv.org/pdf/2203.02155v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the K-way comparison batching, loss and normalization (§3.5, Eq. 1), labeler agreement (§3.4), RM accuracy across labeler groups (§4.1), 175B-versus-6B RM stability and RM hyperparameters (Appendix C.1-C.2), dataset sizes (Table 9), bandit RL setup (§3.5).</span></li>
+  <li id="ref-2"><span class="ref-type">paper</span>Rafailov, R., Sharma, A., Mitchell, E., Ermon, S., Manning, C. D., Finn, C. <em>Direct Preference Optimization: Your Language Model is Secretly a Reward Model</em>. NeurIPS 2023; arXiv v3, 29 Jul 2024. <a href="https://arxiv.org/pdf/2305.18290v3">https://arxiv.org/pdf/2305.18290v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the Bradley-Terry preference model and reward-model loss (§3, Eq. 1-2), the gradient weight (§4), Lemma 1 on per-prompt reward equivalence (§5.1, Appendix A.5), Plackett-Luce (Appendix A.3). The paper cites Bradley and Terry, Biometrika 39(3/4):324-345, 1952, as its reference [5]; the original was not fetched.</span></li>
+  <li id="ref-3"><span class="ref-type">paper</span>Christiano, P. F., Leike, J., Brown, T. B., Martic, M., Legg, S., Amodei, D. <em>Deep Reinforcement Learning from Human Preferences</em>. arXiv 1706.03741 v4, 17 Feb 2023. <a href="https://arxiv.org/pdf/1706.03741">https://arxiv.org/pdf/1706.03741</a>. Accessed 2026-10-27. <span class="ref-use">Used for: preference elicitation with equal and incomparable options (§2.2.2), the Bradley-Terry/Elo preference predictor and the 10% random-response assumption (§2.2.3, Eq. 1).</span></li>
+  <li id="ref-4"><span class="ref-type">paper</span>Stiennon, N., Ouyang, L., Wu, J., Ziegler, D. M., Lowe, R., Voss, C., Radford, A., Amodei, D., Christiano, P. <em>Learning to summarize from human feedback</em>. NeurIPS 2020; arXiv 2009.01325 v3, 15 Feb 2022. <a href="https://arxiv.org/pdf/2009.01325">https://arxiv.org/pdf/2009.01325</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the RM loss, linear head and reward normalization (§3.4), data and model-size scaling and the CNN/DM and length-bias probes (§4.3, Figure 6), labeler agreement and the three-label vote (Appendix C.2), the 64,832-comparison release (§1).</span></li>
+  <li id="ref-5"><span class="ref-type">paper</span>Grattafiori, A., Dubey, A., Jauhri, A. et al. (Llama Team, AI @ Meta). <em>The Llama 3 Herd of Models</em>. arXiv v3, 23 Nov 2024. <a href="https://arxiv.org/pdf/2407.21783v3">https://arxiv.org/pdf/2407.21783v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: reward-model training objective and multi-response rows (§4.1.2), preference-data strength levels and filtering (§4.2.1), rejection sampling and RM quality scoring (§4.2.2-4.2.3), outcome and step-wise RMs for trace filtering (§4.3.3), vision RM regularizer (§7.5.4).</span></li>
+  <li id="ref-6"><span class="ref-type">textbook</span>Lambert, N. <em>Reinforcement Learning from Human Feedback (RLHF Book)</em>. arXiv v12, 11 Sep 2026. <a href="https://arxiv.org/pdf/2504.12501v12">https://arxiv.org/pdf/2504.12501v12</a>. Accessed 2026-10-26. <span class="ref-use">Used for: Bradley-Terry derivation and equivalent loss forms (§5.1, Eq. 12-18), architecture and implementation (§5.1.1-5.1.2), ORM and PRM losses (§5.2-5.3, Eq. 19-21), the type comparison (§5.4), margin, K-wise and generative variants (§5.5-5.6), non-transitive preferences (§10), preference-data practice (§11.2).</span></li>
+  <li id="ref-7"><span class="ref-type">paper</span>Lambert, N., Pyatkin, V., Morrison, J. et al. <em>RewardBench: Evaluating Reward Models for Language Modeling</em>. arXiv 2403.13787 v2, 8 Jun 2024. <a href="https://arxiv.org/pdf/2403.13787">https://arxiv.org/pdf/2403.13787</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the 60-70% accuracy ceilings of older preference validation sets due to inter-annotator disagreement (§1).</span></li>
+  <li id="ref-8"><span class="ref-type">paper</span>Touvron, H., Martin, L., Stone, K. et al. <em>Llama 2: Open Foundation and Fine-Tuned Chat Models</em>. arXiv 2307.09288 v2, 19 Jul 2023. <a href="https://arxiv.org/pdf/2307.09288">https://arxiv.org/pdf/2307.09288</a>. Accessed 2026-10-27. <span class="ref-use">Used for: the two-RM design, ranking loss with margin, training settings, accuracy by preference strength and scaling (§3.2.2, Tables 6-8, Figure 6), margin ablation and reward-distribution shift (Appendix A.3.3, Tables 27-28).</span></li>
+  <li id="ref-9"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>. arXiv v2, 4 Jan 2026 (expanded version; Nature 645:633-638, 2025); v1, 22 Jan 2025. <a href="https://arxiv.org/pdf/2501.12948v2">https://arxiv.org/pdf/2501.12948v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: no neural RMs for reasoning (§2.2), R1-Zero AIME result (§2.3), helpful and safety reward models and AI-labeled pairs (§3.1, Supplement B.3.1), preference reward in the last 400 steps (§3.2.2), reward-hacking observation and Figure 6 (Supplement B.5), open-challenge caveat (Supplement G.1), PRM and MCTS failures (Supplement G.2; §4.2 in v1).</span></li>
+  <li id="ref-10"><span class="ref-type">paper</span>Gao, L., Schulman, J., Hilton, J. <em>Scaling Laws for Reward Model Overoptimization</em>. ICML 2023; arXiv v1, 19 Oct 2022. <a href="https://arxiv.org/pdf/2210.10760v1">https://arxiv.org/pdf/2210.10760v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: translation-invariance and recentering (§2.2), synthetic setup (§2.1), RM data-size and epoch results (§3.3).</span></li>
+  <li id="ref-11"><span class="ref-type">paper</span>Shao, Z., Wang, P., Zhu, Q., Xu, R. et al. <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>. arXiv v3, 27 Apr 2024. <a href="https://arxiv.org/pdf/2402.03300v3">https://arxiv.org/pdf/2402.03300v3</a>. Accessed 2026-10-26. <span class="ref-use">Used for: group-relative advantage and comparative reward models (§4.1.1), process-supervision GRPO (§4.1.3), iterative GRPO with reward-model replay (§4.1.4), GRPO+PS versus GRPO+OS (§5.2.1, Figure 5), the PRM800K annotation-error remark (§5.2.3, footnote 7).</span></li>
+  <li id="ref-12"><span class="ref-type">paper</span>Lambert, N., Morrison, J., Pyatkin, V., Huang, S. et al. <em>Tulu 3: Pushing Frontiers in Open Language Model Post-Training</em>. arXiv v5, 14 Apr 2025. <a href="https://arxiv.org/pdf/2411.15124v5">https://arxiv.org/pdf/2411.15124v5</a>. Accessed 2026-10-26. <span class="ref-use">Used for: RM objective (§5.1.1, Eq. 3), the PPO-versus-DPO comparison, RM head and the benchmark-versus-downstream caveat (§5.4.1), RLVR value-function initialization and "do not use the scores from RM" (§6.2, §6.2.1), RM versus RL cost (§6.3), RM hyperparameters (Appendix A, Table 36).</span></li>
+  <li id="ref-13"><span class="ref-type">paper</span>Frick, E., Li, T., Chen, C., Chiang, W.-L. et al. <em>How to Evaluate Reward Models for RLHF</em> (Preference Proxy Evaluations). arXiv 2410.14872 v2, 22 Oct 2024. <a href="https://arxiv.org/pdf/2410.14872">https://arxiv.org/pdf/2410.14872</a>. Accessed 2026-10-27. <span class="ref-use">Used for: correlation of RM metrics with post-RLHF human preference, accuracy as best predictor and the 77% figure (§7, §9), the DPO-only and nine-model limitation (§8.2), the negative correlation among top RewardBench models (§2).</span></li>
+  <li id="ref-14"><span class="ref-type">paper</span>Lightman, H., Kosaraju, V., Burda, Y., Edwards, H. et al. <em>Let's Verify Step by Step</em>. ICLR 2024; arXiv 2305.20050 v1, 31 May 2023. <a href="https://arxiv.org/abs/2305.20050">https://arxiv.org/abs/2305.20050</a>. Accessed 2026-10-27. <span class="ref-use">Used for: ORM and PRM definitions and PRM800K collection (§2.4-2.6, Appendix B, D-F), best-of-1,860 results (§3, Figure 3), small-scale supervision comparison and active learning (§4), STEM generalization (§5, Table 1), discussion and related work (§6, §7.1), scoring strategies (Appendix F.2, Table 4).</span></li>
+  <li id="ref-15"><span class="ref-type">paper</span>Uesato, J., Kushman, N., Kumar, R., Song, F. et al. <em>Solving math word problems with process- and outcome-based feedback</em>. DeepMind, arXiv 2211.14275 v1, 25 Nov 2022. <a href="https://arxiv.org/pdf/2211.14275">https://arxiv.org/pdf/2211.14275</a>. Accessed 2026-10-27. <span class="ref-use">Used for: final-answer and trace error rates under outcome and process supervision on GSM8K, and the ORM/process-label agreement finding (§1, key results).</span></li>
+  <li id="ref-16"><span class="ref-type">paper</span>Wang, P., Li, L., Shao, Z., Xu, R. X. et al. <em>Math-Shepherd: Verify and Reinforce LLMs Step-by-step without Human Annotations</em>. arXiv 2312.08935 v3, 19 Feb 2024. <a href="https://arxiv.org/pdf/2312.08935">https://arxiv.org/pdf/2312.08935</a>. Accessed 2026-10-27. <span class="ref-use">Used for: automatic hard and soft step labels (§3.3, Eq. 3-4), step-by-step PPO results (§4.1, Table 2), post-PPO verification (Table 3), comparison with PRM800K (§5.1), label-quality check (§5.2).</span></li>
+  <li id="ref-17"><span class="ref-type">paper</span>Kimi Team. <em>Kimi k1.5: Scaling Reinforcement Learning with LLMs</em>. Moonshot AI, arXiv v4, 3 Jun 2025. <a href="https://arxiv.org/pdf/2501.12599v4">https://arxiv.org/pdf/2501.12599v4</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the abstract's design stance of no Monte Carlo tree search, value functions or process reward models.</span></li>
+  <li id="ref-18"><span class="ref-type">paper</span>Team Olmo. <em>Olmo 3</em>. Allen Institute for AI, arXiv v2, 14 Apr 2026. <a href="https://arxiv.org/pdf/2512.13961v2">https://arxiv.org/pdf/2512.13961v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: delta-learning preference pairs without an RM (§4.3, Table 32), verifier and LM-judge rewards in OlmoRL (§4.4, footnote 36).</span></li>
+  <li id="ref-19"><span class="ref-type">paper</span>Yang, A., Li, A., Yang, B., Zhang, B. et al. (Qwen Team). <em>Qwen3 Technical Report</em>. arXiv v1, 14 May 2025. <a href="https://arxiv.org/pdf/2505.09388v1">https://arxiv.org/pdf/2505.09388v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the three reward types, including a preference-trained scalar reward model (§4.4).</span></li>
+  <li id="ref-20"><span class="ref-type">paper</span>GLM-5 Team. <em>GLM-5: from Vibe Coding to Agentic Engineering</em>. Zhipu AI, arXiv v2, 24 Feb 2026. <a href="https://arxiv.org/pdf/2602.15763v2">https://arxiv.org/pdf/2602.15763v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the hybrid rule-based, ORM and GRM reward system and the stated strengths and weaknesses of each (§3.4, General RL).</span></li>
+  <li id="ref-21"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</em>. arXiv v1, 2 Dec 2025. <a href="https://arxiv.org/pdf/2512.02556v1">https://arxiv.org/pdf/2512.02556v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: rule-based rewards for reasoning and agent tasks and a rubric-based generative reward model for general tasks (§3, Mixed RL Training).</span></li>
+  <li id="ref-22"><span class="ref-type">paper</span>DeepSeek-AI. <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv 2606.19348 v1. <a href="https://arxiv.org/pdf/2606.19348v1">https://arxiv.org/pdf/2606.19348v1</a>. Accessed 2026-10-26. <span class="ref-use">Used for: dispensing with scalar reward models in favor of a jointly trained generative reward model (§5.1.1). The arXiv API date for this record is inconsistent with its identifier.</span></li>
+  <li id="ref-23"><span class="ref-type">paper</span>Kimi Team. <em>Kimi K3: Open Frontier Intelligence</em>. Moonshot AI, arXiv v2, 7 Aug 2026. <a href="https://arxiv.org/pdf/2607.24653v2">https://arxiv.org/pdf/2607.24653v2</a>. Accessed 2026-10-26. <span class="ref-use">Used for: the agentic generative reward model and its mandatory scoring protocol (§4.1.2).</span></li>
+</ol>
+</section>
+
+</main>
+</div>
+</body>
+</html>
