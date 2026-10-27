@@ -11,16 +11,26 @@ if (!file) { console.error('usage: build-bibliography.mjs <manifest.json>'); pro
 const abs = resolve(file), dir = dirname(abs);
 const m = JSON.parse(readFileSync(abs, 'utf8'));
 const modules = (m.parts ? m.parts.flatMap(p => p.modules) : m.modules).filter(x => x.format === 'html' && existsSync(join(dir, x.file)));
+// every reference entry in the track, with its body, link and module label
+const refs = modules.flatMap(mod => [...readFileSync(join(dir, mod.file), 'utf8').matchAll(/<li\b[^>]*\bid="ref-\d+"[^>]*>([\s\S]*?)<\/li>/gi)].map(li => {
+  const body = li[1].replace(/<span class="ref-use">[\s\S]*?<\/span>/i, '').trim();
+  const url = (body.match(/href="(https?:\/\/[^"]+)"/i) || [])[1] || body.replace(/<[^>]+>/g, '').slice(0, 80);
+  return { body, url, use: `${m.unitLabel || 'Module'} ${mod.number}` };
+}));
+// arXiv abs and pdf links name one paper, and its versions merge, unless the track cites two versions of it (R1 v1 and v2 differ in their numbers)
+const arxiv = url => url.match(/arxiv\.org\/(?:abs|pdf)\/([a-z.-]*\/?\d{4,7}(?:\.\d+)?)(v\d+)?(?:\.pdf)?(?:[#?]|\/?$)/i);
+const versions = new Map();
+for (const r of refs) {
+  const a = arxiv(r.url);
+  if (a && a[2]) versions.set(a[1].toLowerCase(), new Set([...(versions.get(a[1].toLowerCase()) || []), a[2]]));
+}
 const byUrl = new Map();
-for (const mod of modules) {
-  const html = readFileSync(join(dir, mod.file), 'utf8');
-  for (const li of html.matchAll(/<li\b[^>]*\bid="ref-\d+"[^>]*>([\s\S]*?)<\/li>/gi)) {
-    let body = li[1].replace(/<span class="ref-use">[\s\S]*?<\/span>/i, '').trim();
-    const url = (body.match(/href="(https?:\/\/[^"]+)"/i) || [])[1] || body.replace(/<[^>]+>/g, '').slice(0, 80);
-    const key = url.replace(/[#?].*$/, '').replace(/\/$/, '').toLowerCase();
-    if (!byUrl.has(key)) byUrl.set(key, { body, used: [] });
-    byUrl.get(key).used.push(`${m.unitLabel || 'Module'} ${mod.number}`);
-  }
+for (const r of refs) {
+  const a = arxiv(r.url);
+  const split = a && (versions.get(a[1].toLowerCase()) || new Set()).size > 1;
+  const key = a ? `arxiv:${a[1].toLowerCase()}${split ? (a[2] || '') : ''}` : r.url.replace(/[#?].*$/, '').replace(/\/$/, '').toLowerCase();
+  if (!byUrl.has(key)) byUrl.set(key, { body: r.body, used: [] });
+  byUrl.get(key).used.push(r.use);
 }
 const typeRank = { official: 0, standard: 1, paper: 2, textbook: 3, repo: 4, talk: 5, blog: 6, analysis: 7 };
 const entries = [...byUrl.values()].sort((a, b) => {
